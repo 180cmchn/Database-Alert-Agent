@@ -12,6 +12,7 @@ data/*.db-*
 data/runtime-settings.json
 data/*.audit.jsonl
 data/.*.lock
+runbooks/.runbooks.lock
 frontend/node_modules/
 frontend/dist/
 dist/

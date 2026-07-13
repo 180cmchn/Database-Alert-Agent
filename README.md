@@ -38,18 +38,22 @@ HTTP / Kafka 接入
 - `ManagementNotifier`：接入企业微信、钉钉、邮件或内部通知系统。
 - `AlertRepository`：替换审计存储。
 
-## 本地启动
+## 启动方式
 
-需要 Python 3.12+。
+项目提供两种启动方式。它们都会使用宿主机端口 `8000`，因此默认是**二选一**，不要在 Compose 运行时再次执行默认端口的 Uvicorn。
+
+| 使用场景 | 启动方式 | 包含组件 | 访问地址 |
+| --- | --- | --- | --- |
+| 正常使用、完整体验 | Docker Compose（推荐） | Kafka、API、Worker、Web 管理台 | Web `http://localhost:3000`，API `http://localhost:8000` |
+| 修改代码、断点调试、热更新 | 本地开发 | Uvicorn、Vite；默认使用进程内调度器 | Web `http://localhost:5173`，API `http://localhost:8000` |
+
+第一次运行前复制配置文件（已有 `.env` 时不要覆盖）：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-真实模型模式需在 `.env` 中填写：
+真实模型模式需要在 `.env` 中填写：
 
 ```dotenv
 AI_PROVIDER=openai_compatible
@@ -58,19 +62,80 @@ AI_API_KEY=your-key
 AI_MODEL=your-model
 ```
 
-仅验证框架时可显式使用确定性的测试模型：
+管理手册和 Agent 设置还需要独立的管理员令牌，不要与模型 API Key 复用：
+
+```dotenv
+ADMIN_API_TOKEN=replace-with-a-long-random-token
+```
+
+仅在本地开发或自动化测试时，可以显式使用确定性的 Fake 模型：
 
 ```dotenv
 AI_PROVIDER=fake
 ```
 
-启动 HTTP API：
+### 正常使用：Docker Compose（推荐）
+
+这种方式用于正常运行和体验完整系统，不需要手动启动 Uvicorn 或 Vite：
 
 ```bash
+docker compose up -d --build
+```
+
+启动后访问：
+
+- Web 管理台：`http://localhost:3000`
+- API：`http://localhost:8000`
+- OpenAPI 文档：`http://localhost:8000/docs`
+
+查看状态和日志：
+
+```bash
+docker compose ps
+docker compose logs -f api worker
+```
+
+停止完整系统：
+
+```bash
+docker compose down
+```
+
+### 本地开发：Uvicorn + Vite
+
+这种方式用于修改代码和热更新调试。先停止占用 `8000` 端口的 Compose 服务：
+
+```bash
+docker compose down
+```
+
+需要 Python 3.12+。在项目根目录安装并启动后端：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
 uvicorn app.api.main:app --reload
 ```
 
-访问 `http://localhost:8000/docs` 查看 OpenAPI 文档。
+另开一个终端启动前端：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+本地开发地址为 Web `http://localhost:5173`、API `http://localhost:8000`。Vite 会把 `/api` 和 `/health` 代理到本地 Uvicorn。
+
+如果确实需要保留 Docker，同时启动另一份本地后端，必须改用不同端口，并让 Vite 指向该端口：
+
+```bash
+uvicorn app.api.main:app --reload --port 8001
+
+cd frontend
+VITE_DEV_API_TARGET=http://localhost:8001 npm run dev
+```
 
 ## Web 管理台
 
@@ -82,29 +147,7 @@ uvicorn app.api.main:app --reload
 - Markdown 手册查询、创建、编辑和删除；
 - Agent 模型、API Key、独立验收、ReAct 和管理通知等运行时配置。
 
-先在 `.env` 设置管理员令牌。它只用于管理接口，不要与模型 API Key 复用：
-
-```dotenv
-ADMIN_API_TOKEN=replace-with-a-long-random-token
-```
-
-再启动前端开发服务：
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-打开 `http://localhost:5173`。前端开发服务器会把 `/api` 和 `/health` 代理到 `http://localhost:8000`；管理员令牌只保存在当前浏览器标签页会话中。
-
-也可以一次启动 Kafka、API、Worker 和 Web 管理台：
-
-```bash
-docker compose up --build
-```
-
-此时管理台地址为 `http://localhost:3000`，API 可从本机 `http://localhost:8000` 访问。Compose 默认只把 API 绑定到 `127.0.0.1`；远程告警平台应通过带认证的反向代理或 API 网关接入。
+进入手册或设置页面时输入 `ADMIN_API_TOKEN`。令牌只保存在当前浏览器标签页会话中。Compose 默认只把 API 绑定到 `127.0.0.1`；远程告警平台应通过带认证的反向代理或 API 网关接入。
 
 ### 管理配置的安全语义
 
@@ -159,11 +202,7 @@ curl http://localhost:8000/api/v1/alerts/{alert_id}
 
 ## Kafka
 
-使用 Docker Compose 同时启动 Kafka、API 和 Worker：
-
-```bash
-docker compose up --build
-```
+“正常使用：Docker Compose”模式会自动启动 Kafka、API 和 Worker，无需额外执行命令。本地开发模式默认使用进程内调度器，不要求启动 Kafka；只有调试 Kafka 链路时才需要单独调整 `.env` 并启动相关服务。
 
 Worker 同时接受外部告警信封和 API 发布的内部调查任务。外部告警格式为：
 
