@@ -91,12 +91,16 @@ class KafkaAnalysisScheduler:
     def __init__(self, settings: Settings, service: AlertAnalysisService) -> None:
         self.settings = settings
         self.service = service
-        self.producer = AIOKafkaProducer(
-            bootstrap_servers=settings.kafka_bootstrap_servers,
-            value_serializer=lambda value: json.dumps(value, ensure_ascii=False).encode(),
-        )
+        # aiokafka binds clients to the currently running event loop. FastAPI's
+        # module-level app factory runs before Uvicorn starts that loop, so defer
+        # client creation to the asynchronous lifespan hook.
+        self.producer: AIOKafkaProducer | None = None
 
     async def start(self) -> None:
+        self.producer = AIOKafkaProducer(
+            bootstrap_servers=self.settings.kafka_bootstrap_servers,
+            value_serializer=lambda value: json.dumps(value, ensure_ascii=False).encode(),
+        )
         await self.producer.start()
         pending = await self.service.repository.list_by_status(
             {AlertStatus.QUEUED, AlertStatus.ANALYZING}
@@ -105,9 +109,13 @@ class KafkaAnalysisScheduler:
             await self.enqueue(str(stored.alert.id))
 
     async def stop(self) -> None:
-        await self.producer.stop()
+        if self.producer is not None:
+            await self.producer.stop()
+            self.producer = None
 
     async def enqueue(self, alert_id: str) -> None:
+        if self.producer is None:
+            raise RuntimeError("Kafka analysis scheduler is not started")
         await self.producer.send_and_wait(
             self.settings.kafka_alert_topic,
             {

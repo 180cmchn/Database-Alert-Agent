@@ -5,9 +5,22 @@ from types import SimpleNamespace
 import pytest
 
 from app.application.factory import build_runtime
-from app.application.scheduler import InMemoryAnalysisScheduler
+from app.application.scheduler import InMemoryAnalysisScheduler, KafkaAnalysisScheduler
 from app.config import Settings
 from app.domain.models import AlertStatus
+
+
+def test_kafka_scheduler_construction_does_not_require_running_event_loop() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        kafka_bootstrap_servers="kafka:9092",
+    )
+    service = SimpleNamespace(repository=SimpleNamespace())
+
+    scheduler = KafkaAnalysisScheduler(settings, service)  # type: ignore[arg-type]
+
+    assert scheduler.producer is None
 
 
 @pytest.mark.asyncio
