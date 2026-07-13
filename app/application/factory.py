@@ -2,14 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.adapters.ai import FakeAIAdvisor, OpenAICompatibleAdvisor
+from app.adapters.ai import (
+    FakeAIAdvisor,
+    FakeConclusionValidator,
+    OpenAICompatibleAdvisor,
+    OpenAICompatibleConclusionValidator,
+)
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
+from app.adapters.investigation import (
+    DefaultInvestigationStrategyProvider,
+    InvestigationToolRegistry,
+    ToolExecutor,
+    build_default_tool_registry,
+)
 from app.adapters.notification import LogManagementNotifier, WebhookManagementNotifier
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.adapters.runbooks import LocalMarkdownRunbookProvider
 from app.application.service import AlertAnalysisService
+from app.application.validation import RuleConclusionValidator
 from app.config import Settings
-from app.domain.ports import AIAdvisor, AlertRepository, ManagementNotifier, RunbookProvider
+from app.domain.ports import (
+    AIAdvisor,
+    AlertRepository,
+    ConclusionValidator,
+    InvestigationStrategyProvider,
+    ManagementNotifier,
+    RunbookProvider,
+)
 
 
 @dataclass
@@ -17,6 +36,68 @@ class Runtime:
     settings: Settings
     repository: AlertRepository
     service: AlertAnalysisService
+
+
+def _build_advisor(settings: Settings) -> AIAdvisor:
+    if settings.ai_provider == "fake":
+        return FakeAIAdvisor()
+    return OpenAICompatibleAdvisor(
+        api_key=settings.ai_api_key,
+        base_url=settings.ai_base_url,
+        model=settings.ai_model,
+        timeout_seconds=settings.ai_timeout_seconds,
+        max_retries=settings.ai_max_retries,
+        json_mode=settings.ai_json_mode,
+    )
+
+
+def _build_conclusion_validator(settings: Settings) -> ConclusionValidator:
+    if settings.ai_provider == "fake":
+        return FakeConclusionValidator()
+    return OpenAICompatibleConclusionValidator(
+        api_key=settings.ai_api_key,
+        base_url=settings.ai_base_url,
+        model=settings.ai_model,
+        timeout_seconds=settings.ai_timeout_seconds,
+        max_retries=settings.ai_max_retries,
+    )
+
+
+def _build_notifier(settings: Settings) -> ManagementNotifier:
+    if settings.notifier_mode == "webhook":
+        return WebhookManagementNotifier(
+            settings.management_webhook_url,
+            settings.management_webhook_bearer_token,
+        )
+    return LogManagementNotifier()
+
+
+def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
+    """Apply a validated runtime configuration without replacing stateful components."""
+
+    service = runtime.service
+    # Build every replaceable adapter before mutating the live service. Constructors
+    # perform no network I/O, so this synchronous swap cannot yield halfway through.
+    advisor = _build_advisor(settings)
+    conclusion_validator = _build_conclusion_validator(settings)
+    notifier = _build_notifier(settings)
+    strategy_provider = DefaultInvestigationStrategyProvider(
+        settings.react_max_dynamic_turns if settings.react_enabled else 0
+    )
+
+    service.advisor = advisor
+    service.conclusion_validator = conclusion_validator
+    service.notifier = notifier
+    service.strategy_provider = strategy_provider
+    service.escalation_severities = {
+        item.value.upper() for item in settings.escalation_severities
+    }
+    service.runbook_limit = settings.runbook_limit
+    service.notification_max_attempts = settings.notification_max_attempts
+    service.notification_backoff_seconds = settings.notification_retry_backoff_seconds
+    service.react_enabled = settings.react_enabled
+    service.validation_enabled = settings.validation_enabled
+    runtime.settings = settings
 
 
 def build_runtime(
@@ -27,34 +108,36 @@ def build_runtime(
     notifier: ManagementNotifier | None = None,
     runbook_provider: RunbookProvider | None = None,
     source_registry: AlertSourceRegistry | None = None,
+    strategy_provider: InvestigationStrategyProvider | None = None,
+    tool_registry: InvestigationToolRegistry | None = None,
+    rule_validator: ConclusionValidator | None = None,
+    conclusion_validator: ConclusionValidator | None = None,
 ) -> Runtime:
     repository = repository or SQLAlchemyAlertRepository(settings.database_url)
     source_registry = source_registry or AlertSourceRegistry(
-        [CanonicalAlertSourceAdapter(settings.severity_mapping)]
+        [
+            CanonicalAlertSourceAdapter(
+                settings.severity_mapping, settings.environment_aliases
+            )
+        ]
     )
     runbook_provider = runbook_provider or LocalMarkdownRunbookProvider(settings.runbook_dir)
 
     if advisor is None:
-        if settings.ai_provider == "fake":
-            advisor = FakeAIAdvisor()
-        else:
-            advisor = OpenAICompatibleAdvisor(
-                api_key=settings.ai_api_key,
-                base_url=settings.ai_base_url,
-                model=settings.ai_model,
-                timeout_seconds=settings.ai_timeout_seconds,
-                max_retries=settings.ai_max_retries,
-                json_mode=settings.ai_json_mode,
-            )
+        advisor = _build_advisor(settings)
+
+    if conclusion_validator is None:
+        conclusion_validator = _build_conclusion_validator(settings)
 
     if notifier is None:
-        if settings.notifier_mode == "webhook":
-            notifier = WebhookManagementNotifier(
-                settings.management_webhook_url,
-                settings.management_webhook_bearer_token,
-            )
-        else:
-            notifier = LogManagementNotifier()
+        notifier = _build_notifier(settings)
+
+    tool_registry = tool_registry or build_default_tool_registry()
+    strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
+        settings.react_max_dynamic_turns if settings.react_enabled else 0
+    )
+    rule_validator = rule_validator or RuleConclusionValidator()
+    tool_executor = ToolExecutor(tool_registry, settings.tool_max_result_chars)
 
     service = AlertAnalysisService(
         source_registry=source_registry,
@@ -62,9 +145,17 @@ def build_runtime(
         advisor=advisor,
         notifier=notifier,
         repository=repository,
+        strategy_provider=strategy_provider,
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        rule_validator=rule_validator,
+        conclusion_validator=conclusion_validator,
         escalation_severities={item.value for item in settings.escalation_severities},
         runbook_limit=settings.runbook_limit,
         notification_max_attempts=settings.notification_max_attempts,
         notification_backoff_seconds=settings.notification_retry_backoff_seconds,
+        investigation_lease_seconds=settings.investigation_lease_seconds,
+        react_enabled=settings.react_enabled,
+        validation_enabled=settings.validation_enabled,
     )
     return Runtime(settings=settings, repository=repository, service=service)

@@ -24,14 +24,34 @@ class RecordingAdvisor(FakeAIAdvisor):
         self.events = events
         self.calls = 0
 
-    async def advise(self, alert, runbooks):  # type: ignore[no-untyped-def]
+    async def advise(  # type: ignore[no-untyped-def]
+        self,
+        alert,
+        runbooks,
+        evidence=None,
+        knowledge_cases=None,
+        strategy=None,
+    ):
         self.events.append("ADVISOR")
         self.calls += 1
-        return await super().advise(alert, runbooks)
+        return await super().advise(
+            alert,
+            runbooks,
+            evidence=evidence,
+            knowledge_cases=knowledge_cases,
+            strategy=strategy,
+        )
 
 
 class FailingAdvisor:
-    async def advise(self, alert, runbooks):  # type: ignore[no-untyped-def]
+    async def advise(  # type: ignore[no-untyped-def]
+        self,
+        alert,
+        runbooks,
+        evidence=None,
+        knowledge_cases=None,
+        strategy=None,
+    ):
         raise AdvisorError("provider unavailable")
 
 
@@ -39,11 +59,24 @@ class FlakyAdvisor(FakeAIAdvisor):
     def __init__(self) -> None:
         self.calls = 0
 
-    async def advise(self, alert, runbooks):  # type: ignore[no-untyped-def]
+    async def advise(  # type: ignore[no-untyped-def]
+        self,
+        alert,
+        runbooks,
+        evidence=None,
+        knowledge_cases=None,
+        strategy=None,
+    ):
         self.calls += 1
         if self.calls == 1:
             raise AdvisorError("temporary failure")
-        return await super().advise(alert, runbooks)
+        return await super().advise(
+            alert,
+            runbooks,
+            evidence=evidence,
+            knowledge_cases=knowledge_cases,
+            strategy=strategy,
+        )
 
 
 def settings_for(tmp_path: Path) -> Settings:

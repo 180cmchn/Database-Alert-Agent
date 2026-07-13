@@ -1,10 +1,14 @@
+import os
 from pathlib import Path
 
 import pytest
 
+from app.adapters import runbooks as runbook_module
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
+from app.adapters.runbook_store import LocalMarkdownRunbookStore
 from app.adapters.runbooks import LocalMarkdownRunbookProvider
 from app.config import DEFAULT_SEVERITY_MAPPING
+from app.domain.models import RunbookDocument
 
 
 @pytest.mark.asyncio
@@ -51,4 +55,49 @@ async def test_unmatched_runbook_returns_empty_list(tmp_path: Path) -> None:
     alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
         {"severity": "LOW", "title": "Disk usage", "reason": "disk"}
     )
+    assert await LocalMarkdownRunbookProvider(tmp_path).search(alert) == []
+
+
+@pytest.mark.asyncio
+async def test_search_works_with_read_only_runbook_mount(tmp_path: Path) -> None:
+    await LocalMarkdownRunbookStore(tmp_path).create(
+        RunbookDocument(
+            id="read-only",
+            title="Read-only runbook",
+            reasons=["latency"],
+            content="Read-only latency procedure.",
+        )
+    )
+    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+        {"severity": "HIGH", "title": "Latency", "reason": "latency"}
+    )
+
+    (tmp_path / ".runbooks.lock").unlink()
+    os.chmod(tmp_path, 0o555)
+    try:
+        matches = await LocalMarkdownRunbookProvider(tmp_path).search(alert)
+    finally:
+        os.chmod(tmp_path, 0o755)
+
+    assert [item.runbook_id for item in matches] == ["read-only"]
+
+
+@pytest.mark.asyncio
+async def test_search_skips_file_removed_by_external_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vanished.md"
+    path.write_text(
+        "---\nid: vanished\nreasons: [latency]\n---\nProcedure.\n",
+        encoding="utf-8",
+    )
+    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+        {"severity": "HIGH", "title": "Latency", "reason": "latency"}
+    )
+
+    def remove_before_open(candidate: Path):  # type: ignore[no-untyped-def]
+        candidate.unlink()
+        raise FileNotFoundError(candidate)
+
+    monkeypatch.setattr(runbook_module, "_parse_markdown", remove_before_open)
     assert await LocalMarkdownRunbookProvider(tmp_path).search(alert) == []

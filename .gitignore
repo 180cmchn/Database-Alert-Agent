@@ -9,5 +9,9 @@ htmlcov/
 .env
 data/*.db
 data/*.db-*
+data/runtime-settings.json
+data/*.audit.jsonl
+frontend/node_modules/
+frontend/dist/
 dist/
 build/

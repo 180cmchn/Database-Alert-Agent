@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,12 @@ class CanonicalAlertPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     external_id: str | None = None
+    environment: str = "unknown"
+    service_name: str | None = None
+    alert_type: str | None = None
+    metric_name: str | None = None
+    error_pattern: str | None = None
+    error_summary: str | None = None
     severity: str
     title: str = Field(min_length=1)
     reason: str = Field(min_length=1)
@@ -35,24 +42,80 @@ class CanonicalAlertPayload(BaseModel):
         return value
 
 
-def stable_alert_fingerprint(source: str, payload: CanonicalAlertPayload) -> str:
-    identity = {
-        "source": source,
-        "severity": payload.severity.upper(),
-        "title": payload.title,
-        "reason": payload.reason,
-        "occurred_at": payload.occurred_at.isoformat(),
-        "database": payload.database.model_dump(mode="json") if payload.database else None,
-    }
+def _stable_hash(prefix: str, identity: dict[str, Any]) -> str:
     encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()
-    return f"generated-{hashlib.sha256(encoded).hexdigest()[:32]}"
+    return f"{prefix}-{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+
+def stable_event_id(source: str, raw_payload: dict[str, Any]) -> str:
+    identity = {"source": source, "payload": raw_payload}
+    return _stable_hash("generated", identity)
+
+
+def normalize_error_pattern(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "<uuid>",
+        value,
+    )
+    value = re.sub(r"\b0x[0-9a-f]+\b", "<hex>", value)
+    value = re.sub(r"\d+(?:\.\d+)?", "<n>", value)
+    return re.sub(r"\s+", " ", value)[:500]
+
+
+def incident_fingerprint(
+    source: str,
+    payload: CanonicalAlertPayload,
+    *,
+    environment: str,
+    service_name: str,
+    alert_type: str,
+) -> str:
+    database_engine = (
+        payload.database.engine.lower()
+        if payload.database and payload.database.engine
+        else None
+    )
+    pattern = payload.error_pattern or payload.error_summary or payload.description or payload.title
+    identity = {
+        "version": "v1",
+        "source": source.lower(),
+        "environment": environment,
+        "service_name": service_name.lower(),
+        "database_engine": database_engine,
+        "alert_type": alert_type.lower(),
+        "metric_name": (payload.metric_name or "").lower(),
+        "error_pattern": normalize_error_pattern(pattern),
+    }
+    return _stable_hash("incident-v1", identity)
+
+
+class EnvironmentResolver:
+    def __init__(self, aliases: dict[str, list[str]]) -> None:
+        self._aliases: dict[str, str] = {}
+        for canonical, values in aliases.items():
+            self._aliases[canonical.lower()] = canonical.lower()
+            for value in values:
+                self._aliases[str(value).strip().lower()] = canonical.lower()
+
+    def resolve(self, value: str | None) -> str:
+        if not value:
+            return "unknown"
+        normalized = value.strip().lower()
+        return self._aliases.get(normalized, normalized)
 
 
 class CanonicalAlertSourceAdapter:
     source = "canonical"
 
-    def __init__(self, severity_mapping: dict[str, str]) -> None:
+    def __init__(
+        self,
+        severity_mapping: dict[str, str],
+        environment_aliases: dict[str, list[str]] | None = None,
+    ) -> None:
         self._mapping = {key.upper(): value.upper() for key, value in severity_mapping.items()}
+        self._environment_resolver = EnvironmentResolver(environment_aliases or {})
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert:
         try:
@@ -70,12 +133,41 @@ class CanonicalAlertSourceAdapter:
         known_fields = set(CanonicalAlertPayload.model_fields)
         extension_fields = {key: value for key, value in payload.items() if key not in known_fields}
         attributes = {**parsed.attributes, **extension_fields}
-        external_id = parsed.external_id or stable_alert_fingerprint(self.source, parsed)
+        environment = self._environment_resolver.resolve(
+            parsed.environment or parsed.labels.get("environment") or parsed.labels.get("env")
+        )
+        service_name = (
+            parsed.service_name
+            or parsed.labels.get("service")
+            or parsed.labels.get("app")
+            or (parsed.database.instance if parsed.database else None)
+            or "unknown"
+        )
+        alert_type = parsed.alert_type or parsed.reason
+        external_id = parsed.external_id or stable_event_id(self.source, payload)
+        fingerprint = incident_fingerprint(
+            self.source,
+            parsed,
+            environment=environment,
+            service_name=service_name,
+            alert_type=alert_type,
+        )
         return NormalizedAlert(
             external_id=external_id,
             source=self.source,
             raw_severity=parsed.severity,
             severity=severity,
+            incident_fingerprint=fingerprint,
+            fingerprint_version="v1",
+            environment=environment,
+            service_name=service_name,
+            alert_type=alert_type,
+            metric_name=parsed.metric_name,
+            error_pattern=(
+                parsed.error_pattern
+                or normalize_error_pattern(parsed.description or parsed.title)
+            ),
+            error_summary=parsed.error_summary or parsed.description or parsed.title,
             title=parsed.title,
             reason=parsed.reason,
             description=parsed.description,
