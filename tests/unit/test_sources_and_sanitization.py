@@ -30,6 +30,40 @@ def test_unknown_severity_is_preserved_and_normalized_to_unknown() -> None:
     assert alert.severity == Severity.UNKNOWN
 
 
+def test_incident_fingerprint_ignores_event_identity_and_occurrence_time() -> None:
+    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
+    common = {
+        "environment": "production",
+        "service_name": "orders-api",
+        "alert_type": "connection_exhausted",
+        "metric_name": "connection_usage_percent",
+        "severity": "HIGH",
+        "title": "Database connections exhausted",
+        "reason": "connection_exhausted",
+        "description": "Connection usage reached 95% on instance orders-primary",
+        "database": {"engine": "postgresql", "instance": "orders-primary"},
+    }
+
+    first = adapter.normalize(
+        {
+            **common,
+            "external_id": "event-1001",
+            "occurred_at": "2026-07-10T08:00:00Z",
+        }
+    )
+    second = adapter.normalize(
+        {
+            **common,
+            "external_id": "event-1002",
+            "occurred_at": "2026-07-10T09:00:00Z",
+        }
+    )
+
+    assert first.external_id != second.external_id
+    assert first.occurred_at != second.occurred_at
+    assert first.incident_fingerprint == second.incident_fingerprint
+
+
 def test_sensitive_data_is_recursively_redacted() -> None:
     payload = {
         "password": "clear-text",

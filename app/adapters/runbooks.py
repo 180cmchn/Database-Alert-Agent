@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import os
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +13,37 @@ import yaml
 
 from app.domain.errors import RunbookError
 from app.domain.models import NormalizedAlert, RunbookExcerpt
+
+
+@contextmanager
+def _runbook_directory_lock(
+    directory: Path,
+    *,
+    exclusive: bool,
+    create_directory: bool = False,
+) -> Iterator[None]:
+    """Coordinate readers and CRUD writers across threads and API processes."""
+
+    if create_directory:
+        directory.mkdir(parents=True, exist_ok=True)
+    if not directory.exists():
+        raise RunbookError(f"Runbook directory does not exist: {directory}")
+    lock_path = directory / ".runbooks.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RunbookError(f"Cannot open runbook directory lock: {directory}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise RunbookError(f"Runbook directory lock is not a regular file: {lock_path}")
+        os.fchmod(file_descriptor, 0o600)
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(file_descriptor, operation)
+        yield
+    finally:
+        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+        os.close(file_descriptor)
 
 
 def _as_lower_strings(value: Any) -> list[str]:
@@ -74,10 +110,18 @@ class LocalMarkdownRunbookProvider:
             raise RunbookError(f"Runbook directory does not exist: {self._directory}")
 
         matches: list[RunbookExcerpt] = []
+        # Readers intentionally do not create or modify a lock file: production
+        # workers mount the runbook directory read-only. Administrative writers
+        # serialize with an exclusive lock and publish changes via atomic replace,
+        # so a reader sees either the old or new complete file. A concurrent delete
+        # may make a glob result disappear and is safely treated as absent.
         for path in sorted(self._directory.glob("*.md")):
             if path.name.lower() == "readme.md":
                 continue
-            metadata, content = _parse_markdown(path)
+            try:
+                metadata, content = _parse_markdown(path)
+            except FileNotFoundError:
+                continue
             score = _score_runbook(metadata, content, alert)
             if score <= 0:
                 continue
