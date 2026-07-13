@@ -23,6 +23,18 @@ class RunbookError(AlertAgentError):
     pass
 
 
+class InvalidRunbookIdError(RunbookError, ValueError):
+    pass
+
+
+class RunbookNotFoundError(RunbookError, LookupError):
+    pass
+
+
+class RunbookConflictError(RunbookError, RuntimeError):
+    pass
+
+
 class NotificationError(AlertAgentError):
     pass
 

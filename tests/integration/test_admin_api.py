@@ -79,10 +79,12 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     secret = "ai-key-that-must-never-be-returned"
     webhook_secret = "webhook-token-that-must-never-be-returned"
     with client:
+        initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
         response = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
             json={
+                "expected_revision": initial["revision"],
                 "ai_provider": "openai_compatible",
                 "ai_base_url": "https://models.example.test/v1",
                 "ai_api_key": secret,
@@ -112,11 +114,39 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         unchanged = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
-            json={"ai_model": "example-model-v2", "runbook_limit": 7},
+            json={
+                "expected_revision": body["revision"],
+                "ai_model": "example-model-v2",
+                "runbook_limit": 7,
+            },
         )
         assert unchanged.status_code == 200
         assert unchanged.json()["changed_fields"] == []
         assert unchanged.json()["revision"] == body["revision"]
+
+        conflict = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={"expected_revision": "0" * 16, "runbook_limit": 8},
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == (
+            "RUNTIME_SETTINGS_REVISION_CONFLICT"
+        )
+
+        unusable_notifier = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": body["revision"],
+                "notifier_mode": "webhook",
+                "management_webhook_url": "",
+            },
+        )
+        assert unusable_notifier.status_code == 422
+        assert unusable_notifier.json()["detail"]["code"] == (
+            "INVALID_RUNTIME_SETTINGS"
+        )
 
         assert isinstance(runtime.service.advisor, OpenAICompatibleAdvisor)
         assert runtime.service.advisor._model == "example-model-v2"
@@ -126,7 +156,10 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         rejected = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
-            json={"ai_base_url": "https://user:password@models.example.test/v1"},
+            json={
+                "expected_revision": body["revision"],
+                "ai_base_url": "https://user:password@models.example.test/v1",
+            },
         )
         assert rejected.status_code == 422
         assert "password" not in rejected.text
@@ -135,7 +168,10 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         rejected_secret = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
-            json={"ai_api_key": oversized_secret},
+            json={
+                "expected_revision": body["revision"],
+                "ai_api_key": oversized_secret,
+            },
         )
         assert rejected_secret.status_code == 422
         assert oversized_secret not in rejected_secret.text

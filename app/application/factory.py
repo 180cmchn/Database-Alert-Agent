@@ -17,6 +17,7 @@ from app.adapters.investigation import (
 )
 from app.adapters.notification import LogManagementNotifier, WebhookManagementNotifier
 from app.adapters.persistence import SQLAlchemyAlertRepository
+from app.adapters.runbook_store import LocalMarkdownRunbookStore
 from app.adapters.runbooks import LocalMarkdownRunbookProvider
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
@@ -28,6 +29,7 @@ from app.domain.ports import (
     InvestigationStrategyProvider,
     ManagementNotifier,
     RunbookProvider,
+    RunbookStore,
 )
 
 
@@ -36,6 +38,8 @@ class Runtime:
     settings: Settings
     repository: AlertRepository
     service: AlertAnalysisService
+    runbook_provider: RunbookProvider
+    runbook_store: RunbookStore
 
 
 def _build_advisor(settings: Settings) -> AIAdvisor:
@@ -70,6 +74,26 @@ def _build_notifier(settings: Settings) -> ManagementNotifier:
             settings.management_webhook_bearer_token,
         )
     return LogManagementNotifier()
+
+
+def _resolve_runbook_adapters(
+    settings: Settings,
+    provider: RunbookProvider | None,
+    store: RunbookStore | None,
+) -> tuple[RunbookProvider, RunbookStore]:
+    """Resolve one searchable and administrable runbook corpus as an atomic pair."""
+
+    if provider is None and store is None:
+        return (
+            LocalMarkdownRunbookProvider(settings.runbook_dir),
+            LocalMarkdownRunbookStore(settings.runbook_dir),
+        )
+    if provider is None or store is None:
+        raise ValueError(
+            "runbook_provider and runbook_store must be provided together so "
+            "administration and analysis use the same runbook corpus"
+        )
+    return provider, store
 
 
 def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
@@ -107,12 +131,16 @@ def build_runtime(
     advisor: AIAdvisor | None = None,
     notifier: ManagementNotifier | None = None,
     runbook_provider: RunbookProvider | None = None,
+    runbook_store: RunbookStore | None = None,
     source_registry: AlertSourceRegistry | None = None,
     strategy_provider: InvestigationStrategyProvider | None = None,
     tool_registry: InvestigationToolRegistry | None = None,
     rule_validator: ConclusionValidator | None = None,
     conclusion_validator: ConclusionValidator | None = None,
 ) -> Runtime:
+    runbook_provider, runbook_store = _resolve_runbook_adapters(
+        settings, runbook_provider, runbook_store
+    )
     repository = repository or SQLAlchemyAlertRepository(settings.database_url)
     source_registry = source_registry or AlertSourceRegistry(
         [
@@ -121,8 +149,6 @@ def build_runtime(
             )
         ]
     )
-    runbook_provider = runbook_provider or LocalMarkdownRunbookProvider(settings.runbook_dir)
-
     if advisor is None:
         advisor = _build_advisor(settings)
 
@@ -158,4 +184,10 @@ def build_runtime(
         react_enabled=settings.react_enabled,
         validation_enabled=settings.validation_enabled,
     )
-    return Runtime(settings=settings, repository=repository, service=service)
+    return Runtime(
+        settings=settings,
+        repository=repository,
+        service=service,
+        runbook_provider=runbook_provider,
+        runbook_store=runbook_store,
+    )
