@@ -15,12 +15,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
 from app.adapters.persistence import SQLAlchemyAlertRepository
-from app.adapters.runbook_store import (
-    InvalidRunbookIdError,
-    LocalMarkdownRunbookStore,
-    RunbookConflictError,
-    RunbookNotFoundError,
-)
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
@@ -30,7 +24,11 @@ from app.api.schemas import (
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
 )
-from app.application.admin import AdminAuditLogger, RuntimeSettingsManager
+from app.application.admin import (
+    AdminAuditLogger,
+    RuntimeSettingsConflictError,
+    RuntimeSettingsManager,
+)
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
 from app.application.scheduler import (
     InMemoryAnalysisScheduler,
@@ -42,6 +40,9 @@ from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
     InvalidAlertPayloadError,
+    InvalidRunbookIdError,
+    RunbookConflictError,
+    RunbookNotFoundError,
     UnknownAlertSourceError,
 )
 from app.domain.models import (
@@ -66,7 +67,7 @@ def create_app(
     settings = settings or get_settings()
     runtime = runtime or build_runtime(settings)
     runtime_settings = RuntimeSettingsManager(settings.runtime_settings_path)
-    runbook_store = LocalMarkdownRunbookStore(settings.runbook_dir)
+    runbook_store = runtime.runbook_store
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
         if settings.http_scheduler == "kafka":
@@ -395,8 +396,13 @@ def create_app(
         dependencies=[Depends(require_admin)],
     )
     async def read_runtime_settings() -> RuntimeSettingsResponse:
+        updated, changed, revision = await runtime_settings.reload_if_changed(
+            runtime.settings
+        )
+        if changed:
+            apply_runtime_settings(runtime, updated)
         return RuntimeSettingsResponse.from_settings(
-            runtime.settings, revision=runtime_settings.revision
+            runtime.settings, revision=revision
         )
 
     @app.patch(
@@ -411,8 +417,20 @@ def create_app(
         updates = payload.updates()
         try:
             updated, revision, changed_fields = await runtime_settings.patch(
-                runtime.settings, updates
+                runtime.settings,
+                updates,
+                expected_revision=payload.expected_revision,
             )
+        except RuntimeSettingsConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RUNTIME_SETTINGS_REVISION_CONFLICT",
+                    "message": "Runtime settings changed; reload before retrying",
+                    "expected_revision": exc.expected_revision,
+                    "current_revision": exc.current_revision,
+                },
+            ) from exc
         except (ValidationError, ValueError) as exc:
             logger.info("Rejected invalid runtime settings update: %s", type(exc).__name__)
             raise HTTPException(

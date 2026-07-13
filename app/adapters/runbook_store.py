@@ -10,6 +10,11 @@ from typing import Any
 import yaml
 
 from app.adapters.runbooks import _parse_markdown, _runbook_directory_lock
+from app.domain.errors import (
+    InvalidRunbookIdError,
+    RunbookConflictError,
+    RunbookNotFoundError,
+)
 from app.domain.models import RunbookDocument, utc_now
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -24,18 +29,6 @@ _RESERVED_METADATA = {
     "version",
     "updated_at",
 }
-
-
-class InvalidRunbookIdError(ValueError):
-    pass
-
-
-class RunbookNotFoundError(LookupError):
-    pass
-
-
-class RunbookConflictError(RuntimeError):
-    pass
 
 
 class LocalMarkdownRunbookStore:

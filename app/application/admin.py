@@ -1,15 +1,52 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
+import stat
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from app.config import RUNTIME_SETTINGS_KEYS, Settings, load_runtime_overrides
+
+
+def _revision_for(overrides: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        overrides, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def runtime_configuration_issues(settings: Settings) -> list[str]:
+    """Return non-sensitive issues that prevent a usable runtime configuration."""
+
+    issues = list(settings.readiness_issues())
+    if settings.ai_provider == "openai_compatible":
+        if not settings.ai_api_key.strip():
+            issues.append("AI_API_KEY is required for openai_compatible provider")
+        if not settings.ai_model.strip():
+            issues.append("AI_MODEL is required for openai_compatible provider")
+    if settings.notifier_mode == "webhook" and not settings.management_webhook_url.strip():
+        issues.append("MANAGEMENT_WEBHOOK_URL is required in webhook mode")
+    if settings.app_env.lower() in {"production", "prod"} and settings.ai_provider == "fake":
+        issues.append("AI_PROVIDER=fake is not allowed in production")
+    return list(dict.fromkeys(issues))
+
+
+class RuntimeSettingsConflictError(RuntimeError):
+    def __init__(self, *, expected_revision: str, current_revision: str) -> None:
+        super().__init__(
+            "Runtime settings changed; reload them before retrying "
+            f"(expected={expected_revision}, current={current_revision})"
+        )
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
 
 
 class RuntimeSettingsManager:
@@ -22,42 +59,31 @@ class RuntimeSettingsManager:
 
     @property
     def revision(self) -> str:
-        encoded = json.dumps(
-            self._overrides, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode()
-        return hashlib.sha256(encoded).hexdigest()[:16]
+        return _revision_for(self._overrides)
 
     async def patch(
-        self, current: Settings, updates: dict[str, Any]
+        self,
+        current: Settings,
+        updates: dict[str, Any],
+        *,
+        expected_revision: str,
     ) -> tuple[Settings, str, list[str]]:
+        updates = updates.copy()
+        if not expected_revision:
+            raise ValueError("expected_revision is required")
         unexpected = set(updates) - RUNTIME_SETTINGS_KEYS
         if unexpected:
             raise ValueError(f"Runtime setting is not editable: {sorted(unexpected)[0]}")
-        if not updates:
-            return current, self.revision, []
 
         async with self._lock:
-            candidate_overrides = {**self._overrides, **updates}
-            candidate = Settings.model_validate(
-                {**current.model_dump(mode="python"), **candidate_overrides}
+            candidate, persisted, revision, changed_fields = await asyncio.to_thread(
+                self._patch_locked_sync,
+                current,
+                updates,
+                expected_revision,
             )
-            current_values = current.model_dump(mode="json")
-            serialized = candidate.model_dump(mode="json")
-            changed_fields = sorted(
-                key
-                for key in updates
-                if serialized.get(key) != current_values.get(key)
-            )
-            if not changed_fields:
-                return current, self.revision, []
-            persisted = {
-                key: serialized[key]
-                for key in {*self._overrides, *changed_fields}
-                if key in RUNTIME_SETTINGS_KEYS
-            }
-            await asyncio.to_thread(self._write_atomic_sync, persisted)
             self._overrides = persisted
-            return candidate, self.revision, changed_fields
+            return candidate, revision, changed_fields
 
     async def reload_if_changed(
         self, current: Settings
@@ -70,13 +96,94 @@ class RuntimeSettingsManager:
                 overrides, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ).encode()
             revision = hashlib.sha256(encoded).hexdigest()[:16]
-            if revision == self.revision:
+            if revision == _revision_for(self._overrides):
                 return current, False, revision
             updated = Settings.model_validate(
                 {**current.model_dump(mode="python"), **overrides}
             )
+            self._validate_runnable(updated)
             self._overrides = overrides
             return updated, True, revision
+
+    def _patch_locked_sync(
+        self,
+        current: Settings,
+        updates: dict[str, Any],
+        expected_revision: str,
+    ) -> tuple[Settings, dict[str, Any], str, list[str]]:
+        with self._settings_file_lock_sync():
+            latest_overrides = load_runtime_overrides(self.path)
+            latest_revision = _revision_for(latest_overrides)
+            if expected_revision != latest_revision:
+                raise RuntimeSettingsConflictError(
+                    expected_revision=expected_revision,
+                    current_revision=latest_revision,
+                )
+
+            effective_current = Settings.model_validate(
+                {**current.model_dump(mode="python"), **latest_overrides}
+            )
+            candidate_overrides = {**latest_overrides, **updates}
+            candidate = Settings.model_validate(
+                {**current.model_dump(mode="python"), **candidate_overrides}
+            )
+            self._validate_runnable(candidate)
+            current_values = effective_current.model_dump(mode="json")
+            serialized = candidate.model_dump(mode="json")
+            changed_fields = sorted(
+                key
+                for key in updates
+                if serialized.get(key) != current_values.get(key)
+            )
+            if not changed_fields:
+                return effective_current, latest_overrides, latest_revision, []
+
+            persisted = {
+                key: serialized[key]
+                for key in {*latest_overrides, *changed_fields}
+                if key in RUNTIME_SETTINGS_KEYS
+            }
+            self._write_atomic_sync(persisted)
+            return candidate, persisted, _revision_for(persisted), changed_fields
+
+    @contextmanager
+    def _settings_file_lock_sync(self) -> Iterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise ValueError("Runtime settings lock is not a regular file")
+            os.fchmod(file_descriptor, 0o600)
+            fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            os.close(file_descriptor)
+
+    @staticmethod
+    def _validate_runnable(settings: Settings) -> None:
+        blocking: list[str] = []
+        if settings.ai_provider == "openai_compatible":
+            if not settings.ai_api_key.strip():
+                blocking.append("AI API key is required for openai_compatible provider")
+            if not settings.ai_model.strip():
+                blocking.append("AI model is required for openai_compatible provider")
+        if settings.notifier_mode == "webhook" and not settings.management_webhook_url.strip():
+            blocking.append("Management webhook URL is required in webhook mode")
+        if (
+            settings.app_env.lower() in {"production", "prod"}
+            and settings.notifier_mode != "webhook"
+        ):
+            blocking.append("Webhook notifier is required in production")
+        if (
+            settings.app_env.lower() in {"production", "prod"}
+            and settings.ai_provider == "fake"
+        ):
+            blocking.append("Fake AI provider is not allowed in production")
+        if blocking:
+            raise ValueError("; ".join(blocking))
 
     def _write_atomic_sync(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

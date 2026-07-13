@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.application.admin import runtime_configuration_issues
 from app.config import Settings
 from app.domain.models import AlertStatus, FeedbackVerdict, RunbookDocument, Severity
 
@@ -92,6 +93,7 @@ class RunbookListResponse(BaseModel):
 class RuntimeSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{16}$")
     ai_provider: Literal["openai_compatible", "fake"] | None = None
     ai_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
     ai_api_key: str | None = Field(default=None, max_length=8192, repr=False)
@@ -115,10 +117,16 @@ class RuntimeSettingsPatch(BaseModel):
     )
 
     def updates(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude_unset=True)
+        return self.model_dump(
+            mode="json", exclude_unset=True, exclude={"expected_revision"}
+        )
 
 
 class RuntimeSettingsResponse(BaseModel):
+    app_env: str
+    fake_provider_allowed: bool
+    ready: bool
+    issues: list[str]
     ai_provider: str
     ai_base_url: str
     ai_api_key_configured: bool
@@ -149,7 +157,12 @@ class RuntimeSettingsResponse(BaseModel):
         revision: str,
         changed_fields: list[str] | None = None,
     ) -> RuntimeSettingsResponse:
+        issues = runtime_configuration_issues(settings)
         return cls(
+            app_env=settings.app_env,
+            fake_provider_allowed=settings.app_env.lower() not in {"production", "prod"},
+            ready=not issues,
+            issues=issues,
             ai_provider=settings.ai_provider,
             ai_base_url=settings.ai_base_url,
             ai_api_key_configured=bool(settings.ai_api_key),
