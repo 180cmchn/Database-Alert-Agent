@@ -75,6 +75,43 @@ def test_fake_provider_is_rejected_in_production() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key",
+        "https://example.test/cgi-bin/webhook/send?key=test-key",
+        "https://qyapi.weixin.qq.com/cgi-bin/not-webhook/send?key=test-key",
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send",
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key&extra=1",
+    ],
+)
+def test_wecom_url_requires_official_https_group_robot_endpoint(url: str) -> None:
+    with pytest.raises(ValidationError, match="official HTTPS WeCom"):
+        Settings(_env_file=None, ai_provider="fake", wecom_webhook_url=url)
+
+    valid = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        wecom_webhook_url=(
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
+        ),
+    )
+    assert valid.wecom_webhook_url.endswith("key=test-key")
+
+
+def test_settings_validation_error_hides_invalid_wecom_url_secret() -> None:
+    secret = "wecom-key-that-must-not-appear-in-validation-errors"
+    with pytest.raises(ValidationError) as caught:
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            wecom_webhook_url=f"not-a-url?key={secret}",
+        )
+
+    assert secret not in str(caught.value)
+
+
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
@@ -157,6 +194,12 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_notifier_combinatio
             {"notifier_mode": "webhook", "management_webhook_url": ""},
             expected_revision=manager.revision,
         )
+    with pytest.raises(ValueError, match="WeCom webhook URL"):
+        await manager.patch(
+            settings,
+            {"notifier_mode": "wecom", "wecom_webhook_url": ""},
+            expected_revision=manager.revision,
+        )
     production_fake = settings.model_copy(update={"app_env": "production"})
     with pytest.raises(ValidationError, match="fake is not allowed in production"):
         await manager.patch(
@@ -167,7 +210,7 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_notifier_combinatio
 
 
 @pytest.mark.asyncio
-async def test_runtime_patch_requires_webhook_notifier_in_production(
+async def test_runtime_patch_requires_external_notifier_in_production(
     tmp_path: Path,
 ) -> None:
     runbooks = tmp_path / "runbooks"
@@ -186,12 +229,25 @@ async def test_runtime_patch_requires_webhook_notifier_in_production(
     )
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
-    with pytest.raises(ValueError, match="Webhook notifier is required"):
+    with pytest.raises(ValueError, match="notifier is required"):
         await manager.patch(
             settings,
             {"runbook_limit": 7},
             expected_revision=manager.revision,
         )
+
+    configured, _, changed = await manager.patch(
+        settings,
+        {
+            "notifier_mode": "wecom",
+            "wecom_webhook_url": (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
+            ),
+        },
+        expected_revision=manager.revision,
+    )
+    assert configured.notifier_mode == "wecom"
+    assert changed == ["notifier_mode", "wecom_webhook_url"]
 
 
 def test_runtime_settings_response_contains_only_safe_readiness_summary(
@@ -204,8 +260,24 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["fake_provider_allowed"] is True
     assert body["ready"] is True
     assert body["issues"] == []
+    assert body["wecom_webhook_url_configured"] is False
     assert "ai_api_key" not in body
     assert "management_webhook_bearer_token" not in body
+    assert "wecom_webhook_url" not in body
+
+    configured_wecom = settings.model_copy(
+        update={
+            "wecom_webhook_url": (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=must-not-leak"
+            )
+        }
+    )
+    safe_response = RuntimeSettingsResponse.from_settings(
+        configured_wecom, revision="1" * 16
+    )
+    safe_body = safe_response.model_dump(mode="json")
+    assert safe_body["wecom_webhook_url_configured"] is True
+    assert "must-not-leak" not in safe_response.model_dump_json()
 
     incomplete = settings.model_copy(
         update={"ai_provider": "openai_compatible", "ai_api_key": "", "ai_model": ""}

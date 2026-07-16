@@ -41,6 +41,14 @@ class CanonicalAlertPayload(BaseModel):
             raise ValueError("severity cannot be empty")
         return value
 
+    @field_validator("title", "reason")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value cannot be empty or whitespace")
+        return value
+
 
 def _stable_hash(prefix: str, identity: dict[str, Any]) -> str:
     encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()

@@ -1,0 +1,8 @@
+services:
+  api:
+    volumes:
+      - ./examples/qq-trial/runbooks:/app/runbooks
+
+  worker:
+    volumes:
+      - ./examples/qq-trial/runbooks:/app/runbooks:ro

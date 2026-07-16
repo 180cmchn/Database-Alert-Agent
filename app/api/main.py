@@ -55,6 +55,7 @@ from app.domain.models import (
     StoredAlert,
 )
 from app.domain.ports import AnalysisJobScheduler
+from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+        configure_logging(settings.log_level)
         await runtime.repository.initialize()
         app.state.runtime = runtime
         app.state.scheduler = scheduler

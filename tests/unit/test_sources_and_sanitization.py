@@ -1,6 +1,9 @@
+import pytest
+
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.application.sanitization import REDACTED, sanitize, sanitize_alert
+from app.application.sanitization import REDACTED, sanitize, sanitize_alert, sanitize_text
 from app.config import DEFAULT_SEVERITY_MAPPING
+from app.domain.errors import InvalidAlertPayloadError
 from app.domain.models import Severity
 
 
@@ -28,6 +31,15 @@ def test_unknown_severity_is_preserved_and_normalized_to_unknown() -> None:
     )
     assert alert.raw_severity == "vendor-special"
     assert alert.severity == Severity.UNKNOWN
+
+
+@pytest.mark.parametrize("field", ["title", "reason"])
+def test_required_text_rejects_whitespace(field: str) -> None:
+    payload = {"severity": "HIGH", "title": "Title", "reason": "reason"}
+    payload[field] = "   "
+
+    with pytest.raises(InvalidAlertPayloadError):
+        CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(payload)
 
 
 def test_incident_fingerprint_ignores_event_identity_and_occurrence_time() -> None:
@@ -77,6 +89,32 @@ def test_sensitive_data_is_recursively_redacted() -> None:
     assert sanitized["nested"]["note"] == "Bearer ***REDACTED***"
     assert sanitized["dsn_value"] == REDACTED
     assert sanitized["safe"] == "visible"
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    [
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("Authorization=ApiKey top-secret", "top-secret"),
+        ("Proxy-Authorization: Digest digest-secret", "digest-secret"),
+        (
+            'Proxy-Authorization: Digest username="u", realm="r", response="digest-secret"',
+            "digest-secret",
+        ),
+        ("access_token=access-secret", "access-secret"),
+        ("refresh-token: refresh-secret", "refresh-secret"),
+        (
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=wecom-secret",
+            "wecom-secret",
+        ),
+    ],
+)
+def test_sensitive_text_redacts_authorization_and_common_tokens(
+    value: str, secret: str
+) -> None:
+    sanitized = sanitize_text(value)
+    assert secret not in sanitized
+    assert REDACTED in sanitized
 
 
 def test_alert_is_sanitized_before_external_use() -> None:

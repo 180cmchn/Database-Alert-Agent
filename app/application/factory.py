@@ -15,7 +15,11 @@ from app.adapters.investigation import (
     ToolExecutor,
     build_default_tool_registry,
 )
-from app.adapters.notification import LogManagementNotifier, WebhookManagementNotifier
+from app.adapters.notification import (
+    LogManagementNotifier,
+    WebhookManagementNotifier,
+    WeComManagementNotifier,
+)
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.adapters.runbook_store import LocalMarkdownRunbookStore
 from app.adapters.runbooks import LocalMarkdownRunbookProvider
@@ -68,12 +72,16 @@ def _build_conclusion_validator(settings: Settings) -> ConclusionValidator:
 
 
 def _build_notifier(settings: Settings) -> ManagementNotifier:
+    if settings.notifier_mode == "wecom":
+        return WeComManagementNotifier(settings.wecom_webhook_url)
     if settings.notifier_mode == "webhook":
         return WebhookManagementNotifier(
             settings.management_webhook_url,
             settings.management_webhook_bearer_token,
         )
-    return LogManagementNotifier()
+    if settings.notifier_mode == "log":
+        return LogManagementNotifier()
+    raise ValueError(f"Unsupported notifier mode: {settings.notifier_mode}")
 
 
 def _resolve_runbook_adapters(

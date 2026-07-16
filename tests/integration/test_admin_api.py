@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.adapters.ai import OpenAICompatibleAdvisor
+from app.adapters.notification import WeComManagementNotifier
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
@@ -185,6 +186,42 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     assert secret not in audit
     assert webhook_secret not in audit
     assert "ai_api_key" in audit
+
+
+def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    wecom_url = (
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+        "wecom-key-that-must-never-be-returned"
+    )
+    with client:
+        initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        response = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": initial["revision"],
+                "notifier_mode": "wecom",
+                "wecom_webhook_url": wecom_url,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["notifier_mode"] == "wecom"
+        assert body["wecom_webhook_url_configured"] is True
+        assert "wecom_webhook_url" not in body
+        assert wecom_url not in response.text
+        assert isinstance(runtime.service.notifier, WeComManagementNotifier)
+
+        current = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS)
+        assert current.status_code == 200
+        assert current.json()["wecom_webhook_url_configured"] is True
+        assert wecom_url not in current.text
+
+    persisted = (tmp_path / "runtime-settings.json").read_text(encoding="utf-8")
+    assert wecom_url in persisted
+    audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
+    assert wecom_url not in audit
 
 
 def test_runbook_crud_uses_safe_ids_and_optimistic_versions(tmp_path: Path) -> None:

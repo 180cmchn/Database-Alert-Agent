@@ -4,7 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -51,6 +51,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "notifier_mode",
         "management_webhook_url",
         "management_webhook_bearer_token",
+        "wecom_webhook_url",
         "notification_max_attempts",
         "notification_retry_backoff_seconds",
         "react_enabled",
@@ -62,7 +63,11 @@ RUNTIME_SETTINGS_KEYS = frozenset(
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_env: str = "development"
@@ -95,6 +100,7 @@ class Settings(BaseSettings):
     notifier_mode: str = "log"
     management_webhook_url: str = ""
     management_webhook_bearer_token: str = ""
+    wecom_webhook_url: str = Field(default="", repr=False)
     notification_max_attempts: int = Field(default=3, ge=1, le=10)
     notification_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
 
@@ -140,6 +146,7 @@ class Settings(BaseSettings):
         for field_name, required in (
             ("ai_base_url", True),
             ("management_webhook_url", False),
+            ("wecom_webhook_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -149,6 +156,21 @@ class Settings(BaseSettings):
                 raise ValueError(f"{field_name} must be an absolute HTTP(S) URL")
             if parsed.username is not None or parsed.password is not None:
                 raise ValueError(f"{field_name} must not contain embedded credentials")
+            if field_name == "wecom_webhook_url":
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                valid_key = len(query.get("key", [])) == 1 and bool(query["key"][0].strip())
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname != "qyapi.weixin.qq.com"
+                    or parsed.port not in {None, 443}
+                    or parsed.path != "/cgi-bin/webhook/send"
+                    or parsed.fragment
+                    or set(query) != {"key"}
+                    or not valid_key
+                ):
+                    raise ValueError(
+                        "wecom_webhook_url must be an official HTTPS WeCom group robot URL"
+                    )
             if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
                 raise ValueError(f"{field_name} must use HTTPS in production")
         if (
@@ -170,11 +192,16 @@ class Settings(BaseSettings):
 
         if self.notifier_mode == "webhook" and not self.management_webhook_url:
             issues.append("MANAGEMENT_WEBHOOK_URL is required in webhook mode")
-        elif self.notifier_mode not in {"log", "webhook"}:
+        elif self.notifier_mode == "wecom" and not self.wecom_webhook_url:
+            issues.append("WECOM_WEBHOOK_URL is required in wecom mode")
+        elif self.notifier_mode not in {"log", "webhook", "wecom"}:
             issues.append(f"Unsupported NOTIFIER_MODE: {self.notifier_mode}")
 
-        if self.app_env.lower() in {"production", "prod"} and self.notifier_mode != "webhook":
-            issues.append("Production requires NOTIFIER_MODE=webhook")
+        if (
+            self.app_env.lower() in {"production", "prod"}
+            and self.notifier_mode not in {"webhook", "wecom"}
+        ):
+            issues.append("Production requires NOTIFIER_MODE=wecom or webhook")
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:

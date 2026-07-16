@@ -1,0 +1,30 @@
+{
+  "external_id": "qq-trial-slow-query-001",
+  "severity": "MEDIUM",
+  "title": "【QQ试运行】支付库慢查询数量异常增加",
+  "reason": "slow_query_spike",
+  "description": "最近 10 分钟慢查询数量由每分钟 3 条升至 42 条，P95 延迟达到 2.4 秒",
+  "environment": "test",
+  "service_name": "payment-api",
+  "alert_type": "query_performance",
+  "metric_name": "slow_query_count",
+  "database": {
+    "engine": "mysql",
+    "instance": "payment-test-01",
+    "database": "payment"
+  },
+  "features": {
+    "slow_queries_per_minute": 42,
+    "baseline_per_minute": 3,
+    "query_p95_ms": 2400,
+    "duration_minutes": 10
+  },
+  "labels": {
+    "trial_channel": "qq",
+    "team": "database",
+    "application": "payment-api"
+  },
+  "attributes": {
+    "test_case": "match-slow-query-runbook-without-management-notification"
+  }
+}

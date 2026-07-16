@@ -77,6 +77,34 @@ services:
       kafka:
         condition: service_healthy
 
+  qq-mail-relay:
+    profiles: ["qq-mail-relay"]
+    build: .
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - tools.qq_mail_relay.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    env_file:
+      - path: ./tools/qq_mail_relay/.env
+        required: false
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   frontend:
     build:
       context: ./frontend

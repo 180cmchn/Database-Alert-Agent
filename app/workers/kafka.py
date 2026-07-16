@@ -20,6 +20,7 @@ from app.domain.errors import (
     UnknownAlertSourceError,
 )
 from app.domain.models import AlertStatus, StoredAlert
+from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ class KafkaAlertWorker:
 
 async def main() -> None:
     settings = get_settings()
-    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    configure_logging(settings.log_level)
     if not settings.kafka_enabled:
         raise RuntimeError("KAFKA_ENABLED must be true to start the Kafka worker")
     runtime = build_runtime(settings)
