@@ -59,6 +59,47 @@ async def test_unmatched_runbook_returns_empty_list(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_severity_and_labels_only_boost_semantic_matches(tmp_path: Path) -> None:
+    (tmp_path / "slow-query.md").write_text(
+        """---
+id: slow-query
+title: Slow query
+reasons: [slow_query_spike]
+keywords: [slow query]
+severities: [CRITICAL]
+labels:
+  trial_channel: qq
+---
+Read-only slow query procedure.
+""",
+        encoding="utf-8",
+    )
+    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
+
+    unrelated = adapter.normalize(
+        {
+            "severity": "CRITICAL",
+            "title": "Replication lag is high",
+            "reason": "replication_lag_high",
+            "labels": {"trial_channel": "qq"},
+        }
+    )
+    assert await LocalMarkdownRunbookProvider(tmp_path).search(unrelated) == []
+
+    related = adapter.normalize(
+        {
+            "severity": "CRITICAL",
+            "title": "Slow query count increased",
+            "reason": "slow_query_spike",
+            "labels": {"trial_channel": "qq"},
+        }
+    )
+    matches = await LocalMarkdownRunbookProvider(tmp_path).search(related)
+    assert [item.runbook_id for item in matches] == ["slow-query"]
+    assert matches[0].score == 17
+
+
+@pytest.mark.asyncio
 async def test_search_works_with_read_only_runbook_mount(tmp_path: Path) -> None:
     await LocalMarkdownRunbookStore(tmp_path).create(
         RunbookDocument(

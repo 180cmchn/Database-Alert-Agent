@@ -153,9 +153,18 @@ VITE_DEV_API_TARGET=http://localhost:8001 npm run dev
 
 管理台不会直接编辑进程环境或把任意环境变量写入 `.env`。它只允许修改经过校验的白名单配置，并以权限 `0600` 原子保存到 `data/runtime-settings.json`。这些覆盖值优先于启动时的同名模型/通知配置；API 立即应用，Kafka Worker 在领取下一条任务前检查配置版本。
 
-配置更新携带当前 `revision` 并在跨进程文件锁内比较；其他管理员已经修改配置时会返回 `409`，前端自动加载最新版本，避免旧页面静默覆盖新值。切换真实模型时必须同时具备 API Key 和 Model，切换 Webhook 时必须提供有效 URL；不可运行的组合不会显示为“已应用”。`Fake` Provider 只允许开发/测试环境使用。
+配置更新携带当前 `revision` 并在跨进程文件锁内比较；其他管理员已经修改配置时会返回 `409`，
+前端自动加载最新版本，避免旧页面静默覆盖新值。切换真实模型时必须同时具备 API Key 和
+Model；切换企业微信或通用 Webhook 时必须具备对应 URL，不可运行的组合不会显示为“已应用”。
+`Fake` Provider 只允许开发/测试环境使用。
 
-`AI_API_KEY` 和 `MANAGEMENT_WEBHOOK_BEARER_TOKEN` 是只写字段：查询接口只返回“是否已配置”，不会返回原值。`DATABASE_URL`、Kafka 地址、管理员令牌、手册目录等基础设施配置不能从网页修改，仍需通过部署环境设置并重启服务。生产环境应把 `data/` 放在受控的加密磁盘或 Secret 管理系统中，并在网关接入企业 SSO/RBAC；内置静态 Bearer Token 只保护管理接口，不替代企业身份系统。告警接入、列表和详情接口在首版默认由部署网络边界保护，生产环境不得把 8000 端口直接暴露到不可信网络。
+`AI_API_KEY`、`WECOM_WEBHOOK_URL` 和 `MANAGEMENT_WEBHOOK_BEARER_TOKEN` 是只写字段：
+查询接口只返回“是否已配置”，不会返回原值；企业微信地址中的机器人 `key` 也不会回显。
+`DATABASE_URL`、Kafka 地址、管理员令牌、手册目录等基础设施配置不能从网页修改，仍需通过
+部署环境设置并重启服务。生产环境应把 `data/` 放在受控的加密磁盘或 Secret 管理系统中，并在
+网关接入企业 SSO/RBAC；内置静态 Bearer Token 只保护管理接口，不替代企业身份系统。告警
+接入、列表和详情接口在首版默认由部署网络边界保护，生产环境不得把 8000 端口直接暴露到
+不可信网络。
 
 ## HTTP 示例
 
@@ -256,15 +265,58 @@ REACT_MAX_DYNAMIC_TURNS=2
 
 ### 管理通知
 
-设置以下配置启用通用 Webhook：
+管理通知支持三种互斥模式；一次运行只会选择其中一种，不会同时向企业微信和 QQ 邮箱扇出：
+
+| 模式 | 用途 | 外部载荷 |
+| --- | --- | --- |
+| `wecom` | 正常使用及正式管理通知（推荐） | 企业微信群机器人 Markdown |
+| `webhook` | 通用兼容通道；本仓库 QQ 邮箱试运行使用此模式 | `NotificationEvent` JSON |
+| `log` | 本地开发且不需要外部通知 | 仅写应用日志 |
+
+通知阶段包括 `INITIAL_ALERT`、`ADVICE_READY` 和 `ANALYSIS_FAILED`。默认只有 `CRITICAL`
+告警触发通知：模型调用前先发送原始告警；调查成功后补发建议，失败则补发需人工介入的失败
+状态。通知失败会按配置重试并写入审计记录，但不会丢弃已经生成的分析结果。
+
+#### 企业微信：正常/正式使用
+
+在接收通知的企业微信群中创建群机器人并复制 Webhook URL，然后通过部署环境配置：
+
+```dotenv
+NOTIFIER_MODE=wecom
+WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+ESCALATION_SEVERITIES=["CRITICAL"]
+```
+
+也可以进入 Web 管理台的“设置 → 管理通知”，选择“企业微信（推荐）”，粘贴群机器人
+Webhook URL 并保存。该 URL 是只写凭据：已配置后页面只显示配置状态，输入框留空表示保持原值。
+通过管理台保存后 API 立即应用，Worker 在领取下一条任务前刷新；修改 `.env` 则需要重启
+相应服务。
+
+机器人 URL 中的 `key` 等同通知凭据，不要提交到 Git、粘贴到工单或输出到日志。生产环境应
+从 Secret 管理系统注入，并仅把机器人加入受控的管理通知群。企业微信群机器人创建方式可参考
+[腾讯云文档](https://intl.cloud.tencent.com/zh/document/product/1254/78645)。
+
+#### QQ 邮箱：个人试运行
+
+个人试运行不要选择 `wecom`。选择 `webhook`，让 Agent 把 `NotificationEvent` 发送到仓库内
+`tools/qq_mail_relay`；中转服务会将事件二次脱敏、转换为纯文本，并通过 QQ SMTP 授权码发到
+固定收件邮箱。它不会接受请求方临时指定收件人。
+
+最小配置如下，具体 URL 取决于 Agent 与中转服务运行位置：
 
 ```dotenv
 NOTIFIER_MODE=webhook
-MANAGEMENT_WEBHOOK_URL=https://management.example/alerts
-MANAGEMENT_WEBHOOK_BEARER_TOKEN=optional-token
+MANAGEMENT_WEBHOOK_URL=http://qq-mail-relay:8080/api/v1/notifications
+MANAGEMENT_WEBHOOK_BEARER_TOKEN=replace-with-the-same-32-plus-character-relay-token
+ESCALATION_SEVERITIES=["CRITICAL"]
 ```
 
-Webhook 接收 `NotificationEvent` JSON。阶段包括 `INITIAL_ALERT`、`ADVICE_READY` 和 `ANALYSIS_FAILED`。通知失败会按配置重试并写入审计记录，但不会丢弃已经生成的分析结果。
+完整的中转服务配置、dry-run、网络地址对照和 SMTP 启用步骤见
+[`tools/qq_mail_relay/README.md`](tools/qq_mail_relay/README.md)。测试手册、四类告警信号和自动
+验证脚本见 [`examples/qq-trial/README.md`](examples/qq-trial/README.md)。
+
+若将来需要一条告警同时发企业微信和邮件，应先为通知审计增加 `channel` 维度再实现多通道；
+当前版本不要用外部转发复制请求，否则同一阶段的审计和重试状态无法分别表达两个渠道。
 
 ### 人工反馈与案例知识库
 

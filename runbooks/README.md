@@ -18,3 +18,13 @@ labels:
 ```
 
 获得真实手册系统后，实现 `RunbookProvider.search()` 并在 `app/application/factory.py` 注册即可；核心工作流无需修改。
+
+本地匹配器先使用 `reasons`、`keywords` 或正文中的原因代码建立语义相关性，再用
+`severities` 和 `labels` 加权排序。仅等级相同或仅标签相同不会被视为手册命中。
+
+当前一个 Markdown 文件对应一个可引用的手册片段和一个 `section`。如果一份手册包含
+多种告警，建议按告警类型拆成多个文件，并通过自定义元数据（例如 `manual_group`）标记为
+同一手册集，避免模型收到无关处置步骤。
+
+自定义元数据只用于标识，不会自动变成过滤条件。例如 `test_only: true` 本身不能阻止生产
+告警命中该文件；测试手册应放在独立目录，并通过单独的 `RUNBOOK_DIR` 加载。

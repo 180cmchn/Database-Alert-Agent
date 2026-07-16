@@ -71,8 +71,8 @@ def _parse_markdown(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def _score_runbook(metadata: dict[str, Any], content: str, alert: NormalizedAlert) -> float:
-    score = 0.0
-    reason = alert.reason.lower()
+    semantic_score = 0.0
+    reason = alert.reason.strip().lower()
     title_and_reason = f"{alert.title} {alert.reason} {alert.description}".lower()
     reasons = _as_lower_strings(metadata.get("reasons"))
     keywords = _as_lower_strings(metadata.get("keywords"))
@@ -81,20 +81,28 @@ def _score_runbook(metadata: dict[str, Any], content: str, alert: NormalizedAler
 
     for candidate in reasons:
         if reason == candidate:
-            score += 10
+            semantic_score += 10
         elif candidate in reason or reason in candidate:
-            score += 6
-    score += sum(3 for keyword in keywords if keyword in title_and_reason)
+            semantic_score += 6
+    semantic_score += sum(3 for keyword in keywords if keyword in title_and_reason)
+
+    # Content is a weak secondary match; explicit metadata remains authoritative.
+    if reason and reason in content.lower():
+        semantic_score += 1
+
+    # Severity and labels describe applicability, but do not identify the alert
+    # type. Treating either as a standalone hit makes every CRITICAL alert match
+    # every CRITICAL runbook, so they only boost an existing semantic match.
+    if semantic_score <= 0:
+        return 0.0
+
+    score = semantic_score
     if alert.severity.value in severities:
         score += 2
     if isinstance(label_rules, dict):
         for key, expected in label_rules.items():
             if alert.labels.get(str(key), "").lower() == str(expected).lower():
                 score += 2
-
-    # Content is a weak secondary match; explicit metadata remains authoritative.
-    if reason and reason in content.lower():
-        score += 1
     return score
 
 

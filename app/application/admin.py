@@ -34,6 +34,8 @@ def runtime_configuration_issues(settings: Settings) -> list[str]:
             issues.append("AI_MODEL is required for openai_compatible provider")
     if settings.notifier_mode == "webhook" and not settings.management_webhook_url.strip():
         issues.append("MANAGEMENT_WEBHOOK_URL is required in webhook mode")
+    if settings.notifier_mode == "wecom" and not settings.wecom_webhook_url.strip():
+        issues.append("WECOM_WEBHOOK_URL is required in wecom mode")
     if settings.app_env.lower() in {"production", "prod"} and settings.ai_provider == "fake":
         issues.append("AI_PROVIDER=fake is not allowed in production")
     return list(dict.fromkeys(issues))
@@ -172,11 +174,13 @@ class RuntimeSettingsManager:
                 blocking.append("AI model is required for openai_compatible provider")
         if settings.notifier_mode == "webhook" and not settings.management_webhook_url.strip():
             blocking.append("Management webhook URL is required in webhook mode")
+        if settings.notifier_mode == "wecom" and not settings.wecom_webhook_url.strip():
+            blocking.append("WeCom webhook URL is required in wecom mode")
         if (
             settings.app_env.lower() in {"production", "prod"}
-            and settings.notifier_mode != "webhook"
+            and settings.notifier_mode not in {"webhook", "wecom"}
         ):
-            blocking.append("Webhook notifier is required in production")
+            blocking.append("WeCom or generic webhook notifier is required in production")
         if (
             settings.app_env.lower() in {"production", "prod"}
             and settings.ai_provider == "fake"

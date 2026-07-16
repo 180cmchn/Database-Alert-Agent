@@ -7,12 +7,13 @@ __pycache__/
 .coverage
 htmlcov/
 .env
+tools/qq_mail_relay/.env
 data/*.db
 data/*.db-*
 data/runtime-settings.json
 data/*.audit.jsonl
 data/.*.lock
-runbooks/.runbooks.lock
+**/.runbooks.lock
 frontend/node_modules/
 frontend/dist/
 dist/

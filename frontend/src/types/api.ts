@@ -282,7 +282,7 @@ export interface AdminSettings {
   ai_json_mode: boolean;
   runbook_limit: number;
   escalation_severities: Severity[];
-  notifier_mode: "log" | "webhook" | string;
+  notifier_mode: "log" | "webhook" | "wecom";
   management_webhook_url: string;
   notification_max_attempts: number;
   notification_retry_backoff_seconds: number;
@@ -291,6 +291,7 @@ export interface AdminSettings {
   validation_enabled: boolean;
   ai_api_key_configured: boolean;
   management_webhook_bearer_token_configured: boolean;
+  wecom_webhook_url_configured: boolean;
   revision: string;
   apply_status: "applied";
   worker_refresh_mode: "before_each_job";
@@ -307,8 +308,9 @@ export interface AdminSettingsPatch {
   ai_json_mode?: boolean;
   runbook_limit?: number;
   escalation_severities?: Severity[];
-  notifier_mode?: string;
+  notifier_mode?: "log" | "webhook" | "wecom";
   management_webhook_url?: string;
+  wecom_webhook_url?: string;
   notification_max_attempts?: number;
   notification_retry_backoff_seconds?: number;
   react_enabled?: boolean;

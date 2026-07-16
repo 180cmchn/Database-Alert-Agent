@@ -105,7 +105,8 @@ class RuntimeSettingsPatch(BaseModel):
     react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
     validation_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
-    notifier_mode: Literal["log", "webhook"] | None = None
+    notifier_mode: Literal["log", "webhook", "wecom"] | None = None
+    wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     management_webhook_url: str | None = Field(default=None, max_length=2048)
     management_webhook_bearer_token: str | None = Field(
         default=None, max_length=8192, repr=False
@@ -139,6 +140,7 @@ class RuntimeSettingsResponse(BaseModel):
     validation_enabled: bool
     runbook_limit: int
     notifier_mode: str
+    wecom_webhook_url_configured: bool
     management_webhook_url: str
     management_webhook_bearer_token_configured: bool
     escalation_severities: list[Severity]
@@ -175,6 +177,7 @@ class RuntimeSettingsResponse(BaseModel):
             validation_enabled=settings.validation_enabled,
             runbook_limit=settings.runbook_limit,
             notifier_mode=settings.notifier_mode,
+            wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             management_webhook_url=settings.management_webhook_url,
             management_webhook_bearer_token_configured=bool(
                 settings.management_webhook_bearer_token
