@@ -25,12 +25,12 @@ def test_severity_mapping_and_stable_fingerprint() -> None:
     assert first.external_id.startswith("generated-")
 
 
-def test_unknown_severity_is_preserved_and_normalized_to_unknown() -> None:
+def test_unknown_severity_is_preserved_and_conservatively_normalized() -> None:
     alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
         {"severity": "vendor-special", "title": "x", "reason": "y"}
     )
     assert alert.raw_severity == "vendor-special"
-    assert alert.severity == Severity.UNKNOWN
+    assert alert.severity == Severity.WARNING
 
 
 @pytest.mark.parametrize("field", ["title", "reason"])

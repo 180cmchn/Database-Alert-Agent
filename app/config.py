@@ -13,17 +13,17 @@ from app.domain.models import Severity
 
 DEFAULT_SEVERITY_MAPPING = {
     "P0": "CRITICAL",
-    "P1": "HIGH",
-    "P2": "MEDIUM",
-    "P3": "LOW",
+    "P1": "WARNING",
+    "P2": "WARNING",
+    "P3": "INFO",
     "FATAL": "CRITICAL",
-    "ERROR": "HIGH",
-    "WARN": "MEDIUM",
-    "WARNING": "MEDIUM",
-    "INFO": "LOW",
-    "LOW": "LOW",
-    "MEDIUM": "MEDIUM",
-    "HIGH": "HIGH",
+    "ERROR": "WARNING",
+    "WARN": "WARNING",
+    "WARNING": "WARNING",
+    "INFO": "INFO",
+    "LOW": "INFO",
+    "MEDIUM": "WARNING",
+    "HIGH": "WARNING",
     "CRITICAL": "CRITICAL",
 }
 
@@ -106,6 +106,23 @@ class Settings(BaseSettings):
     )
     escalation_severities: list[Severity] = Field(default_factory=lambda: [Severity.CRITICAL])
 
+    alert_routing_policy_path: Path = Path("./policies/alert-routing.yaml")
+    alert_routing_enabled: bool = True
+    alert_routing_poll_seconds: float = Field(default=2, ge=0.2, le=60)
+    alert_routing_timezone: str = "Asia/Shanghai"
+    alert_group_webhook_urls: dict[str, str] = Field(default_factory=dict, repr=False)
+    wecom_card_api_url: str = ""
+    wecom_card_api_bearer_token: SecretStr = Field(default=SecretStr(""), repr=False)
+    wecom_ack_callback_base_url: str = ""
+    wecom_ack_callback_token: SecretStr = Field(default=SecretStr(""), repr=False)
+    wecom_oncall_api_url: str = ""
+    wecom_oncall_api_bearer_token: SecretStr = Field(default=SecretStr(""), repr=False)
+    phone_notification_api_url: str = ""
+    phone_notification_api_bearer_token: SecretStr = Field(
+        default=SecretStr(""), repr=False
+    )
+    fallback_oncall: str = "sona"
+
     notifier_mode: str = "log"
     management_webhook_url: str = ""
     management_webhook_bearer_token: str = ""
@@ -131,7 +148,34 @@ class Settings(BaseSettings):
     @field_validator("severity_mapping")
     @classmethod
     def normalize_mapping(cls, value: dict[str, str]) -> dict[str, str]:
-        return {str(key).upper(): str(mapped).upper() for key, mapped in value.items()}
+        legacy_aliases = {
+            "HIGH": "WARNING",
+            "MEDIUM": "WARNING",
+            "LOW": "INFO",
+            "UNKNOWN": "WARNING",
+        }
+        return {
+            str(key).upper(): legacy_aliases.get(
+                str(mapped).upper(), str(mapped).upper()
+            )
+            for key, mapped in value.items()
+        }
+
+    @field_validator("escalation_severities", mode="before")
+    @classmethod
+    def normalize_escalation_severities(cls, value: Any) -> Any:
+        aliases = {
+            "HIGH": "WARNING",
+            "MEDIUM": "WARNING",
+            "LOW": "INFO",
+            "UNKNOWN": "WARNING",
+        }
+        if isinstance(value, str):
+            value = json.loads(value)
+        if isinstance(value, list):
+            normalized = [aliases.get(str(item).upper(), str(item).upper()) for item in value]
+            return list(dict.fromkeys(normalized))
+        return value
 
     @field_validator(
         "ai_provider",
@@ -167,12 +211,23 @@ class Settings(BaseSettings):
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
 
+    @field_validator("alert_group_webhook_urls", mode="before")
+    @classmethod
+    def normalize_group_webhooks(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return json.loads(value) if value.strip() else {}
+        return value
+
     @model_validator(mode="after")
     def validate_admin_editable_urls(self) -> Settings:
         for field_name, required in (
             ("ai_base_url", True),
             ("management_webhook_url", False),
             ("wecom_webhook_url", False),
+            ("wecom_card_api_url", False),
+            ("wecom_ack_callback_base_url", False),
+            ("wecom_oncall_api_url", False),
+            ("phone_notification_api_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -199,6 +254,16 @@ class Settings(BaseSettings):
                     )
             if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
                 raise ValueError(f"{field_name} must use HTTPS in production")
+        for target, url in self.alert_group_webhook_urls.items():
+            parsed = urlsplit(url)
+            if not target.strip() or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(
+                    "alert_group_webhook_urls must map non-empty ids to absolute HTTP(S) URLs"
+                )
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("alert_group_webhook_urls must not embed credentials")
+            if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
+                raise ValueError("alert_group_webhook_urls must use HTTPS in production")
         if (
             self.app_env.lower() in {"production", "prod"}
             and self.ai_provider == "fake"
@@ -263,6 +328,18 @@ class Settings(BaseSettings):
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
         if not self.runbook_dir.exists():
             issues.append(f"Runbook directory does not exist: {self.runbook_dir}")
+        if self.alert_routing_enabled and not self.alert_routing_policy_path.exists():
+            issues.append(
+                f"Alert routing policy does not exist: {self.alert_routing_policy_path}"
+            )
+        if self.wecom_card_api_url and (
+            not self.wecom_ack_callback_base_url
+            or not self.wecom_ack_callback_token.get_secret_value()
+        ):
+            issues.append(
+                "WECOM_ACK_CALLBACK_BASE_URL and WECOM_ACK_CALLBACK_TOKEN are "
+                "required when WECOM_CARD_API_URL is configured"
+            )
         if not self.runbook_web_allowed_hosts:
             issues.append("RUNBOOK_WEB_ALLOWED_HOSTS is required")
         if (

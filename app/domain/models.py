@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utc_now() -> datetime:
@@ -13,11 +13,24 @@ def utc_now() -> datetime:
 
 
 class Severity(StrEnum):
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
     CRITICAL = "CRITICAL"
-    UNKNOWN = "UNKNOWN"
+    WARNING = "WARNING"
+    INFO = "INFO"
+
+
+def normalize_severity_name(value: str | Severity) -> str:
+    normalized = str(value).upper()
+    return {
+        "HIGH": Severity.WARNING.value,
+        "MEDIUM": Severity.WARNING.value,
+        "LOW": Severity.INFO.value,
+        "UNKNOWN": Severity.WARNING.value,
+    }.get(normalized, normalized)
+
+
+class AlertSignalState(StrEnum):
+    FIRING = "FIRING"
+    RESOLVED = "RESOLVED"
 
 
 class AlertStatus(StrEnum):
@@ -94,11 +107,17 @@ class NormalizedAlert(BaseModel):
     source: str
     raw_severity: str
     severity: Severity
+    signal_state: AlertSignalState = AlertSignalState.FIRING
+    dedup_key: str = ""
     incident_fingerprint: str = ""
     fingerprint_version: str = "v1"
     environment: str = "unknown"
     service_name: str = "unknown"
     alert_type: str = "unknown"
+    alert_name: str = "unknown"
+    resource_type: str | None = None
+    cluster: str | None = None
+    alarm_type: str | None = None
     metric_name: str | None = None
     error_pattern: str | None = None
     error_summary: str | None = None
@@ -111,6 +130,11 @@ class NormalizedAlert(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     attributes: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalize_legacy_severity(cls, value: str | Severity) -> str:
+        return normalize_severity_name(value)
 
 
 class RunbookExcerpt(BaseModel):
@@ -134,6 +158,15 @@ class RunbookDocument(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     version: int = Field(default=1, ge=1)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("severities", mode="before")
+    @classmethod
+    def normalize_legacy_severities(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return list(
+                dict.fromkeys(normalize_severity_name(str(item)) for item in value)
+            )
+        return value
 
 
 class RunbookReference(BaseModel):

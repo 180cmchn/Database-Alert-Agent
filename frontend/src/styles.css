@@ -21,10 +21,7 @@
   --accent-soft: rgba(72, 216, 173, 0.12);
   --cyan: #5bc4ef;
   --critical: #ff6571;
-  --high: #ff9e68;
-  --medium: #f2c85f;
-  --low: #48d8ad;
-  --unknown: #70879a;
+  --info: #48d8ad;
   --danger: #ff6571;
   --warning: #f2c85f;
   --radius: 16px;
@@ -130,10 +127,8 @@ button { color: inherit; }
 .badge { width: max-content; display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 999px; font-size: 9px; font-weight: 700; letter-spacing: 0.03em; white-space: nowrap; }
 .badge-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .severity-critical { color: #ff8a92; background: rgba(255, 101, 113, 0.12); border: 1px solid rgba(255, 101, 113, 0.19); }
-.severity-high { color: #ffb086; background: rgba(255, 158, 104, 0.11); border: 1px solid rgba(255, 158, 104, 0.16); }
-.severity-medium { color: #efd37d; background: rgba(242, 200, 95, 0.1); border: 1px solid rgba(242, 200, 95, 0.15); }
-.severity-low { color: #75e5c4; background: rgba(72, 216, 173, 0.1); border: 1px solid rgba(72, 216, 173, 0.15); }
-.severity-unknown { color: #96a9b7; background: rgba(112, 135, 154, 0.11); border: 1px solid rgba(112, 135, 154, 0.16); }
+.severity-warning { color: #efd37d; background: rgba(242, 200, 95, 0.1); border: 1px solid rgba(242, 200, 95, 0.15); }
+.severity-info { color: #75e5c4; background: rgba(72, 216, 173, 0.1); border: 1px solid rgba(72, 216, 173, 0.15); }
 .status { color: #a9becb; background: rgba(109, 142, 163, 0.1); border: 1px solid rgba(109, 142, 163, 0.16); }
 .status-analyzing { color: #72daf4; background: rgba(91, 196, 239, 0.1); border-color: rgba(91, 196, 239, 0.18); }
 .status-completed { color: #78e4c4; background: rgba(72, 216, 173, 0.1); border-color: rgba(72, 216, 173, 0.16); }
@@ -169,7 +164,7 @@ button { color: inherit; }
 .severity-legend > div { display: grid; grid-template-columns: 7px 1fr auto; align-items: center; gap: 7px; color: #8197a6; font-size: 9px; }
 .severity-legend strong { color: #b8c8d1; font-family: "Source Code Pro", monospace; }
 .legend-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.legend-dot.severity-critical { color: var(--critical); }.legend-dot.severity-high { color: var(--high); }.legend-dot.severity-medium { color: var(--medium); }.legend-dot.severity-low { color: var(--low); }.legend-dot.severity-unknown { color: var(--unknown); }
+.legend-dot.severity-critical { color: var(--critical); }.legend-dot.severity-warning { color: var(--warning); }.legend-dot.severity-info { color: var(--info); }
 
 .alert-table-wrap { width: 100%; overflow-x: auto; }
 .alert-table { width: 100%; min-width: 760px; border-collapse: collapse; }

@@ -39,10 +39,7 @@ async def test_qq_trial_alerts_complete_without_local_runbooks(tmp_path: Path) -
             )
             phases = [item.phase for item in result.notifications]
             if case["expects_management_notification"]:
-                assert phases == [
-                    NotificationPhase.INITIAL_ALERT,
-                    NotificationPhase.ADVICE_READY,
-                ]
+                assert phases == [NotificationPhase.ADVICE_READY]
             else:
                 assert phases == []
     finally:

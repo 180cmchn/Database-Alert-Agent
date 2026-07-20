@@ -45,7 +45,7 @@ const blankDraft: RunbookDraft = {
   section: "main",
   reasons: "",
   keywords: "",
-  severities: ["HIGH", "CRITICAL"],
+  severities: ["WARNING", "CRITICAL"],
   labels: "{}",
   sourceUrl: "",
   contentSelector: "",
@@ -279,7 +279,7 @@ export function RunbooksPage() {
 
               <fieldset className="severity-selector">
                 <legend>适用告警等级</legend>
-                <div>{(["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"] as Severity[]).map((severity) => (
+                <div>{(["CRITICAL", "WARNING", "INFO"] as Severity[]).map((severity) => (
                   <label key={severity} className={draft.severities.includes(severity) ? "checked" : ""}>
                     <input type="checkbox" checked={draft.severities.includes(severity)} onChange={(event) => setDraft({ ...draft, severities: event.target.checked ? [...draft.severities, severity] : draft.severities.filter((item) => item !== severity) })} />
                     <SeverityBadge severity={severity} />

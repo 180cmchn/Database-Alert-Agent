@@ -53,6 +53,10 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         queued = client.get(body["detail_url"])
         assert queued.status_code == 200
         assert queued.json()["status"] == "QUEUED"
+        incident = client.get(f"/api/v1/alerts/{body['alert_id']}/incident")
+        assert incident.status_code == 200
+        assert incident.json()["policy_id"] == "critical_warning"
+        assert incident.json()["state"] == "PENDING"
 
         assert client.portal is not None
         client.portal.call(runtime.service.analyze_by_id, body["alert_id"])

@@ -91,7 +91,7 @@ export function CreateAlertPage() {
           <div className="form-grid two-cols">
             <label className="field span-2"><span>告警标题 <b>*</b></span><input name="title" required placeholder="例如：数据库连接数接近上限" /></label>
             <label className="field"><span>告警原因 <b>*</b></span><input name="reason" required placeholder="例如：connection_exhausted" /></label>
-            <label className="field"><span>标准等级 <b>*</b></span><select name="severity" defaultValue="HIGH"><option value="CRITICAL">CRITICAL · 紧急</option><option value="HIGH">HIGH · 高</option><option value="MEDIUM">MEDIUM · 中</option><option value="LOW">LOW · 低</option><option value="UNKNOWN">UNKNOWN · 未知</option></select></label>
+            <label className="field"><span>标准等级 <b>*</b></span><select name="severity" defaultValue="WARNING"><option value="CRITICAL">CRITICAL · 紧急</option><option value="WARNING">WARNING · 警告</option><option value="INFO">INFO · 提示</option></select></label>
             <label className="field span-2"><span>现象描述</span><textarea name="description" rows={4} placeholder="补充当前指标、持续时间和业务影响等信息" /></label>
             <label className="field"><span>外部事件 ID</span><input name="external_id" placeholder="可留空，由后端生成稳定 ID" /></label>
             <label className="field"><span>告警类型</span><input name="alert_type" placeholder="例如：database_capacity" /></label>

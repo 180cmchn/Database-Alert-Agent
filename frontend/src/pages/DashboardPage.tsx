@@ -24,7 +24,7 @@ const statusOrder: AlertStatus[] = [
   "FAILED",
   "RECEIVED",
 ];
-const severityOrder: Severity[] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"];
+const severityOrder: Severity[] = ["CRITICAL", "WARNING", "INFO"];
 
 export function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -147,10 +147,8 @@ export function DashboardPage() {
               background: severityTotal
                 ? `conic-gradient(
                     #ff5964 0 ${(summary?.by_severity.CRITICAL || 0) / severityTotal * 100}%,
-                    #ff9b62 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.HIGH || 0)) / severityTotal * 100}%,
-                    #f6c85f 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.HIGH || 0) + (summary?.by_severity.MEDIUM || 0)) / severityTotal * 100}%,
-                    #43d6a4 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.HIGH || 0) + (summary?.by_severity.MEDIUM || 0) + (summary?.by_severity.LOW || 0)) / severityTotal * 100}%,
-                    #63788e 0 100%)`
+                    #f6c85f 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.WARNING || 0)) / severityTotal * 100}%,
+                    #43d6a4 0 100%)`
                 : undefined,
             }}
           >

@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
+    AlertAcknowledgementRequest,
     FeedbackRequest,
     RunbookCreate,
     RunbookListResponse,
@@ -55,6 +56,7 @@ from app.domain.models import (
     StoredAlert,
 )
 from app.domain.ports import AnalysisJobScheduler
+from app.domain.routing import AlertIncident
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -87,7 +89,11 @@ def create_app(
         app.state.runtime = runtime
         app.state.scheduler = scheduler
         await scheduler.start()
+        if runtime.escalation_scheduler is not None:
+            await runtime.escalation_scheduler.start()
         yield
+        if runtime.escalation_scheduler is not None:
+            await runtime.escalation_scheduler.stop()
         await scheduler.stop()
         if isinstance(runtime.repository, SQLAlchemyAlertRepository):
             await runtime.repository.close()
@@ -143,6 +149,31 @@ def create_app(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),  # noqa: B008
     ) -> str:
         return authenticate_admin(credentials)
+
+    async def require_wecom_callback(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),  # noqa: B008
+    ) -> None:
+        expected = runtime.settings.wecom_ack_callback_token.get_secret_value()
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "WECOM_ACK_NOT_CONFIGURED",
+                    "message": "WECOM_ACK_CALLBACK_TOKEN is not configured",
+                },
+            )
+        if (
+            credentials is None
+            or credentials.scheme.casefold() != "bearer"
+            or not secrets.compare_digest(
+                credentials.credentials.encode("utf-8"), expected.encode("utf-8")
+            )
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "UNAUTHORIZED", "message": "Invalid callback token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     @app.exception_handler(UnknownAlertSourceError)
     async def unknown_source_handler(
@@ -224,11 +255,12 @@ def create_app(
     )
     async def analyze_alert(source: str, payload: dict[str, Any]) -> AlertAccepted:
         stored, created = await runtime.service.ingest(source, payload)
-        if created or stored.status in {
+        if stored.alert.signal_state.value == "FIRING" and (created or stored.status in {
             AlertStatus.QUEUED,
             AlertStatus.FAILED,
-        }:
+        }):
             await scheduler.enqueue(str(stored.alert.id))
+        await runtime.service.route_signal(stored.alert)
         return AlertAccepted(
             alert_id=stored.alert.id,
             event_id=stored.alert.external_id,
@@ -280,6 +312,55 @@ def create_app(
     )
     async def get_alert(alert_id: str) -> StoredAlert:
         return await runtime.service.get(alert_id)
+
+    @app.get(
+        "/api/v1/alerts/{alert_id}/incident",
+        response_model=AlertIncident,
+        tags=["alerts"],
+    )
+    async def get_alert_incident(alert_id: str) -> AlertIncident:
+        if runtime.routing_service is None:
+            raise HTTPException(status_code=503, detail="Alert routing is disabled")
+        incident = await runtime.routing_service.get_incident_for_alert(alert_id)
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Alert incident not found")
+        return incident
+
+    @app.post(
+        "/api/v1/integrations/wecom/alerts/{incident_id}/ack",
+        response_model=AlertIncident,
+        tags=["integrations"],
+        dependencies=[Depends(require_wecom_callback)],
+    )
+    async def acknowledge_from_wecom(
+        incident_id: str, request_body: AlertAcknowledgementRequest
+    ) -> AlertIncident:
+        if runtime.routing_service is None:
+            raise HTTPException(status_code=503, detail="Alert routing is disabled")
+        incident = await runtime.routing_service.acknowledge(
+            incident_id, request_body.actor
+        )
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Alert incident not found")
+        return incident
+
+    @app.post(
+        "/api/v1/admin/incidents/{incident_id}/ack",
+        response_model=AlertIncident,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def acknowledge_from_admin(
+        incident_id: str, request_body: AlertAcknowledgementRequest
+    ) -> AlertIncident:
+        if runtime.routing_service is None:
+            raise HTTPException(status_code=503, detail="Alert routing is disabled")
+        incident = await runtime.routing_service.acknowledge(
+            incident_id, request_body.actor
+        )
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Alert incident not found")
+        return incident
 
     @app.post(
         "/api/v1/alerts/{alert_id}/feedback",

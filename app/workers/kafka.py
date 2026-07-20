@@ -19,7 +19,7 @@ from app.domain.errors import (
     InvestigationLeaseUnavailableError,
     UnknownAlertSourceError,
 )
-from app.domain.models import AlertStatus, StoredAlert
+from app.domain.models import AlertSignalState, AlertStatus, StoredAlert
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,11 @@ async def process_envelope(
         result = await service.analyze(
             parsed["source"], parsed["payload"], retry_failed=True
         )
+    if (
+        getattr(result.alert, "signal_state", AlertSignalState.FIRING)
+        == AlertSignalState.RESOLVED
+    ):
+        return result
     if result.status == AlertStatus.FAILED:
         raise RuntimeError(result.error or "Previously failed alert analysis")
     if result.status in {AlertStatus.QUEUED, AlertStatus.ANALYZING}:
@@ -194,8 +199,12 @@ async def main() -> None:
     await runtime.repository.initialize()
     worker = KafkaAlertWorker(settings, runtime.service, runtime=runtime)
     try:
+        if runtime.escalation_scheduler is not None:
+            await runtime.escalation_scheduler.start()
         await worker.run()
     finally:
+        if runtime.escalation_scheduler is not None:
+            await runtime.escalation_scheduler.stop()
         close = getattr(runtime.repository, "close", None)
         if close:
             await close()

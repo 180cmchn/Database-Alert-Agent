@@ -1,4 +1,4 @@
-export type Severity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" | "UNKNOWN";
+export type Severity = "CRITICAL" | "WARNING" | "INFO";
 
 export type AlertStatus =
   | "RECEIVED"
@@ -72,11 +72,17 @@ export interface NormalizedAlert {
   source: string;
   raw_severity: string;
   severity: Severity;
+  signal_state: "FIRING" | "RESOLVED";
+  dedup_key: string;
   incident_fingerprint: string;
   fingerprint_version: string;
   environment: string;
   service_name: string;
   alert_type: string;
+  alert_name: string;
+  resource_type?: string | null;
+  cluster?: string | null;
+  alarm_type?: string | null;
   metric_name?: string | null;
   error_pattern?: string | null;
   error_summary?: string | null;
@@ -233,9 +239,48 @@ export interface AlertAccepted {
   deduplicated: boolean;
 }
 
+export interface RoutingAction {
+  channel: "wecom_group" | "wecom_card" | "phone";
+  target?: string | null;
+  recipient?: string | null;
+  severities: Severity[];
+  mention_on_call: boolean;
+}
+
+export interface RoutingStep {
+  name: string;
+  delay_seconds: number;
+  actions: RoutingAction[];
+}
+
+export interface AlertIncident {
+  id: string;
+  dedup_key: string;
+  alert_id: string;
+  policy_id: string;
+  policy_version: string;
+  policy_snapshot?: {
+    id: string;
+    name: string;
+    priority: number;
+    hold_seconds: number;
+    steps: RoutingStep[];
+  } | null;
+  severity: Severity;
+  state: "PENDING" | "FIRING" | "ACKNOWLEDGED" | "RESOLVED";
+  current_step: number;
+  next_action_at?: string | null;
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
+  resolved_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface CanonicalAlertPayload {
   external_id?: string;
   severity: Severity;
+  status?: "firing" | "resolved";
   title: string;
   reason: string;
   description?: string;
@@ -243,6 +288,10 @@ export interface CanonicalAlertPayload {
   environment?: string;
   service_name?: string;
   alert_type?: string;
+  alert_name?: string;
+  resource_type?: string;
+  cluster?: string;
+  alarm_type?: string;
   metric_name?: string;
   database?: DatabaseTarget;
   features?: Record<string, unknown>;

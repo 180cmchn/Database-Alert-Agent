@@ -8,7 +8,7 @@ import { severityLabel, statusLabel } from "../lib/format";
 import type { AlertListResponse, AlertStatus, Severity } from "../types/api";
 
 const statuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING", "COMPLETED", "REVIEW_REQUIRED", "FAILED"];
-const severities: Severity[] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"];
+const severities: Severity[] = ["CRITICAL", "WARNING", "INFO"];
 const PAGE_SIZE = 20;
 
 export function AlertsPage() {

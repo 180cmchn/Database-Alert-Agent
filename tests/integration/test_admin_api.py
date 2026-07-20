@@ -93,6 +93,31 @@ def test_frontend_origin_is_allowed_by_cors(tmp_path: Path) -> None:
         assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
 
 
+def test_admin_can_acknowledge_routed_incident(tmp_path: Path) -> None:
+    client, _ = create_admin_client(tmp_path)
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "admin-ack-1",
+                "severity": "CRITICAL",
+                "title": "Critical database alert",
+                "reason": "availability",
+            },
+        ).json()
+        incident = client.get(
+            f"/api/v1/alerts/{accepted['alert_id']}/incident"
+        ).json()
+        response = client.post(
+            f"/api/v1/admin/incidents/{incident['id']}/ack",
+            headers=ADMIN_HEADERS,
+            json={"actor": "dba-operator"},
+        )
+        assert response.status_code == 200
+        assert response.json()["state"] == "ACKNOWLEDGED"
+        assert response.json()["acknowledged_by"] == "dba-operator"
+
+
 def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     tmp_path: Path,
 ) -> None:
@@ -252,7 +277,7 @@ def test_runbook_crud_uses_safe_ids_and_optimistic_versions(tmp_path: Path) -> N
         "section": "triage",
         "reasons": ["connection_exhausted"],
         "keywords": ["连接数"],
-        "severities": ["HIGH", "CRITICAL"],
+        "severities": ["WARNING", "CRITICAL"],
         "labels": {"team": "dba"},
         "content": "1. 只读检查当前连接数。",
         "metadata": {
@@ -333,7 +358,7 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
             },
             {
                 "external_id": "list-high",
-                "severity": "HIGH",
+                "severity": "WARNING",
                 "title": "Orders connection usage",
                 "reason": "connection_exhausted",
                 "environment": "prd",
@@ -364,7 +389,7 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
             "/api/v1/alerts",
             params={
                 "status": "QUEUED",
-                "severity": "HIGH",
+                "severity": "WARNING",
                 "environment": "production",
                 "search": "orders",
             },
@@ -436,7 +461,7 @@ def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
                 "section": "read-only-triage",
                 "reasons": ["latency"],
                 "keywords": ["延迟", "latency"],
-                "severities": ["HIGH"],
+                "severities": ["WARNING"],
                 "labels": {},
                 "content": "本地仅保存索引备注。",
                 "metadata": {
