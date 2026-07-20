@@ -1,30 +1,29 @@
 {
   "schema_version": 1,
-  "manual_group": "qq-trial-database-alerts",
   "cases": [
     {
       "name": "critical-replication-lag",
       "file": "alerts/01-critical-replication-lag.json",
-      "expected_manual_matches": ["qq-trial-replication-lag"],
-      "expected_section": "readonly-triage",
+      "expected_manual_matches": [],
+      "expected_section": null,
       "expects_management_notification": true,
-      "purpose": "精确命中复制延迟手册，并验证 CRITICAL 两阶段通知"
+      "purpose": "在未配置网页手册时验证 CRITICAL 两阶段通知"
     },
     {
       "name": "high-connection-pool",
       "file": "alerts/02-high-connection-pool.json",
-      "expected_manual_matches": ["qq-trial-connection-pool"],
-      "expected_section": "readonly-triage",
+      "expected_manual_matches": [],
+      "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "命中同一测试手册集中的另一种告警，但默认不通知管理人员"
+      "purpose": "验证 HIGH 告警默认不通知管理人员"
     },
     {
       "name": "medium-slow-query",
       "file": "alerts/03-medium-slow-query.json",
-      "expected_manual_matches": ["qq-trial-slow-query"],
-      "expected_section": "readonly-triage",
+      "expected_manual_matches": [],
+      "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "命中慢查询手册，验证原因优先于共享的测试标签"
+      "purpose": "验证 MEDIUM 告警默认不通知管理人员"
     },
     {
       "name": "medium-unmatched-deadlock",
@@ -32,7 +31,7 @@
       "expected_manual_matches": [],
       "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "手册未收录该原因；即使等级和标签相同也不应误命中"
+      "purpose": "验证另一条 MEDIUM 告警的无手册保守建议"
     }
   ]
 }

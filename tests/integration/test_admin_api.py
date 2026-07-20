@@ -4,10 +4,13 @@ import json
 import stat
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.adapters.ai import OpenAICompatibleAdvisor
 from app.adapters.notification import WeComManagementNotifier
+from app.adapters.runbook_store import LocalMarkdownRunbookStore
+from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
@@ -18,7 +21,10 @@ ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def create_admin_client(
-    tmp_path: Path, *, admin_token: str = ADMIN_TOKEN
+    tmp_path: Path,
+    *,
+    admin_token: str = ADMIN_TOKEN,
+    runbook_transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[TestClient, Runtime]:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(parents=True, exist_ok=True)
@@ -32,7 +38,21 @@ def create_admin_client(
         runtime_settings_path=tmp_path / "runtime-settings.json",
         notification_retry_backoff_seconds=0,
     )
-    runtime = build_runtime(settings)
+    runtime = None
+    if runbook_transport is not None:
+        runtime = build_runtime(
+            settings,
+            runbook_provider=AuthenticatedWebRunbookProvider(
+                runbooks,
+                allowed_hosts=["wiki.corp.example"],
+                auth_mode="cookie",
+                auth_secret="company_session=authenticated",
+                transport=runbook_transport,
+            ),
+            runbook_store=LocalMarkdownRunbookStore(runbooks),
+        )
+    else:
+        runtime = build_runtime(settings)
     app = create_app(settings, runtime, ManualAnalysisScheduler())
     return TestClient(app), runtime
 
@@ -235,9 +255,19 @@ def test_runbook_crud_uses_safe_ids_and_optimistic_versions(tmp_path: Path) -> N
         "severities": ["HIGH", "CRITICAL"],
         "labels": {"team": "dba"},
         "content": "1. 只读检查当前连接数。",
-        "metadata": {"owner": "database-team"},
+        "metadata": {
+            "owner": "database-team",
+            "source_url": "https://wiki.corp.example/runbooks/connection-limit",
+        },
     }
     with client:
+        missing_source = client.post(
+            "/api/v1/admin/runbooks",
+            headers=ADMIN_HEADERS,
+            json={**create_payload, "metadata": {"owner": "database-team"}},
+        )
+        assert missing_source.status_code == 422
+        assert "source_url" in missing_source.text
         assert (
             client.post(
                 "/api/v1/admin/runbooks",
@@ -385,7 +415,17 @@ def test_feedback_requires_admin_and_uses_authenticated_actor(tmp_path: Path) ->
 def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
     tmp_path: Path,
 ) -> None:
-    client, runtime = create_admin_client(tmp_path)
+    def runbook_page(request: httpx.Request) -> httpx.Response:
+        assert request.headers["cookie"] == "company_session=authenticated"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text="<main id='article-content'>通过只读监控确认延迟趋势。</main>",
+        )
+
+    client, runtime = create_admin_client(
+        tmp_path, runbook_transport=httpx.MockTransport(runbook_page)
+    )
     with client:
         runbook = client.post(
             "/api/v1/admin/runbooks",
@@ -398,8 +438,11 @@ def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
                 "keywords": ["延迟", "latency"],
                 "severities": ["HIGH"],
                 "labels": {},
-                "content": "1. 通过只读监控确认延迟趋势。",
-                "metadata": {},
+                "content": "本地仅保存索引备注。",
+                "metadata": {
+                    "source_url": "https://wiki.corp.example/runbooks/latency",
+                    "content_selector": "#article-content",
+                },
             },
         )
         assert runbook.status_code == 201

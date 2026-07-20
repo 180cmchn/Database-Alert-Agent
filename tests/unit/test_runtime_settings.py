@@ -75,6 +75,36 @@ def test_fake_provider_is_rejected_in_production() -> None:
         )
 
 
+def test_web_runbook_readiness_requires_host_allowlist_and_auth_secret(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        runbook_dir=tmp_path,
+    )
+
+    issues = settings.readiness_issues()
+
+    assert "RUNBOOK_WEB_ALLOWED_HOSTS is required" in issues
+    assert "RUNBOOK_WEB_AUTH_SECRET is required for authenticated runbooks" in issues
+
+
+def test_web_runbook_hosts_accept_json_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "RUNBOOK_WEB_ALLOWED_HOSTS", '["wiki.corp.example", "docs.corp.example"]'
+    )
+
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.runbook_web_allowed_hosts == [
+        "wiki.corp.example",
+        "docs.corp.example",
+    ]
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -120,6 +150,8 @@ def runtime_test_settings(tmp_path: Path) -> Settings:
         ai_provider="fake",
         notifier_mode="log",
         runbook_dir=runbooks,
+        runbook_web_allowed_hosts=["wiki.corp.example"],
+        runbook_web_auth_mode="none",
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
 

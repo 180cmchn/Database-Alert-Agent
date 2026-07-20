@@ -1,144 +1,150 @@
-import os
 from pathlib import Path
 
+import httpx
 import pytest
 
-from app.adapters import runbooks as runbook_module
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.adapters.runbook_store import LocalMarkdownRunbookStore
-from app.adapters.runbooks import LocalMarkdownRunbookProvider
+from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
 from app.config import DEFAULT_SEVERITY_MAPPING
-from app.domain.models import RunbookDocument
+from app.domain.errors import RunbookError
 
 
 @pytest.mark.asyncio
-async def test_runbook_metadata_controls_priority(tmp_path: Path) -> None:
-    (tmp_path / "exact.md").write_text(
+async def test_web_runbook_uses_authenticated_page_body_and_cache(tmp_path: Path) -> None:
+    (tmp_path / "latency.md").write_text(
         """---
-id: exact
-title: Exact
-reasons: [connection_exhausted]
-keywords: [connection]
-severities: [CRITICAL]
+id: latency
+title: Database latency
+section: initial-triage
+reasons: [latency_high]
+source_url: https://wiki.corp.example/runbooks/latency
+content_selector: '#article-content'
 ---
-Approved exact procedure.
+The authoritative content is stored at source_url.
 """,
         encoding="utf-8",
     )
-    (tmp_path / "weak.md").write_text(
-        """---
-id: weak
-title: Weak
-keywords: [connection]
----
-Generic procedure.
-""",
-        encoding="utf-8",
-    )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {
-            "severity": "CRITICAL",
-            "title": "Connection use is high",
-            "reason": "connection_exhausted",
-        }
-    )
-    matches = await LocalMarkdownRunbookProvider(tmp_path).search(alert)
-    assert [item.runbook_id for item in matches] == ["exact", "weak"]
-    assert matches[0].score > matches[1].score
+    requests: list[httpx.Request] = []
 
-
-@pytest.mark.asyncio
-async def test_unmatched_runbook_returns_empty_list(tmp_path: Path) -> None:
-    (tmp_path / "cpu.md").write_text(
-        "---\nid: cpu\nkeywords: [cpu]\n---\nCPU procedure.\n", encoding="utf-8"
-    )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "LOW", "title": "Disk usage", "reason": "disk"}
-    )
-    assert await LocalMarkdownRunbookProvider(tmp_path).search(alert) == []
-
-
-@pytest.mark.asyncio
-async def test_severity_and_labels_only_boost_semantic_matches(tmp_path: Path) -> None:
-    (tmp_path / "slow-query.md").write_text(
-        """---
-id: slow-query
-title: Slow query
-reasons: [slow_query_spike]
-keywords: [slow query]
-severities: [CRITICAL]
-labels:
-  trial_channel: qq
----
-Read-only slow query procedure.
-""",
-        encoding="utf-8",
-    )
-    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
-
-    unrelated = adapter.normalize(
-        {
-            "severity": "CRITICAL",
-            "title": "Replication lag is high",
-            "reason": "replication_lag_high",
-            "labels": {"trial_channel": "qq"},
-        }
-    )
-    assert await LocalMarkdownRunbookProvider(tmp_path).search(unrelated) == []
-
-    related = adapter.normalize(
-        {
-            "severity": "CRITICAL",
-            "title": "Slow query count increased",
-            "reason": "slow_query_spike",
-            "labels": {"trial_channel": "qq"},
-        }
-    )
-    matches = await LocalMarkdownRunbookProvider(tmp_path).search(related)
-    assert [item.runbook_id for item in matches] == ["slow-query"]
-    assert matches[0].score == 17
-
-
-@pytest.mark.asyncio
-async def test_search_works_with_read_only_runbook_mount(tmp_path: Path) -> None:
-    await LocalMarkdownRunbookStore(tmp_path).create(
-        RunbookDocument(
-            id="read-only",
-            title="Read-only runbook",
-            reasons=["latency"],
-            content="Read-only latency procedure.",
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["cookie"] == "company_session=authenticated"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text="""
+            <html><nav>Unrelated navigation</nav><main id="article-content">
+              <h1>Latency runbook</h1><p>Collect slow-query evidence read-only.</p>
+            </main></html>
+            """,
         )
+
+    provider = AuthenticatedWebRunbookProvider(
+        tmp_path,
+        allowed_hosts=["wiki.corp.example"],
+        auth_mode="cookie",
+        auth_secret="company_session=authenticated",
+        cache_ttl_seconds=300,
+        transport=httpx.MockTransport(handler),
     )
     alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Latency", "reason": "latency"}
+        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
     )
 
-    (tmp_path / ".runbooks.lock").unlink()
-    os.chmod(tmp_path, 0o555)
-    try:
-        matches = await LocalMarkdownRunbookProvider(tmp_path).search(alert)
-    finally:
-        os.chmod(tmp_path, 0o755)
+    first = await provider.search(alert)
+    second = await provider.search(alert)
 
-    assert [item.runbook_id for item in matches] == ["read-only"]
+    assert len(requests) == 1
+    assert [item.runbook_id for item in first] == ["latency"]
+    assert first == second
+    assert first[0].section == "initial-triage"
+    assert "Collect slow-query evidence read-only." in first[0].content
+    assert "Unrelated navigation" not in first[0].content
 
 
 @pytest.mark.asyncio
-async def test_search_skips_file_removed_by_external_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "vanished.md"
-    path.write_text(
-        "---\nid: vanished\nreasons: [latency]\n---\nProcedure.\n",
+async def test_web_runbook_does_not_fetch_unrelated_catalog_entry(tmp_path: Path) -> None:
+    (tmp_path / "cpu.md").write_text(
+        """---
+id: cpu
+reasons: [cpu_high]
+source_url: https://wiki.corp.example/runbooks/cpu
+---
+Web catalog record.
+""",
         encoding="utf-8",
     )
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    provider = AuthenticatedWebRunbookProvider(
+        tmp_path,
+        allowed_hosts=["wiki.corp.example"],
+        auth_mode="cookie",
+        auth_secret="company_session=authenticated",
+        transport=httpx.MockTransport(unexpected_request),
+    )
     alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Latency", "reason": "latency"}
+        {"severity": "HIGH", "title": "Disk usage", "reason": "disk_high"}
     )
 
-    def remove_before_open(candidate: Path):  # type: ignore[no-untyped-def]
-        candidate.unlink()
-        raise FileNotFoundError(candidate)
+    assert await provider.search(alert) == []
 
-    monkeypatch.setattr(runbook_module, "_parse_markdown", remove_before_open)
-    assert await LocalMarkdownRunbookProvider(tmp_path).search(alert) == []
+
+@pytest.mark.asyncio
+async def test_web_runbook_never_matches_local_markdown_body(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "local-only.md").write_text(
+        "---\nid: local-only\nreasons: [latency_high]\n---\nAdministrative note.\n",
+        encoding="utf-8",
+    )
+    provider = AuthenticatedWebRunbookProvider(
+        tmp_path,
+        allowed_hosts=["wiki.corp.example"],
+        auth_mode="cookie",
+        auth_secret="company_session=authenticated",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail(f"unexpected request: {request.url}")
+        ),
+    )
+    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
+    )
+
+    assert await provider.search(alert) == []
+
+
+@pytest.mark.asyncio
+async def test_web_runbook_rejects_cross_origin_login_redirect(tmp_path: Path) -> None:
+    (tmp_path / "latency.md").write_text(
+        """---
+id: latency
+reasons: [latency_high]
+source_url: https://wiki.corp.example/runbooks/latency
+---
+Web catalog record.
+""",
+        encoding="utf-8",
+    )
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(request.url.host)
+        return httpx.Response(302, headers={"location": "https://sso.corp.example/login"})
+
+    provider = AuthenticatedWebRunbookProvider(
+        tmp_path,
+        allowed_hosts=["wiki.corp.example", "sso.corp.example"],
+        auth_mode="cookie",
+        auth_secret="company_session=expired",
+        transport=httpx.MockTransport(handler),
+    )
+    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
+    )
+
+    with pytest.raises(RunbookError, match="login session may be missing or expired"):
+        await provider.search(alert)
+    assert requested_hosts == ["wiki.corp.example"]
