@@ -44,7 +44,9 @@ def format_wecom_markdown(event: NotificationEvent) -> str:
 
     alert = event.alert
     phase_title = _PHASE_TITLES[event.phase]
-    severity_color = "warning" if alert.severity.value in {"CRITICAL", "HIGH"} else "info"
+    severity_color = (
+        "warning" if alert.severity.value in {"CRITICAL", "WARNING"} else "info"
+    )
     lines = [
         f"### 数据库告警 · {phase_title}",
         (

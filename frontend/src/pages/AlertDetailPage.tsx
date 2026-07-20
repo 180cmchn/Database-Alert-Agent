@@ -35,9 +35,9 @@ import {
   StatusBadge,
   ToolStatusBadge,
 } from "../components/ui";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
-import type { AlertStatus, StoredAlert } from "../types/api";
+import type { AlertIncident, AlertStatus, StoredAlert } from "../types/api";
 
 const activeStatuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING"];
 const terminalStages = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
@@ -45,6 +45,7 @@ const terminalStages = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
 export function AlertDetailPage() {
   const { alertId = "" } = useParams();
   const [record, setRecord] = useState<StoredAlert | null>(null);
+  const [incident, setIncident] = useState<AlertIncident | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -53,8 +54,15 @@ export function AlertDetailPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const result = await api.getAlert(alertId);
+      const [result, routingResult] = await Promise.all([
+        api.getAlert(alertId),
+        api.getAlertIncident(alertId).catch((requestError: unknown) => {
+          if (requestError instanceof ApiError && requestError.status === 404) return null;
+          throw requestError;
+        }),
+      ]);
       setRecord(result);
+      setIncident(routingResult);
       setError("");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "告警详情加载失败");
@@ -71,10 +79,10 @@ export function AlertDetailPage() {
     [record],
   );
   const isTracking = Boolean(
-    record && (
+    (record && (
       activeStatuses.includes(record.status)
       || (record.latest_run && (!currentStage || !terminalStages.includes(currentStage)))
-    ),
+    )) || (incident && ["PENDING", "FIRING"].includes(incident.state)),
   );
 
   useEffect(() => {
@@ -167,6 +175,28 @@ export function AlertDetailPage() {
           ) : (
             <EmptyState kind="runbook" title="未命中处置手册" description="Agent 的通用建议应降低置信度，并明确要求人工复核。" />
           )}
+        </SectionCard>
+
+        <SectionCard
+          eyebrow="ROUTING & ESCALATION"
+          title="分派与升级状态"
+          description={incident
+            ? `${incident.policy_snapshot?.name || incident.policy_id} · 策略版本 ${incident.policy_version}`
+            : "尚未生成路由事件"}
+        >
+          {incident ? (
+            <div className="validation-list">
+              <article className={["ACKNOWLEDGED", "RESOLVED"].includes(incident.state) ? "passed" : "rejected"}>
+                <span>{["ACKNOWLEDGED", "RESOLVED"].includes(incident.state) ? <CheckCircle2 size={18} /> : <Siren size={18} />}</span>
+                <div>
+                  <strong>{incident.state === "PENDING" ? "等待首轮通知" : incident.state === "FIRING" ? "告警升级中" : incident.state === "ACKNOWLEDGED" ? "告警已确认" : "告警已恢复"}</strong>
+                  <p>已执行 {incident.current_step} / {incident.policy_snapshot?.steps.length || 0} 个步骤{incident.next_action_at ? ` · 下次 ${formatDateTime(incident.next_action_at)}` : ""}</p>
+                  {incident.acknowledged_by && <small>确认人：{incident.acknowledged_by}</small>}
+                </div>
+                <b>{incident.state}</b>
+              </article>
+            </div>
+          ) : <EmptyState title="没有路由记录" description="恢复信号或未启用路由时可能没有对应事件。" />}
         </SectionCard>
       </section>
 
@@ -308,7 +338,7 @@ export function AlertDetailPage() {
           ) : <EmptyState title="暂无校验记录" description="建议生成后，校验结果会记录在审计链路中。" />}
         </SectionCard>
 
-        <SectionCard eyebrow="ESCALATION" title="管理通知" description="紧急告警采用原始告警与分析结论两阶段通知">
+        <SectionCard eyebrow="AI REPORT" title="AI 调查结果通知" description="原始告警分派由独立路由流程负责">
           {record.notifications.length ? (
             <div className="notification-list">
               {record.notifications.map((notification) => (
@@ -318,7 +348,7 @@ export function AlertDetailPage() {
                 </article>
               ))}
             </div>
-          ) : <EmptyState title="未触发管理通知" description="默认只有 CRITICAL 告警会进入升级通知流程。" />}
+          ) : <EmptyState title="未触发 AI 结果通知" description="默认只有 CRITICAL 会补发调查建议或失败状态。" />}
         </SectionCard>
       </section>
 
@@ -326,6 +356,7 @@ export function AlertDetailPage() {
         <dl className="traceability-grid">
           <div><dt>告警 ID</dt><dd>{alert.id}</dd></div>
           <div><dt>事件指纹</dt><dd>{alert.incident_fingerprint || "尚未生成"}</dd></div>
+          <div><dt>路由聚合键</dt><dd>{alert.dedup_key || "尚未生成"}</dd></div>
           <div><dt>来源适配器</dt><dd>{alert.source}</dd></div>
           <div><dt>最后更新</dt><dd>{formatDateTime(record.updated_at)}</dd></div>
           {record.advisor_metadata?.request_id && <div><dt>模型请求 ID</dt><dd>{record.advisor_metadata.request_id}</dd></div>}

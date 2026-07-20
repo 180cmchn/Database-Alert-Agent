@@ -2,10 +2,8 @@ import type { AlertStatus, InvestigationStage, Severity } from "../types/api";
 
 export const severityLabel: Record<Severity, string> = {
   CRITICAL: "紧急",
-  HIGH: "高",
-  MEDIUM: "中",
-  LOW: "低",
-  UNKNOWN: "未知",
+  WARNING: "警告",
+  INFO: "提示",
 };
 
 export const statusLabel: Record<AlertStatus, string> = {

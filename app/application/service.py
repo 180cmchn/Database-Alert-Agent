@@ -36,6 +36,7 @@ from app.domain.models import (
 from app.domain.ports import (
     AIAdvisor,
     AlertRepository,
+    AlertSignalRouter,
     ConclusionValidator,
     InvestigationStrategyProvider,
     ManagementNotifier,
@@ -65,6 +66,7 @@ class AlertAnalysisService:
         react_enabled: bool = False,
         validation_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
+        signal_router: AlertSignalRouter | None = None,
     ) -> None:
         self.source_registry = source_registry
         self.runbook_provider = runbook_provider
@@ -84,6 +86,7 @@ class AlertAnalysisService:
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
         self.alert_sanitizer = alert_sanitizer
+        self.signal_router = signal_router
 
     async def ingest(
         self, source: str, payload: dict[str, Any]
@@ -91,34 +94,44 @@ class AlertAnalysisService:
         normalized = self.source_registry.normalize(source, payload)
         alert = self.alert_sanitizer(normalized)
         stored, created = await self.repository.create_or_get(alert)
+        routed_alert = alert if created else alert.model_copy(update={"id": stored.alert.id})
+        if alert.signal_state.value == "RESOLVED":
+            return stored.model_copy(update={"alert": routed_alert}), created
         if not created:
             return stored, False
 
         alert_id = str(alert.id)
         await self.repository.set_status(alert_id, AlertStatus.QUEUED)
-        if alert.severity.value in self.escalation_severities:
-            await self._notify(
-                alert,
-                phase=NotificationPhase.INITIAL_ALERT,
-                message="收到最高等级数据库告警，调查任务已排队；请管理人员立即关注。",
-            )
         queued = await self.repository.get(alert_id)
         if queued is None:  # pragma: no cover - repository contract guard
             raise AlertNotFoundError(alert_id)
         return queued, True
 
+    async def route_signal(self, alert: NormalizedAlert) -> None:
+        if self.signal_router is not None:
+            await self.signal_router.handle_signal(alert)
+
     async def analyze(
         self, source: str, payload: dict[str, Any], *, retry_failed: bool = False
     ) -> StoredAlert:
         stored, created = await self.ingest(source, payload)
-        if not created and stored.status in {
-            AlertStatus.COMPLETED,
-            AlertStatus.REVIEW_REQUIRED,
-        }:
+        if stored.alert.signal_state.value == "RESOLVED":
+            await self.route_signal(stored.alert)
             return stored
-        if not created and stored.status == AlertStatus.FAILED and not retry_failed:
-            return stored
-        return await self.analyze_by_id(str(stored.alert.id))
+        routing_task = asyncio.create_task(
+            self.route_signal(stored.alert), name=f"route-alert-{stored.alert.id}"
+        )
+        try:
+            if not created and stored.status in {
+                AlertStatus.COMPLETED,
+                AlertStatus.REVIEW_REQUIRED,
+            }:
+                return stored
+            if not created and stored.status == AlertStatus.FAILED and not retry_failed:
+                return stored
+            return await self.analyze_by_id(str(stored.alert.id))
+        finally:
+            await routing_task
 
     async def analyze_by_id(self, alert_id: str) -> StoredAlert:
         stored = await self.get(alert_id)

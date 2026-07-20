@@ -19,6 +19,10 @@ class AlertAccepted(BaseModel):
     deduplicated: bool
 
 
+class AlertAcknowledgementRequest(BaseModel):
+    actor: str = Field(default="wecom-card", min_length=1, max_length=255)
+
+
 class FeedbackRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     verdict: FeedbackVerdict

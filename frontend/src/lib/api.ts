@@ -2,6 +2,7 @@ import type {
   AdminSettings,
   AdminSettingsPatch,
   AlertAccepted,
+  AlertIncident,
   AlertListResponse,
   AlertStatus,
   ApiProblem,
@@ -101,6 +102,9 @@ export const api = {
 
   getAlert: (alertId: string) =>
     request<StoredAlert>(`/api/v1/alerts/${encodeURIComponent(alertId)}`),
+
+  getAlertIncident: (alertId: string) =>
+    request<AlertIncident>(`/api/v1/alerts/${encodeURIComponent(alertId)}/incident`),
 
   createAlert: (payload: CanonicalAlertPayload) =>
     request<AlertAccepted>("/api/v1/alerts/canonical/analyze", {

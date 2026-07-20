@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 from app.domain.errors import RunbookError
-from app.domain.models import NormalizedAlert
+from app.domain.models import NormalizedAlert, normalize_severity_name
 
 
 @contextmanager
@@ -75,7 +75,10 @@ def _score_runbook(metadata: dict[str, Any], content: str, alert: NormalizedAler
     title_and_reason = f"{alert.title} {alert.reason} {alert.description}".lower()
     reasons = _as_lower_strings(metadata.get("reasons"))
     keywords = _as_lower_strings(metadata.get("keywords"))
-    severities = {item.upper() for item in _as_lower_strings(metadata.get("severities"))}
+    severities = {
+        normalize_severity_name(item)
+        for item in _as_lower_strings(metadata.get("severities"))
+    }
     label_rules = metadata.get("labels") or {}
 
     for candidate in reasons:

@@ -108,13 +108,12 @@ async def test_critical_notifies_before_and_after_advisor_and_deduplicates(tmp_p
     first = await runtime.service.analyze("canonical", payload)
     second = await runtime.service.analyze("canonical", payload)
 
-    assert events == ["INITIAL_ALERT", "ADVISOR", "ADVICE_READY"]
+    assert events == ["ADVISOR", "ADVICE_READY"]
     assert advisor.calls == 1
     assert first.alert.id == second.alert.id
     assert first.status == AlertStatus.COMPLETED
     assert [item.phase for item in first.notifications] == [
-        NotificationPhase.INITIAL_ALERT,
-        NotificationPhase.ADVICE_READY,
+        NotificationPhase.ADVICE_READY
     ]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
@@ -158,7 +157,7 @@ async def test_critical_advisor_failure_is_audited_and_notified(tmp_path: Path) 
     stored = await runtime.service.get(caught.value.alert_id)
     assert stored.status == AlertStatus.FAILED
     assert "provider unavailable" in (stored.error or "")
-    assert events == ["INITIAL_ALERT", "ANALYSIS_FAILED"]
+    assert events == ["ANALYSIS_FAILED"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -184,9 +183,8 @@ async def test_failed_record_can_be_explicitly_retried_without_duplicate_notific
     result = await runtime.service.analyze("canonical", payload, retry_failed=True)
     assert result.status == AlertStatus.COMPLETED
     assert advisor.calls == 2
-    assert events == ["INITIAL_ALERT", "ANALYSIS_FAILED", "ADVICE_READY"]
+    assert events == ["ANALYSIS_FAILED", "ADVICE_READY"]
     assert [item.phase for item in result.notifications] == [
-        NotificationPhase.INITIAL_ALERT,
         NotificationPhase.ANALYSIS_FAILED,
         NotificationPhase.ADVICE_READY,
     ]

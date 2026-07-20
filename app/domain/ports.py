@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from app.domain.models import (
@@ -25,6 +26,12 @@ from app.domain.models import (
     StoredAlert,
     ToolExecutionRequest,
     ValidationRecord,
+)
+from app.domain.routing import (
+    AlertIncident,
+    EscalationDelivery,
+    IncidentState,
+    RoutingPolicy,
 )
 
 
@@ -114,6 +121,60 @@ class AnalysisJobScheduler(Protocol):
     async def stop(self) -> None: ...
 
     async def enqueue(self, alert_id: str) -> None: ...
+
+
+class AlertSignalRouter(Protocol):
+    async def handle_signal(self, alert: NormalizedAlert) -> AlertIncident | None: ...
+
+    async def acknowledge(self, incident_id: str, actor: str) -> AlertIncident | None: ...
+
+    async def get_incident(self, incident_id: str) -> AlertIncident | None: ...
+
+    async def get_incident_for_alert(self, alert_id: str) -> AlertIncident | None: ...
+
+
+class AlertRoutingRepository(Protocol):
+    async def upsert_firing_incident(
+        self,
+        alert: NormalizedAlert,
+        policy: RoutingPolicy,
+        policy_version: str,
+        first_action_at: datetime,
+    ) -> tuple[AlertIncident, bool]: ...
+
+    async def resolve_incident(
+        self, dedup_key: str, resolved_at: datetime
+    ) -> AlertIncident | None: ...
+
+    async def acknowledge_incident(
+        self, incident_id: str, actor: str, acknowledged_at: datetime
+    ) -> AlertIncident | None: ...
+
+    async def get_incident(self, incident_id: str) -> AlertIncident | None: ...
+
+    async def get_incident_for_alert(self, alert_id: str) -> AlertIncident | None: ...
+
+    async def claim_due_incidents(
+        self, owner: str, now: datetime, lease_seconds: int, limit: int = 20
+    ) -> list[AlertIncident]: ...
+
+    async def complete_incident_step(
+        self,
+        incident_id: str,
+        owner: str,
+        expected_step: int,
+        *,
+        next_action_at: datetime | None,
+        state: IncidentState,
+    ) -> None: ...
+
+    async def release_incident_claim(
+        self, incident_id: str, owner: str, retry_at: datetime
+    ) -> None: ...
+
+    async def save_escalation_delivery(
+        self, delivery: EscalationDelivery
+    ) -> EscalationDelivery: ...
 
 
 class AlertRepository(Protocol):
