@@ -1,6 +1,6 @@
 {
   "external_id": "qq-trial-connection-pool-001",
-  "severity": "HIGH",
+  "severity": "WARNING",
   "title": "【QQ试运行】订单服务数据库连接池饱和",
   "reason": "pool_saturation",
   "description": "连接池活跃连接 48/50，等待队列连续 10 分钟超过 120",

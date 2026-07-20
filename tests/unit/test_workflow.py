@@ -119,7 +119,7 @@ async def test_critical_notifies_before_and_after_advisor_and_deduplicates(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_noncritical_does_not_notify(tmp_path: Path) -> None:
+async def test_warning_does_not_send_ai_result_notification(tmp_path: Path) -> None:
     events: list[str] = []
     runtime = build_runtime(
         settings_for(tmp_path),
@@ -129,7 +129,12 @@ async def test_noncritical_does_not_notify(tmp_path: Path) -> None:
     await runtime.repository.initialize()
     result = await runtime.service.analyze(
         "canonical",
-        {"external_id": "high-1", "severity": "HIGH", "title": "High", "reason": "x"},
+        {
+            "external_id": "warning-1",
+            "severity": "WARNING",
+            "title": "Warning",
+            "reason": "x",
+        },
     )
     assert result.status == AlertStatus.COMPLETED
     assert events == ["ADVISOR"]

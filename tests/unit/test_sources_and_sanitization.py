@@ -2,15 +2,18 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.application.sanitization import REDACTED, sanitize, sanitize_alert, sanitize_text
-from app.config import DEFAULT_SEVERITY_MAPPING
 from app.domain.errors import InvalidAlertPayloadError
 from app.domain.models import Severity
 
 
-def test_severity_mapping_and_stable_fingerprint() -> None:
-    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
+def test_alert_severity_has_exactly_three_levels() -> None:
+    assert {item.value for item in Severity} == {"CRITICAL", "WARNING", "INFO"}
+
+
+def test_three_level_severity_and_stable_fingerprint() -> None:
+    adapter = CanonicalAlertSourceAdapter()
     payload = {
-        "severity": "p0",
+        "severity": "CRITICAL",
         "title": "Connections exhausted",
         "reason": "connection_exhausted",
         "occurred_at": "2026-07-10T08:00:00Z",
@@ -25,31 +28,30 @@ def test_severity_mapping_and_stable_fingerprint() -> None:
     assert first.external_id.startswith("generated-")
 
 
-def test_unknown_severity_is_preserved_and_conservatively_normalized() -> None:
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "vendor-special", "title": "x", "reason": "y"}
-    )
-    assert alert.raw_severity == "vendor-special"
-    assert alert.severity == Severity.WARNING
+def test_unmapped_severity_is_rejected() -> None:
+    with pytest.raises(InvalidAlertPayloadError, match="CRITICAL, WARNING, or INFO"):
+        CanonicalAlertSourceAdapter().normalize(
+            {"severity": "vendor-special", "title": "x", "reason": "y"}
+        )
 
 
 @pytest.mark.parametrize("field", ["title", "reason"])
 def test_required_text_rejects_whitespace(field: str) -> None:
-    payload = {"severity": "HIGH", "title": "Title", "reason": "reason"}
+    payload = {"severity": "WARNING", "title": "Title", "reason": "reason"}
     payload[field] = "   "
 
     with pytest.raises(InvalidAlertPayloadError):
-        CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(payload)
+        CanonicalAlertSourceAdapter().normalize(payload)
 
 
 def test_incident_fingerprint_ignores_event_identity_and_occurrence_time() -> None:
-    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
+    adapter = CanonicalAlertSourceAdapter()
     common = {
         "environment": "production",
         "service_name": "orders-api",
         "alert_type": "connection_exhausted",
         "metric_name": "connection_usage_percent",
-        "severity": "HIGH",
+        "severity": "WARNING",
         "title": "Database connections exhausted",
         "reason": "connection_exhausted",
         "description": "Connection usage reached 95% on instance orders-primary",
@@ -118,11 +120,11 @@ def test_sensitive_text_redacts_authorization_and_common_tokens(
 
 
 def test_alert_is_sanitized_before_external_use() -> None:
-    adapter = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING)
+    adapter = CanonicalAlertSourceAdapter()
     alert = adapter.normalize(
         {
             "external_id": "sensitive-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "token=secret-value",
             "reason": "leak",
             "features": {"authorization": "Bearer abc"},

@@ -2,14 +2,13 @@ import pytest
 
 from app.adapters.ai import FakeAIAdvisor, _validate_manual_policy
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.config import DEFAULT_SEVERITY_MAPPING
 from app.domain.errors import AdvisorError
 from app.domain.models import Recommendation, RecommendationStep, RunbookExcerpt
 
 
 def make_alert():
-    return CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Unknown issue", "reason": "unknown_reason"}
+    return CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "Unclassified issue", "reason": "unclassified_reason"}
     )
 
 

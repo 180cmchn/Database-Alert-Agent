@@ -11,22 +11,6 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.domain.models import Severity
 
-DEFAULT_SEVERITY_MAPPING = {
-    "P0": "CRITICAL",
-    "P1": "WARNING",
-    "P2": "WARNING",
-    "P3": "INFO",
-    "FATAL": "CRITICAL",
-    "ERROR": "WARNING",
-    "WARN": "WARNING",
-    "WARNING": "WARNING",
-    "INFO": "INFO",
-    "LOW": "INFO",
-    "MEDIUM": "WARNING",
-    "HIGH": "WARNING",
-    "CRITICAL": "CRITICAL",
-}
-
 DEFAULT_ENVIRONMENT_ALIASES = {
     "production": ["prod", "prd", "production", "生产", "生产环境"],
     "staging": ["staging", "stage", "pre", "预发", "预发布"],
@@ -98,9 +82,6 @@ class Settings(BaseSettings):
         default=1_000_000, ge=10_000, le=10_000_000
     )
     runbook_web_verify_tls: bool = True
-    severity_mapping: dict[str, str] = Field(
-        default_factory=lambda: DEFAULT_SEVERITY_MAPPING.copy()
-    )
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
@@ -145,35 +126,13 @@ class Settings(BaseSettings):
     react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
     validation_enabled: bool = True
 
-    @field_validator("severity_mapping")
-    @classmethod
-    def normalize_mapping(cls, value: dict[str, str]) -> dict[str, str]:
-        legacy_aliases = {
-            "HIGH": "WARNING",
-            "MEDIUM": "WARNING",
-            "LOW": "INFO",
-            "UNKNOWN": "WARNING",
-        }
-        return {
-            str(key).upper(): legacy_aliases.get(
-                str(mapped).upper(), str(mapped).upper()
-            )
-            for key, mapped in value.items()
-        }
-
     @field_validator("escalation_severities", mode="before")
     @classmethod
     def normalize_escalation_severities(cls, value: Any) -> Any:
-        aliases = {
-            "HIGH": "WARNING",
-            "MEDIUM": "WARNING",
-            "LOW": "INFO",
-            "UNKNOWN": "WARNING",
-        }
         if isinstance(value, str):
             value = json.loads(value)
         if isinstance(value, list):
-            normalized = [aliases.get(str(item).upper(), str(item).upper()) for item in value]
+            normalized = [str(item).upper() for item in value]
             return list(dict.fromkeys(normalized))
         return value
 

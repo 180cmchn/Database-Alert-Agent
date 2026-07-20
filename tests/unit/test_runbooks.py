@@ -5,7 +5,6 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
-from app.config import DEFAULT_SEVERITY_MAPPING
 from app.domain.errors import RunbookError
 
 
@@ -47,8 +46,8 @@ The authoritative content is stored at source_url.
         cache_ttl_seconds=300,
         transport=httpx.MockTransport(handler),
     )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
     )
 
     first = await provider.search(alert)
@@ -85,8 +84,8 @@ Web catalog record.
         auth_secret="company_session=authenticated",
         transport=httpx.MockTransport(unexpected_request),
     )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Disk usage", "reason": "disk_high"}
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "Disk usage", "reason": "disk_high"}
     )
 
     assert await provider.search(alert) == []
@@ -109,8 +108,8 @@ async def test_web_runbook_never_matches_local_markdown_body(
             lambda request: pytest.fail(f"unexpected request: {request.url}")
         ),
     )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
     )
 
     assert await provider.search(alert) == []
@@ -141,8 +140,8 @@ Web catalog record.
         auth_secret="company_session=expired",
         transport=httpx.MockTransport(handler),
     )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
-        {"severity": "HIGH", "title": "Latency", "reason": "latency_high"}
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
     )
 
     with pytest.raises(RunbookError, match="login session may be missing or expired"):

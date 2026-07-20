@@ -349,15 +349,15 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
     with client:
         payloads = [
             {
-                "external_id": "list-low",
-                "severity": "LOW",
+                "external_id": "list-info",
+                "severity": "INFO",
                 "title": "Reporting replica latency",
                 "reason": "latency",
                 "environment": "test",
                 "service_name": "reporting-api",
             },
             {
-                "external_id": "list-high",
+                "external_id": "list-warning",
                 "severity": "WARNING",
                 "title": "Orders connection usage",
                 "reason": "connection_exhausted",
@@ -395,13 +395,13 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
             },
         ).json()
         assert filtered["total"] == 1
-        assert filtered["items"][0]["external_id"] == "list-high"
+        assert filtered["items"][0]["external_id"] == "list-warning"
 
         completed = client.get(
             "/api/v1/alerts", params={"status": "COMPLETED"}
         ).json()
         assert completed["total"] == 1
-        assert completed["items"][0]["external_id"] == "list-low"
+        assert completed["items"][0]["external_id"] == "list-info"
 
         dashboard = client.get("/api/v1/dashboard/summary").json()
         assert dashboard["total"] == 3
@@ -418,7 +418,7 @@ def test_feedback_requires_admin_and_uses_authenticated_actor(tmp_path: Path) ->
             "/api/v1/alerts/canonical/analyze",
             json={
                 "external_id": "feedback-auth",
-                "severity": "LOW",
+                "severity": "INFO",
                 "title": "Latency",
                 "reason": "latency",
             },
@@ -476,7 +476,7 @@ def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
             "/api/v1/alerts/canonical/analyze",
             json={
                 "external_id": "console-flow-1",
-                "severity": "HIGH",
+                "severity": "WARNING",
                 "title": "数据库延迟升高",
                 "reason": "latency",
                 "environment": "test",

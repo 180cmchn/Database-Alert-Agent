@@ -78,7 +78,7 @@ def event_payload(phase: str = "ADVICE_READY") -> dict[str, Any]:
             "id": "11111111-1111-4111-8111-111111111111",
             "external_id": "qq-mail-relay-test-001",
             "source": "canonical",
-            "raw_severity": "P0",
+            "raw_severity": "CRITICAL",
             "severity": "CRITICAL",
             "environment": "test",
             "service_name": "orders-db",

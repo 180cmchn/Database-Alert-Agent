@@ -13,8 +13,7 @@ from app.application.routing_policy import (
     RoutingPolicyError,
     RoutingPolicyLoader,
 )
-from app.config import DEFAULT_SEVERITY_MAPPING
-from app.domain.models import AlertSignalState, NormalizedAlert, Severity, utc_now
+from app.domain.models import AlertSignalState, Severity, utc_now
 from app.domain.routing import (
     DeliveryResult,
     DeliveryState,
@@ -58,7 +57,7 @@ def normalize(**overrides):
         "reason": "routing_test",
         **overrides,
     }
-    return CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(payload)
+    return CanonicalAlertSourceAdapter().normalize(payload)
 
 
 def test_flowchart_policies_are_first_match_wins_in_top_to_bottom_order() -> None:
@@ -113,7 +112,7 @@ policies:
 
 def test_normalization_builds_three_level_signal_and_dedup_fields() -> None:
     alert = normalize(
-        severity="HIGH",
+        severity="WARNING",
         status="resolved",
         alert_name="replica_lag",
         cluster="cluster-a",
@@ -125,11 +124,6 @@ def test_normalization_builds_three_level_signal_and_dedup_fields() -> None:
     assert alert.alert_name == "replica_lag"
     assert alert.cluster == "cluster-a"
     assert alert.dedup_key.startswith("dedup-v1-")
-
-    historical = alert.model_dump(mode="json")
-    historical["severity"] = "HIGH"
-    assert NormalizedAlert.model_validate(historical).severity is Severity.WARNING
-
 
 @pytest.mark.asyncio
 async def test_phone_connection_acknowledges_without_waiting_for_ai(tmp_path: Path) -> None:

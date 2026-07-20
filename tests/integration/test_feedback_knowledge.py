@@ -29,7 +29,7 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
 
     with TestClient(app) as client:
         base_payload = {
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Orders latency reached 123ms",
             "description": "Orders latency reached 123ms",
             "reason": "latency",

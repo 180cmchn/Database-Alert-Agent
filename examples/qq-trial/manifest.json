@@ -10,28 +10,28 @@
       "purpose": "在未配置网页手册时验证 CRITICAL 两阶段通知"
     },
     {
-      "name": "high-connection-pool",
-      "file": "alerts/02-high-connection-pool.json",
+      "name": "warning-connection-pool",
+      "file": "alerts/02-warning-connection-pool.json",
       "expected_manual_matches": [],
       "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "验证 HIGH 告警默认不通知管理人员"
+      "purpose": "验证 WARNING 告警默认不发送 AI 结果通知"
     },
     {
-      "name": "medium-slow-query",
-      "file": "alerts/03-medium-slow-query.json",
+      "name": "warning-slow-query",
+      "file": "alerts/03-warning-slow-query.json",
       "expected_manual_matches": [],
       "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "验证 MEDIUM 告警默认不通知管理人员"
+      "purpose": "验证 WARNING 告警默认不发送 AI 结果通知"
     },
     {
-      "name": "medium-unmatched-deadlock",
-      "file": "alerts/04-medium-unmatched-deadlock.json",
+      "name": "warning-unmatched-deadlock",
+      "file": "alerts/04-warning-unmatched-deadlock.json",
       "expected_manual_matches": [],
       "expected_section": null,
       "expects_management_notification": false,
-      "purpose": "验证另一条 MEDIUM 告警的无手册保守建议"
+      "purpose": "验证另一条 WARNING 告警的无手册保守建议"
     }
   ]
 }

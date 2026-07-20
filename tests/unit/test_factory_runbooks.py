@@ -69,7 +69,7 @@ async def test_default_provider_uses_web_content_and_never_local_body(
     alert = runtime.service.source_registry.normalize(
         "canonical",
         {
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Connections exhausted",
             "reason": "connection_exhausted",
         }

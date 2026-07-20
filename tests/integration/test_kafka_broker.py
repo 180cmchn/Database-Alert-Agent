@@ -40,7 +40,7 @@ async def test_kafka_broker_message_uses_shared_pipeline(tmp_path: Path) -> None
             "source": "canonical",
             "payload": {
                 "external_id": uuid4().hex,
-                "severity": "HIGH",
+                "severity": "WARNING",
                 "title": "Kafka alert",
                 "reason": "integration_test",
             },

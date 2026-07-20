@@ -122,7 +122,7 @@ export interface RecommendationStep {
 export interface RootCauseAssessment {
   cause: string;
   evidence_refs: string[];
-  confidence: "LOW" | "MEDIUM" | "HIGH";
+  confidence: number;
   verified: boolean;
 }
 
