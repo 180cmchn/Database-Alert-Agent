@@ -4,7 +4,6 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.application.validation import RuleConclusionValidator
-from app.config import DEFAULT_SEVERITY_MAPPING
 from app.domain.models import (
     EvidenceRecord,
     InvestigationRun,
@@ -16,10 +15,10 @@ from app.domain.models import (
 
 
 def make_alert():  # type: ignore[no-untyped-def]
-    return CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+    return CanonicalAlertSourceAdapter().normalize(
         {
             "external_id": "validation-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Connections exhausted",
             "reason": "connection_exhausted",
         }
@@ -56,7 +55,7 @@ async def test_rule_validator_rejects_missing_and_failed_evidence() -> None:
             RootCauseAssessment(
                 cause="connection leak",
                 evidence_refs=[str(failed_evidence.id), str(missing_id)],
-                confidence="HIGH",
+                confidence=0.9,
                 verified=True,
             )
         ]

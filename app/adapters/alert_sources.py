@@ -167,10 +167,8 @@ class CanonicalAlertSourceAdapter:
 
     def __init__(
         self,
-        severity_mapping: dict[str, str],
         environment_aliases: dict[str, list[str]] | None = None,
     ) -> None:
-        self._mapping = {key.upper(): value.upper() for key, value in severity_mapping.items()}
         self._environment_resolver = EnvironmentResolver(environment_aliases or {})
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert:
@@ -180,13 +178,12 @@ class CanonicalAlertSourceAdapter:
             raise InvalidAlertPayloadError(str(exc)) from exc
 
         raw_severity = parsed.severity.upper()
-        mapped = self._mapping.get(raw_severity, raw_severity)
         try:
-            severity = Severity(mapped)
-        except ValueError:
-            # Unknown upstream levels must not silently suppress an operational alert.
-            # WARNING is the conservative middle level until the source mapping is known.
-            severity = Severity.WARNING
+            severity = Severity(raw_severity)
+        except ValueError as exc:
+            raise InvalidAlertPayloadError(
+                "severity must be CRITICAL, WARNING, or INFO"
+            ) from exc
 
         known_fields = set(CanonicalAlertPayload.model_fields)
         extension_fields = {key: value for key, value in payload.items() if key not in known_fields}

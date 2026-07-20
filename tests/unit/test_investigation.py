@@ -5,7 +5,6 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
-from app.config import DEFAULT_SEVERITY_MAPPING
 from app.domain.models import (
     InvestigationContext,
     InvestigationStrategy,
@@ -40,10 +39,10 @@ class FailingTool:
 
 
 def make_context() -> InvestigationContext:
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+    alert = CanonicalAlertSourceAdapter().normalize(
         {
             "external_id": "tool-test-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Database latency",
             "reason": "latency",
         }

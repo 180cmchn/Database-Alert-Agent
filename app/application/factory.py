@@ -206,9 +206,7 @@ def build_runtime(
         )
     source_registry = source_registry or AlertSourceRegistry(
         [
-            CanonicalAlertSourceAdapter(
-                settings.severity_mapping, settings.environment_aliases
-            )
+            CanonicalAlertSourceAdapter(settings.environment_aliases)
         ]
     )
     if advisor is None:

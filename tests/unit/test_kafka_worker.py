@@ -29,7 +29,7 @@ class StubService:
 
 
 def test_parse_envelope_validates_shape() -> None:
-    assert parse_envelope(b'{"source":"canonical","payload":{"severity":"HIGH"}}')[
+    assert parse_envelope(b'{"source":"canonical","payload":{"severity":"WARNING"}}')[
         "source"
     ] == "canonical"
     with pytest.raises(Exception, match="requires an object payload"):

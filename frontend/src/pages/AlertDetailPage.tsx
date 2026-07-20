@@ -273,7 +273,7 @@ export function AlertDetailPage() {
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
                     <span className="root-index">{String(index + 1).padStart(2, "0")}</span>
                     <div><strong>{rootCause.cause}</strong><p>{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p></div>
-                    <span className="root-confidence">{rootCause.confidence}</span>
+                    <span className="root-confidence">{formatPercent(rootCause.confidence)}</span>
                     <span className="verified-label">{rootCause.verified ? <><Check size={13} /> 已验证</> : <><CircleAlert size={13} /> 待验证</>}</span>
                   </article>
                 ))}

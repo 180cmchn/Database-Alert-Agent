@@ -57,7 +57,7 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
         "canonical",
         {
             "external_id": "connection-live-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Connection usage 95%",
             "reason": "connection_exhausted",
             "environment": "prd",
@@ -87,7 +87,7 @@ async def test_missing_required_connection_tools_requires_review(tmp_path: Path)
         "canonical",
         {
             "external_id": "connection-missing-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Connection usage 95%",
             "reason": "connection_exhausted",
         },

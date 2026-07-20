@@ -14,7 +14,7 @@ title: 手册标题
 section: main
 reasons: [alert_reason_code]
 keywords: [连接数, connection]
-severities: [HIGH, CRITICAL]
+severities: [WARNING, CRITICAL]
 labels:
   database_team: core
 source_url: https://wiki.corp.example/runbooks/database/connection-limit

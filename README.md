@@ -200,7 +200,7 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 curl http://localhost:8000/api/v1/alerts/{alert_id}
 ```
 
-标准等级只有 `CRITICAL`、`WARNING`、`INFO`。旧的 `HIGH/MEDIUM` 会映射为 `WARNING`，`LOW` 映射为 `INFO`；未知上游等级保守映射为 `WARNING`，避免静默漏报。
+标准等级只有 `CRITICAL`、`WARNING`、`INFO`。Canonical 接口拒绝其他值；平台自有字段只能在该平台专用的 `AlertSourceAdapter` 内转换为这三种等级，系统不提供全局等级映射，也不会同时保留另一套等级。
 
 `external_id` 是告警平台事件幂等键；生产接入应始终提供。系统另行生成不含发生时间的 `incident_fingerprint`，用于匹配同类已确认案例；路由生命周期使用 `source + alert_name + cluster + instance + environment` 生成 `dedup_key`，三者语义不可混用。上游可传 `status=firing` 或 `status=resolved`，恢复信号会终止对应事件尚未执行的升级动作。
 

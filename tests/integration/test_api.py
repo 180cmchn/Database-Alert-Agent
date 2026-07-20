@@ -38,7 +38,7 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
             "/api/v1/alerts/canonical/analyze",
             json={
                 "external_id": "api-1",
-                "severity": "HIGH",
+                "severity": "WARNING",
                 "title": "Database latency",
                 "reason": "latency",
             },
@@ -77,7 +77,7 @@ def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:
         assert unknown.json()["code"] == "UNKNOWN_ALERT_SOURCE"
 
         invalid = client.post(
-            "/api/v1/alerts/canonical/analyze", json={"severity": "HIGH"}
+            "/api/v1/alerts/canonical/analyze", json={"severity": "WARNING"}
         )
         assert invalid.status_code == 422
         assert invalid.json()["code"] == "INVALID_ALERT_PAYLOAD"

@@ -265,7 +265,7 @@ class FakeAIAdvisor:
                     RootCauseAssessment(
                         cause=alert.reason,
                         evidence_refs=evidence_refs,
-                        confidence="MEDIUM" if has_live_diagnostics else "LOW",
+                        confidence=0.65 if has_live_diagnostics else 0.3,
                         verified=has_live_diagnostics,
                     )
                 ],
@@ -291,7 +291,7 @@ class FakeAIAdvisor:
                     RootCauseAssessment(
                         cause=alert.reason,
                         evidence_refs=evidence_refs,
-                        confidence="MEDIUM" if has_live_diagnostics else "LOW",
+                        confidence=0.65 if has_live_diagnostics else 0.3,
                         verified=has_live_diagnostics,
                     )
                 ],

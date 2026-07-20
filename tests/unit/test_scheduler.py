@@ -40,7 +40,7 @@ async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
         "canonical",
         {
             "external_id": "scheduled-1",
-            "severity": "HIGH",
+            "severity": "WARNING",
             "title": "Latency",
             "reason": "latency",
         },

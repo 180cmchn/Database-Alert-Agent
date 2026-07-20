@@ -18,16 +18,6 @@ class Severity(StrEnum):
     INFO = "INFO"
 
 
-def normalize_severity_name(value: str | Severity) -> str:
-    normalized = str(value).upper()
-    return {
-        "HIGH": Severity.WARNING.value,
-        "MEDIUM": Severity.WARNING.value,
-        "LOW": Severity.INFO.value,
-        "UNKNOWN": Severity.WARNING.value,
-    }.get(normalized, normalized)
-
-
 class AlertSignalState(StrEnum):
     FIRING = "FIRING"
     RESOLVED = "RESOLVED"
@@ -131,12 +121,6 @@ class NormalizedAlert(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("severity", mode="before")
-    @classmethod
-    def normalize_legacy_severity(cls, value: str | Severity) -> str:
-        return normalize_severity_name(value)
-
-
 class RunbookExcerpt(BaseModel):
     runbook_id: str
     title: str
@@ -161,11 +145,13 @@ class RunbookDocument(BaseModel):
 
     @field_validator("severities", mode="before")
     @classmethod
-    def normalize_legacy_severities(cls, value: Any) -> Any:
+    def validate_severities(cls, value: Any) -> Any:
         if isinstance(value, list):
-            return list(
-                dict.fromkeys(normalize_severity_name(str(item)) for item in value)
-            )
+            normalized = list(dict.fromkeys(str(item).upper() for item in value))
+            valid = {item.value for item in Severity}
+            if set(normalized) - valid:
+                raise ValueError("severities must be CRITICAL, WARNING, or INFO")
+            return normalized
         return value
 
 
@@ -185,7 +171,7 @@ class RecommendationStep(BaseModel):
 class RootCauseAssessment(BaseModel):
     cause: str
     evidence_refs: list[str] = Field(default_factory=list)
-    confidence: Literal["LOW", "MEDIUM", "HIGH"] = "LOW"
+    confidence: float = Field(default=0, ge=0, le=1)
     verified: bool = False
 
 

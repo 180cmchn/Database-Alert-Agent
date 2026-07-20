@@ -162,9 +162,9 @@ python3 examples/qq-trial/run_cases.py --case all --require-webhook
 也可以只运行某个对照项：
 
 ```bash
-python3 examples/qq-trial/run_cases.py --case high-connection-pool
-python3 examples/qq-trial/run_cases.py --case medium-slow-query
-python3 examples/qq-trial/run_cases.py --case medium-unmatched-deadlock
+python3 examples/qq-trial/run_cases.py --case warning-connection-pool
+python3 examples/qq-trial/run_cases.py --case warning-slow-query
+python3 examples/qq-trial/run_cases.py --case warning-unmatched-deadlock
 ```
 
 默认只有 CRITICAL 触发管理通知，因此后三条不应发送邮件。所有告警都应返回空

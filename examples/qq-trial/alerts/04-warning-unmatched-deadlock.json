@@ -1,6 +1,6 @@
 {
   "external_id": "qq-trial-unmatched-deadlock-001",
-  "severity": "MEDIUM",
+  "severity": "WARNING",
   "title": "【QQ试运行】库存库死锁次数轻微增加",
   "reason": "deadlock_spike",
   "description": "最近 15 分钟检测到 4 次死锁，当前没有已确认的业务错误",
