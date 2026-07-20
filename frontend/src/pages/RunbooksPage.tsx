@@ -32,6 +32,8 @@ interface RunbookDraft {
   keywords: string;
   severities: Severity[];
   labels: string;
+  sourceUrl: string;
+  contentSelector: string;
   metadata: string;
   content: string;
   version: number;
@@ -45,12 +47,15 @@ const blankDraft: RunbookDraft = {
   keywords: "",
   severities: ["HIGH", "CRITICAL"],
   labels: "{}",
+  sourceUrl: "",
+  contentSelector: "",
   metadata: "{}",
-  content: "",
+  content: "权威正文来自 source_url；本地内容仅为索引管理备注。",
   version: 0,
 };
 
 function toDraft(record: RunbookRecord): RunbookDraft {
+  const { source_url, content_selector, ...otherMetadata } = record.metadata;
   return {
     id: record.id,
     title: record.title,
@@ -59,7 +64,9 @@ function toDraft(record: RunbookRecord): RunbookDraft {
     keywords: record.keywords.join(", "),
     severities: record.severities,
     labels: JSON.stringify(record.labels, null, 2),
-    metadata: JSON.stringify(record.metadata, null, 2),
+    sourceUrl: typeof source_url === "string" ? source_url : "",
+    contentSelector: typeof content_selector === "string" ? content_selector : "",
+    metadata: JSON.stringify(otherMetadata, null, 2),
     content: record.content,
     version: record.version,
   };
@@ -157,7 +164,11 @@ export function RunbooksPage() {
         severities: draft.severities,
         labels: labels as Record<string, string>,
         content: draft.content,
-        metadata: parseObject(draft.metadata, "扩展元数据"),
+        metadata: {
+          ...parseObject(draft.metadata, "扩展元数据"),
+          source_url: draft.sourceUrl.trim(),
+          ...(draft.contentSelector.trim() ? { content_selector: draft.contentSelector.trim() } : {}),
+        },
       };
       let saved: RunbookRecord;
       if (selectedId) {
@@ -225,7 +236,7 @@ export function RunbooksPage() {
       <PageHeader
         eyebrow="RUNBOOK LIBRARY"
         title="处置手册"
-        description="管理 Agent 检索时优先遵循的标准操作步骤与风险边界。"
+        description="管理网页手册地址、匹配条件和正文提取范围；处置依据始终来自实际网页。"
         actions={<><button type="button" className="button secondary" onClick={lock}><KeyRound size={16} /> 锁定会话</button><button type="button" className="button primary" onClick={createNew}><CirclePlus size={17} /> 新建手册</button></>}
       />
 
@@ -260,6 +271,8 @@ export function RunbooksPage() {
                 <label className="field"><span>手册 ID <b>*</b></span><input value={draft.id} onChange={(event) => setDraft({ ...draft, id: event.target.value })} required disabled={Boolean(selectedId)} placeholder="connection-exhausted" /></label>
                 <label className="field"><span>章节 <b>*</b></span><input value={draft.section} onChange={(event) => setDraft({ ...draft, section: event.target.value })} required placeholder="initial-triage" /></label>
                 <label className="field span-2"><span>标题 <b>*</b></span><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} required placeholder="数据库连接数耗尽处理手册" /></label>
+                <label className="field span-2"><span>公司内网手册网址 <b>*</b></span><input type="url" value={draft.sourceUrl} onChange={(event) => setDraft({ ...draft, sourceUrl: event.target.value })} required placeholder="https://wiki.corp.example/runbooks/connection-limit" /></label>
+                <label className="field span-2"><span>正文选择器（可选）</span><input value={draft.contentSelector} onChange={(event) => setDraft({ ...draft, contentSelector: event.target.value })} placeholder="#article-content、.wiki-content 或 main" /></label>
                 <label className="field"><span>告警原因（逗号分隔）</span><input value={draft.reasons} onChange={(event) => setDraft({ ...draft, reasons: event.target.value })} placeholder="connection_exhausted, too_many_connections" /></label>
                 <label className="field"><span>检索关键词（逗号分隔）</span><input value={draft.keywords} onChange={(event) => setDraft({ ...draft, keywords: event.target.value })} placeholder="连接数, connection" /></label>
               </div>
@@ -274,7 +287,7 @@ export function RunbooksPage() {
                 ))}</div>
               </fieldset>
 
-              <label className="field"><span>手册正文（Markdown） <b>*</b></span><textarea className="runbook-content-editor" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required rows={16} spellCheck={false} placeholder={'1. 通过只读监控确认当前状态…\n2. 核对最近变更…\n3. 任何变更前必须由值班 DBA 审批…'} /></label>
+              <label className="field"><span>索引管理备注（不参与匹配） <b>*</b></span><textarea className="runbook-content-editor" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required rows={6} spellCheck={false} placeholder="记录手册负责人、审批状态或迁移说明；处置正文始终从网址读取。" /></label>
               <div className="json-fields">
                 <label className="field"><span>匹配标签 JSON</span><textarea rows={5} value={draft.labels} onChange={(event) => setDraft({ ...draft, labels: event.target.value })} spellCheck={false} /></label>
                 <label className="field"><span>扩展元数据 JSON</span><textarea rows={5} value={draft.metadata} onChange={(event) => setDraft({ ...draft, metadata: event.target.value })} spellCheck={false} /></label>

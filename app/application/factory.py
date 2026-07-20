@@ -22,7 +22,7 @@ from app.adapters.notification import (
 )
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.adapters.runbook_store import LocalMarkdownRunbookStore
-from app.adapters.runbooks import LocalMarkdownRunbookProvider
+from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
 from app.config import Settings
@@ -93,7 +93,17 @@ def _resolve_runbook_adapters(
 
     if provider is None and store is None:
         return (
-            LocalMarkdownRunbookProvider(settings.runbook_dir),
+            AuthenticatedWebRunbookProvider(
+                settings.runbook_dir,
+                allowed_hosts=settings.runbook_web_allowed_hosts,
+                auth_mode=settings.runbook_web_auth_mode,
+                auth_secret=settings.runbook_web_auth_secret.get_secret_value(),
+                timeout_seconds=settings.runbook_web_timeout_seconds,
+                cache_ttl_seconds=settings.runbook_web_cache_ttl_seconds,
+                max_response_bytes=settings.runbook_web_max_response_bytes,
+                verify_tls=settings.runbook_web_verify_tls,
+                require_https=settings.app_env.lower() in {"production", "prod"},
+            ),
             LocalMarkdownRunbookStore(settings.runbook_dir),
         )
     if provider is None or store is None:

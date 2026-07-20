@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import fcntl
 import os
 import stat
@@ -12,7 +11,7 @@ from typing import Any
 import yaml
 
 from app.domain.errors import RunbookError
-from app.domain.models import NormalizedAlert, RunbookExcerpt
+from app.domain.models import NormalizedAlert
 
 
 @contextmanager
@@ -104,44 +103,3 @@ def _score_runbook(metadata: dict[str, Any], content: str, alert: NormalizedAler
             if alert.labels.get(str(key), "").lower() == str(expected).lower():
                 score += 2
     return score
-
-
-class LocalMarkdownRunbookProvider:
-    def __init__(self, directory: Path) -> None:
-        self._directory = directory
-
-    async def search(self, alert: NormalizedAlert, limit: int = 5) -> list[RunbookExcerpt]:
-        return await asyncio.to_thread(self._search_sync, alert, limit)
-
-    def _search_sync(self, alert: NormalizedAlert, limit: int) -> list[RunbookExcerpt]:
-        if not self._directory.exists():
-            raise RunbookError(f"Runbook directory does not exist: {self._directory}")
-
-        matches: list[RunbookExcerpt] = []
-        # Readers intentionally do not create or modify a lock file: production
-        # workers mount the runbook directory read-only. Administrative writers
-        # serialize with an exclusive lock and publish changes via atomic replace,
-        # so a reader sees either the old or new complete file. A concurrent delete
-        # may make a glob result disappear and is safely treated as absent.
-        for path in sorted(self._directory.glob("*.md")):
-            if path.name.lower() == "readme.md":
-                continue
-            try:
-                metadata, content = _parse_markdown(path)
-            except FileNotFoundError:
-                continue
-            score = _score_runbook(metadata, content, alert)
-            if score <= 0:
-                continue
-            matches.append(
-                RunbookExcerpt(
-                    runbook_id=str(metadata.get("id") or path.stem),
-                    title=str(metadata.get("title") or path.stem),
-                    section=str(metadata.get("section") or "main"),
-                    content=content,
-                    score=score,
-                    metadata=metadata,
-                )
-            )
-        matches.sort(key=lambda item: (-item.score, item.runbook_id))
-        return matches[:limit]

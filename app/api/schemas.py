@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -66,6 +67,25 @@ class RunbookWriteBase(BaseModel):
         overlap = reserved.intersection(self.metadata)
         if overlap:
             raise ValueError(f"metadata contains reserved key: {sorted(overlap)[0]}")
+        source_url = self.metadata.get("source_url")
+        if not isinstance(source_url, str) or not source_url.strip():
+            raise ValueError("metadata.source_url is required")
+        parsed = urlsplit(source_url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("metadata.source_url must be an absolute HTTP(S) URL")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("metadata.source_url contains an invalid port") from exc
+        if port == 0:
+            raise ValueError("metadata.source_url contains an invalid port")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("metadata.source_url must not contain credentials")
+        selector = self.metadata.get("content_selector")
+        if selector is not None and (
+            not isinstance(selector, str) or not selector.strip()
+        ):
+            raise ValueError("metadata.content_selector must be a non-empty string")
         return self
 
 

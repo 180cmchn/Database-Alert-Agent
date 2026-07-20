@@ -2,11 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.runbook_store import LocalMarkdownRunbookStore
-from app.adapters.runbooks import LocalMarkdownRunbookProvider
+from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
 from app.application.factory import build_runtime
-from app.config import DEFAULT_SEVERITY_MAPPING, Settings
+from app.config import Settings
 from app.domain.models import NormalizedAlert, RunbookDocument, RunbookExcerpt
 
 
@@ -50,12 +49,12 @@ class ExternalRunbookStore:
 
 
 @pytest.mark.asyncio
-async def test_default_runbook_provider_and_store_share_local_corpus(
+async def test_default_provider_uses_web_content_and_never_local_body(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(settings_for(tmp_path))
 
-    assert isinstance(runtime.runbook_provider, LocalMarkdownRunbookProvider)
+    assert isinstance(runtime.runbook_provider, AuthenticatedWebRunbookProvider)
     assert isinstance(runtime.runbook_store, LocalMarkdownRunbookStore)
     assert runtime.service.runbook_provider is runtime.runbook_provider
 
@@ -64,10 +63,11 @@ async def test_default_runbook_provider_and_store_share_local_corpus(
             id="connection-limit",
             title="Connection limit",
             reasons=["connection_exhausted"],
-            content="Approved connection recovery procedure.",
+            content="This local catalog note must never be matched.",
         )
     )
-    alert = CanonicalAlertSourceAdapter(DEFAULT_SEVERITY_MAPPING).normalize(
+    alert = runtime.service.source_registry.normalize(
+        "canonical",
         {
             "severity": "HIGH",
             "title": "Connections exhausted",
@@ -77,7 +77,7 @@ async def test_default_runbook_provider_and_store_share_local_corpus(
 
     matches = await runtime.runbook_provider.search(alert)
 
-    assert [match.runbook_id for match in matches] == ["connection-limit"]
+    assert matches == []
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

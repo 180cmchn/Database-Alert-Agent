@@ -1,6 +1,6 @@
 # QQ 邮箱试运行样例
 
-这组材料用于验证“告警接收 → 手册匹配 → AI 调查与建议 → CRITICAL 两阶段邮件通知”的完整
+这组材料用于验证“告警接收 → AI 调查与建议 → CRITICAL 两阶段邮件通知”的完整
 链路，不会连接数据库或执行处置动作。邮件由仓库内 `tools/qq_mail_relay` 接收
 `NotificationEvent`、转换为纯文本，再通过 QQ SMTP 授权码发送到固定 QQ 邮箱。
 
@@ -9,17 +9,14 @@
 和邮件。中转服务的完整安全说明见
 [`../../tools/qq_mail_relay/README.md`](../../tools/qq_mail_relay/README.md)。
 
-## 样例组成与预期匹配
+## 样例组成
 
-`runbooks/` 中三个 Markdown 文件共同组成隔离的测试手册。当前本地检索器以一个 Markdown
-文件作为一个可引用片段，因此按告警类型拆成：
+`alerts/` 包含四类不同等级的数据库告警，用于验证通知升级、幂等和无手册时的保守建议。
+旧版仅供试运行的本地 Markdown 手册已经删除；所有样例都应返回空 `manual_matches`、
+`manual_matched=false`，且建议置信度不超过 `0.45`。
 
-- `qq-trial-replication-lag`：本轮 CRITICAL 主测试信号，预期精确命中并发送两阶段通知；
-- `qq-trial-connection-pool`：另一种处理方法，预期精确命中但不通知；
-- `qq-trial-slow-query`：另一种处理方法，预期精确命中但不通知。
-
-`alerts/` 还包含一条手册未收录的死锁告警，用于验证共享等级或标签不会造成误命中。完整
-预期见 `manifest.json`。测试手册与默认 `runbooks/` 隔离，不会污染正常运行时的手册语料。
+如需验证手册命中，应按项目根目录 `runbooks/README.md` 配置可访问的公司内网网页手册；
+本样例不再提供任何本地正文回退。
 
 ## 1. 配置 QQ 邮件中转
 
@@ -50,23 +47,18 @@ dry-run 会完整验证鉴权、事件格式、脱敏、文本转换和幂等记
 
 ## 2. 启动隔离测试环境
 
-同时启用测试手册覆盖和 `qq-mail-relay` Compose profile：
+启用 `qq-mail-relay` Compose profile：
 
 ```bash
 docker compose \
-  -f docker-compose.yml \
-  -f examples/qq-trial/docker-compose.yml \
   --profile qq-mail-relay \
   up -d --build
 ```
 
-这会启动 Kafka、API、Worker、Web 管理台和 QQ 邮件中转，并仅把 API/Worker 的手册目录替换
-为本样例目录。确认服务就绪：
+这会启动 Kafka、API、Worker、Web 管理台和 QQ 邮件中转。确认服务就绪：
 
 ```bash
 docker compose \
-  -f docker-compose.yml \
-  -f examples/qq-trial/docker-compose.yml \
   --profile qq-mail-relay \
   ps
 
@@ -77,7 +69,7 @@ curl -sS http://127.0.0.1:8000/health/ready | python3 -m json.tool
 若要全部使用本地进程，可先停止 Compose，再分别启动：
 
 ```bash
-RUNBOOK_DIR=./examples/qq-trial/runbooks uvicorn app.api.main:app --reload
+uvicorn app.api.main:app --reload
 
 uvicorn tools.qq_mail_relay.main:app \
   --host 127.0.0.1 \
@@ -110,6 +102,9 @@ NOTIFIER_MODE=webhook
 MANAGEMENT_WEBHOOK_URL=http://qq-mail-relay:8080/api/v1/notifications
 MANAGEMENT_WEBHOOK_BEARER_TOKEN=与中转服务相同的随机值
 ESCALATION_SEVERITIES=["CRITICAL"]
+# 本试运行不配置手册索引；占位白名单仅用于通过启动就绪检查，不会发起访问。
+RUNBOOK_WEB_ALLOWED_HOSTS=["unused.invalid"]
+RUNBOOK_WEB_AUTH_MODE=none
 ```
 
 如果以前通过管理台保存过设置，`data/runtime-settings.json` 优先于 `.env`，请继续在管理台
@@ -130,12 +125,12 @@ python3 examples/qq-trial/run_cases.py \
 位于升级等级中。它从 `ADMIN_API_TOKEN` 环境变量读取管理员令牌；未设置且有交互终端时会
 安全提示输入，输入内容不会显示。
 
-脚本为 `external_id` 添加唯一后缀，发送后轮询分析结果，并检查手册命中、引用、规则验收与
+脚本为 `external_id` 添加唯一后缀，发送后轮询分析结果，并检查无手册策略、规则验收与
 通知审计。成功时应满足：
 
-1. `manual_matches` 只包含 `qq-trial-replication-lag`；
+1. `manual_matches` 为空，且建议使用无手册置信度上限；
 2. 中转先接受 `INITIAL_ALERT`，AI 成功后再接受 `ADVICE_READY`；
-3. `recommendation.manual_matched=true`，且每个步骤引用命中的手册章节；
+3. `recommendation.manual_matched=false`，且不会伪造手册引用；
 4. 规则验收通过，两个通知阶段的审计状态均为 `SENT`。
 
 dry-run 下不会收到邮件，`SENT` 只表示中转服务成功完成模拟投递。关闭 dry-run 并正确配置
@@ -156,7 +151,7 @@ python3 examples/qq-trial/run_cases.py \
 `deduplicated=true`、复用同一 `alert_id`，且通知阶段不增加。中转服务还会按
 `alert.id + phase` 保存成功投递 ID，防止 Agent Webhook 重试造成重复邮件。
 
-## 5. 验证其他手册匹配
+## 5. 验证其他告警等级
 
 一次运行全部四种信号：
 
@@ -172,8 +167,8 @@ python3 examples/qq-trial/run_cases.py --case medium-slow-query
 python3 examples/qq-trial/run_cases.py --case medium-unmatched-deadlock
 ```
 
-默认只有 CRITICAL 触发管理通知，因此后三条只验证匹配，不应发送邮件。未命中的死锁告警应
-返回空 `manual_matches`、`manual_matched=false`，且建议置信度不超过 `0.45`。
+默认只有 CRITICAL 触发管理通知，因此后三条不应发送邮件。所有告警都应返回空
+`manual_matches`、`manual_matched=false`，且建议置信度不超过 `0.45`。
 
 不使用脚本时也可直接发送 JSON；固定 ID 的第二次请求会被去重：
 
@@ -188,8 +183,6 @@ curl -sS -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 
 ```bash
 docker compose \
-  -f docker-compose.yml \
-  -f examples/qq-trial/docker-compose.yml \
   --profile qq-mail-relay \
   logs -f api worker qq-mail-relay
 ```
@@ -200,14 +193,12 @@ docker compose \
 
 ```bash
 docker compose \
-  -f docker-compose.yml \
-  -f examples/qq-trial/docker-compose.yml \
   --profile qq-mail-relay \
   down
 ```
 
 在管理台将通知模式切为“企业微信（推荐）”，填写只写的企业微信群机器人 Webhook URL，再用
-默认手册启动正常环境：
+网页手册配置启动正常环境：
 
 ```bash
 docker compose up -d --build
