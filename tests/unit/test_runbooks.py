@@ -1,149 +1,94 @@
 from pathlib import Path
+from shutil import copy2
 
-import httpx
 import pytest
+from pypdf import PdfWriter
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
-from app.domain.errors import RunbookError
+from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
+from app.domain.errors import InvalidRunbookIdError, RunbookError
+
+SOURCE_PDFS = Path(__file__).parents[2] / "runbooks" / "pdfs"
+TIKV_PDF = (
+    SOURCE_PDFS
+    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
+)
+DMP_PDF = SOURCE_PDFS / "INFRA-224075463-210726-1007-4075.pdf"
+MYSQL_CRASH_PDF = SOURCE_PDFS / "INFRA-231966487-210726-1008-4079.pdf"
 
 
 @pytest.mark.asyncio
-async def test_web_runbook_uses_authenticated_page_body_and_cache(tmp_path: Path) -> None:
-    (tmp_path / "latency.md").write_text(
-        """---
-id: latency
-title: Database latency
-section: initial-triage
-reasons: [latency_high]
-source_url: https://wiki.corp.example/runbooks/latency
-content_selector: '#article-content'
----
-The authoritative content is stored at source_url.
-""",
-        encoding="utf-8",
-    )
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        assert request.headers["cookie"] == "company_session=authenticated"
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/html; charset=utf-8"},
-            text="""
-            <html><nav>Unrelated navigation</nav><main id="article-content">
-              <h1>Latency runbook</h1><p>Collect slow-query evidence read-only.</p>
-            </main></html>
-            """,
-        )
-
-    provider = AuthenticatedWebRunbookProvider(
-        tmp_path,
-        allowed_hosts=["wiki.corp.example"],
-        auth_mode="cookie",
-        auth_secret="company_session=authenticated",
-        cache_ttl_seconds=300,
-        transport=httpx.MockTransport(handler),
-    )
-    alert = CanonicalAlertSourceAdapter().normalize(
-        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
-    )
-
-    first = await provider.search(alert)
-    second = await provider.search(alert)
-
-    assert len(requests) == 1
-    assert [item.runbook_id for item in first] == ["latency"]
-    assert first == second
-    assert first[0].section == "initial-triage"
-    assert "Collect slow-query evidence read-only." in first[0].content
-    assert "Unrelated navigation" not in first[0].content
-
-
-@pytest.mark.asyncio
-async def test_web_runbook_does_not_fetch_unrelated_catalog_entry(tmp_path: Path) -> None:
-    (tmp_path / "cpu.md").write_text(
-        """---
-id: cpu
-reasons: [cpu_high]
-source_url: https://wiki.corp.example/runbooks/cpu
----
-Web catalog record.
-""",
-        encoding="utf-8",
-    )
-
-    def unexpected_request(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"unexpected request: {request.url}")
-
-    provider = AuthenticatedWebRunbookProvider(
-        tmp_path,
-        allowed_hosts=["wiki.corp.example"],
-        auth_mode="cookie",
-        auth_secret="company_session=authenticated",
-        transport=httpx.MockTransport(unexpected_request),
-    )
-    alert = CanonicalAlertSourceAdapter().normalize(
-        {"severity": "WARNING", "title": "Disk usage", "reason": "disk_high"}
-    )
-
-    assert await provider.search(alert) == []
-
-
-@pytest.mark.asyncio
-async def test_web_runbook_never_matches_local_markdown_body(
+async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "local-only.md").write_text(
-        "---\nid: local-only\nreasons: [latency_high]\n---\nAdministrative note.\n",
-        encoding="utf-8",
-    )
-    provider = AuthenticatedWebRunbookProvider(
-        tmp_path,
-        allowed_hosts=["wiki.corp.example"],
-        auth_mode="cookie",
-        auth_secret="company_session=authenticated",
-        transport=httpx.MockTransport(
-            lambda request: pytest.fail(f"unexpected request: {request.url}")
-        ),
-    )
+    copy2(TIKV_PDF, tmp_path / TIKV_PDF.name)
+    copy2(DMP_PDF, tmp_path / DMP_PDF.name)
+    library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
-        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
+        {
+            "severity": "CRITICAL",
+            "title": "TiKV server report failure",
+            "reason": "TiKV_server_report_failure_msg_total",
+            "database": {"engine": "TiDB"},
+        }
     )
 
-    assert await provider.search(alert) == []
+    first = await library.search(alert)
+    first_documents = await library.list()
+    second_documents = await library.list()
+
+    assert [item.runbook_id for item in first] == [TIKV_PDF.stem]
+    assert "排查步骤" in first[0].content
+    assert first[0].section == "PDF"
+    assert first[0].metadata["source_type"] == "local_pdf"
+    assert first[0].metadata["page_count"] == 3
+    assert first_documents[0] is second_documents[0]
 
 
 @pytest.mark.asyncio
-async def test_web_runbook_rejects_cross_origin_login_redirect(tmp_path: Path) -> None:
-    (tmp_path / "latency.md").write_text(
-        """---
-id: latency
-reasons: [latency_high]
-source_url: https://wiki.corp.example/runbooks/latency
----
-Web catalog record.
-""",
-        encoding="utf-8",
-    )
-    requested_hosts: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requested_hosts.append(request.url.host)
-        return httpx.Response(302, headers={"location": "https://sso.corp.example/login"})
-
-    provider = AuthenticatedWebRunbookProvider(
-        tmp_path,
-        allowed_hosts=["wiki.corp.example", "sso.corp.example"],
-        auth_mode="cookie",
-        auth_secret="company_session=expired",
-        transport=httpx.MockTransport(handler),
-    )
+async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) -> None:
+    copy2(DMP_PDF, tmp_path / DMP_PDF.name)
+    library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
-        {"severity": "WARNING", "title": "Latency", "reason": "latency_high"}
+        {
+            "severity": "WARNING",
+            "title": "磁盘使用率过高",
+            "reason": "disk_usage_high",
+        }
     )
 
-    with pytest.raises(RunbookError, match="login session may be missing or expired"):
-        await provider.search(alert)
-    assert requested_hosts == ["wiki.corp.example"]
+    assert await library.search(alert) == []
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
+    tmp_path: Path,
+) -> None:
+    copy2(MYSQL_CRASH_PDF, tmp_path / MYSQL_CRASH_PDF.name)
+    library = LocalPDFRunbookLibrary(tmp_path)
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {"severity": "WARNING", "title": "MySQL Crash", "reason": "MySQL Crash"}
+    )
+
+    matches = await library.search(alert)
+
+    assert [item.runbook_id for item in matches] == [MYSQL_CRASH_PDF.stem]
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_runbook_rejects_image_only_pdf(tmp_path: Path) -> None:
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    with (tmp_path / "image-only.pdf").open("wb") as handle:
+        writer.write(handle)
+
+    with pytest.raises(RunbookError, match="OCR is required"):
+        await LocalPDFRunbookLibrary(tmp_path).list()
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_runbook_get_rejects_unsafe_id(tmp_path: Path) -> None:
+    library = LocalPDFRunbookLibrary(tmp_path)
+
+    with pytest.raises(InvalidRunbookIdError):
+        await library.get("../escape")

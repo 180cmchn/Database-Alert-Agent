@@ -266,11 +266,6 @@ export interface RunbookRecord {
   updated_at: string;
 }
 
-export type RunbookCreateInput = Omit<RunbookRecord, "updated_at" | "version">;
-export type RunbookUpdateInput = Omit<RunbookRecord, "id" | "updated_at" | "version"> & {
-  expected_version: number;
-};
-
 export interface AdminSettings {
   app_env: string;
   fake_provider_allowed: boolean;

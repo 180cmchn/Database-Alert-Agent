@@ -39,23 +39,11 @@ class RunbookProvider(Protocol):
 
 
 class RunbookStore(Protocol):
-    """Administrative CRUD port for the same corpus exposed by a runbook provider."""
+    """Read-only inventory port for the same local PDFs exposed by the provider."""
 
     async def list(self) -> list[RunbookDocument]: ...
 
     async def get(self, runbook_id: str) -> RunbookDocument: ...
-
-    async def create(self, document: RunbookDocument) -> RunbookDocument: ...
-
-    async def update(
-        self,
-        runbook_id: str,
-        document: RunbookDocument,
-        *,
-        expected_version: int | None = None,
-    ) -> RunbookDocument: ...
-
-    async def delete(self, runbook_id: str) -> None: ...
 
 
 class AIAdvisor(Protocol):

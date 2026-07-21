@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from shutil import copy2
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +13,13 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.config import Settings, get_settings
+
+SOURCE_PDF = (
+    Path(__file__).parents[2]
+    / "runbooks"
+    / "pdfs"
+    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
+)
 
 
 def test_get_settings_loads_only_persisted_runtime_whitelist(
@@ -75,34 +83,23 @@ def test_fake_provider_is_rejected_in_production() -> None:
         )
 
 
-def test_web_runbook_readiness_requires_host_allowlist_and_auth_secret(
+def test_pdf_runbook_readiness_requires_directory_and_pdf(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        runbook_dir=tmp_path,
+        runbook_pdf_dir=tmp_path / "missing",
     )
 
     issues = settings.readiness_issues()
 
-    assert "RUNBOOK_WEB_ALLOWED_HOSTS is required" in issues
-    assert "RUNBOOK_WEB_AUTH_SECRET is required for authenticated runbooks" in issues
+    assert any("PDF runbook directory does not exist" in issue for issue in issues)
 
-
-def test_web_runbook_hosts_accept_json_environment_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "RUNBOOK_WEB_ALLOWED_HOSTS", '["wiki.corp.example", "docs.corp.example"]'
-    )
-
-    settings = Settings(_env_file=None, ai_provider="fake")
-
-    assert settings.runbook_web_allowed_hosts == [
-        "wiki.corp.example",
-        "docs.corp.example",
-    ]
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    settings = Settings(_env_file=None, ai_provider="fake", runbook_pdf_dir=empty)
+    assert any("No PDF runbooks found" in issue for issue in settings.readiness_issues())
 
 
 @pytest.mark.parametrize(
@@ -145,12 +142,11 @@ def test_settings_validation_error_hides_invalid_wecom_url_secret() -> None:
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
+    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     return Settings(
         _env_file=None,
         ai_provider="fake",
-        runbook_dir=runbooks,
-        runbook_web_allowed_hosts=["wiki.corp.example"],
-        runbook_web_auth_mode="none",
+        runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
 
@@ -240,6 +236,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
 ) -> None:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
+    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     settings = Settings(
         _env_file=None,
         app_env="production",
@@ -248,7 +245,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         ai_model="configured-test-model",
         ai_base_url="https://models.example.test/v1",
         admin_api_token="configured-admin-token",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
     manager = RuntimeSettingsManager(settings.runtime_settings_path)

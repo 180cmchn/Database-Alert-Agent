@@ -31,7 +31,7 @@ services:
         required: false
     environment:
       DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
-      RUNBOOK_DIR: /app/runbooks
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: "true"
       HTTP_SCHEDULER: kafka
@@ -66,7 +66,7 @@ services:
         required: false
     environment:
       DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
-      RUNBOOK_DIR: /app/runbooks
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       KAFKA_ENABLED: "true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json

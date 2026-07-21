@@ -17,7 +17,7 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         ai_provider="fake",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'feedback.db'}",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
         admin_api_token="test-admin-token",
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )

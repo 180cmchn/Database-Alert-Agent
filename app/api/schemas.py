@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.application.admin import runtime_configuration_issues
 from app.config import Settings
-from app.domain.models import AlertStatus, FeedbackVerdict, RunbookDocument, Severity
+from app.domain.models import AlertStatus, FeedbackVerdict, RunbookDocument
 
 
 class AlertAccepted(BaseModel):
@@ -28,81 +27,6 @@ class FeedbackRequest(BaseModel):
     final_root_cause: str | None = None
     actual_resolution: str | None = None
     recovered: bool | None = None
-
-
-class RunbookWriteBase(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str = Field(min_length=1, max_length=300)
-    section: str = Field(default="main", min_length=1, max_length=200)
-    reasons: list[str] = Field(default_factory=list, max_length=200)
-    keywords: list[str] = Field(default_factory=list, max_length=200)
-    severities: list[str] = Field(default_factory=list, max_length=10)
-    labels: dict[str, str] = Field(default_factory=dict)
-    content: str = Field(min_length=1, max_length=1_000_000)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("severities")
-    @classmethod
-    def normalize_severities(cls, value: list[str]) -> list[str]:
-        valid = {item.value for item in Severity}
-        normalized = [item.strip().upper() for item in value]
-        if any(item not in valid for item in normalized):
-            raise ValueError(f"severities must be one of: {', '.join(sorted(valid))}")
-        return normalized
-
-    @model_validator(mode="after")
-    def validate_custom_metadata(self) -> RunbookWriteBase:
-        reserved = {
-            "id",
-            "title",
-            "section",
-            "reasons",
-            "keywords",
-            "severities",
-            "labels",
-            "version",
-            "updated_at",
-        }
-        overlap = reserved.intersection(self.metadata)
-        if overlap:
-            raise ValueError(f"metadata contains reserved key: {sorted(overlap)[0]}")
-        source_url = self.metadata.get("source_url")
-        if not isinstance(source_url, str) or not source_url.strip():
-            raise ValueError("metadata.source_url is required")
-        parsed = urlsplit(source_url.strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("metadata.source_url must be an absolute HTTP(S) URL")
-        try:
-            port = parsed.port
-        except ValueError as exc:
-            raise ValueError("metadata.source_url contains an invalid port") from exc
-        if port == 0:
-            raise ValueError("metadata.source_url contains an invalid port")
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("metadata.source_url must not contain credentials")
-        selector = self.metadata.get("content_selector")
-        if selector is not None and (
-            not isinstance(selector, str) or not selector.strip()
-        ):
-            raise ValueError("metadata.content_selector must be a non-empty string")
-        return self
-
-
-class RunbookCreate(RunbookWriteBase):
-    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-
-    def to_document(self) -> RunbookDocument:
-        return RunbookDocument.model_validate(self.model_dump())
-
-
-class RunbookUpdate(RunbookWriteBase):
-    expected_version: int | None = Field(default=None, ge=1)
-
-    def to_document(self, runbook_id: str) -> RunbookDocument:
-        return RunbookDocument(
-            id=runbook_id, **self.model_dump(exclude={"expected_version"})
-        )
 
 
 class RunbookListResponse(BaseModel):

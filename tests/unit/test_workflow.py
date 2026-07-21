@@ -88,7 +88,7 @@ def settings_for(tmp_path: Path) -> Settings:
     return Settings(
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
     )
 
 

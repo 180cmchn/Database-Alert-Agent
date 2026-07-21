@@ -1,4 +1,5 @@
 from pathlib import Path
+from shutil import copy2
 
 from fastapi.testclient import TestClient
 
@@ -7,18 +8,24 @@ from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
 
+SOURCE_PDF = (
+    Path(__file__).parents[2]
+    / "runbooks"
+    / "pdfs"
+    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
+)
+
 
 def create_test_client(
     tmp_path: Path,
 ) -> tuple[TestClient, Runtime, ManualAnalysisScheduler]:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
+    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     settings = Settings(
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
-        runbook_dir=runbooks,
-        runbook_web_allowed_hosts=["wiki.corp.example"],
-        runbook_web_auth_mode="none",
+        runbook_pdf_dir=runbooks,
     )
     runtime = build_runtime(settings)
     scheduler = ManualAnalysisScheduler()

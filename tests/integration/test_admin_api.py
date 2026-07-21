@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+from shutil import copy2
 
-import httpx
 from fastapi.testclient import TestClient
 
 from app.adapters.ai import OpenAICompatibleAdvisor
 from app.adapters.notification import WeComManagementNotifier
-from app.adapters.runbook_store import LocalMarkdownRunbookStore
-from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
@@ -18,39 +16,31 @@ from app.config import Settings
 
 ADMIN_TOKEN = "integration-admin-token"
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+SOURCE_PDF = (
+    Path(__file__).parents[2]
+    / "runbooks"
+    / "pdfs"
+    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
+)
 
 
 def create_admin_client(
     tmp_path: Path,
     *,
     admin_token: str = ADMIN_TOKEN,
-    runbook_transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[TestClient, Runtime]:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(parents=True, exist_ok=True)
+    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     settings = Settings(
         ai_provider="fake",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'admin.db'}",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
         admin_api_token=admin_token,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
-    runtime = None
-    if runbook_transport is not None:
-        runtime = build_runtime(
-            settings,
-            runbook_provider=AuthenticatedWebRunbookProvider(
-                runbooks,
-                allowed_hosts=["wiki.corp.example"],
-                auth_mode="cookie",
-                auth_secret="company_session=authenticated",
-                transport=runbook_transport,
-            ),
-            runbook_store=LocalMarkdownRunbookStore(runbooks),
-        )
-    else:
-        runtime = build_runtime(settings)
+    runtime = build_runtime(settings)
     app = create_app(settings, runtime, ManualAnalysisScheduler())
     return TestClient(app), runtime
 
@@ -233,79 +223,36 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
     assert wecom_url not in audit
 
 
-def test_runbook_crud_uses_safe_ids_and_optimistic_versions(tmp_path: Path) -> None:
+def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
     client, _ = create_admin_client(tmp_path)
-    create_payload = {
-        "id": "connection-limit",
-        "title": "连接数告警手册",
-        "section": "triage",
-        "reasons": ["connection_exhausted"],
-        "keywords": ["连接数"],
-        "severities": ["WARNING", "CRITICAL"],
-        "labels": {"team": "dba"},
-        "content": "1. 只读检查当前连接数。",
-        "metadata": {
-            "owner": "database-team",
-            "source_url": "https://wiki.corp.example/runbooks/connection-limit",
-        },
-    }
     with client:
-        missing_source = client.post(
-            "/api/v1/admin/runbooks",
-            headers=ADMIN_HEADERS,
-            json={**create_payload, "metadata": {"owner": "database-team"}},
-        )
-        assert missing_source.status_code == 422
-        assert "source_url" in missing_source.text
-        assert (
-            client.post(
-                "/api/v1/admin/runbooks",
-                headers=ADMIN_HEADERS,
-                json={**create_payload, "id": "../escape"},
-            ).status_code
-            == 422
-        )
-        created = client.post(
-            "/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json=create_payload
-        )
-        assert created.status_code == 201
-        assert created.json()["version"] == 1
-
         listed = client.get("/api/v1/admin/runbooks", headers=ADMIN_HEADERS).json()
         assert listed["total"] == 1
-        assert listed["items"][0]["id"] == "connection-limit"
+        item = listed["items"][0]
+        assert item["id"] == SOURCE_PDF.stem
+        assert item["section"] == "PDF"
+        assert item["metadata"]["source_type"] == "local_pdf"
+        assert item["metadata"]["file_name"] == SOURCE_PDF.name
 
-        update_payload = {
-            key: value for key, value in create_payload.items() if key != "id"
-        }
-        update_payload["content"] = "1. 只读检查当前和最大连接数。"
-        update_payload["expected_version"] = 1
-        updated = client.put(
-            "/api/v1/admin/runbooks/connection-limit",
+        detail = client.get(
+            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}", headers=ADMIN_HEADERS
+        )
+        assert detail.status_code == 200
+        assert "TiKV_server_report_failure_msg_total" in detail.json()["content"]
+        assert client.get(
+            "/api/v1/admin/runbooks/../escape", headers=ADMIN_HEADERS
+        ).status_code in {404, 422}
+        assert client.post(
+            "/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json={}
+        ).status_code == 405
+        assert client.put(
+            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}",
             headers=ADMIN_HEADERS,
-            json=update_payload,
-        )
-        assert updated.status_code == 200
-        assert updated.json()["version"] == 2
-
-        stale = client.put(
-            "/api/v1/admin/runbooks/connection-limit",
-            headers=ADMIN_HEADERS,
-            json=update_payload,
-        )
-        assert stale.status_code == 409
-
-        deleted = client.delete(
-            "/api/v1/admin/runbooks/connection-limit", headers=ADMIN_HEADERS
-        )
-        assert deleted.status_code == 204
-        assert (
-            client.get(
-                "/api/v1/admin/runbooks/connection-limit", headers=ADMIN_HEADERS
-            ).status_code
-            == 404
-        )
-    assert not (tmp_path / "escape.md").exists()
+            json={},
+        ).status_code == 405
+        assert client.delete(
+            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}", headers=ADMIN_HEADERS
+        ).status_code == 405
 
 
 def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -> None:
@@ -401,50 +348,21 @@ def test_feedback_requires_admin_and_uses_authenticated_actor(tmp_path: Path) ->
         assert saved.json()["reviewer"] == "admin"
 
 
-def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
+def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
     tmp_path: Path,
 ) -> None:
-    def runbook_page(request: httpx.Request) -> httpx.Response:
-        assert request.headers["cookie"] == "company_session=authenticated"
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/html; charset=utf-8"},
-            text="<main id='article-content'>通过只读监控确认延迟趋势。</main>",
-        )
-
-    client, runtime = create_admin_client(
-        tmp_path, runbook_transport=httpx.MockTransport(runbook_page)
-    )
+    client, runtime = create_admin_client(tmp_path)
     with client:
-        runbook = client.post(
-            "/api/v1/admin/runbooks",
-            headers=ADMIN_HEADERS,
-            json={
-                "id": "latency-triage",
-                "title": "数据库延迟排查手册",
-                "section": "read-only-triage",
-                "reasons": ["latency"],
-                "keywords": ["延迟", "latency"],
-                "severities": ["WARNING"],
-                "labels": {},
-                "content": "本地仅保存索引备注。",
-                "metadata": {
-                    "source_url": "https://wiki.corp.example/runbooks/latency",
-                    "content_selector": "#article-content",
-                },
-            },
-        )
-        assert runbook.status_code == 201
-
         accepted = client.post(
             "/api/v1/alerts/canonical/analyze",
             json={
-                "external_id": "console-flow-1",
-                "severity": "WARNING",
-                "title": "数据库延迟升高",
-                "reason": "latency",
+                "external_id": "local-pdf-flow-1",
+                "severity": "CRITICAL",
+                "title": "TiKV server report failure",
+                "reason": "TiKV_server_report_failure_msg_total",
                 "environment": "test",
                 "service_name": "orders-api",
+                "database": {"engine": "TiDB"},
             },
         )
         assert accepted.status_code == 202
@@ -456,11 +374,11 @@ def test_admin_created_runbook_is_used_by_the_visible_investigation_flow(
         assert detail.status_code == 200
         body = detail.json()
         assert body["status"] == "COMPLETED"
-        assert body["manual_matches"][0]["runbook_id"] == "latency-triage"
+        assert body["manual_matches"][0]["runbook_id"] == SOURCE_PDF.stem
         assert body["recommendation"]["manual_matched"] is True
         assert body["recommendation"]["steps"][0]["source_ref"] == {
-            "runbook_id": "latency-triage",
-            "section": "read-only-triage",
+            "runbook_id": SOURCE_PDF.stem,
+            "section": "PDF",
         }
         assert [item["stage"] for item in body["progress"]] == [
             "RECEIVED",

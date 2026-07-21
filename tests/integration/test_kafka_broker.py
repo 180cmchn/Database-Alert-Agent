@@ -25,7 +25,7 @@ async def test_kafka_broker_message_uses_shared_pipeline(tmp_path: Path) -> None
     settings = Settings(
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'kafka.db'}",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
     )
     runtime = build_runtime(settings)
     await runtime.repository.initialize()

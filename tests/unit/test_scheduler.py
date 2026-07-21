@@ -32,7 +32,7 @@ async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
     settings = Settings(
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'scheduler.db'}",
-        runbook_dir=runbooks,
+        runbook_pdf_dir=runbooks,
     )
     runtime = build_runtime(settings)
     await runtime.repository.initialize()
