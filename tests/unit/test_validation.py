@@ -5,6 +5,8 @@ import pytest
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.application.validation import RuleConclusionValidator
 from app.domain.models import (
+    AnalysisBasis,
+    AnalysisBasisSource,
     EvidenceRecord,
     InvestigationRun,
     Recommendation,
@@ -30,6 +32,12 @@ def make_recommendation(
 ) -> Recommendation:
     return Recommendation(
         summary="candidate conclusion",
+        analysis_bases=[
+            AnalysisBasis(
+                source=AnalysisBasisSource.AI,
+                statement="AI analysis based on alert fields",
+            )
+        ],
         steps=[RecommendationStep(order=1, action=action)],
         requires_human=True,
         confidence=0.5,

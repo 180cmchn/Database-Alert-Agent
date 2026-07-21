@@ -38,7 +38,6 @@ export interface AlertListItem {
   manual_matched: boolean;
   requires_human: boolean;
   confidence: number | null;
-  notification_count: number;
 }
 
 export interface AlertListResponse {
@@ -72,8 +71,6 @@ export interface NormalizedAlert {
   source: string;
   raw_severity: string;
   severity: Severity;
-  signal_state: "FIRING" | "RESOLVED";
-  dedup_key: string;
   incident_fingerprint: string;
   fingerprint_version: string;
   environment: string;
@@ -119,6 +116,12 @@ export interface RecommendationStep {
   source_ref?: RunbookReference | null;
 }
 
+export interface AnalysisBasis {
+  source: "RUNBOOK" | "AI";
+  statement: string;
+  source_ref?: RunbookReference | null;
+}
+
 export interface RootCauseAssessment {
   cause: string;
   evidence_refs: string[];
@@ -129,7 +132,7 @@ export interface RootCauseAssessment {
 export interface Recommendation {
   summary: string;
   likely_causes: string[];
-  evidence: string[];
+  analysis_bases: AnalysisBasis[];
   steps: RecommendationStep[];
   risks: string[];
   requires_human: boolean;
@@ -177,16 +180,6 @@ export interface ValidationRecord {
   created_at: string;
 }
 
-export interface NotificationRecord {
-  id: string;
-  phase: "INITIAL_ALERT" | "ADVICE_READY" | "ANALYSIS_FAILED";
-  status: "SENT" | "FAILED";
-  attempts: number;
-  error?: string | null;
-  external_delivery_id?: string | null;
-  created_at: string;
-}
-
 export interface InvestigationRun {
   id: string;
   alert_id: string;
@@ -220,7 +213,6 @@ export interface StoredAlert {
     usage: Record<string, unknown>;
   } | null;
   error?: string | null;
-  notifications: NotificationRecord[];
   latest_run?: InvestigationRun | null;
   progress: ProgressRecord[];
   evidence_records: EvidenceRecord[];
@@ -239,48 +231,9 @@ export interface AlertAccepted {
   deduplicated: boolean;
 }
 
-export interface RoutingAction {
-  channel: "wecom_group" | "wecom_card" | "phone";
-  target?: string | null;
-  recipient?: string | null;
-  severities: Severity[];
-  mention_on_call: boolean;
-}
-
-export interface RoutingStep {
-  name: string;
-  delay_seconds: number;
-  actions: RoutingAction[];
-}
-
-export interface AlertIncident {
-  id: string;
-  dedup_key: string;
-  alert_id: string;
-  policy_id: string;
-  policy_version: string;
-  policy_snapshot?: {
-    id: string;
-    name: string;
-    priority: number;
-    hold_seconds: number;
-    steps: RoutingStep[];
-  } | null;
-  severity: Severity;
-  state: "PENDING" | "FIRING" | "ACKNOWLEDGED" | "RESOLVED";
-  current_step: number;
-  next_action_at?: string | null;
-  acknowledged_at?: string | null;
-  acknowledged_by?: string | null;
-  resolved_at?: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface CanonicalAlertPayload {
   external_id?: string;
   severity: Severity;
-  status?: "firing" | "resolved";
   title: string;
   reason: string;
   description?: string;
@@ -330,16 +283,10 @@ export interface AdminSettings {
   ai_max_retries: number;
   ai_json_mode: boolean;
   runbook_limit: number;
-  escalation_severities: Severity[];
-  notifier_mode: "log" | "webhook" | "wecom";
-  management_webhook_url: string;
-  notification_max_attempts: number;
-  notification_retry_backoff_seconds: number;
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
   ai_api_key_configured: boolean;
-  management_webhook_bearer_token_configured: boolean;
   wecom_webhook_url_configured: boolean;
   revision: string;
   apply_status: "applied";
@@ -356,17 +303,11 @@ export interface AdminSettingsPatch {
   ai_max_retries?: number;
   ai_json_mode?: boolean;
   runbook_limit?: number;
-  escalation_severities?: Severity[];
-  notifier_mode?: "log" | "webhook" | "wecom";
-  management_webhook_url?: string;
   wecom_webhook_url?: string;
-  notification_max_attempts?: number;
-  notification_retry_backoff_seconds?: number;
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;
   validation_enabled?: boolean;
   ai_api_key?: string;
-  management_webhook_bearer_token?: string;
 }
 
 export interface ApiProblem {

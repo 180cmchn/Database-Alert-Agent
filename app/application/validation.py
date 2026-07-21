@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from app.domain.models import (
+    AnalysisBasisSource,
     EvidenceRecord,
     InvestigationRun,
     NormalizedAlert,
@@ -74,10 +75,34 @@ class RuleConclusionValidator:
                 )
 
         manual_matched = recommendation.manual_matched or bool(runbooks)
+        sources = [item.source for item in recommendation.analysis_bases]
+        if AnalysisBasisSource.AI not in sources:
+            issues.append("判断依据必须至少包含一条 AI 分析依据")
         if manual_matched:
             valid_runbook_refs = {
                 (excerpt.runbook_id, excerpt.section) for excerpt in runbooks
             }
+            if AnalysisBasisSource.RUNBOOK not in sources:
+                issues.append("命中手册时必须提供至少一条手册依据")
+            if AnalysisBasisSource.AI in sources:
+                first_ai = sources.index(AnalysisBasisSource.AI)
+                if any(
+                    source == AnalysisBasisSource.RUNBOOK
+                    for source in sources[first_ai:]
+                ):
+                    issues.append("判断依据顺序错误：手册依据必须全部排在 AI 依据之前")
+            for index, basis in enumerate(recommendation.analysis_bases, start=1):
+                if basis.source != AnalysisBasisSource.RUNBOOK:
+                    continue
+                if basis.source_ref is None:
+                    issues.append(f"手册依据 #{index} 缺少 source_ref")
+                    continue
+                ref_key = (basis.source_ref.runbook_id, basis.source_ref.section)
+                if ref_key not in valid_runbook_refs:
+                    issues.append(
+                        f"手册依据 #{index} 引用了无效章节："
+                        f"{basis.source_ref.runbook_id}/{basis.source_ref.section}"
+                    )
             for index, step in enumerate(recommendation.steps, start=1):
                 source_ref = step.source_ref
                 if source_ref is None:

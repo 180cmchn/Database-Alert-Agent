@@ -35,7 +35,6 @@ def make_settings(tmp_path: Path, name: str) -> Settings:
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / f'{name}.db'}",
         runbook_dir=runbooks,
-        notification_retry_backoff_seconds=0,
     )
 
 

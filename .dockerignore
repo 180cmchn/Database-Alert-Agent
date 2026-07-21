@@ -2,7 +2,6 @@
 .gitignore
 .env
 **/.env
-tools/qq_mail_relay/.env
 .venv
 __pycache__
 *.py[cod]

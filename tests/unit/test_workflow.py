@@ -7,16 +7,19 @@ from app.adapters.notification import LogManagementNotifier
 from app.application.factory import build_runtime
 from app.config import Settings
 from app.domain.errors import AdvisorError, AnalysisFailedError
-from app.domain.models import AlertStatus, NotificationPhase
+from app.domain.models import AlertStatus
 
 
 class RecordingNotifier(LogManagementNotifier):
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], *, fail: bool = False) -> None:
         self.events = events
+        self.fail = fail
 
     async def send(self, event):  # type: ignore[no-untyped-def]
-        self.events.append(event.phase.value)
-        return f"recorded-{event.phase.value}"
+        self.events.append(f"RESULT:{event.alert.severity.value}")
+        if self.fail:
+            raise RuntimeError("wecom unavailable")
+        return "recorded"
 
 
 class RecordingAdvisor(FakeAIAdvisor):
@@ -84,15 +87,16 @@ def settings_for(tmp_path: Path) -> Settings:
     runbooks.mkdir(exist_ok=True)
     return Settings(
         ai_provider="fake",
-        notifier_mode="log",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         runbook_dir=runbooks,
-        notification_retry_backoff_seconds=0,
     )
 
 
 @pytest.mark.asyncio
-async def test_critical_notifies_before_and_after_advisor_and_deduplicates(tmp_path: Path) -> None:
+@pytest.mark.parametrize("severity", ["CRITICAL", "WARNING", "INFO"])
+async def test_every_severity_sends_one_final_ai_result(
+    tmp_path: Path, severity: str
+) -> None:
     events: list[str] = []
     advisor = RecordingAdvisor(events)
     runtime = build_runtime(
@@ -100,76 +104,73 @@ async def test_critical_notifies_before_and_after_advisor_and_deduplicates(tmp_p
     )
     await runtime.repository.initialize()
     payload = {
-        "external_id": "critical-1",
-        "severity": "CRITICAL",
-        "title": "Critical alert",
+        "external_id": f"{severity.lower()}-1",
+        "severity": severity,
+        "title": f"{severity} alert",
         "reason": "unknown",
     }
+
     first = await runtime.service.analyze("canonical", payload)
     second = await runtime.service.analyze("canonical", payload)
 
-    assert events == ["ADVISOR", "ADVICE_READY"]
+    assert events == ["ADVISOR", f"RESULT:{severity}"]
     assert advisor.calls == 1
     assert first.alert.id == second.alert.id
     assert first.status == AlertStatus.COMPLETED
-    assert [item.phase for item in first.notifications] == [
-        NotificationPhase.ADVICE_READY
-    ]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_warning_does_not_send_ai_result_notification(tmp_path: Path) -> None:
-    events: list[str] = []
-    runtime = build_runtime(
-        settings_for(tmp_path),
-        advisor=RecordingAdvisor(events),
-        notifier=RecordingNotifier(events),
-    )
-    await runtime.repository.initialize()
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "warning-1",
-            "severity": "WARNING",
-            "title": "Warning",
-            "reason": "x",
-        },
-    )
-    assert result.status == AlertStatus.COMPLETED
-    assert events == ["ADVISOR"]
-    assert result.notifications == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_critical_advisor_failure_is_audited_and_notified(tmp_path: Path) -> None:
+async def test_ai_failure_does_not_send_a_fake_final_result(tmp_path: Path) -> None:
     events: list[str] = []
     runtime = build_runtime(
         settings_for(tmp_path), advisor=FailingAdvisor(), notifier=RecordingNotifier(events)
     )
     await runtime.repository.initialize()
+
     with pytest.raises(AnalysisFailedError) as caught:
         await runtime.service.analyze(
             "canonical",
             {
-                "external_id": "critical-failed",
+                "external_id": "failed",
                 "severity": "CRITICAL",
                 "title": "Critical",
                 "reason": "x",
             },
         )
+
     stored = await runtime.service.get(caught.value.alert_id)
     assert stored.status == AlertStatus.FAILED
     assert "provider unavailable" in (stored.error or "")
-    assert events == ["ANALYSIS_FAILED"]
+    assert events == []
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_failed_record_can_be_explicitly_retried_without_duplicate_notifications(
-    tmp_path: Path,
-) -> None:
+async def test_wecom_send_failure_does_not_change_completed_analysis(tmp_path: Path) -> None:
+    events: list[str] = []
+    runtime = build_runtime(
+        settings_for(tmp_path), notifier=RecordingNotifier(events, fail=True)
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "send-failed",
+            "severity": "WARNING",
+            "title": "Warning",
+            "reason": "x",
+        },
+    )
+
+    assert result.status == AlertStatus.COMPLETED
+    assert events == ["RESULT:WARNING"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Path) -> None:
     events: list[str] = []
     advisor = FlakyAdvisor()
     runtime = build_runtime(
@@ -186,11 +187,8 @@ async def test_failed_record_can_be_explicitly_retried_without_duplicate_notific
         await runtime.service.analyze("canonical", payload)
 
     result = await runtime.service.analyze("canonical", payload, retry_failed=True)
+
     assert result.status == AlertStatus.COMPLETED
     assert advisor.calls == 2
-    assert events == ["ANALYSIS_FAILED", "ADVICE_READY"]
-    assert [item.phase for item in result.notifications] == [
-        NotificationPhase.ANALYSIS_FAILED,
-        NotificationPhase.ADVICE_READY,
-    ]
+    assert events == ["RESULT:CRITICAL"]
     await runtime.repository.close()  # type: ignore[attr-defined]

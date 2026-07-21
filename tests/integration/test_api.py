@@ -15,12 +15,10 @@ def create_test_client(
     runbooks.mkdir(exist_ok=True)
     settings = Settings(
         ai_provider="fake",
-        notifier_mode="log",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
         runbook_dir=runbooks,
         runbook_web_allowed_hosts=["wiki.corp.example"],
         runbook_web_auth_mode="none",
-        notification_retry_backoff_seconds=0,
     )
     runtime = build_runtime(settings)
     scheduler = ManualAnalysisScheduler()
@@ -53,11 +51,6 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         queued = client.get(body["detail_url"])
         assert queued.status_code == 200
         assert queued.json()["status"] == "QUEUED"
-        incident = client.get(f"/api/v1/alerts/{body['alert_id']}/incident")
-        assert incident.status_code == 200
-        assert incident.json()["policy_id"] == "critical_warning"
-        assert incident.json()["state"] == "PENDING"
-
         assert client.portal is not None
         client.portal.call(runtime.service.analyze_by_id, body["alert_id"])
 
