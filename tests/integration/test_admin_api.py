@@ -373,7 +373,7 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
         detail = client.get(f"/api/v1/alerts/{alert_id}")
         assert detail.status_code == 200
         body = detail.json()
-        assert body["status"] == "COMPLETED"
+        assert body["status"] == "REVIEW_REQUIRED"
         assert body["manual_matches"][0]["runbook_id"] == SOURCE_PDF.stem
         assert body["recommendation"]["manual_matched"] is True
         assert body["recommendation"]["steps"][0]["source_ref"] == {
@@ -389,5 +389,5 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
             "ADVISING",
             "VALIDATING",
             "REPORTING",
-            "COMPLETED",
+            "REVIEW_REQUIRED",
         ]

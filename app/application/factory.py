@@ -87,6 +87,8 @@ def _resolve_runbook_adapters(
             settings.runbook_pdf_dir,
             max_file_bytes=settings.runbook_pdf_max_file_bytes,
             max_text_chars=settings.runbook_pdf_max_text_chars,
+            min_score=settings.runbook_match_min_score,
+            min_confidence=settings.runbook_match_min_confidence,
         )
         return library, library
     if provider is None or store is None:
@@ -117,6 +119,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.runbook_limit = settings.runbook_limit
     service.react_enabled = settings.react_enabled
     service.validation_enabled = settings.validation_enabled
+    service.shadow_enabled = settings.shadow_enabled
     runtime.settings = settings
 
 
@@ -174,6 +177,7 @@ def build_runtime(
         investigation_lease_seconds=settings.investigation_lease_seconds,
         react_enabled=settings.react_enabled,
         validation_enabled=settings.validation_enabled,
+        shadow_enabled=settings.shadow_enabled,
     )
     return Runtime(
         settings=settings,

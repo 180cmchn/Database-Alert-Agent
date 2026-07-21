@@ -33,6 +33,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "react_enabled",
         "react_max_dynamic_turns",
         "validation_enabled",
+        "shadow_enabled",
     }
 )
 
@@ -71,6 +72,8 @@ class Settings(BaseSettings):
     runbook_pdf_max_text_chars: int = Field(
         default=200_000, ge=10_000, le=1_000_000
     )
+    runbook_match_min_score: float = Field(default=12, ge=0, le=200)
+    runbook_match_min_confidence: float = Field(default=0.35, ge=0, le=1)
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
@@ -90,6 +93,8 @@ class Settings(BaseSettings):
     react_enabled: bool = False
     react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
     validation_enabled: bool = True
+    shadow_enabled: bool = False
+    production_gate_approved: bool = False
 
     @field_validator(
         "ai_provider",
@@ -167,6 +172,15 @@ class Settings(BaseSettings):
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
+        if (
+            self.app_env.lower() in {"production", "prod"}
+            and not self.shadow_enabled
+            and not self.production_gate_approved
+        ):
+            issues.append(
+                "PRODUCTION_GATE_APPROVED must be true before disabling shadow mode "
+                "in production"
+            )
         if not self.runbook_pdf_dir.exists():
             issues.append(f"PDF runbook directory does not exist: {self.runbook_pdf_dir}")
         elif not self.runbook_pdf_dir.is_dir():

@@ -99,7 +99,7 @@ export function RunbooksPage() {
                 {filtered.map((runbook) => (
                   <button type="button" key={runbook.id} className={selectedId === runbook.id ? "active" : ""} onClick={() => setSelectedId(runbook.id)}>
                     <span className="runbook-list-icon"><BookOpenCheck size={18} /></span>
-                    <span><strong>{runbook.title}</strong><small>{metadataString(runbook, "page_count")} 页 · PDF</small><em>{formatDateTime(runbook.updated_at)}</em></span>
+                    <span><strong>{runbook.title}</strong><small>{metadataString(runbook, "page_count")} 页 · {runbook.knowledge_type} · {runbook.quality_status}</small><em>{formatDateTime(runbook.updated_at)}</em></span>
                   </button>
                 ))}
               </div>
@@ -118,9 +118,11 @@ export function RunbooksPage() {
                     <div><dt>页数</dt><dd>{metadataString(selected, "page_count")}</dd></div>
                     <div><dt>大小</dt><dd>{metadataString(selected, "file_size_bytes")} bytes</dd></div>
                     <div><dt>手册 ID</dt><dd>{selected.id}</dd></div>
+                    <div><dt>知识类型</dt><dd>{selected.knowledge_type}</dd></div>
+                    <div><dt>质量状态</dt><dd>{selected.quality_status}</dd></div>
                   </dl>
                   {selected.severities.length > 0 && <div className="runbook-severities">{selected.severities.map((severity) => <SeverityBadge key={severity} severity={severity} />)}</div>}
-                  <p className="runbook-readonly-note">更新手册请替换部署目录中的 PDF 文件；网页地址、登录凭据和在线编辑均已停用。</p>
+                  <p className="runbook-readonly-note">PDF 是审计原文；章节、诊断图和质量状态来自只读结构化索引。review_required/draft 资料不能通过生产准入门槛。</p>
                   <pre className="runbook-content-preview">{selected.content}</pre>
                 </div>
               </>

@@ -173,6 +173,17 @@ class FeedbackRow(Base):
     final_root_cause: Mapped[str | None] = mapped_column(Text)
     actual_resolution: Mapped[str | None] = mapped_column(Text)
     recovered: Mapped[int | None] = mapped_column(Integer)
+    runbook_match_verdict: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="UNKNOWN"
+    )
+    correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
+    correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
+    missed_runbook_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    supporting_evidence_ids_json: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    wrong_agent_claims_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    accepted_step_orders_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     reviewer: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -190,6 +201,11 @@ class KnowledgeCaseRow(Base):
     service_name: Mapped[str] = mapped_column(String(255), nullable=False)
     alert_type: Mapped[str] = mapped_column(String(255), nullable=False)
     database_engine: Mapped[str | None] = mapped_column(String(100))
+    correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
+    correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
+    supporting_evidence_ids_json: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     final_root_cause: Mapped[str] = mapped_column(Text, nullable=False)
     actual_resolution: Mapped[str] = mapped_column(Text, nullable=False)
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
@@ -620,6 +636,13 @@ class SQLAlchemyAlertRepository:
                         if feedback.recovered is False
                         else None
                     ),
+                    runbook_match_verdict=feedback.runbook_match_verdict.value,
+                    correct_runbook_id=feedback.correct_runbook_id,
+                    correct_runbook_section=feedback.correct_runbook_section,
+                    missed_runbook_ids_json=feedback.missed_runbook_ids,
+                    supporting_evidence_ids_json=feedback.supporting_evidence_ids,
+                    wrong_agent_claims_json=feedback.wrong_agent_claims,
+                    accepted_step_orders_json=feedback.accepted_step_orders,
                     reviewer=feedback.reviewer,
                     created_at=feedback.created_at,
                 )
@@ -645,6 +668,11 @@ class SQLAlchemyAlertRepository:
                             service_name=knowledge_case.service_name,
                             alert_type=knowledge_case.alert_type,
                             database_engine=knowledge_case.database_engine,
+                            correct_runbook_id=knowledge_case.correct_runbook_id,
+                            correct_runbook_section=knowledge_case.correct_runbook_section,
+                            supporting_evidence_ids_json=(
+                                knowledge_case.supporting_evidence_ids
+                            ),
                             final_root_cause=knowledge_case.final_root_cause,
                             actual_resolution=knowledge_case.actual_resolution,
                             recommendation_json=(
@@ -889,6 +917,13 @@ class SQLAlchemyAlertRepository:
             final_root_cause=row.final_root_cause,
             actual_resolution=row.actual_resolution,
             recovered=bool(row.recovered) if row.recovered is not None else None,
+            runbook_match_verdict=row.runbook_match_verdict,
+            correct_runbook_id=row.correct_runbook_id,
+            correct_runbook_section=row.correct_runbook_section,
+            missed_runbook_ids=row.missed_runbook_ids_json or [],
+            supporting_evidence_ids=row.supporting_evidence_ids_json or [],
+            wrong_agent_claims=row.wrong_agent_claims_json or [],
+            accepted_step_orders=row.accepted_step_orders_json or [],
             reviewer=row.reviewer,
             created_at=row.created_at,
         )
@@ -905,6 +940,9 @@ class SQLAlchemyAlertRepository:
             service_name=row.service_name,
             alert_type=row.alert_type,
             database_engine=row.database_engine,
+            correct_runbook_id=row.correct_runbook_id,
+            correct_runbook_section=row.correct_runbook_section,
+            supporting_evidence_ids=row.supporting_evidence_ids_json or [],
             final_root_cause=row.final_root_cause,
             actual_resolution=row.actual_resolution,
             recommendation=(

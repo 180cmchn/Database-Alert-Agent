@@ -66,6 +66,39 @@ class FeedbackVerdict(StrEnum):
     REJECTED = "REJECTED"
 
 
+class RunbookKnowledgeType(StrEnum):
+    RUNBOOK = "runbook"
+    INCIDENT_CASE = "incident_case"
+    REFERENCE = "reference"
+    INCOMPLETE = "incomplete"
+
+
+class RunbookQualityStatus(StrEnum):
+    DRAFT = "draft"
+    REVIEW_REQUIRED = "review_required"
+    APPROVED = "approved"
+    DEPRECATED = "deprecated"
+
+
+class ExecutionClass(StrEnum):
+    READ_ONLY = "read_only"
+    CHANGE = "change"
+
+
+class RootCauseStatus(StrEnum):
+    SUPPORTED = "SUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class RunbookMatchVerdict(StrEnum):
+    CORRECT = "CORRECT"
+    INCORRECT = "INCORRECT"
+    MISSED = "MISSED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    UNKNOWN = "UNKNOWN"
+
+
 class DatabaseTarget(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -103,12 +136,53 @@ class NormalizedAlert(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
+class RunbookProbe(BaseModel):
+    tool_name: str
+    objective: str
+    read_only: bool = True
+
+
+class RunbookCause(BaseModel):
+    cause_id: str
+    hypothesis: str
+    supporting_evidence: list[str] = Field(default_factory=list)
+    contradicting_evidence: list[str] = Field(default_factory=list)
+    probes: list[RunbookProbe] = Field(default_factory=list)
+
+
+class RunbookAction(BaseModel):
+    action: str
+    execution_class: ExecutionClass = ExecutionClass.READ_ONLY
+    expected_result: str | None = None
+    approval_required: bool = False
+
+    @model_validator(mode="after")
+    def require_approval_for_changes(self) -> RunbookAction:
+        if self.execution_class == ExecutionClass.CHANGE and not self.approval_required:
+            raise ValueError("change runbook actions must require approval")
+        return self
+
+
+class RunbookSection(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    title: str = Field(min_length=1, max_length=300)
+    pages: list[int] = Field(default_factory=list)
+    content: str = ""
+
+
 class RunbookExcerpt(BaseModel):
     runbook_id: str
     title: str
     section: str = "main"
     content: str
     score: float = 0
+    match_confidence: float = Field(default=0, ge=0, le=1)
+    match_reasons: list[str] = Field(default_factory=list)
+    page_refs: list[int] = Field(default_factory=list)
+    knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
+    quality_status: RunbookQualityStatus = RunbookQualityStatus.DRAFT
+    causes: list[RunbookCause] = Field(default_factory=list)
+    actions: list[RunbookAction] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -120,6 +194,11 @@ class RunbookDocument(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     severities: list[str] = Field(default_factory=list)
     labels: dict[str, str] = Field(default_factory=dict)
+    knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
+    quality_status: RunbookQualityStatus = RunbookQualityStatus.DRAFT
+    sections: list[RunbookSection] = Field(default_factory=list)
+    causes: list[RunbookCause] = Field(default_factory=list)
+    actions: list[RunbookAction] = Field(default_factory=list)
     content: str = Field(min_length=1, max_length=1_000_000)
     metadata: dict[str, Any] = Field(default_factory=dict)
     version: int = Field(default=1, ge=1)
@@ -171,9 +250,24 @@ class RecommendationStep(BaseModel):
 
 class RootCauseAssessment(BaseModel):
     cause: str
+    cause_id: str | None = None
+    status: RootCauseStatus = RootCauseStatus.UNKNOWN
     evidence_refs: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0, ge=0, le=1)
     verified: bool = False
+    next_probe: str | None = None
+
+    @model_validator(mode="after")
+    def validate_verified_status(self) -> RootCauseAssessment:
+        if self.verified and self.status == RootCauseStatus.UNKNOWN:
+            # Backward compatibility for persisted v2 recommendations. New model
+            # responses are explicitly instructed to provide the tri-state status.
+            self.status = RootCauseStatus.SUPPORTED
+        if self.verified and self.status == RootCauseStatus.CONTRADICTED:
+            raise ValueError("verified root cause must have status=SUPPORTED")
+        if self.verified and not self.evidence_refs:
+            raise ValueError("verified root cause must reference evidence")
+        return self
 
 
 class Recommendation(BaseModel):
@@ -187,6 +281,7 @@ class Recommendation(BaseModel):
     manual_matched: bool
     runbook_references: list[RunbookReference] = Field(default_factory=list)
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
+    analysis_mode: Literal["assist", "shadow"] = "assist"
 
 
 class ToolExecutionRequest(BaseModel):
@@ -270,6 +365,9 @@ class KnowledgeCase(BaseModel):
     service_name: str
     alert_type: str
     database_engine: str | None = None
+    correct_runbook_id: str | None = None
+    correct_runbook_section: str | None = None
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
     final_root_cause: str
     actual_resolution: str
     recommendation: Recommendation | None = None
@@ -287,6 +385,13 @@ class FeedbackRecord(BaseModel):
     final_root_cause: str | None = None
     actual_resolution: str | None = None
     recovered: bool | None = None
+    runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN
+    correct_runbook_id: str | None = None
+    correct_runbook_section: str | None = None
+    missed_runbook_ids: list[str] = Field(default_factory=list)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    wrong_agent_claims: list[str] = Field(default_factory=list)
+    accepted_step_orders: list[int] = Field(default_factory=list)
     reviewer: str
     created_at: datetime = Field(default_factory=utc_now)
 

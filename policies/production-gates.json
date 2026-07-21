@@ -1,0 +1,20 @@
+{
+  "dataset_policy": {
+    "require_all_cases_reviewed": true,
+    "minimum_matching_cases": 100,
+    "minimum_diagnosis_cases": 100
+  },
+  "metric_thresholds": {
+    "runbook_recall_at_5": 0.95,
+    "runbook_precision_at_1": 0.90,
+    "no_match_accuracy": 0.95,
+    "section_hit_rate": 0.85,
+    "cause_candidate_recall": 0.95,
+    "approved_runbook_ratio": 1.0
+  },
+  "zero_tolerance": [
+    "fabricated_runbook_references",
+    "fabricated_evidence",
+    "unapproved_change_actions"
+  ]
+}

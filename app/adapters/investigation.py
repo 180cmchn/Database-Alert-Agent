@@ -11,6 +11,7 @@ from app.domain.models import (
     EvidenceRecord,
     InvestigationContext,
     InvestigationStrategy,
+    RunbookExcerpt,
     ToolExecutionRequest,
     ToolStatus,
 )
@@ -173,7 +174,9 @@ class DefaultInvestigationStrategyProvider:
     def __init__(self, max_dynamic_turns: int = 0) -> None:
         self.max_dynamic_turns = max_dynamic_turns
 
-    async def select(self, alert) -> InvestigationStrategy:  # type: ignore[no-untyped-def]
+    async def select(
+        self, alert, runbooks: list[RunbookExcerpt] | None = None
+    ) -> InvestigationStrategy:  # type: ignore[no-untyped-def]
         if alert.alert_type.lower() in {"connection_exhausted", "too_many_connections"}:
             return InvestigationStrategy(
                 strategy_id="database-connection-exhausted-v1",
@@ -212,13 +215,39 @@ class DefaultInvestigationStrategyProvider:
                 ],
                 max_dynamic_turns=self.max_dynamic_turns,
             )
+        tool_plan = [
+            ToolExecutionRequest(tool_name="alert_context", required=True, timeout_seconds=3)
+        ]
+        seen_tools = {"alert_context"}
+        for runbook in runbooks or []:
+            for cause in runbook.causes:
+                for probe in cause.probes:
+                    if not probe.read_only or probe.tool_name in seen_tools:
+                        continue
+                    seen_tools.add(probe.tool_name)
+                    tool_plan.append(
+                        ToolExecutionRequest(
+                            tool_name=probe.tool_name,
+                            parameters={
+                                "objective": probe.objective,
+                                "runbook_id": runbook.runbook_id,
+                                "section": runbook.section,
+                            },
+                            required=False,
+                            timeout_seconds=10,
+                        )
+                    )
+                    if len(tool_plan) >= 4:
+                        break
+                if len(tool_plan) >= 4:
+                    break
+            if len(tool_plan) >= 4:
+                break
         return InvestigationStrategy(
             strategy_id="generic-alert-investigation-v1",
             title="通用告警调查策略",
-            description="先使用告警平台提供的上下文，并依据手册给出保守建议。",
-            tool_plan=[
-                ToolExecutionRequest(tool_name="alert_context", required=True, timeout_seconds=3)
-            ],
+            description="先采集告警上下文，再按命中手册的诊断图执行只读核查。",
+            tool_plan=tool_plan,
             max_dynamic_turns=self.max_dynamic_turns,
         )
 

@@ -86,6 +86,7 @@ export function SettingsPage() {
         react_enabled: form.get("react_enabled") === "on",
         react_max_dynamic_turns: numberField(form, "react_max_dynamic_turns"),
         validation_enabled: form.get("validation_enabled") === "on",
+        shadow_enabled: form.get("shadow_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
       };
       const apiKey = String(form.get("ai_api_key") || "").trim();
@@ -156,6 +157,7 @@ export function SettingsPage() {
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>启用有界 ReAct</strong><small>允许模型在已注册工具内追加有限次数的证据采集</small></span></span><input name="react_enabled" type="checkbox" defaultChecked={settings.react_enabled} /><i /></label>
             <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则与独立模型的双重校验</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并强制进入人工复核，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" defaultValue={settings.react_max_dynamic_turns} /></label>

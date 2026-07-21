@@ -81,7 +81,9 @@ class InvestigationTool(Protocol):
 
 
 class InvestigationStrategyProvider(Protocol):
-    async def select(self, alert: NormalizedAlert) -> InvestigationStrategy: ...
+    async def select(
+        self, alert: NormalizedAlert, runbooks: list[RunbookExcerpt] | None = None
+    ) -> InvestigationStrategy: ...
 
 
 class ConclusionValidator(Protocol):

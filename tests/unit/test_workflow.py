@@ -192,3 +192,27 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
     assert advisor.calls == 2
     assert events == ["RESULT:CRITICAL"]
     await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_always_requires_review(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path).model_copy(update={"shadow_enabled": True})
+    runtime = build_runtime(settings)
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "shadow-warning",
+            "severity": "WARNING",
+            "title": "Unknown warning",
+            "reason": "unknown_warning",
+        },
+    )
+
+    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.recommendation is not None
+    assert result.recommendation.analysis_mode == "shadow"
+    assert result.recommendation.requires_human is True
+    assert result.progress[-1].details["shadow_enabled"] is True
+    await runtime.repository.close()  # type: ignore[attr-defined]

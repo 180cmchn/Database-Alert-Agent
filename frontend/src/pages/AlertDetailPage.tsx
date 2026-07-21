@@ -9,6 +9,7 @@ import {
   CircleAlert,
   Clock3,
   Database,
+  Eye,
   ExternalLink,
   FileCheck2,
   Gauge,
@@ -155,9 +156,12 @@ export function AlertDetailPage() {
                 <details key={`${match.runbook_id}-${match.section}`} className="runbook-evidence" open={record.manual_matches.length === 1}>
                   <summary>
                     <div><strong>{match.title}</strong><span>{match.runbook_id} / {match.section}</span></div>
-                    <span className="score-chip">相关度 {match.score.toFixed(1)}</span>
+                    <span className="score-chip">置信度 {formatPercent(match.match_confidence)}</span>
                   </summary>
-                  <div className="runbook-content">{match.content}</div>
+                  <div className="runbook-content">
+                    <p>页码：{match.page_refs.join("、") || "未标注"} · 质量：{match.quality_status} · {match.match_reasons.join("；")}</p>
+                    {match.content}
+                  </div>
                 </details>
               ))}
             </div>
@@ -226,7 +230,7 @@ export function AlertDetailPage() {
           <div className="recommendation-hero">
             <div className="recommendation-mark"><BrainCircuit size={27} /></div>
             <div className="recommendation-copy">
-              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 手册约束</span>}</div>
+              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.analysis_mode === "shadow" && <span className="manual-proof"><Eye size={13} /> 影子分析</span>}{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 手册约束</span>}</div>
               <h2>{recommendation.summary}</h2>
               <div className="recommendation-meta">
                 <span><Gauge size={15} /> 置信度 <strong>{formatPercent(recommendation.confidence)}</strong></span>
@@ -242,9 +246,9 @@ export function AlertDetailPage() {
                 {recommendation.root_causes.map((rootCause, index) => (
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
                     <span className="root-index">{String(index + 1).padStart(2, "0")}</span>
-                    <div><strong>{rootCause.cause}</strong><p>{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p></div>
+                    <div><strong>{rootCause.cause}</strong><p>{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>{rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}</div>
                     <span className="root-confidence">{formatPercent(rootCause.confidence)}</span>
-                    <span className="verified-label">{rootCause.verified ? <><Check size={13} /> 已验证</> : <><CircleAlert size={13} /> 待验证</>}</span>
+                    <span className="verified-label">{rootCause.verified ? <><Check size={13} /> 已验证</> : <><CircleAlert size={13} /> {rootCause.status}</>}</span>
                   </article>
                 ))}
               </div>

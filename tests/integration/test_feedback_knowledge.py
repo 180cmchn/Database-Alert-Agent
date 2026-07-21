@@ -40,6 +40,8 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         ).json()
         assert client.portal is not None
         client.portal.call(runtime.service.analyze_by_id, first["alert_id"])
+        first_detail = client.get(first["detail_url"]).json()
+        evidence_id = first_detail["evidence_records"][0]["id"]
 
         feedback = client.post(
             f"/api/v1/alerts/{first['alert_id']}/feedback",
@@ -51,9 +53,15 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
                 "final_root_cause": "上游延迟抖动",
                 "actual_resolution": "上游恢复后告警解除",
                 "recovered": True,
+                "runbook_match_verdict": "NOT_APPLICABLE",
+                "supporting_evidence_ids": [evidence_id],
+                "wrong_agent_claims": ["把告警字段直接当成已确认根因"],
+                "accepted_step_orders": [1],
             },
         )
         assert feedback.status_code == 201
+        assert feedback.json()["runbook_match_verdict"] == "NOT_APPLICABLE"
+        assert feedback.json()["supporting_evidence_ids"] == [evidence_id]
         duplicate = client.post(
             f"/api/v1/alerts/{first['alert_id']}/feedback",
             headers={"Authorization": "Bearer test-admin-token"},
@@ -82,6 +90,9 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
 
         assert len(detail["knowledge_matches"]) == 1
         assert detail["knowledge_matches"][0]["final_root_cause"] == "上游延迟抖动"
+        assert detail["knowledge_matches"][0]["supporting_evidence_ids"] == [
+            evidence_id
+        ]
         assert any(
             item["tool_name"] == "alert_context"
             and item["status"] == "SUCCESS"

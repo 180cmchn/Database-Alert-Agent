@@ -105,6 +105,11 @@ export interface RunbookExcerpt {
   section: string;
   content: string;
   score: number;
+  match_confidence: number;
+  match_reasons: string[];
+  page_refs: number[];
+  knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
+  quality_status: "draft" | "review_required" | "approved" | "deprecated";
   metadata: Record<string, unknown>;
 }
 
@@ -124,9 +129,12 @@ export interface AnalysisBasis {
 
 export interface RootCauseAssessment {
   cause: string;
+  cause_id?: string | null;
+  status: "SUPPORTED" | "CONTRADICTED" | "UNKNOWN";
   evidence_refs: string[];
   confidence: number;
   verified: boolean;
+  next_probe?: string | null;
 }
 
 export interface Recommendation {
@@ -140,6 +148,7 @@ export interface Recommendation {
   manual_matched: boolean;
   runbook_references: RunbookReference[];
   root_causes: RootCauseAssessment[];
+  analysis_mode: "assist" | "shadow";
 }
 
 export interface ProgressRecord {
@@ -260,6 +269,21 @@ export interface RunbookRecord {
   keywords: string[];
   severities: Severity[];
   labels: Record<string, string>;
+  knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
+  quality_status: "draft" | "review_required" | "approved" | "deprecated";
+  sections: Array<{ id: string; title: string; pages: number[]; content: string }>;
+  causes: Array<{
+    cause_id: string;
+    hypothesis: string;
+    supporting_evidence: string[];
+    contradicting_evidence: string[];
+  }>;
+  actions: Array<{
+    action: string;
+    execution_class: "read_only" | "change";
+    expected_result?: string | null;
+    approval_required: boolean;
+  }>;
   content: string;
   metadata: Record<string, unknown>;
   version: number;
@@ -281,6 +305,8 @@ export interface AdminSettings {
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
+  shadow_enabled: boolean;
+  production_gate_approved: boolean;
   ai_api_key_configured: boolean;
   wecom_webhook_url_configured: boolean;
   revision: string;
@@ -302,6 +328,7 @@ export interface AdminSettingsPatch {
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;
   validation_enabled?: boolean;
+  shadow_enabled?: boolean;
   ai_api_key?: string;
 }
 
