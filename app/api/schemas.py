@@ -91,6 +91,9 @@ class RuntimeSettingsResponse(BaseModel):
     production_gate_approved: bool
     runbook_limit: int
     wecom_webhook_url_configured: bool
+    flashduty_enabled: bool
+    flashduty_base_url: str
+    flashduty_app_key_configured: bool
     revision: str
     apply_status: Literal["applied"] = "applied"
     worker_refresh_mode: Literal["before_each_job"] = "before_each_job"
@@ -124,6 +127,9 @@ class RuntimeSettingsResponse(BaseModel):
             production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
+            flashduty_enabled=settings.flashduty_enabled,
+            flashduty_base_url=settings.flashduty_base_url,
+            flashduty_app_key_configured=bool(settings.flashduty_app_key),
             revision=revision,
             changed_fields=changed_fields or [],
         )

@@ -153,6 +153,12 @@ export function SettingsPage() {
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
 
+        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty 只读连接" description="APP Key 与数据源绑定由部署环境管理；控制台仅显示状态，不能在线改写。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读连接已启用" : "APP Key 未配置") : "未启用"}</span>}>
+          <div className="form-grid two-cols">
+            <label className="field span-2"><span>官方 API Endpoint</span><input value={settings.flashduty_base_url} readOnly /></label>
+          </div>
+        </SectionCard>
+
         <SectionCard eyebrow="REASONING GUARDRAILS" title="推理与校验护栏" description="动态工具规划默认关闭；只有接入真实工具适配器后再开启。">
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>启用有界 ReAct</strong><small>允许模型在已注册工具内追加有限次数的证据采集</small></span></span><input name="react_enabled" type="checkbox" defaultChecked={settings.react_enabled} /><i /></label>

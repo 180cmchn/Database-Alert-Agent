@@ -9,6 +9,11 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
+from app.adapters.flashduty import (
+    FlashDutyAlertSourceAdapter,
+    FlashDutyClient,
+    build_flashduty_tools,
+)
 from app.adapters.investigation import (
     DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
@@ -75,6 +80,28 @@ def _build_notifier(settings: Settings) -> ManagementNotifier:
     return LogManagementNotifier()
 
 
+def _build_tool_registry(settings: Settings) -> InvestigationToolRegistry:
+    registry = build_default_tool_registry()
+    if not settings.flashduty_enabled or not settings.flashduty_app_key:
+        return registry
+
+    client = FlashDutyClient(
+        settings.flashduty_app_key,
+        base_url=settings.flashduty_base_url,
+        timeout_seconds=settings.flashduty_timeout_seconds,
+        max_retries=settings.flashduty_max_retries,
+    )
+    for tool in build_flashduty_tools(
+        client,
+        item_limit=settings.flashduty_context_item_limit,
+        metrics_ds_name=settings.flashduty_metrics_ds_name,
+        logs_ds_name=settings.flashduty_logs_ds_name,
+        logs_ds_type=settings.flashduty_logs_ds_type,
+    ):
+        registry.register(tool)
+    return registry
+
+
 def _resolve_runbook_adapters(
     settings: Settings,
     provider: RunbookProvider | None,
@@ -109,7 +136,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     conclusion_validator = _build_conclusion_validator(settings)
     notifier = _build_notifier(settings)
     strategy_provider = DefaultInvestigationStrategyProvider(
-        settings.react_max_dynamic_turns if settings.react_enabled else 0
+        settings.react_max_dynamic_turns if settings.react_enabled else 0,
+        external_tool_timeout_seconds=settings.flashduty_timeout_seconds,
     )
 
     service.advisor = advisor
@@ -143,7 +171,8 @@ def build_runtime(
     repository = repository or SQLAlchemyAlertRepository(settings.database_url)
     source_registry = source_registry or AlertSourceRegistry(
         [
-            CanonicalAlertSourceAdapter(settings.environment_aliases)
+            CanonicalAlertSourceAdapter(settings.environment_aliases),
+            FlashDutyAlertSourceAdapter(settings.environment_aliases),
         ]
     )
     if advisor is None:
@@ -155,9 +184,10 @@ def build_runtime(
     if notifier is None:
         notifier = _build_notifier(settings)
 
-    tool_registry = tool_registry or build_default_tool_registry()
+    tool_registry = tool_registry or _build_tool_registry(settings)
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
-        settings.react_max_dynamic_turns if settings.react_enabled else 0
+        settings.react_max_dynamic_turns if settings.react_enabled else 0,
+        external_tool_timeout_seconds=settings.flashduty_timeout_seconds,
     )
     rule_validator = rule_validator or RuleConclusionValidator()
     tool_executor = ToolExecutor(tool_registry, settings.tool_max_result_chars)

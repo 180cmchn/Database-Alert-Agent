@@ -79,6 +79,19 @@ class Settings(BaseSettings):
     )
     wecom_webhook_url: str = Field(default="", repr=False)
 
+    # FlashDuty credentials and data-source bindings are deployment settings.
+    # They intentionally remain outside RUNTIME_SETTINGS_KEYS so an admin API
+    # caller cannot replace the APP Key or redirect diagnostic traffic.
+    flashduty_enabled: bool = False
+    flashduty_base_url: str = "https://api.flashcat.cloud"
+    flashduty_app_key: str = Field(default="", repr=False)
+    flashduty_timeout_seconds: float = Field(default=40, ge=35, le=120)
+    flashduty_max_retries: int = Field(default=2, ge=0, le=5)
+    flashduty_context_item_limit: int = Field(default=20, ge=1, le=100)
+    flashduty_metrics_ds_name: str = ""
+    flashduty_logs_ds_name: str = ""
+    flashduty_logs_ds_type: str = "loki"
+
     kafka_enabled: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_alert_topic: str = "database-alerts"
@@ -99,6 +112,7 @@ class Settings(BaseSettings):
     @field_validator(
         "ai_provider",
         "http_scheduler",
+        "flashduty_logs_ds_type",
     )
     @classmethod
     def normalize_mode(cls, value: str) -> str:
@@ -121,6 +135,7 @@ class Settings(BaseSettings):
         for field_name, required in (
             ("ai_base_url", True),
             ("wecom_webhook_url", False),
+            ("flashduty_base_url", True),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -145,6 +160,17 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "wecom_webhook_url must be an official HTTPS WeCom group robot URL"
                     )
+            if field_name == "flashduty_base_url" and (
+                parsed.scheme != "https"
+                or parsed.hostname != "api.flashcat.cloud"
+                or parsed.port not in {None, 443}
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "flashduty_base_url must be the official HTTPS FlashDuty API endpoint"
+                )
             if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
                 raise ValueError(f"{field_name} must use HTTPS in production")
         if (
@@ -152,6 +178,8 @@ class Settings(BaseSettings):
             and self.ai_provider == "fake"
         ):
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
+        if self.flashduty_logs_ds_type not in {"loki", "victorialogs"}:
+            raise ValueError("FLASHDUTY_LOGS_DS_TYPE must be loki or victorialogs")
         return self
 
     def readiness_issues(self) -> list[str]:
@@ -168,6 +196,8 @@ class Settings(BaseSettings):
             issues.append("WECOM_WEBHOOK_URL is required in production")
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
+        if self.flashduty_enabled and not self.flashduty_app_key:
+            issues.append("FLASHDUTY_APP_KEY is required when FlashDuty is enabled")
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:

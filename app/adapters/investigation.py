@@ -171,8 +171,16 @@ class UnavailableExternalTool:
 
 
 class DefaultInvestigationStrategyProvider:
-    def __init__(self, max_dynamic_turns: int = 0) -> None:
+    def __init__(
+        self,
+        max_dynamic_turns: int = 0,
+        *,
+        alert_context_timeout_seconds: float = 15,
+        external_tool_timeout_seconds: float = 45,
+    ) -> None:
         self.max_dynamic_turns = max_dynamic_turns
+        self.alert_context_timeout_seconds = alert_context_timeout_seconds
+        self.external_tool_timeout_seconds = external_tool_timeout_seconds
 
     async def select(
         self, alert, runbooks: list[RunbookExcerpt] | None = None
@@ -186,7 +194,9 @@ class DefaultInvestigationStrategyProvider:
                 ),
                 tool_plan=[
                     ToolExecutionRequest(
-                        tool_name="alert_context", required=True, timeout_seconds=3
+                        tool_name="alert_context",
+                        required=True,
+                        timeout_seconds=self.alert_context_timeout_seconds,
                     ),
                     ToolExecutionRequest(
                         tool_name="query_metrics",
@@ -200,7 +210,7 @@ class DefaultInvestigationStrategyProvider:
                             "instance": alert.database.instance if alert.database else None,
                         },
                         required=True,
-                        timeout_seconds=10,
+                        timeout_seconds=self.external_tool_timeout_seconds,
                     ),
                     ToolExecutionRequest(
                         tool_name="query_database_diagnostics",
@@ -210,13 +220,17 @@ class DefaultInvestigationStrategyProvider:
                             "instance": alert.database.instance if alert.database else None,
                         },
                         required=True,
-                        timeout_seconds=15,
+                        timeout_seconds=self.external_tool_timeout_seconds,
                     ),
                 ],
                 max_dynamic_turns=self.max_dynamic_turns,
             )
         tool_plan = [
-            ToolExecutionRequest(tool_name="alert_context", required=True, timeout_seconds=3)
+            ToolExecutionRequest(
+                tool_name="alert_context",
+                required=True,
+                timeout_seconds=self.alert_context_timeout_seconds,
+            )
         ]
         seen_tools = {"alert_context"}
         for runbook in runbooks or []:
@@ -234,7 +248,7 @@ class DefaultInvestigationStrategyProvider:
                                 "section": runbook.section,
                             },
                             required=False,
-                            timeout_seconds=10,
+                            timeout_seconds=self.external_tool_timeout_seconds,
                         )
                     )
                     if len(tool_plan) >= 4:
@@ -265,5 +279,7 @@ def build_default_tool_registry() -> InvestigationToolRegistry:
             UnavailableExternalTool(
                 "query_database_diagnostics", "database_management_platform"
             ),
+            UnavailableExternalTool("query_changes", "alert_platform"),
+            UnavailableExternalTool("query_similar_incidents", "alert_platform"),
         ]
     )
