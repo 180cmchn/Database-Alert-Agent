@@ -7,7 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.application.admin import runtime_configuration_issues
 from app.config import Settings
-from app.domain.models import AlertStatus, FeedbackVerdict, RunbookDocument
+from app.domain.models import (
+    AlertStatus,
+    FeedbackVerdict,
+    RunbookDocument,
+    RunbookMatchVerdict,
+)
 
 
 class AlertAccepted(BaseModel):
@@ -27,6 +32,15 @@ class FeedbackRequest(BaseModel):
     final_root_cause: str | None = None
     actual_resolution: str | None = None
     recovered: bool | None = None
+    runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN
+    correct_runbook_id: str | None = Field(default=None, min_length=1, max_length=128)
+    correct_runbook_section: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    missed_runbook_ids: list[str] = Field(default_factory=list, max_length=20)
+    supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    wrong_agent_claims: list[str] = Field(default_factory=list, max_length=20)
+    accepted_step_orders: list[int] = Field(default_factory=list, max_length=50)
 
 
 class RunbookListResponse(BaseModel):
@@ -48,6 +62,7 @@ class RuntimeSettingsPatch(BaseModel):
     react_enabled: bool | None = None
     react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
     validation_enabled: bool | None = None
+    shadow_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
 
@@ -72,6 +87,8 @@ class RuntimeSettingsResponse(BaseModel):
     react_enabled: bool
     react_max_dynamic_turns: int
     validation_enabled: bool
+    shadow_enabled: bool
+    production_gate_approved: bool
     runbook_limit: int
     wecom_webhook_url_configured: bool
     revision: str
@@ -103,6 +120,8 @@ class RuntimeSettingsResponse(BaseModel):
             react_enabled=settings.react_enabled,
             react_max_dynamic_turns=settings.react_max_dynamic_turns,
             validation_enabled=settings.validation_enabled,
+            shadow_enabled=settings.shadow_enabled,
+            production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             revision=revision,

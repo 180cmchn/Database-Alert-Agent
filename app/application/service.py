@@ -24,6 +24,8 @@ from app.domain.models import (
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
+    RunbookMatchVerdict,
+    RunbookQualityStatus,
     RunStatus,
     StoredAlert,
     ToolStatus,
@@ -60,6 +62,7 @@ class AlertAnalysisService:
         investigation_lease_seconds: int = 300,
         react_enabled: bool = False,
         validation_enabled: bool = True,
+        shadow_enabled: bool = False,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
     ) -> None:
         self.source_registry = source_registry
@@ -76,6 +79,7 @@ class AlertAnalysisService:
         self.investigation_lease_seconds = investigation_lease_seconds
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
+        self.shadow_enabled = shadow_enabled
         self.alert_sanitizer = alert_sanitizer
 
     async def ingest(
@@ -154,7 +158,7 @@ class AlertAnalysisService:
             )
             runbooks = await self.runbook_provider.search(alert, limit=self.runbook_limit)
             await self.repository.save_runbooks(alert_id, runbooks)
-            strategy = await self.strategy_provider.select(alert)
+            strategy = await self.strategy_provider.select(alert, runbooks)
             await self.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
 
             await self._progress(
@@ -227,9 +231,18 @@ class AlertAnalysisService:
                     )
                 await self.repository.save_validation(alert_id, agent_validation)
 
-            passed = rule_validation.passed and (
+            validation_passed = rule_validation.passed and (
                 not self.validation_enabled
                 or (agent_validation is not None and agent_validation.passed)
+            )
+            unapproved_runbook = any(
+                item.quality_status != RunbookQualityStatus.APPROVED
+                for item in runbooks
+            )
+            passed = (
+                validation_passed
+                and not self.shadow_enabled
+                and not unapproved_runbook
             )
             final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
             run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
@@ -243,7 +256,14 @@ class AlertAnalysisService:
                     update={
                         "requires_human": True,
                         "confidence": min(recommendation.confidence, 0.5),
+                        "analysis_mode": (
+                            "shadow" if self.shadow_enabled else "assist"
+                        ),
                     }
+                )
+            else:
+                recommendation = recommendation.model_copy(
+                    update={"analysis_mode": "assist"}
                 )
 
             await self._progress(
@@ -262,6 +282,11 @@ class AlertAnalysisService:
                     run_id=run.id,
                     stage=final_stage,
                     message="调查完成。" if passed else "结论需要人工复核。",
+                    details={
+                        "validation_passed": validation_passed,
+                        "shadow_enabled": self.shadow_enabled,
+                        "unapproved_runbook": unapproved_runbook,
+                    },
                 ),
             )
             # Publish the alert-level terminal status only after the run and its
@@ -281,7 +306,11 @@ class AlertAnalysisService:
                 message=(
                     "数据库告警分析已完成。"
                     if passed
-                    else "数据库告警已生成候选分析，但校验未通过，请人工复核。"
+                    else (
+                        "数据库告警已生成影子分析，请人工复核。"
+                        if self.shadow_enabled
+                        else "数据库告警已生成候选分析，请人工复核。"
+                    )
                 ),
             )
             return await self.get(alert_id)
@@ -317,6 +346,13 @@ class AlertAnalysisService:
         final_root_cause: str | None = None,
         actual_resolution: str | None = None,
         recovered: bool | None = None,
+        runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN,
+        correct_runbook_id: str | None = None,
+        correct_runbook_section: str | None = None,
+        missed_runbook_ids: list[str] | None = None,
+        supporting_evidence_ids: list[str] | None = None,
+        wrong_agent_claims: list[str] | None = None,
+        accepted_step_orders: list[int] | None = None,
     ) -> FeedbackRecord:
         stored = await self.get(alert_id)
         if stored.status not in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
@@ -329,6 +365,66 @@ class AlertAnalysisService:
             raise InvalidAlertPayloadError(
                 "Confirmed or corrected feedback requires final_root_cause and actual_resolution"
             )
+        if runbook_match_verdict == RunbookMatchVerdict.CORRECT and not correct_runbook_id:
+            if len(stored.manual_matches) == 1:
+                correct_runbook_id = stored.manual_matches[0].runbook_id
+                correct_runbook_section = (
+                    correct_runbook_section or stored.manual_matches[0].section
+                )
+            else:
+                raise InvalidAlertPayloadError(
+                    "CORRECT runbook feedback requires correct_runbook_id "
+                    "when matches are ambiguous"
+                )
+        retrieved_runbook_ids = {item.runbook_id for item in stored.manual_matches}
+        if (
+            runbook_match_verdict == RunbookMatchVerdict.CORRECT
+            and correct_runbook_id not in retrieved_runbook_ids
+        ):
+            raise InvalidAlertPayloadError(
+                "CORRECT runbook feedback must reference a retrieved runbook"
+            )
+        if runbook_match_verdict in {
+            RunbookMatchVerdict.INCORRECT,
+            RunbookMatchVerdict.MISSED,
+        } and not correct_runbook_id:
+            raise InvalidAlertPayloadError(
+                "INCORRECT or MISSED runbook feedback requires correct_runbook_id"
+            )
+        if (
+            runbook_match_verdict == RunbookMatchVerdict.MISSED
+            and correct_runbook_id in retrieved_runbook_ids
+        ):
+            raise InvalidAlertPayloadError(
+                "MISSED runbook feedback must reference a runbook that was not retrieved"
+            )
+        if (
+            runbook_match_verdict == RunbookMatchVerdict.NOT_APPLICABLE
+            and correct_runbook_id
+        ):
+            raise InvalidAlertPayloadError(
+                "NOT_APPLICABLE runbook feedback cannot provide correct_runbook_id"
+            )
+        evidence_ids = list(dict.fromkeys(supporting_evidence_ids or []))
+        evidence_by_id = {str(item.id): item for item in stored.evidence_records}
+        invalid_evidence = [
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id not in evidence_by_id
+            or evidence_by_id[evidence_id].status != ToolStatus.SUCCESS
+        ]
+        if invalid_evidence:
+            raise InvalidAlertPayloadError(
+                "supporting_evidence_ids must reference SUCCESS evidence from this investigation"
+            )
+        accepted_orders = sorted(set(accepted_step_orders or []))
+        valid_orders = {
+            step.order for step in (stored.recommendation.steps if stored.recommendation else [])
+        }
+        if not set(accepted_orders).issubset(valid_orders):
+            raise InvalidAlertPayloadError(
+                "accepted_step_orders must reference recommendation steps from this investigation"
+            )
         feedback = FeedbackRecord(
             alert_id=stored.alert.id,
             run_id=stored.latest_run.id,
@@ -337,6 +433,13 @@ class AlertAnalysisService:
             final_root_cause=sanitize(final_root_cause),
             actual_resolution=sanitize(actual_resolution),
             recovered=recovered,
+            runbook_match_verdict=runbook_match_verdict,
+            correct_runbook_id=sanitize(correct_runbook_id),
+            correct_runbook_section=sanitize(correct_runbook_section),
+            missed_runbook_ids=sanitize(list(dict.fromkeys(missed_runbook_ids or []))),
+            supporting_evidence_ids=evidence_ids,
+            wrong_agent_claims=sanitize(wrong_agent_claims or []),
+            accepted_step_orders=accepted_orders,
             reviewer=sanitize(reviewer),
         )
         knowledge_case = None
@@ -357,6 +460,9 @@ class AlertAnalysisService:
                 database_engine=(
                     stored.alert.database.engine if stored.alert.database else None
                 ),
+                correct_runbook_id=sanitize(correct_runbook_id),
+                correct_runbook_section=sanitize(correct_runbook_section),
+                supporting_evidence_ids=evidence_ids,
                 final_root_cause=sanitize(final_root_cause),
                 actual_resolution=sanitize(actual_resolution),
                 recommendation=stored.recommendation,

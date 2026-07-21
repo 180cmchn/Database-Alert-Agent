@@ -3,8 +3,8 @@
 本项目只负责一条告警分析链路：
 
 1. 接收并规范化数据库告警；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
-2. 读取项目内的本地 PDF 告警手册并完成全文匹配。
-3. 由 AI Agent 结合告警信息生成可能原因、判断依据和只读核查建议。
+2. 读取本地 PDF 原文及结构化索引，完成章节级混合检索、精排和拒识。
+3. 由 AI Agent 按诊断图结合告警与实时证据，生成三态原因判断和只读核查建议。
 4. 判断依据严格按“命中手册在前、AI 分析在后”输出。
 5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
 
@@ -17,7 +17,7 @@
           ↓
 三等级规范化与脱敏
           ↓
-本地 PDF 告警手册匹配（首要依据）
+结构化字段 + BM25/中文片段的章节级手册匹配（首要依据）
           ↓
 AI 分析（次要依据）+ 规则校验
           ↓
@@ -30,9 +30,13 @@ AI 分析（次要依据）+ 规则校验
 
 ## 告警手册
 
-`runbooks/pdfs/*.pdf` 是唯一手册数据源。当前目录包含随本项目提供的 10 份告警处理手册。
-服务从 PDF 文字层提取标题与正文，并依次使用告警原因、告警名称、指标名、告警类型、故障
-摘要、标题等字段进行匹配。文件名（不含 `.pdf`）作为手册 ID，引用章节统一为 `PDF`。
+`runbooks/pdfs/*.pdf` 是不可变的审计原文，`runbooks/index.json` 是对应的结构化检索和诊断
+索引。索引记录知识类型、质量状态、适用范围、告警别名、真实章节/页码、候选原因、支持证据、
+反证、只读核查动作和需要审批的变更动作。文件名（不含 `.pdf`）仍是稳定手册 ID。
+
+检索先按数据库适用范围过滤，再组合结构化字段精确召回、BM25/中文字符片段召回和质量重排。
+每份 PDF 只返回得分最高的章节；低于分数或置信度阈值时明确返回“未命中”。`incomplete` 和
+`deprecated` 资料不会参与召回，`draft`/`review_required` 命中后强制进入人工复核。
 
 PDF 必须未加密且带可提取文字层；纯扫描件需先 OCR。手册目录为只读运行数据，更新方式是
 替换目录内 PDF 后重启 API 和 Worker，不支持通过管理 API 在线增删改。
@@ -44,6 +48,8 @@ RUNBOOK_PDF_DIR=./runbooks/pdfs
 RUNBOOK_LIMIT=5
 RUNBOOK_PDF_MAX_FILE_BYTES=20000000
 RUNBOOK_PDF_MAX_TEXT_CHARS=200000
+RUNBOOK_MATCH_MIN_SCORE=12
+RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 ```
 
 网页抓取、内网域名白名单、Cookie/Bearer 登录和 Markdown 手册索引均已删除。
@@ -63,11 +69,18 @@ AI_PROVIDER=openai_compatible
 AI_BASE_URL=https://api.openai.com/v1
 AI_API_KEY=replace-me
 AI_MODEL=replace-me
+SHADOW_ENABLED=true
+PRODUCTION_GATE_APPROVED=false
 
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 ```
 
 `AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
+
+影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `REVIEW_REQUIRED`，建议
+标记为 `analysis_mode=shadow`。收集到足够专家反馈且生产门槛通过前，建议保持开启。
+生产环境只有在部署侧显式设置 `PRODUCTION_GATE_APPROVED=true` 后才允许关闭影子模式；该开关
+不属于管理 API 可在线修改的配置。
 
 企微消息包含：
 
@@ -151,6 +164,44 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 
 当命中手册时，所有 `RUNBOOK` 项必须先于 `AI` 项；手册引用必须对应本次实际召回的 PDF。没有命中手册时，只允许输出明确标注的 AI 依据，并降低置信度。
 
+根因使用三态输出：
+
+- `SUPPORTED`：存在非告警平台的实时 `SUCCESS` 证据；
+- `CONTRADICTED`：实时证据与候选原因冲突；
+- `UNKNOWN`：证据不足，同时给出 `next_probe`。
+
+只有 `SUPPORTED` 可以设置 `verified=true`。手册诊断图中的候选原因不是本次事故已经成立的
+事实，历史确认案例也只能作为线索。
+
+## 人工反馈与训练闭环
+
+`POST /api/v1/alerts/{id}/feedback` 除最终根因和实际恢复动作外，还支持：
+
+- `runbook_match_verdict`：`CORRECT`、`INCORRECT`、`MISSED`、`NOT_APPLICABLE`；
+- 正确手册 ID/章节和漏召回手册列表；
+- 支持结论的本次调查证据 ID；
+- Agent 的错误声明和被采纳步骤。
+
+确认或纠正且恢复成功的反馈会成为同问题指纹的候选历史案例，但新事件仍必须重新采集实时证据。
+
+## 离线评测与生产准入
+
+运行当前检索与诊断知识覆盖基准：
+
+```bash
+.venv/bin/python tools/evaluate_runbooks.py
+```
+
+在 CI 或发布流程中强制生产门槛：
+
+```bash
+.venv/bin/python tools/evaluate_runbooks.py --enforce-gates
+```
+
+数据集位于 `evaluation/datasets/`，门槛位于 `policies/production-gates.json`。当前仓库中的样本和
+手册标签均为保守初标，因此准入检查预期失败；必须由数据库专家审核，并用真实、按事故/时间
+隔离的历史样本扩充到门槛要求后才能批准上线。
+
 ## 验证
 
 ```bash
@@ -159,4 +210,4 @@ ruff check app tests migrations
 cd frontend && npm run build
 ```
 
-数据库升级使用 Alembic。`0005_reduce_analysis_scope` 会删除旧的路由、升级和通知送达表，并把历史建议中的旧 `evidence` 字段迁移为有来源标记的 `analysis_bases`。
+数据库升级使用 Alembic。`0006_training_feedback` 增加手册匹配、证据引用和步骤采纳等训练反馈字段。

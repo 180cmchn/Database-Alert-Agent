@@ -92,3 +92,32 @@ async def test_local_pdf_runbook_get_rejects_unsafe_id(tmp_path: Path) -> None:
 
     with pytest.raises(InvalidRunbookIdError):
         await library.get("../escape")
+
+
+@pytest.mark.asyncio
+async def test_repository_annotations_provide_sections_quality_and_diagnosis_graph() -> None:
+    library = LocalPDFRunbookLibrary(SOURCE_PDFS)
+    documents = await library.list()
+    template = next(item for item in documents if item.id == "INFRA-229346366-210726-1007-4071")
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "CRITICAL",
+            "title": "TiKV server report failure",
+            "reason": "TiKV_server_report_failure_msg_total",
+            "database": {"engine": "TiDB"},
+        }
+    )
+
+    matches = await library.search(alert)
+
+    assert template.knowledge_type.value == "incomplete"
+    assert template.quality_status.value == "draft"
+    assert all(item.runbook_id != template.id for item in matches)
+    assert matches[0].section != "PDF"
+    assert matches[0].page_refs
+    assert matches[0].match_confidence >= 0.35
+    assert {cause.cause_id for cause in matches[0].causes} >= {
+        "tikv_host_down",
+        "tikv_resource_pressure",
+        "tikv_oom_kill",
+    }

@@ -92,7 +92,7 @@ def create_app(
     app = FastAPI(
         title="Database Alert AI Agent",
         version="0.1.0",
-        description="数据库告警接入、本地 PDF 手册匹配、AI 分析与企微结果发送服务。",
+        description="数据库告警接入、结构化 PDF 手册匹配、证据化 AI 分析与企微结果发送服务。",
         lifespan=lifespan,
     )
     app.state.runtime = runtime
@@ -297,11 +297,30 @@ def create_app(
             final_root_cause=feedback.final_root_cause,
             actual_resolution=feedback.actual_resolution,
             recovered=feedback.recovered,
+            runbook_match_verdict=feedback.runbook_match_verdict,
+            correct_runbook_id=feedback.correct_runbook_id,
+            correct_runbook_section=feedback.correct_runbook_section,
+            missed_runbook_ids=feedback.missed_runbook_ids,
+            supporting_evidence_ids=feedback.supporting_evidence_ids,
+            wrong_agent_claims=feedback.wrong_agent_claims,
+            accepted_step_orders=feedback.accepted_step_orders,
         )
         await audit_logger.record(
             action="feedback",
             target=f"alert:{alert_id}",
-            fields=["verdict", "final_root_cause", "actual_resolution", "recovered"],
+            fields=[
+                "verdict",
+                "final_root_cause",
+                "actual_resolution",
+                "recovered",
+                "runbook_match_verdict",
+                "correct_runbook_id",
+                "correct_runbook_section",
+                "missed_runbook_ids",
+                "supporting_evidence_ids",
+                "wrong_agent_claims",
+                "accepted_step_orders",
+            ],
             actor=actor,
         )
         return saved

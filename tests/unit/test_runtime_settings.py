@@ -245,6 +245,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         ai_model="configured-test-model",
         ai_base_url="https://models.example.test/v1",
         admin_api_token="configured-admin-token",
+        production_gate_approved=True,
         runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
@@ -306,3 +307,32 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     )
     assert incomplete_response.ready is False
     assert any("AI_API_KEY" in issue for issue in incomplete_response.issues)
+
+
+def test_production_requires_gate_approval_before_shadow_mode_is_disabled(
+    tmp_path: Path,
+) -> None:
+    runbooks = tmp_path / "runbooks"
+    runbooks.mkdir()
+    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    base = {
+        "_env_file": None,
+        "app_env": "production",
+        "ai_provider": "openai_compatible",
+        "ai_api_key": "configured-test-key",
+        "ai_model": "configured-test-model",
+        "ai_base_url": "https://models.example.test/v1",
+        "admin_api_token": "configured-admin-token",
+        "wecom_webhook_url": (
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
+        ),
+        "runbook_pdf_dir": runbooks,
+    }
+
+    blocked = Settings(**base, shadow_enabled=False, production_gate_approved=False)
+    shadow = Settings(**base, shadow_enabled=True, production_gate_approved=False)
+
+    assert any("PRODUCTION_GATE_APPROVED" in issue for issue in blocked.readiness_issues())
+    assert not any(
+        "PRODUCTION_GATE_APPROVED" in issue for issue in shadow.readiness_issues()
+    )

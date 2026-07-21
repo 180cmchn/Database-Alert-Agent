@@ -1,0 +1,320 @@
+{
+  "schema_version": 1,
+  "review_policy": "All entries are conservative initial annotations and require a database SME to approve them before production gating can pass.",
+  "runbooks": [
+    {
+      "runbook_id": "INFRA-201503239-210726-1007-4077",
+      "knowledge_type": "reference",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["mysql", "oceanbase"], "components": ["pt-archiver", "archery"]},
+      "match": {
+        "alert_names": [],
+        "metric_names": [],
+        "aliases": ["pt-archiver 归档报错", "Character set mismatch", "Invalid utf8 character string"],
+        "keywords": ["pt-archiver", "utf8mb4", "bulk-insert", "no-check-charset"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "charset-failures", "title": "字符集相关归档失败", "pages": [1, 2]}
+      ],
+      "causes": [
+        {
+          "cause_id": "archive_charset_mismatch",
+          "hypothesis": "归档工具、连接或目标表使用的字符集不一致",
+          "supporting_evidence": ["错误包含 Character set mismatch", "错误包含 Invalid utf8 character string"],
+          "contradicting_evidence": ["源端、目标端和工具显式字符集完全一致"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "核对错误文本、表字符集和归档参数", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "核对源表、目标表和归档命令的字符集配置", "execution_class": "read_only", "expected_result": "定位字符集不一致的位置", "approval_required": false},
+        {"action": "调整归档脚本字符集参数", "execution_class": "change", "expected_result": "归档任务不再出现字符集错误", "approval_required": true}
+      ],
+      "review_notes": ["经验总结类资料，不应在缺少具体错误文本时作为告警根因金标准。"]
+    },
+    {
+      "runbook_id": "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073",
+      "knowledge_type": "runbook",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["tidb"], "components": ["tikv"]},
+      "match": {
+        "alert_names": ["TiKV_server_report_failure_msg_total"],
+        "metric_names": ["tikv_server_report_failure_msg_total"],
+        "aliases": ["TiKV server report failure", "TiKV 无法连接远端", "TiKV unreachable"],
+        "keywords": ["server_report_failure_msg_total", "unreachable", "TiKV"],
+        "required_conditions": ["type=unreachable"],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "alert-definition", "title": "告警内容与规则", "pages": [1]},
+        {"id": "diagnosis", "title": "排查步骤", "pages": [1, 2, 3]}
+      ],
+      "causes": [
+        {
+          "cause_id": "tikv_host_down",
+          "hypothesis": "TiKV 所在主机或服务不可用",
+          "supporting_evidence": ["节点监控数据中断", "同时出现主机宕机或服务不可用告警"],
+          "contradicting_evidence": ["节点监控连续且 TiKV 服务状态正常"],
+          "probes": [{"tool_name": "query_metrics", "objective": "核查节点存活和 TiKV 服务状态", "read_only": true}]
+        },
+        {
+          "cause_id": "tikv_resource_pressure",
+          "hypothesis": "TiKV 节点 CPU 或内存资源压力过高",
+          "supporting_evidence": ["告警时段 CPU 持续高位", "告警时段内存使用率异常升高"],
+          "contradicting_evidence": ["CPU、内存和负载均处于正常区间"],
+          "probes": [{"tool_name": "query_metrics", "objective": "检查告警时段 CPU、内存和节点负载", "read_only": true}]
+        },
+        {
+          "cause_id": "tikv_oom_kill",
+          "hypothesis": "TiKV 进程因系统 OOM 被终止",
+          "supporting_evidence": ["系统日志存在 OOM 或 killed process 记录", "内存先升高后进程退出"],
+          "contradicting_evidence": ["系统日志无 OOM 记录且进程未发生退出"],
+          "probes": [{"tool_name": "query_logs", "objective": "核查系统 OOM 事件和进程退出记录", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "核查集群节点、服务状态和资源指标", "execution_class": "read_only", "expected_result": "区分宕机、资源压力和 OOM 分支", "approval_required": false},
+        {"action": "分析告警时段的高内存 SQL", "execution_class": "read_only", "expected_result": "识别可能触发内存压力的 SQL", "approval_required": false}
+      ],
+      "review_notes": ["手册列出多条原因分支，任何单一分支都必须由实时证据确认。"]
+    },
+    {
+      "runbook_id": "INFRA-224075463-210726-1007-4075",
+      "knowledge_type": "incident_case",
+      "quality_status": "review_required",
+      "scope": {"database_engines": [], "components": ["dmp", "urman-agent"]},
+      "match": {
+        "alert_names": ["URMAN_TASK_FAILED"],
+        "metric_names": [],
+        "aliases": ["DMP URMAN_TASK_FAILED", "urman agent handshake failure"],
+        "keywords": ["URMAN_TASK_FAILED", "握手协议", "文件权限"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "case-analysis", "title": "案例分析步骤与结论", "pages": [1, 2]}
+      ],
+      "causes": [
+        {
+          "cause_id": "urman_file_permission",
+          "hypothesis": "urman-agent 文件权限异常",
+          "supporting_evidence": ["端口连通但握手失败", "文件权限核查异常"],
+          "contradicting_evidence": ["端口不可达", "文件权限与正常节点一致"],
+          "probes": [{"tool_name": "query_logs", "objective": "核对端口连通性和 agent 文件权限", "read_only": true}]
+        }
+      ],
+      "actions": [{"action": "核对网络连通性和 urman-agent 文件权限", "execution_class": "read_only", "expected_result": "确认故障位于网络还是 agent 权限", "approval_required": false}],
+      "review_notes": ["单次事故案例，只能提供候选原因，不能泛化为所有同名告警的固定根因。"]
+    },
+    {
+      "runbook_id": "INFRA-229346366-210726-1007-4071",
+      "knowledge_type": "incomplete",
+      "quality_status": "draft",
+      "scope": {"database_engines": ["mysql"], "components": []},
+      "match": {
+        "alert_names": [],
+        "metric_names": [],
+        "aliases": ["MySQL CPU 飙升"],
+        "keywords": ["长事务", "CPU", "auto_kill_long_transaction"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [{"id": "template", "title": "未完成 KB 模板", "pages": [1]}],
+      "causes": [],
+      "actions": [],
+      "review_notes": ["模板内容不完整，检索时必须排除。"]
+    },
+    {
+      "runbook_id": "INFRA-231966487-210726-1008-4079",
+      "knowledge_type": "reference",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["mysql"], "components": ["mysqld"]},
+      "match": {
+        "alert_names": ["MySQL Crash"],
+        "metric_names": [],
+        "aliases": ["MySQL 出现 Crash", "mysqld signal 11", "MySQL 崩溃"],
+        "keywords": ["mysqld", "signal 11", "coredump", "stacktrace"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "crash-signature", "title": "Crash 日志特征", "pages": [1]},
+        {"id": "bug-investigation", "title": "BUG 定位方法", "pages": [1, 2]}
+      ],
+      "causes": [
+        {
+          "cause_id": "mysql_software_bug_or_hardware",
+          "hypothesis": "mysqld 因软件缺陷或硬件异常崩溃",
+          "supporting_evidence": ["错误日志出现 signal 11 和调用栈", "调用栈可定位到具体函数"],
+          "contradicting_evidence": ["没有进程崩溃或 core dump 证据"],
+          "probes": [{"tool_name": "query_logs", "objective": "收集错误日志、core dump 和版本信息", "read_only": true}]
+        }
+      ],
+      "actions": [{"action": "解析调用栈并对照对应版本源码和发布说明", "execution_class": "read_only", "expected_result": "定位可能的缺陷函数或已知问题", "approval_required": false}],
+      "review_notes": ["属于排障方法参考，不能仅凭 Crash 告警确认具体 BUG。"]
+    },
+    {
+      "runbook_id": "INFRA-244038090-210726-1012-4083",
+      "knowledge_type": "reference",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["tidb"], "components": ["tidb", "tikv"]},
+      "match": {
+        "alert_names": [],
+        "metric_names": [],
+        "aliases": ["TiDB 批量删除越删越慢", "TiDB delete slowdown"],
+        "keywords": ["批量删除", "copr-cache", "tombstone", "delete limit"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "slow-delete-cause", "title": "批量删除变慢原因", "pages": [1]},
+        {"id": "copr-cache-solution", "title": "Coprocessor Cache 方案", "pages": [1]}
+      ],
+      "causes": [
+        {
+          "cause_id": "tidb_repeated_deleted_row_scan",
+          "hypothesis": "重复批量删除需要持续扫描已标记删除的数据，扫描量逐次增加",
+          "supporting_evidence": ["相同 DELETE 语句执行耗时随批次持续增长", "扫描行数随批次增长"],
+          "contradicting_evidence": ["执行耗时稳定或瓶颈来自锁等待"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "比较各批次耗时、扫描行数和执行计划", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "比较批量删除各批次的耗时和扫描行数", "execution_class": "read_only", "expected_result": "确认是否存在扫描放大", "approval_required": false},
+        {"action": "评估并调整 Coprocessor Cache 配置", "execution_class": "change", "expected_result": "减少重复下推计算开销", "approval_required": true}
+      ],
+      "review_notes": ["配置建议存在版本适用性，执行前必须核对当前 TiDB 版本。"]
+    },
+    {
+      "runbook_id": "INFRA-265591786-210726-1013-4085",
+      "knowledge_type": "runbook",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["mongodb"], "components": ["host", "mongod"]},
+      "match": {
+        "alert_names": ["HostSwapIsFillingUp"],
+        "metric_names": [],
+        "aliases": ["主机 Swap 使用率过高", "MongoDB swap filling up"],
+        "keywords": ["HostSwapIsFillingUp", "swappiness", "swap", "mongod"],
+        "required_conditions": ["swap usage > 80%"],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "alert-symptom", "title": "告警现象", "pages": [1]},
+        {"id": "diagnosis", "title": "内存与 Swap 分析步骤", "pages": [1, 2]},
+        {"id": "remediation", "title": "处理方案", "pages": [3]}
+      ],
+      "causes": [
+        {
+          "cause_id": "swap_runtime_config_drift",
+          "hypothesis": "配置文件声明关闭 Swap，但运行时 Swap 和 swappiness 未按基线生效",
+          "supporting_evidence": ["available 内存充足但 Swap 使用率高", "运行时 swappiness 与配置基线不一致", "fstab 已注释但 Swap 仍启用"],
+          "contradicting_evidence": ["物理内存确实不足", "运行时 Swap 配置与基线完全一致"],
+          "probes": [{"tool_name": "query_metrics", "objective": "核对 available 内存、Swap 使用、swappiness 和持久化配置", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "核对集群各主机的内存、Swap 和 swappiness", "execution_class": "read_only", "expected_result": "确认配置漂移及影响范围", "approval_required": false},
+        {"action": "滚动处理副本并关闭 Swap", "execution_class": "change", "expected_result": "恢复数据库主机基线配置", "approval_required": true}
+      ],
+      "review_notes": ["包含重启与关闭 Swap，必须经人工审批并由现有变更流程执行。"]
+    },
+    {
+      "runbook_id": "INFRA-270941633-210726-1013-4087",
+      "knowledge_type": "runbook",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["tidb"], "components": ["dm", "validator"]},
+      "match": {
+        "alert_names": ["DM_validator_binlog_pos_not_changing"],
+        "metric_names": [],
+        "aliases": ["DM validator binlog not changing", "validator binlog 超过 10 分钟不变"],
+        "keywords": ["validatorBinlog", "too much pending data", "validation update"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "alert-definition", "title": "告警内容", "pages": [1]},
+        {"id": "diagnosis-and-recovery", "title": "状态诊断与恢复记录", "pages": [1, 2, 3, 4, 5]}
+      ],
+      "causes": [
+        {
+          "cause_id": "dm_validator_pending_data_limit",
+          "hypothesis": "DM Validator 待校验数据超过限制后停止推进 Binlog",
+          "supporting_evidence": ["validation stage 为 Stopped", "错误包含 too much pending data", "pending row size 超过 max"],
+          "contradicting_evidence": ["Validator 正在运行且 Binlog 持续推进"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "查询 DM 任务状态、Validator 阶段和 pending 数据", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "查询 DM 同步与 Validator 状态", "execution_class": "read_only", "expected_result": "获得停止原因和当前 Binlog 位置", "approval_required": false},
+        {"action": "更新 Validator cutover 位置", "execution_class": "change", "expected_result": "Validator 从新位置恢复", "approval_required": true}
+      ],
+      "review_notes": ["恢复命令含环境参数，必须模板化并通过变更审批。"]
+    },
+    {
+      "runbook_id": "INFRA-272960264-210726-1013-4089",
+      "knowledge_type": "runbook",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["tidb"], "components": ["dm", "syncer"]},
+      "match": {
+        "alert_names": ["DM_binlog_file_gap_between_master_syncer"],
+        "metric_names": [],
+        "aliases": ["DM 同步延迟", "master syncer binlog file gap"],
+        "keywords": ["entry too large", "txn-entry-size-limit", "raft-entry-max-size", "resume-task"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "alert-definition", "title": "告警详情", "pages": [1]},
+        {"id": "root-cause", "title": "问题分析", "pages": [1]},
+        {"id": "remediation", "title": "参数调整与任务恢复", "pages": [2]}
+      ],
+      "causes": [
+        {
+          "cause_id": "dm_entry_too_large",
+          "hypothesis": "同步数据单条记录超过 TiDB 或 TiKV 条目大小限制，导致 DM 任务暂停",
+          "supporting_evidence": ["DM 状态错误包含 entry too large", "实际 entry size 大于 max entry size"],
+          "contradicting_evidence": ["任务没有 entry too large 错误", "同步延迟来自上游无新 Binlog"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "查询 DM 任务错误、数据大小和相关限制参数", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "查询 DM 状态及 TiDB/TiKV 条目限制参数", "execution_class": "read_only", "expected_result": "确认数据大小与配置阈值的关系", "approval_required": false},
+        {"action": "评估并调整条目大小限制后恢复任务", "execution_class": "change", "expected_result": "同步任务恢复且不再出现 entry too large", "approval_required": true}
+      ],
+      "review_notes": ["原文中的示例参数值可能相互矛盾，批准前需由 TiDB 专家重新核验。"]
+    },
+    {
+      "runbook_id": "INFRA-83776054-210726-1012-4081",
+      "knowledge_type": "reference",
+      "quality_status": "review_required",
+      "scope": {"database_engines": ["tidb"], "components": ["prometheus", "tiflash"]},
+      "match": {
+        "alert_names": [],
+        "metric_names": [],
+        "aliases": ["TiDB Prometheus 日志增长", "Prometheus 监控数据快速增长"],
+        "keywords": ["tiflash", "thread_id", "metric_relabel_configs", "prometheus.yml"],
+        "required_conditions": [],
+        "exclusion_conditions": []
+      },
+      "sections": [
+        {"id": "cause", "title": "监控数据增长原因", "pages": [1]},
+        {"id": "workaround", "title": "指标过滤临时方案", "pages": [1, 2]}
+      ],
+      "causes": [
+        {
+          "cause_id": "tiflash_high_cardinality_metrics",
+          "hypothesis": "特定 TiFlash 版本按线程维度上报高基数指标，导致 Prometheus 数据快速增长",
+          "supporting_evidence": ["高基数指标包含 thread_name 和 thread_id", "相关 TiFlash 指标序列数异常增长"],
+          "contradicting_evidence": ["增长主要来自其它 job 或指标", "当前版本已修复且无相关指标"],
+          "probes": [{"tool_name": "query_metrics", "objective": "核对 TiFlash 版本和高基数指标序列增长", "read_only": true}]
+        }
+      ],
+      "actions": [
+        {"action": "统计 Prometheus 中增长最快的指标和标签基数", "execution_class": "read_only", "expected_result": "确认是否由 TiFlash 线程指标造成", "approval_required": false},
+        {"action": "配置指标过滤或升级到修复版本", "execution_class": "change", "expected_result": "控制监控数据增长", "approval_required": true}
+      ],
+      "review_notes": ["临时修改可能被 tiup 操作覆盖，执行前需明确长期维护方案。"]
+    }
+  ]
+}

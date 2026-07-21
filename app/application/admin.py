@@ -178,6 +178,14 @@ class RuntimeSettingsManager:
             and settings.ai_provider == "fake"
         ):
             blocking.append("Fake AI provider is not allowed in production")
+        if (
+            settings.app_env.lower() in {"production", "prod"}
+            and not settings.shadow_enabled
+            and not settings.production_gate_approved
+        ):
+            blocking.append(
+                "Production gate approval is required before disabling shadow mode"
+            )
         if blocking:
             raise ValueError("; ".join(blocking))
 

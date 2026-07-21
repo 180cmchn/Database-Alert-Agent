@@ -8,7 +8,9 @@ from app.domain.models import (
     InvestigationRun,
     NormalizedAlert,
     Recommendation,
+    RootCauseStatus,
     RunbookExcerpt,
+    RunbookQualityStatus,
     ToolStatus,
     ValidationKind,
     ValidationRecord,
@@ -53,6 +55,7 @@ class RuleConclusionValidator:
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
             successful_refs: set[str] = set()
+            live_successful_refs: set[str] = set()
 
             for evidence_ref in dict.fromkeys(root_cause.evidence_refs):
                 record = evidence_by_id.get(evidence_ref)
@@ -68,10 +71,21 @@ class RuleConclusionValidator:
                     )
                     continue
                 successful_refs.add(evidence_ref)
+                if record.source_system != "alert_platform":
+                    live_successful_refs.add(evidence_ref)
 
-            if root_cause.verified and not successful_refs:
+            if root_cause.verified and not live_successful_refs:
                 issues.append(
                     f"已验证根因 #{index}（{cause_label}）必须至少引用一条 SUCCESS 证据"
+                    "（且来自实时系统）"
+                )
+            if root_cause.status == RootCauseStatus.SUPPORTED and not live_successful_refs:
+                issues.append(
+                    f"SUPPORTED 根因 #{index}（{cause_label}）缺少实时 SUCCESS 证据"
+                )
+            if root_cause.status != RootCauseStatus.SUPPORTED and root_cause.verified:
+                issues.append(
+                    f"根因 #{index}（{cause_label}）只有 SUPPORTED 状态才能标记已验证"
                 )
 
         manual_matched = recommendation.manual_matched or bool(runbooks)
@@ -114,6 +128,23 @@ class RuleConclusionValidator:
                         f"处理步骤 #{index} 引用了无效的手册章节："
                         f"{source_ref.runbook_id}/{source_ref.section}"
                     )
+            known_cause_ids = {
+                cause.cause_id for excerpt in runbooks for cause in excerpt.causes
+            }
+            for index, root_cause in enumerate(recommendation.root_causes, start=1):
+                if root_cause.cause_id and root_cause.cause_id not in known_cause_ids:
+                    issues.append(
+                        f"根因 #{index} 引用了手册中不存在的 cause_id："
+                        f"{root_cause.cause_id}"
+                    )
+            if any(
+                excerpt.quality_status != RunbookQualityStatus.APPROVED
+                for excerpt in runbooks
+            ):
+                if not recommendation.requires_human:
+                    issues.append("待审核手册的建议必须要求人工复核")
+                if recommendation.confidence > 0.65:
+                    issues.append("待审核手册的建议置信度不得超过 0.65")
 
         for index, step in enumerate(recommendation.steps, start=1):
             matches = [
