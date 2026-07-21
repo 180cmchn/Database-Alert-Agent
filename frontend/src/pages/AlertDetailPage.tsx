@@ -15,7 +15,6 @@ import {
   History,
   Radio,
   RefreshCw,
-  Route,
   ShieldCheck,
   Siren,
   TerminalSquare,
@@ -35,9 +34,9 @@ import {
   StatusBadge,
   ToolStatusBadge,
 } from "../components/ui";
-import { api, ApiError } from "../lib/api";
+import { api } from "../lib/api";
 import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
-import type { AlertIncident, AlertStatus, StoredAlert } from "../types/api";
+import type { AlertStatus, StoredAlert } from "../types/api";
 
 const activeStatuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING"];
 const terminalStages = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
@@ -45,7 +44,6 @@ const terminalStages = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
 export function AlertDetailPage() {
   const { alertId = "" } = useParams();
   const [record, setRecord] = useState<StoredAlert | null>(null);
-  const [incident, setIncident] = useState<AlertIncident | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -54,15 +52,8 @@ export function AlertDetailPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const [result, routingResult] = await Promise.all([
-        api.getAlert(alertId),
-        api.getAlertIncident(alertId).catch((requestError: unknown) => {
-          if (requestError instanceof ApiError && requestError.status === 404) return null;
-          throw requestError;
-        }),
-      ]);
+      const result = await api.getAlert(alertId);
       setRecord(result);
-      setIncident(routingResult);
       setError("");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "告警详情加载失败");
@@ -82,7 +73,7 @@ export function AlertDetailPage() {
     (record && (
       activeStatuses.includes(record.status)
       || (record.latest_run && (!currentStage || !terminalStages.includes(currentStage)))
-    )) || (incident && ["PENDING", "FIRING"].includes(incident.state)),
+    )),
   );
 
   useEffect(() => {
@@ -125,7 +116,7 @@ export function AlertDetailPage() {
       </div>
 
       <PageHeader
-        eyebrow={`INCIDENT · ${alert.external_id}`}
+        eyebrow={`ALERT · ${alert.external_id}`}
         title={alert.title}
         description={alert.description || "该告警未提供补充描述。"}
         actions={<><SeverityBadge severity={alert.severity} /><StatusBadge status={record.status} /></>}
@@ -137,7 +128,7 @@ export function AlertDetailPage() {
       )}
 
       <section className="incident-facts">
-        <div><span><Route size={15} /> 告警原因</span><strong>{alert.reason}</strong></div>
+        <div><span><CircleAlert size={15} /> 告警原因</span><strong>{alert.reason}</strong></div>
         <div><span><Database size={15} /> 数据库目标</span><strong>{[alert.database?.engine, alert.database?.instance].filter(Boolean).join(" · ") || "未提供"}</strong></div>
         <div><span><Gauge size={15} /> 环境 / 服务</span><strong>{alert.environment} · {alert.service_name}</strong></div>
         <div><span><Clock3 size={15} /> 发生时间</span><strong>{formatDateTime(alert.occurred_at)}</strong></div>
@@ -177,27 +168,6 @@ export function AlertDetailPage() {
           )}
         </SectionCard>
 
-        <SectionCard
-          eyebrow="ROUTING & ESCALATION"
-          title="分派与升级状态"
-          description={incident
-            ? `${incident.policy_snapshot?.name || incident.policy_id} · 策略版本 ${incident.policy_version}`
-            : "尚未生成路由事件"}
-        >
-          {incident ? (
-            <div className="validation-list">
-              <article className={["ACKNOWLEDGED", "RESOLVED"].includes(incident.state) ? "passed" : "rejected"}>
-                <span>{["ACKNOWLEDGED", "RESOLVED"].includes(incident.state) ? <CheckCircle2 size={18} /> : <Siren size={18} />}</span>
-                <div>
-                  <strong>{incident.state === "PENDING" ? "等待首轮通知" : incident.state === "FIRING" ? "告警升级中" : incident.state === "ACKNOWLEDGED" ? "告警已确认" : "告警已恢复"}</strong>
-                  <p>已执行 {incident.current_step} / {incident.policy_snapshot?.steps.length || 0} 个步骤{incident.next_action_at ? ` · 下次 ${formatDateTime(incident.next_action_at)}` : ""}</p>
-                  {incident.acknowledged_by && <small>确认人：{incident.acknowledged_by}</small>}
-                </div>
-                <b>{incident.state}</b>
-              </article>
-            </div>
-          ) : <EmptyState title="没有路由记录" description="恢复信号或未启用路由时可能没有对应事件。" />}
-        </SectionCard>
       </section>
 
       {record.knowledge_matches.length > 0 && (
@@ -308,8 +278,8 @@ export function AlertDetailPage() {
                   </ol>
                 </SectionCard>
               )}
-              <SectionCard eyebrow="EVIDENCE" title="判断依据">
-                {recommendation.evidence.length ? <ul className="evidence-points">{recommendation.evidence.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="muted-copy">建议中未列出额外判断依据。</p>}
+              <SectionCard eyebrow="BASIS" title="判断依据" description="顺序固定为手册依据优先、AI 分析依据其次">
+                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basis.source === "RUNBOOK" ? "手册" : "AI"}</strong> · {basis.statement}{basis.source_ref && <small className="source-ref"><BookCheck size={13} /> {basis.source_ref.runbook_id} / {basis.source_ref.section}</small>}</div></li>)}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
               </SectionCard>
               <SectionCard eyebrow="RISK GUARD" title="风险提示" className="risk-card">
                 {recommendation.risks.length ? <ul className="risk-points">{recommendation.risks.map((risk) => <li key={risk}><Siren size={14} /> {risk}</li>)}</ul> : <p className="muted-copy">没有额外风险提示。</p>}
@@ -338,25 +308,12 @@ export function AlertDetailPage() {
           ) : <EmptyState title="暂无校验记录" description="建议生成后，校验结果会记录在审计链路中。" />}
         </SectionCard>
 
-        <SectionCard eyebrow="AI REPORT" title="AI 调查结果通知" description="原始告警分派由独立路由流程负责">
-          {record.notifications.length ? (
-            <div className="notification-list">
-              {record.notifications.map((notification) => (
-                <article key={notification.id}>
-                  <span className={notification.status === "SENT" ? "sent" : "failed"}>{notification.status === "SENT" ? <Check size={15} /> : <XCircle size={15} />}</span>
-                  <div><strong>{notification.phase === "INITIAL_ALERT" ? "原始告警升级" : notification.phase === "ADVICE_READY" ? "分析建议补发" : "分析失败通知"}</strong><p>{formatDateTime(notification.created_at)} · 尝试 {notification.attempts} 次</p>{notification.error && <small>{notification.error}</small>}</div>
-                </article>
-              ))}
-            </div>
-          ) : <EmptyState title="未触发 AI 结果通知" description="默认只有 CRITICAL 会补发调查建议或失败状态。" />}
-        </SectionCard>
       </section>
 
       <SectionCard eyebrow="TRACEABILITY" title="事件标识与审计信息">
         <dl className="traceability-grid">
           <div><dt>告警 ID</dt><dd>{alert.id}</dd></div>
           <div><dt>事件指纹</dt><dd>{alert.incident_fingerprint || "尚未生成"}</dd></div>
-          <div><dt>路由聚合键</dt><dd>{alert.dedup_key || "尚未生成"}</dd></div>
           <div><dt>来源适配器</dt><dd>{alert.source}</dd></div>
           <div><dt>最后更新</dt><dd>{formatDateTime(record.updated_at)}</dd></div>
           {record.advisor_metadata?.request_id && <div><dt>模型请求 ID</dt><dd>{record.advisor_metadata.request_id}</dd></div>}

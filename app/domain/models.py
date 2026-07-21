@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -16,11 +16,6 @@ class Severity(StrEnum):
     CRITICAL = "CRITICAL"
     WARNING = "WARNING"
     INFO = "INFO"
-
-
-class AlertSignalState(StrEnum):
-    FIRING = "FIRING"
-    RESOLVED = "RESOLVED"
 
 
 class AlertStatus(StrEnum):
@@ -71,17 +66,6 @@ class FeedbackVerdict(StrEnum):
     REJECTED = "REJECTED"
 
 
-class NotificationPhase(StrEnum):
-    INITIAL_ALERT = "INITIAL_ALERT"
-    ADVICE_READY = "ADVICE_READY"
-    ANALYSIS_FAILED = "ANALYSIS_FAILED"
-
-
-class NotificationStatus(StrEnum):
-    SENT = "SENT"
-    FAILED = "FAILED"
-
-
 class DatabaseTarget(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -97,8 +81,6 @@ class NormalizedAlert(BaseModel):
     source: str
     raw_severity: str
     severity: Severity
-    signal_state: AlertSignalState = AlertSignalState.FIRING
-    dedup_key: str = ""
     incident_fingerprint: str = ""
     fingerprint_version: str = "v1"
     environment: str = "unknown"
@@ -160,6 +142,25 @@ class RunbookReference(BaseModel):
     section: str = "main"
 
 
+class AnalysisBasisSource(StrEnum):
+    RUNBOOK = "RUNBOOK"
+    AI = "AI"
+
+
+class AnalysisBasis(BaseModel):
+    source: AnalysisBasisSource
+    statement: str = Field(min_length=1)
+    source_ref: RunbookReference | None = None
+
+    @model_validator(mode="after")
+    def validate_source_reference(self) -> AnalysisBasis:
+        if self.source == AnalysisBasisSource.RUNBOOK and self.source_ref is None:
+            raise ValueError("RUNBOOK analysis basis requires source_ref")
+        if self.source == AnalysisBasisSource.AI and self.source_ref is not None:
+            raise ValueError("AI analysis basis must not contain source_ref")
+        return self
+
+
 class RecommendationStep(BaseModel):
     order: int = Field(ge=1)
     action: str
@@ -178,7 +179,7 @@ class RootCauseAssessment(BaseModel):
 class Recommendation(BaseModel):
     summary: str
     likely_causes: list[str] = Field(default_factory=list)
-    evidence: list[str] = Field(default_factory=list)
+    analysis_bases: list[AnalysisBasis] = Field(default_factory=list)
     steps: list[RecommendationStep]
     risks: list[str] = Field(default_factory=list)
     requires_human: bool = True
@@ -305,21 +306,11 @@ class AdvisorMetadata(BaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
 
 
-class NotificationEvent(BaseModel):
-    phase: NotificationPhase
+class AnalysisResultEvent(BaseModel):
     alert: NormalizedAlert
-    recommendation: Recommendation | None = None
+    recommendation: Recommendation
+    status: AlertStatus
     message: str
-
-
-class NotificationRecord(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    phase: NotificationPhase
-    status: NotificationStatus
-    attempts: int = Field(ge=1)
-    error: str | None = None
-    external_delivery_id: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
 
 
 class StoredAlert(BaseModel):
@@ -329,7 +320,6 @@ class StoredAlert(BaseModel):
     manual_matches: list[RunbookExcerpt] = Field(default_factory=list)
     advisor_metadata: AdvisorMetadata | None = None
     error: str | None = None
-    notifications: list[NotificationRecord] = Field(default_factory=list)
     latest_run: InvestigationRun | None = None
     progress: list[ProgressRecord] = Field(default_factory=list)
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)
@@ -357,7 +347,6 @@ class AlertSummary(BaseModel):
     manual_matched: bool = False
     requires_human: bool | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
-    notification_count: int = Field(default=0, ge=0)
 
 
 class AlertListResult(BaseModel):

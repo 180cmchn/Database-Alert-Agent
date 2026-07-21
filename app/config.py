@@ -9,8 +9,6 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from app.domain.models import Severity
-
 DEFAULT_ENVIRONMENT_ALIASES = {
     "production": ["prod", "prd", "production", "生产", "生产环境"],
     "staging": ["staging", "stage", "pre", "预发", "预发布"],
@@ -31,13 +29,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_max_retries",
         "ai_json_mode",
         "runbook_limit",
-        "escalation_severities",
-        "notifier_mode",
-        "management_webhook_url",
-        "management_webhook_bearer_token",
         "wecom_webhook_url",
-        "notification_max_attempts",
-        "notification_retry_backoff_seconds",
         "react_enabled",
         "react_max_dynamic_turns",
         "validation_enabled",
@@ -85,31 +77,7 @@ class Settings(BaseSettings):
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
-    escalation_severities: list[Severity] = Field(default_factory=lambda: [Severity.CRITICAL])
-
-    alert_routing_policy_path: Path = Path("./policies/alert-routing.yaml")
-    alert_routing_enabled: bool = True
-    alert_routing_poll_seconds: float = Field(default=2, ge=0.2, le=60)
-    alert_routing_timezone: str = "Asia/Shanghai"
-    alert_group_webhook_urls: dict[str, str] = Field(default_factory=dict, repr=False)
-    wecom_card_api_url: str = ""
-    wecom_card_api_bearer_token: SecretStr = Field(default=SecretStr(""), repr=False)
-    wecom_ack_callback_base_url: str = ""
-    wecom_ack_callback_token: SecretStr = Field(default=SecretStr(""), repr=False)
-    wecom_oncall_api_url: str = ""
-    wecom_oncall_api_bearer_token: SecretStr = Field(default=SecretStr(""), repr=False)
-    phone_notification_api_url: str = ""
-    phone_notification_api_bearer_token: SecretStr = Field(
-        default=SecretStr(""), repr=False
-    )
-    fallback_oncall: str = "sona"
-
-    notifier_mode: str = "log"
-    management_webhook_url: str = ""
-    management_webhook_bearer_token: str = ""
     wecom_webhook_url: str = Field(default="", repr=False)
-    notification_max_attempts: int = Field(default=3, ge=1, le=10)
-    notification_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
 
     kafka_enabled: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
@@ -126,19 +94,8 @@ class Settings(BaseSettings):
     react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
     validation_enabled: bool = True
 
-    @field_validator("escalation_severities", mode="before")
-    @classmethod
-    def normalize_escalation_severities(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            value = json.loads(value)
-        if isinstance(value, list):
-            normalized = [str(item).upper() for item in value]
-            return list(dict.fromkeys(normalized))
-        return value
-
     @field_validator(
         "ai_provider",
-        "notifier_mode",
         "http_scheduler",
         "runbook_web_auth_mode",
     )
@@ -170,23 +127,11 @@ class Settings(BaseSettings):
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
 
-    @field_validator("alert_group_webhook_urls", mode="before")
-    @classmethod
-    def normalize_group_webhooks(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return json.loads(value) if value.strip() else {}
-        return value
-
     @model_validator(mode="after")
     def validate_admin_editable_urls(self) -> Settings:
         for field_name, required in (
             ("ai_base_url", True),
-            ("management_webhook_url", False),
             ("wecom_webhook_url", False),
-            ("wecom_card_api_url", False),
-            ("wecom_ack_callback_base_url", False),
-            ("wecom_oncall_api_url", False),
-            ("phone_notification_api_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -213,16 +158,6 @@ class Settings(BaseSettings):
                     )
             if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
                 raise ValueError(f"{field_name} must use HTTPS in production")
-        for target, url in self.alert_group_webhook_urls.items():
-            parsed = urlsplit(url)
-            if not target.strip() or parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError(
-                    "alert_group_webhook_urls must map non-empty ids to absolute HTTP(S) URLs"
-                )
-            if parsed.username is not None or parsed.password is not None:
-                raise ValueError("alert_group_webhook_urls must not embed credentials")
-            if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
-                raise ValueError("alert_group_webhook_urls must use HTTPS in production")
         if (
             self.app_env.lower() in {"production", "prod"}
             and self.ai_provider == "fake"
@@ -267,18 +202,8 @@ class Settings(BaseSettings):
         elif self.ai_provider != "fake":
             issues.append(f"Unsupported AI_PROVIDER: {self.ai_provider}")
 
-        if self.notifier_mode == "webhook" and not self.management_webhook_url:
-            issues.append("MANAGEMENT_WEBHOOK_URL is required in webhook mode")
-        elif self.notifier_mode == "wecom" and not self.wecom_webhook_url:
-            issues.append("WECOM_WEBHOOK_URL is required in wecom mode")
-        elif self.notifier_mode not in {"log", "webhook", "wecom"}:
-            issues.append(f"Unsupported NOTIFIER_MODE: {self.notifier_mode}")
-
-        if (
-            self.app_env.lower() in {"production", "prod"}
-            and self.notifier_mode not in {"webhook", "wecom"}
-        ):
-            issues.append("Production requires NOTIFIER_MODE=wecom or webhook")
+        if self.app_env.lower() in {"production", "prod"} and not self.wecom_webhook_url:
+            issues.append("WECOM_WEBHOOK_URL is required in production")
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
@@ -287,18 +212,6 @@ class Settings(BaseSettings):
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
         if not self.runbook_dir.exists():
             issues.append(f"Runbook directory does not exist: {self.runbook_dir}")
-        if self.alert_routing_enabled and not self.alert_routing_policy_path.exists():
-            issues.append(
-                f"Alert routing policy does not exist: {self.alert_routing_policy_path}"
-            )
-        if self.wecom_card_api_url and (
-            not self.wecom_ack_callback_base_url
-            or not self.wecom_ack_callback_token.get_secret_value()
-        ):
-            issues.append(
-                "WECOM_ACK_CALLBACK_BASE_URL and WECOM_ACK_CALLBACK_TOKEN are "
-                "required when WECOM_CARD_API_URL is configured"
-            )
         if not self.runbook_web_allowed_hosts:
             issues.append("RUNBOOK_WEB_ALLOWED_HOSTS is required")
         if (

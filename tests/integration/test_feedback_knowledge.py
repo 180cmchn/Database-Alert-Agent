@@ -15,13 +15,11 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
     runbooks.mkdir()
     settings = Settings(
         ai_provider="fake",
-        notifier_mode="log",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'feedback.db'}",
         runbook_dir=runbooks,
         admin_api_token="test-admin-token",
         runtime_settings_path=tmp_path / "runtime-settings.json",
-        notification_retry_backoff_seconds=0,
     )
     runtime = build_runtime(settings)
     scheduler = ManualAnalysisScheduler()

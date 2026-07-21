@@ -12,7 +12,6 @@ from app.domain.models import NormalizedAlert, RunbookDocument, RunbookExcerpt
 def settings_for(tmp_path: Path) -> Settings:
     return Settings(
         ai_provider="fake",
-        notifier_mode="log",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         runbook_dir=tmp_path / "runbooks",
     )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import (
@@ -12,11 +12,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     desc,
-    func,
-    or_,
     select,
     text,
-    update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -35,7 +32,6 @@ from app.domain.models import (
     InvestigationStage,
     KnowledgeCase,
     NormalizedAlert,
-    NotificationRecord,
     ProgressRecord,
     Recommendation,
     RunbookExcerpt,
@@ -44,12 +40,6 @@ from app.domain.models import (
     ToolStatus,
     ValidationKind,
     ValidationRecord,
-)
-from app.domain.routing import (
-    AlertIncident,
-    EscalationDelivery,
-    IncidentState,
-    RoutingPolicy,
 )
 
 
@@ -79,24 +69,6 @@ class AlertRow(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now
-    )
-
-
-class NotificationRow(Base):
-    __tablename__ = "notifications"
-    __table_args__ = (UniqueConstraint("alert_id", "phase", name="uq_notification_phase"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    alert_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("alerts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    phase: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
-    error: Mapped[str | None] = mapped_column(Text)
-    external_delivery_id: Mapped[str | None] = mapped_column(String(255))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now
     )
 
 
@@ -226,61 +198,6 @@ class KnowledgeCaseRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class AlertIncidentRow(Base):
-    __tablename__ = "alert_incidents"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    active_key: Mapped[str | None] = mapped_column(String(96), unique=True, index=True)
-    dedup_key: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
-    alert_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("alerts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    policy_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
-    policy_json: Mapped[dict] = mapped_column(JSON, nullable=False)
-    severity: Mapped[str] = mapped_column(String(20), nullable=False)
-    state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    current_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    next_action_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), index=True
-    )
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    acknowledged_by: Mapped[str | None] = mapped_column(String(255))
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    lease_owner: Mapped[str | None] = mapped_column(String(255))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
-class EscalationDeliveryRow(Base):
-    __tablename__ = "escalation_deliveries"
-    __table_args__ = (
-        UniqueConstraint(
-            "incident_id", "step_index", "action_index", name="uq_escalation_action"
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    incident_id: Mapped[str] = mapped_column(
-        String(36),
-        ForeignKey("alert_incidents.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    action_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    channel: Mapped[str] = mapped_column(String(32), nullable=False)
-    target: Mapped[str | None] = mapped_column(String(100))
-    recipient: Mapped[str | None] = mapped_column(String(255))
-    state: Mapped[str] = mapped_column(String(32), nullable=False)
-    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
-    external_delivery_id: Mapped[str | None] = mapped_column(String(255))
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
 class SQLAlchemyAlertRepository:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
@@ -335,277 +252,6 @@ class SQLAlchemyAlertRepository:
                 return await self._to_stored(session, existing), False
             await session.refresh(row)
             return await self._to_stored(session, row), True
-
-    async def upsert_firing_incident(
-        self,
-        alert: NormalizedAlert,
-        policy: RoutingPolicy,
-        policy_version: str,
-        first_action_at: datetime,
-    ) -> tuple[AlertIncident, bool]:
-        async with self.session_factory() as session:
-            query = select(AlertIncidentRow).where(
-                AlertIncidentRow.active_key == alert.dedup_key
-            )
-            row = (await session.execute(query)).scalar_one_or_none()
-            now = _utc_now()
-            if row:
-                row.alert_id = str(alert.id)
-                row.severity = alert.severity.value
-                row.updated_at = now
-                await session.commit()
-                return self._incident(row), False
-
-            incident = AlertIncident(
-                dedup_key=alert.dedup_key,
-                alert_id=alert.id,
-                policy_id=policy.id,
-                policy_version=policy_version,
-                policy_snapshot=policy,
-                severity=alert.severity,
-                state=IncidentState.PENDING,
-                next_action_at=first_action_at,
-                created_at=now,
-                updated_at=now,
-            )
-            row = AlertIncidentRow(
-                id=str(incident.id),
-                active_key=alert.dedup_key,
-                dedup_key=alert.dedup_key,
-                alert_id=str(alert.id),
-                policy_id=policy.id,
-                policy_version=policy_version,
-                policy_json=policy.model_dump(mode="json"),
-                severity=alert.severity.value,
-                state=incident.state.value,
-                current_step=0,
-                next_action_at=first_action_at,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(row)
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-                existing = (await session.execute(query)).scalar_one()
-                return self._incident(existing), False
-            return incident, True
-
-    async def resolve_incident(
-        self, dedup_key: str, resolved_at: datetime
-    ) -> AlertIncident | None:
-        async with self.session_factory() as session:
-            row = (
-                await session.execute(
-                    select(AlertIncidentRow).where(
-                        AlertIncidentRow.active_key == dedup_key
-                    )
-                )
-            ).scalar_one_or_none()
-            if not row:
-                return None
-            row.state = IncidentState.RESOLVED.value
-            row.active_key = None
-            row.next_action_at = None
-            row.resolved_at = resolved_at
-            row.lease_owner = None
-            row.lease_expires_at = None
-            row.updated_at = _utc_now()
-            await session.commit()
-            return self._incident(row)
-
-    async def acknowledge_incident(
-        self, incident_id: str, actor: str, acknowledged_at: datetime
-    ) -> AlertIncident | None:
-        async with self.session_factory() as session:
-            row = await session.get(AlertIncidentRow, incident_id)
-            if not row:
-                return None
-            if row.state in {IncidentState.PENDING.value, IncidentState.FIRING.value}:
-                row.state = IncidentState.ACKNOWLEDGED.value
-                row.acknowledged_at = acknowledged_at
-                row.acknowledged_by = actor
-                row.next_action_at = None
-                row.lease_owner = None
-                row.lease_expires_at = None
-                row.updated_at = _utc_now()
-                await session.commit()
-            return self._incident(row)
-
-    async def get_incident(self, incident_id: str) -> AlertIncident | None:
-        async with self.session_factory() as session:
-            row = await session.get(AlertIncidentRow, incident_id)
-            return self._incident(row) if row else None
-
-    async def get_incident_for_alert(self, alert_id: str) -> AlertIncident | None:
-        async with self.session_factory() as session:
-            row = (
-                await session.execute(
-                    select(AlertIncidentRow)
-                    .where(AlertIncidentRow.alert_id == alert_id)
-                    .order_by(desc(AlertIncidentRow.created_at))
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            return self._incident(row) if row else None
-
-    async def claim_due_incidents(
-        self, owner: str, now: datetime, lease_seconds: int, limit: int = 20
-    ) -> list[AlertIncident]:
-        lease_until = now + timedelta(seconds=lease_seconds)
-        active_states = [IncidentState.PENDING.value, IncidentState.FIRING.value]
-        async with self.session_factory() as session:
-            candidate_ids = list(
-                (
-                    await session.execute(
-                        select(AlertIncidentRow.id)
-                        .where(
-                            AlertIncidentRow.state.in_(active_states),
-                            AlertIncidentRow.next_action_at.is_not(None),
-                            AlertIncidentRow.next_action_at <= now,
-                            or_(
-                                AlertIncidentRow.lease_expires_at.is_(None),
-                                AlertIncidentRow.lease_expires_at <= now,
-                            ),
-                        )
-                        .order_by(AlertIncidentRow.next_action_at, AlertIncidentRow.id)
-                        .limit(limit)
-                    )
-                ).scalars()
-            )
-            claimed: list[str] = []
-            for incident_id in candidate_ids:
-                result = await session.execute(
-                    update(AlertIncidentRow)
-                    .where(
-                        AlertIncidentRow.id == incident_id,
-                        AlertIncidentRow.state.in_(active_states),
-                        or_(
-                            AlertIncidentRow.lease_expires_at.is_(None),
-                            AlertIncidentRow.lease_expires_at <= now,
-                        ),
-                    )
-                    .values(lease_owner=owner, lease_expires_at=lease_until)
-                )
-                if result.rowcount:
-                    claimed.append(incident_id)
-            await session.commit()
-            if not claimed:
-                return []
-            rows = (
-                await session.execute(
-                    select(AlertIncidentRow).where(AlertIncidentRow.id.in_(claimed))
-                )
-            ).scalars().all()
-            return [self._incident(row) for row in rows]
-
-    async def complete_incident_step(
-        self,
-        incident_id: str,
-        owner: str,
-        expected_step: int,
-        *,
-        next_action_at: datetime | None,
-        state: IncidentState,
-    ) -> None:
-        async with self.session_factory() as session:
-            await session.execute(
-                update(AlertIncidentRow)
-                .where(
-                    AlertIncidentRow.id == incident_id,
-                    AlertIncidentRow.lease_owner == owner,
-                    AlertIncidentRow.current_step == expected_step,
-                )
-                .values(
-                    current_step=expected_step + 1,
-                    next_action_at=next_action_at,
-                    state=state.value,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=_utc_now(),
-                )
-            )
-            await session.commit()
-
-    async def release_incident_claim(
-        self, incident_id: str, owner: str, retry_at: datetime
-    ) -> None:
-        async with self.session_factory() as session:
-            await session.execute(
-                update(AlertIncidentRow)
-                .where(
-                    AlertIncidentRow.id == incident_id,
-                    AlertIncidentRow.lease_owner == owner,
-                )
-                .values(
-                    next_action_at=retry_at,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=_utc_now(),
-                )
-            )
-            await session.commit()
-
-    async def save_escalation_delivery(
-        self, delivery: EscalationDelivery
-    ) -> EscalationDelivery:
-        async with self.session_factory() as session:
-            row = (
-                await session.execute(
-                    select(EscalationDeliveryRow).where(
-                        EscalationDeliveryRow.incident_id == str(delivery.incident_id),
-                        EscalationDeliveryRow.step_index == delivery.step_index,
-                        EscalationDeliveryRow.action_index == delivery.action_index,
-                    )
-                )
-            ).scalar_one_or_none()
-            if row:
-                row.state = delivery.state.value
-                row.attempts = delivery.attempts
-                row.external_delivery_id = delivery.external_delivery_id
-                row.error = delivery.error
-                row.updated_at = delivery.updated_at
-            else:
-                session.add(
-                    EscalationDeliveryRow(
-                        id=str(delivery.id),
-                        incident_id=str(delivery.incident_id),
-                        step_index=delivery.step_index,
-                        action_index=delivery.action_index,
-                        channel=delivery.channel,
-                        target=delivery.target,
-                        recipient=delivery.recipient,
-                        state=delivery.state.value,
-                        attempts=delivery.attempts,
-                        external_delivery_id=delivery.external_delivery_id,
-                        error=delivery.error,
-                        created_at=delivery.created_at,
-                        updated_at=delivery.updated_at,
-                    )
-                )
-            await session.commit()
-            return delivery
-
-    @staticmethod
-    def _incident(row: AlertIncidentRow) -> AlertIncident:
-        return AlertIncident(
-            id=row.id,
-            dedup_key=row.dedup_key,
-            alert_id=row.alert_id,
-            policy_id=row.policy_id,
-            policy_version=row.policy_version,
-            policy_snapshot=RoutingPolicy.model_validate(row.policy_json),
-            severity=row.severity,
-            state=row.state,
-            current_step=row.current_step,
-            next_action_at=row.next_action_at,
-            acknowledged_at=row.acknowledged_at,
-            acknowledged_by=row.acknowledged_by,
-            resolved_at=row.resolved_at,
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-        )
 
     async def list_by_status(self, statuses: set[AlertStatus]) -> list[StoredAlert]:
         async with self.session_factory() as session:
@@ -739,15 +385,6 @@ class SQLAlchemyAlertRepository:
         if not rows:
             return []
         alert_ids = [row.id for row, _ in rows]
-        notification_counts = dict(
-            (
-                await session.execute(
-                    select(NotificationRow.alert_id, func.count(NotificationRow.id))
-                    .where(NotificationRow.alert_id.in_(alert_ids))
-                    .group_by(NotificationRow.alert_id)
-                )
-            ).all()
-        )
         run_rows = list(
             (
                 await session.execute(
@@ -792,7 +429,6 @@ class SQLAlchemyAlertRepository:
                     ),
                     requires_human=recommendation.get("requires_human"),
                     confidence=recommendation.get("confidence"),
-                    notification_count=int(notification_counts.get(row.id, 0)),
                 )
             )
         return summaries
@@ -1074,36 +710,6 @@ class SQLAlchemyAlertRepository:
             row.updated_at = _utc_now()
             await session.commit()
 
-    async def save_notification(
-        self, alert_id: str, notification: NotificationRecord
-    ) -> None:
-        async with self.session_factory() as session:
-            query = select(NotificationRow).where(
-                NotificationRow.alert_id == alert_id,
-                NotificationRow.phase == notification.phase.value,
-            )
-            row = (await session.execute(query)).scalar_one_or_none()
-            if row:
-                row.status = notification.status.value
-                row.attempts = notification.attempts
-                row.error = notification.error
-                row.external_delivery_id = notification.external_delivery_id
-                row.created_at = notification.created_at
-            else:
-                session.add(
-                    NotificationRow(
-                        id=str(notification.id),
-                        alert_id=alert_id,
-                        phase=notification.phase.value,
-                        status=notification.status.value,
-                        attempts=notification.attempts,
-                        error=notification.error,
-                        external_delivery_id=notification.external_delivery_id,
-                        created_at=notification.created_at,
-                    )
-                )
-            await session.commit()
-
     async def get(self, alert_id: str) -> StoredAlert | None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
@@ -1120,24 +726,6 @@ class SQLAlchemyAlertRepository:
         return (await session.execute(query)).scalar_one_or_none()
 
     async def _to_stored(self, session: AsyncSession, row: AlertRow) -> StoredAlert:
-        query = (
-            select(NotificationRow)
-            .where(NotificationRow.alert_id == row.id)
-            .order_by(NotificationRow.created_at, NotificationRow.phase)
-        )
-        notification_rows = (await session.execute(query)).scalars().all()
-        notifications = [
-            NotificationRecord(
-                id=item.id,
-                phase=item.phase,
-                status=item.status,
-                attempts=item.attempts,
-                error=item.error,
-                external_delivery_id=item.external_delivery_id,
-                created_at=item.created_at,
-            )
-            for item in notification_rows
-        ]
         run_query = (
             select(InvestigationRunRow)
             .where(InvestigationRunRow.alert_id == row.id)
@@ -1243,7 +831,6 @@ class SQLAlchemyAlertRepository:
                 else None
             ),
             error=row.error,
-            notifications=notifications,
             latest_run=latest_run,
             progress=progress,
             evidence_records=evidence_records,

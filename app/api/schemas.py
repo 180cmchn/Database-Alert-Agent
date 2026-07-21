@@ -19,10 +19,6 @@ class AlertAccepted(BaseModel):
     deduplicated: bool
 
 
-class AlertAcknowledgementRequest(BaseModel):
-    actor: str = Field(default="wecom-card", min_length=1, max_length=255)
-
-
 class FeedbackRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     verdict: FeedbackVerdict
@@ -129,17 +125,7 @@ class RuntimeSettingsPatch(BaseModel):
     react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
     validation_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
-    notifier_mode: Literal["log", "webhook", "wecom"] | None = None
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
-    management_webhook_url: str | None = Field(default=None, max_length=2048)
-    management_webhook_bearer_token: str | None = Field(
-        default=None, max_length=8192, repr=False
-    )
-    escalation_severities: list[Severity] | None = None
-    notification_max_attempts: int | None = Field(default=None, ge=1, le=10)
-    notification_retry_backoff_seconds: float | None = Field(
-        default=None, ge=0, le=30
-    )
 
     def updates(self) -> dict[str, Any]:
         return self.model_dump(
@@ -163,13 +149,7 @@ class RuntimeSettingsResponse(BaseModel):
     react_max_dynamic_turns: int
     validation_enabled: bool
     runbook_limit: int
-    notifier_mode: str
     wecom_webhook_url_configured: bool
-    management_webhook_url: str
-    management_webhook_bearer_token_configured: bool
-    escalation_severities: list[Severity]
-    notification_max_attempts: int
-    notification_retry_backoff_seconds: float
     revision: str
     apply_status: Literal["applied"] = "applied"
     worker_refresh_mode: Literal["before_each_job"] = "before_each_job"
@@ -200,17 +180,7 @@ class RuntimeSettingsResponse(BaseModel):
             react_max_dynamic_turns=settings.react_max_dynamic_turns,
             validation_enabled=settings.validation_enabled,
             runbook_limit=settings.runbook_limit,
-            notifier_mode=settings.notifier_mode,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
-            management_webhook_url=settings.management_webhook_url,
-            management_webhook_bearer_token_configured=bool(
-                settings.management_webhook_bearer_token
-            ),
-            escalation_severities=settings.escalation_severities,
-            notification_max_attempts=settings.notification_max_attempts,
-            notification_retry_backoff_seconds=(
-                settings.notification_retry_backoff_seconds
-            ),
             revision=revision,
             changed_fields=changed_fields or [],
         )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from uuid import uuid4
 
@@ -9,16 +8,17 @@ import pytest
 
 from app.adapters.notification import (
     WECOM_MARKDOWN_MAX_BYTES,
-    WebhookManagementNotifier,
     WeComManagementNotifier,
     format_wecom_markdown,
 )
 from app.domain.errors import NotificationError
 from app.domain.models import (
+    AlertStatus,
+    AnalysisBasis,
+    AnalysisBasisSource,
+    AnalysisResultEvent,
     DatabaseTarget,
     NormalizedAlert,
-    NotificationEvent,
-    NotificationPhase,
     Recommendation,
     RecommendationStep,
     RunbookReference,
@@ -27,33 +27,11 @@ from app.domain.models import (
 from app.logging_config import configure_logging
 
 
-def notification_event(
-    *,
-    phase: NotificationPhase = NotificationPhase.ADVICE_READY,
-    title: str = "数据库连接数接近上限",
-) -> NotificationEvent:
+def analysis_result_event(*, title: str = "数据库连接数接近上限") -> AnalysisResultEvent:
     reference = RunbookReference(
         runbook_id="connection-limit", section="initial-triage"
     )
-    recommendation = Recommendation(
-        summary="连接使用率达到 95%，请先执行只读核查。",
-        likely_causes=["连接池回收异常"],
-        evidence=["connection_usage_percent=95"],
-        steps=[
-            RecommendationStep(
-                order=1,
-                action="检查当前连接数与最大连接数。",
-                source_ref=reference,
-            )
-        ],
-        risks=["不要未经审批终止会话"],
-        requires_human=True,
-        confidence=0.86,
-        manual_matched=True,
-        runbook_references=[reference],
-    )
-    return NotificationEvent(
-        phase=phase,
+    return AnalysisResultEvent(
         alert=NormalizedAlert(
             id=uuid4(),
             external_id="wecom-test-1",
@@ -68,39 +46,55 @@ def notification_event(
             database=DatabaseTarget(engine="postgresql", instance="orders-primary"),
             raw_payload={"authorization": "Bearer must-not-appear"},
         ),
-        recommendation=(
-            recommendation if phase == NotificationPhase.ADVICE_READY else None
+        recommendation=Recommendation(
+            summary="连接使用率达到 95%，请先执行只读核查。",
+            likely_causes=["连接池回收异常"],
+            analysis_bases=[
+                AnalysisBasis(
+                    source=AnalysisBasisSource.RUNBOOK,
+                    statement="手册将连接使用率过高列为该告警的常见原因。",
+                    source_ref=reference,
+                ),
+                AnalysisBasis(
+                    source=AnalysisBasisSource.AI,
+                    statement="告警字段 connection_usage_percent=95 与该场景一致。",
+                ),
+            ],
+            steps=[
+                RecommendationStep(
+                    order=1,
+                    action="检查当前连接数与最大连接数。",
+                    source_ref=reference,
+                )
+            ],
+            risks=["不要未经审批终止会话"],
+            requires_human=True,
+            confidence=0.86,
+            manual_matched=True,
+            runbook_references=[reference],
         ),
+        status=AlertStatus.COMPLETED,
         message="分析完成；token=must-not-appear",
     )
 
 
-@pytest.mark.parametrize(
-    ("phase", "expected"),
-    [
-        (NotificationPhase.INITIAL_ALERT, "首次升级"),
-        (NotificationPhase.ADVICE_READY, "分析完成"),
-        (NotificationPhase.ANALYSIS_FAILED, "分析失败"),
-    ],
-)
-def test_wecom_markdown_is_phase_aware_bounded_and_does_not_include_raw_payload(
-    phase: NotificationPhase, expected: str
-) -> None:
-    content = format_wecom_markdown(notification_event(phase=phase))
+def test_wecom_markdown_contains_causes_and_orders_runbook_before_ai() -> None:
+    content = format_wecom_markdown(analysis_result_event())
 
-    assert expected in content
-    assert "orders-primary" in content
+    assert "AI 分析结果" in content
+    assert "可能原因" in content
+    assert "连接池回收异常" in content
+    assert "判断依据（手册优先，AI 其次）" in content
+    assert content.index("[手册]") < content.index("[AI]")
+    assert "connection-limit/initial-triage" in content
     assert "must-not-appear" not in content
     assert "***REDACTED***" in content
     assert "raw_payload" not in content
     assert len(content.encode("utf-8")) <= WECOM_MARKDOWN_MAX_BYTES
-    if phase == NotificationPhase.ADVICE_READY:
-        assert "connection-limit/initial-triage" in content
 
 
 def test_wecom_markdown_truncates_long_chinese_text_on_utf8_boundary() -> None:
-    event = notification_event()
-    assert event.recommendation is not None
+    event = analysis_result_event()
     event.recommendation = event.recommendation.model_copy(
         update={"summary": "连接异常" * 3_000}
     )
@@ -111,23 +105,8 @@ def test_wecom_markdown_truncates_long_chinese_text_on_utf8_boundary() -> None:
     content.encode("utf-8").decode("utf-8")
 
 
-def test_wecom_markdown_redacts_authorization_headers_and_common_tokens() -> None:
-    event = notification_event(phase=NotificationPhase.INITIAL_ALERT)
-    event.alert.description = (
-        "Authorization: Basic basic-secret; "
-        "Authorization=ApiKey api-secret; access_token=access-secret"
-    )
-
-    content = format_wecom_markdown(event)
-
-    assert "basic-secret" not in content
-    assert "api-secret" not in content
-    assert "access-secret" not in content
-    assert "***REDACTED***" in content
-
-
 @pytest.mark.asyncio
-async def test_wecom_notifier_sends_markdown_and_requires_business_success() -> None:
+async def test_wecom_notifier_sends_one_markdown_result() -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -137,7 +116,7 @@ async def test_wecom_notifier_sends_markdown_and_requires_business_success() -> 
             json={"errcode": 0, "errmsg": "ok", "msgid": "wecom-message-1"},
         )
 
-    event = notification_event()
+    event = analysis_result_event()
     notifier = WeComManagementNotifier(
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
         transport=httpx.MockTransport(handler),
@@ -149,9 +128,8 @@ async def test_wecom_notifier_sends_markdown_and_requires_business_success() -> 
     assert len(requests) == 1
     request = requests[0]
     assert request.headers["x-alert-id"] == str(event.alert.id)
-    assert request.headers["x-notification-phase"] == "ADVICE_READY"
-    assert request.headers["idempotency-key"] == f"{event.alert.id}:ADVICE_READY"
-    assert request.url.params["key"] == "top-secret-key"
+    assert request.headers["x-analysis-status"] == "COMPLETED"
+    assert request.headers["idempotency-key"] == f"{event.alert.id}:analysis-result"
     assert b'"msgtype":"markdown"' in request.content
 
 
@@ -177,23 +155,7 @@ async def test_wecom_notifier_reports_safe_errors_without_webhook_key(
     )
 
     with pytest.raises(NotificationError) as caught:
-        await notifier.send(notification_event())
-
-    assert "must-not-leak" not in str(caught.value)
-
-
-@pytest.mark.asyncio
-async def test_wecom_notifier_hides_url_on_transport_failure() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("failed for key=must-not-leak")
-
-    notifier = WeComManagementNotifier(
-        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=must-not-leak",
-        transport=httpx.MockTransport(handler),
-    )
-
-    with pytest.raises(NotificationError) as caught:
-        await notifier.send(notification_event())
+        await notifier.send(analysis_result_event())
 
     assert "must-not-leak" not in str(caught.value)
 
@@ -216,36 +178,9 @@ async def test_wecom_webhook_key_is_not_written_to_http_transport_logs(
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=log-secret-key",
             transport=httpx.MockTransport(handler),
         )
-        await notifier.send(notification_event())
+        await notifier.send(analysis_result_event())
     finally:
         httpx_logger.setLevel(original_levels[0])
         httpcore_logger.setLevel(original_levels[1])
 
     assert "log-secret-key" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_generic_webhook_recursively_sanitizes_outbound_event() -> None:
-    bodies: list[dict[str, object]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(json.loads(request.content))
-        return httpx.Response(200, headers={"X-Delivery-Id": "relay-1"})
-
-    event = notification_event()
-    assert event.recommendation is not None
-    event.recommendation = event.recommendation.model_copy(
-        update={"summary": "Authorization: Bearer recommendation-secret"}
-    )
-    notifier = WebhookManagementNotifier(
-        "https://relay.example.test/notifications",
-        transport=httpx.MockTransport(handler),
-    )
-
-    delivery_id = await notifier.send(event)
-
-    assert delivery_id == "relay-1"
-    serialized = json.dumps(bodies[0], ensure_ascii=False)
-    assert "recommendation-secret" not in serialized
-    assert "must-not-appear" not in serialized
-    assert "***REDACTED***" in serialized

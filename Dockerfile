@@ -6,11 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY app ./app
-COPY tools ./tools
 COPY migrations ./migrations
 COPY alembic.ini ./
 COPY runbooks ./runbooks
-COPY policies ./policies
 RUN pip install --no-cache-dir .
 
 RUN useradd --create-home appuser && mkdir -p /app/data && chown -R appuser:appuser /app

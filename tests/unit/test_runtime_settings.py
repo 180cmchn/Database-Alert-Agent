@@ -148,7 +148,6 @@ def runtime_test_settings(tmp_path: Path) -> Settings:
     return Settings(
         _env_file=None,
         ai_provider="fake",
-        notifier_mode="log",
         runbook_dir=runbooks,
         runbook_web_allowed_hosts=["wiki.corp.example"],
         runbook_web_auth_mode="none",
@@ -208,7 +207,7 @@ async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_value
 
 
 @pytest.mark.asyncio
-async def test_runtime_patch_rejects_unrunnable_provider_and_notifier_combinations(
+async def test_runtime_patch_rejects_unrunnable_provider_and_removed_notifier_fields(
     tmp_path: Path,
 ) -> None:
     settings = runtime_test_settings(tmp_path)
@@ -220,16 +219,10 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_notifier_combinatio
             {"ai_provider": "openai_compatible", "ai_api_key": "", "ai_model": ""},
             expected_revision=manager.revision,
         )
-    with pytest.raises(ValueError, match="webhook URL"):
+    with pytest.raises(ValueError, match="not editable: management_webhook_url"):
         await manager.patch(
             settings,
             {"notifier_mode": "webhook", "management_webhook_url": ""},
-            expected_revision=manager.revision,
-        )
-    with pytest.raises(ValueError, match="WeCom webhook URL"):
-        await manager.patch(
-            settings,
-            {"notifier_mode": "wecom", "wecom_webhook_url": ""},
             expected_revision=manager.revision,
         )
     production_fake = settings.model_copy(update={"app_env": "production"})
@@ -254,14 +247,13 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         ai_api_key="configured-test-key",
         ai_model="configured-test-model",
         ai_base_url="https://models.example.test/v1",
-        notifier_mode="log",
         admin_api_token="configured-admin-token",
         runbook_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
-    with pytest.raises(ValueError, match="notifier is required"):
+    with pytest.raises(ValueError, match="WeCom webhook URL is required"):
         await manager.patch(
             settings,
             {"runbook_limit": 7},
@@ -271,15 +263,14 @@ async def test_runtime_patch_requires_external_notifier_in_production(
     configured, _, changed = await manager.patch(
         settings,
         {
-            "notifier_mode": "wecom",
             "wecom_webhook_url": (
                 "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
             ),
         },
         expected_revision=manager.revision,
     )
-    assert configured.notifier_mode == "wecom"
-    assert changed == ["notifier_mode", "wecom_webhook_url"]
+    assert configured.wecom_webhook_url.endswith("key=test-key")
+    assert changed == ["wecom_webhook_url"]
 
 
 def test_runtime_settings_response_contains_only_safe_readiness_summary(
@@ -294,7 +285,6 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
     assert "ai_api_key" not in body
-    assert "management_webhook_bearer_token" not in body
     assert "wecom_webhook_url" not in body
 
     configured_wecom = settings.model_copy(

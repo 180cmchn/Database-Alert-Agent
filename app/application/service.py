@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import logging
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
@@ -12,6 +12,7 @@ from app.domain.errors import AlertNotFoundError, AnalysisFailedError, InvalidAl
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
+    AnalysisResultEvent,
     DashboardSummary,
     EvidenceRecord,
     FeedbackRecord,
@@ -21,10 +22,6 @@ from app.domain.models import (
     InvestigationStage,
     KnowledgeCase,
     NormalizedAlert,
-    NotificationEvent,
-    NotificationPhase,
-    NotificationRecord,
-    NotificationStatus,
     ProgressRecord,
     Recommendation,
     RunStatus,
@@ -36,12 +33,13 @@ from app.domain.models import (
 from app.domain.ports import (
     AIAdvisor,
     AlertRepository,
-    AlertSignalRouter,
     ConclusionValidator,
     InvestigationStrategyProvider,
     ManagementNotifier,
     RunbookProvider,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AlertAnalysisService:
@@ -58,15 +56,11 @@ class AlertAnalysisService:
         tool_executor: ToolExecutor,
         rule_validator: ConclusionValidator,
         conclusion_validator: ConclusionValidator,
-        escalation_severities: set[str],
         runbook_limit: int = 5,
-        notification_max_attempts: int = 3,
-        notification_backoff_seconds: float = 0.5,
         investigation_lease_seconds: int = 300,
         react_enabled: bool = False,
         validation_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
-        signal_router: AlertSignalRouter | None = None,
     ) -> None:
         self.source_registry = source_registry
         self.runbook_provider = runbook_provider
@@ -78,15 +72,11 @@ class AlertAnalysisService:
         self.tool_executor = tool_executor
         self.rule_validator = rule_validator
         self.conclusion_validator = conclusion_validator
-        self.escalation_severities = {item.upper() for item in escalation_severities}
         self.runbook_limit = runbook_limit
-        self.notification_max_attempts = notification_max_attempts
-        self.notification_backoff_seconds = notification_backoff_seconds
         self.investigation_lease_seconds = investigation_lease_seconds
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
         self.alert_sanitizer = alert_sanitizer
-        self.signal_router = signal_router
 
     async def ingest(
         self, source: str, payload: dict[str, Any]
@@ -94,9 +84,6 @@ class AlertAnalysisService:
         normalized = self.source_registry.normalize(source, payload)
         alert = self.alert_sanitizer(normalized)
         stored, created = await self.repository.create_or_get(alert)
-        routed_alert = alert if created else alert.model_copy(update={"id": stored.alert.id})
-        if alert.signal_state.value == "RESOLVED":
-            return stored.model_copy(update={"alert": routed_alert}), created
         if not created:
             return stored, False
 
@@ -107,31 +94,18 @@ class AlertAnalysisService:
             raise AlertNotFoundError(alert_id)
         return queued, True
 
-    async def route_signal(self, alert: NormalizedAlert) -> None:
-        if self.signal_router is not None:
-            await self.signal_router.handle_signal(alert)
-
     async def analyze(
         self, source: str, payload: dict[str, Any], *, retry_failed: bool = False
     ) -> StoredAlert:
         stored, created = await self.ingest(source, payload)
-        if stored.alert.signal_state.value == "RESOLVED":
-            await self.route_signal(stored.alert)
+        if not created and stored.status in {
+            AlertStatus.COMPLETED,
+            AlertStatus.REVIEW_REQUIRED,
+        }:
             return stored
-        routing_task = asyncio.create_task(
-            self.route_signal(stored.alert), name=f"route-alert-{stored.alert.id}"
-        )
-        try:
-            if not created and stored.status in {
-                AlertStatus.COMPLETED,
-                AlertStatus.REVIEW_REQUIRED,
-            }:
-                return stored
-            if not created and stored.status == AlertStatus.FAILED and not retry_failed:
-                return stored
-            return await self.analyze_by_id(str(stored.alert.id))
-        finally:
-            await routing_task
+        if not created and stored.status == AlertStatus.FAILED and not retry_failed:
+            return stored
+        return await self.analyze_by_id(str(stored.alert.id))
 
     async def analyze_by_id(self, alert_id: str) -> StoredAlert:
         stored = await self.get(alert_id)
@@ -147,7 +121,6 @@ class AlertAnalysisService:
             return await self.get(alert_id)
 
         alert = stored.alert
-        should_escalate = alert.severity.value in self.escalation_severities
         runbooks = []
         evidence: list[EvidenceRecord] = []
         try:
@@ -301,17 +274,16 @@ class AlertAnalysisService:
                 recommendation=recommendation,
                 advisor_metadata=advisor_metadata,
             )
-            if should_escalate:
-                await self._notify_unless_sent(
-                    alert,
-                    phase=NotificationPhase.ADVICE_READY,
-                    recommendation=recommendation,
-                    message=(
-                        "数据库告警调查已完成，请结合证据和手册人工复核。"
-                        if passed
-                        else "数据库告警已生成候选建议，但验收未通过，必须人工复核。"
-                    ),
-                )
+            await self._send_analysis_result(
+                alert,
+                status=final_status,
+                recommendation=recommendation,
+                message=(
+                    "数据库告警分析已完成。"
+                    if passed
+                    else "数据库告警已生成候选分析，但校验未通过，请人工复核。"
+                ),
+            )
             return await self.get(alert_id)
         except Exception as exc:
             error = f"{type(exc).__name__}: {sanitize(str(exc))}"
@@ -333,12 +305,6 @@ class AlertAnalysisService:
             await self.repository.save_analysis(
                 alert_id, AlertStatus.FAILED, runbooks=runbooks, error=error
             )
-            if should_escalate:
-                await self._notify_unless_sent(
-                    alert,
-                    phase=NotificationPhase.ANALYSIS_FAILED,
-                    message=f"AI 调查失败，需要人工介入。错误：{error}",
-                )
             raise AnalysisFailedError(alert_id, error) from exc
 
     async def submit_feedback(
@@ -493,55 +459,28 @@ class AlertAnalysisService:
             ),
         )
 
-    async def _notify_unless_sent(
+    async def _send_analysis_result(
         self,
         alert: NormalizedAlert,
         *,
-        phase: NotificationPhase,
+        status: AlertStatus,
         message: str,
-        recommendation: Recommendation | None = None,
-    ) -> NotificationRecord | None:
-        stored = await self.repository.get(str(alert.id))
-        if stored and any(item.phase == phase for item in stored.notifications):
-            return None
-        return await self._notify(
-            alert, phase=phase, message=message, recommendation=recommendation
-        )
-
-    async def _notify(
-        self,
-        alert: NormalizedAlert,
-        *,
-        phase: NotificationPhase,
-        message: str,
-        recommendation: Recommendation | None = None,
-    ) -> NotificationRecord:
-        event = NotificationEvent(
-            phase=phase,
+        recommendation: Recommendation,
+    ) -> None:
+        event = AnalysisResultEvent(
             alert=alert,
             recommendation=recommendation,
+            status=status,
             message=message,
         )
-        error: str | None = None
-        external_id: str | None = None
-        attempts = 0
-        for attempt in range(1, self.notification_max_attempts + 1):
-            attempts = attempt
-            try:
-                external_id = await self.notifier.send(event)
-                error = None
-                break
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {sanitize(str(exc))}"
-                if attempt < self.notification_max_attempts and self.notification_backoff_seconds:
-                    await asyncio.sleep(self.notification_backoff_seconds * (2 ** (attempt - 1)))
-
-        record = NotificationRecord(
-            phase=phase,
-            status=NotificationStatus.SENT if error is None else NotificationStatus.FAILED,
-            attempts=attempts,
-            error=error,
-            external_delivery_id=external_id,
-        )
-        await self.repository.save_notification(str(alert.id), record)
-        return record
+        try:
+            await self.notifier.send(event)
+        except Exception as exc:
+            # Delivery acknowledgement, retries and escalation are intentionally
+            # outside this project's boundary. A send failure must not rewrite the
+            # completed analysis state.
+            logger.warning(
+                "wecom_analysis_result_send_failed alert_id=%s error=%s",
+                alert.id,
+                sanitize(f"{type(exc).__name__}: {exc}"),
+            )

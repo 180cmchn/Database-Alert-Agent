@@ -1,5 +1,4 @@
 import {
-  BellRing,
   Bot,
   Check,
   CircleAlert,
@@ -23,7 +22,7 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import type { AdminSettings, AdminSettingsPatch, Severity } from "../types/api";
+import type { AdminSettings, AdminSettingsPatch } from "../types/api";
 
 function numberField(form: FormData, name: string): number {
   return Number(form.get(name));
@@ -38,10 +37,8 @@ export function SettingsPage() {
   const [authError, setAuthError] = useState(false);
   const [notice, setNotice] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
-  const [showWebhookToken, setShowWebhookToken] = useState(false);
   const [showWecomUrl, setShowWecomUrl] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
-  const [selectedNotifier, setSelectedNotifier] = useState("log");
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -66,7 +63,6 @@ export function SettingsPage() {
   useEffect(() => {
     if (settings) {
       setSelectedProvider(settings.ai_provider);
-      setSelectedNotifier(settings.notifier_mode);
     }
   }, [settings]);
 
@@ -79,7 +75,6 @@ export function SettingsPage() {
     setError("");
     setNotice("");
     try {
-      const notifierMode = String(form.get("notifier_mode")) as AdminSettings["notifier_mode"];
       const patch: AdminSettingsPatch = {
         expected_revision: settings.revision,
         ai_provider: String(form.get("ai_provider")),
@@ -92,22 +87,11 @@ export function SettingsPage() {
         react_max_dynamic_turns: numberField(form, "react_max_dynamic_turns"),
         validation_enabled: form.get("validation_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
-        notifier_mode: notifierMode,
-        escalation_severities: form.getAll("escalation_severities") as Severity[],
-        notification_max_attempts: numberField(form, "notification_max_attempts"),
-        notification_retry_backoff_seconds: numberField(form, "notification_retry_backoff_seconds"),
       };
       const apiKey = String(form.get("ai_api_key") || "").trim();
       if (apiKey) patch.ai_api_key = apiKey;
-      if (notifierMode === "webhook") {
-        patch.management_webhook_url = String(form.get("management_webhook_url") || "").trim();
-        const webhookToken = String(form.get("management_webhook_bearer_token") || "").trim();
-        if (webhookToken) patch.management_webhook_bearer_token = webhookToken;
-      }
-      if (notifierMode === "wecom") {
-        const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
-        if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
-      }
+      const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
+      if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
       const updated = await api.updateSettings(patch, token);
       setSettings(updated);
       setNotice(updated.changed_fields.length ? `已应用 ${updated.changed_fields.length} 项配置变更` : "配置已校验，当前值无需变更");
@@ -126,7 +110,7 @@ export function SettingsPage() {
   }
 
   if (!unlocked) {
-    return <AdminUnlock title="解锁 Agent 设置" description="模型凭据与管理通知地址属于敏感运行配置，只有管理员会话可以读取安全摘要或提交新值。" />;
+    return <AdminUnlock title="解锁 Agent 设置" description="模型凭据与企微机器人地址属于敏感运行配置，只有管理员会话可以读取安全摘要或提交新值。" />;
   }
 
   if (loading && !settings) return <LoadingState label="正在读取 Agent 安全配置…" />;
@@ -138,7 +122,7 @@ export function SettingsPage() {
       <PageHeader
         eyebrow="RUNTIME CONTROL"
         title="Agent 设置"
-        description="更新模型、推理护栏与管理通知配置；密钥只写不读，响应永不返回秘密值。"
+        description="更新模型、分析护栏与企微机器人配置；密钥只写不读，响应永不返回秘密值。"
         actions={<><button type="button" className="button secondary" onClick={lock}><KeyRound size={16} /> 锁定会话</button><button type="button" className="button secondary" onClick={() => void load()}><RefreshCw size={16} /> 重新读取</button></>}
       />
 
@@ -180,23 +164,12 @@ export function SettingsPage() {
         </SectionCard>
 
         <SectionCard
-          eyebrow="MANAGEMENT ESCALATION"
-          title="管理通知"
-          description="高等级告警会在分析前后分阶段发送；正式通知使用企业微信，通用 Webhook 可连接 QQ 邮件测试中转服务。"
-          action={selectedNotifier === "wecom"
-            ? <span className={`configured-chip ${settings.wecom_webhook_url_configured ? "yes" : "no"}`}><Webhook size={13} />{settings.wecom_webhook_url_configured ? "企业微信地址已配置" : "企业微信地址未配置"}</span>
-            : selectedNotifier === "webhook"
-              ? <span className={`configured-chip ${settings.management_webhook_url ? "yes" : "no"}`}><Webhook size={13} />{settings.management_webhook_url ? "Webhook 地址已配置" : "Webhook 地址未配置"}</span>
-              : <span className="configured-chip neutral"><Webhook size={13} />Log 开发模式</span>}
+          eyebrow="WECOM OUTPUT"
+          title="企微机器人"
+          description="CRITICAL、WARNING、INFO 的最终 AI 分析结果都会发送到此机器人；本服务不跟踪送达、确认或升级。"
+          action={<span className={`configured-chip ${settings.wecom_webhook_url_configured ? "yes" : "no"}`}><Webhook size={13} />{settings.wecom_webhook_url_configured ? "企业微信地址已配置" : "企业微信地址未配置"}</span>}
         >
-          <div className="form-grid two-cols">
-            <label className="field"><span>通知模式</span><select name="notifier_mode" value={selectedNotifier} onChange={(event) => setSelectedNotifier(event.target.value)}><option value="log">Log（本地开发）</option><option value="wecom">企业微信（推荐）</option><option value="webhook">通用 Webhook（兼容）</option></select></label>
-            <label className="field"><span>通知重试次数</span><input name="notification_max_attempts" type="number" min="1" max="10" defaultValue={settings.notification_max_attempts} /></label>
-            {selectedNotifier === "wecom" && <label className="field span-2"><span>企业微信群机器人 Webhook URL（只写） {!settings.wecom_webhook_url_configured && <b>*</b>}</span><div className="secret-field"><input name="wecom_webhook_url" type={showWecomUrl ? "text" : "password"} autoComplete="new-password" required={!settings.wecom_webhook_url_configured} placeholder={settings.wecom_webhook_url_configured ? "已配置 · 留空保持不变" : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."} /><button type="button" onClick={() => setShowWecomUrl((value) => !value)} aria-label={showWecomUrl ? "隐藏企业微信地址" : "显示企业微信地址"}>{showWecomUrl ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>}
-            {selectedNotifier === "webhook" && <><label className="field span-2"><span>Management Webhook URL <b>*</b></span><input name="management_webhook_url" type="url" defaultValue={settings.management_webhook_url} required placeholder="https://example.internal/hooks/database-alerts" /></label><label className="field span-2"><span>Webhook Bearer Token（只写）</span><div className="secret-field"><input name="management_webhook_bearer_token" type={showWebhookToken ? "text" : "password"} autoComplete="new-password" placeholder={settings.management_webhook_bearer_token_configured ? "已配置 · 留空保持不变" : "输入新的通知令牌"} /><button type="button" onClick={() => setShowWebhookToken((value) => !value)} aria-label={showWebhookToken ? "隐藏通知令牌" : "显示通知令牌"}>{showWebhookToken ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label></>}
-            <label className="field"><span>重试退避（秒）</span><input name="notification_retry_backoff_seconds" type="number" min="0" max="30" step="0.1" defaultValue={settings.notification_retry_backoff_seconds} /></label>
-          </div>
-          <fieldset className="escalation-selector"><legend><BellRing size={15} /> 触发管理通知的等级</legend><div>{(["CRITICAL", "WARNING", "INFO"] as Severity[]).map((severity) => <label key={severity}><input type="checkbox" name="escalation_severities" value={severity} defaultChecked={settings.escalation_severities.includes(severity)} /><span>{severity}</span></label>)}</div></fieldset>
+          <label className="field"><span>企业微信群机器人 Webhook URL（只写） {!settings.wecom_webhook_url_configured && settings.app_env === "production" && <b>*</b>}</span><div className="secret-field"><input name="wecom_webhook_url" type={showWecomUrl ? "text" : "password"} autoComplete="new-password" required={!settings.wecom_webhook_url_configured && settings.app_env === "production"} placeholder={settings.wecom_webhook_url_configured ? "已配置 · 留空保持不变" : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."} /><button type="button" onClick={() => setShowWecomUrl((value) => !value)} aria-label={showWecomUrl ? "隐藏企业微信地址" : "显示企业微信地址"}>{showWecomUrl ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
         </SectionCard>
 
         {error && <div className="form-error" role="alert">{error}</div>}

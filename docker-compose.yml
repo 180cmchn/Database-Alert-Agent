@@ -32,7 +32,6 @@ services:
     environment:
       DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
       RUNBOOK_DIR: /app/runbooks
-      ALERT_ROUTING_POLICY_PATH: /app/policies/alert-routing.yaml
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: "true"
       HTTP_SCHEDULER: kafka
@@ -41,7 +40,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./runbooks:/app/runbooks
-      - ./policies:/app/policies:ro
     ports:
       # Keep the unauthenticated alert/read API on the local host. Route remote
       # alert platforms and operators through an authenticated gateway.
@@ -69,45 +67,15 @@ services:
     environment:
       DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
       RUNBOOK_DIR: /app/runbooks
-      ALERT_ROUTING_POLICY_PATH: /app/policies/alert-routing.yaml
       KAFKA_ENABLED: "true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
     volumes:
       - ./data:/app/data
       - ./runbooks:/app/runbooks:ro
-      - ./policies:/app/policies:ro
     depends_on:
       kafka:
         condition: service_healthy
-
-  qq-mail-relay:
-    profiles: ["qq-mail-relay"]
-    build: .
-    restart: unless-stopped
-    command:
-      - uvicorn
-      - tools.qq_mail_relay.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-    env_file:
-      - path: ./tools/qq_mail_relay/.env
-        required: false
-    volumes:
-      - ./data:/app/data
-    ports:
-      - "127.0.0.1:8081:8080"
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)"
-      interval: 10s
-      timeout: 3s
-      retries: 10
 
   frontend:
     build:

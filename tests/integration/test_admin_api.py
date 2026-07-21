@@ -30,13 +30,11 @@ def create_admin_client(
     runbooks.mkdir(parents=True, exist_ok=True)
     settings = Settings(
         ai_provider="fake",
-        notifier_mode="log",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'admin.db'}",
         runbook_dir=runbooks,
         admin_api_token=admin_token,
         runtime_settings_path=tmp_path / "runtime-settings.json",
-        notification_retry_backoff_seconds=0,
     )
     runtime = None
     if runbook_transport is not None:
@@ -93,37 +91,11 @@ def test_frontend_origin_is_allowed_by_cors(tmp_path: Path) -> None:
         assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
 
 
-def test_admin_can_acknowledge_routed_incident(tmp_path: Path) -> None:
-    client, _ = create_admin_client(tmp_path)
-    with client:
-        accepted = client.post(
-            "/api/v1/alerts/canonical/analyze",
-            json={
-                "external_id": "admin-ack-1",
-                "severity": "CRITICAL",
-                "title": "Critical database alert",
-                "reason": "availability",
-            },
-        ).json()
-        incident = client.get(
-            f"/api/v1/alerts/{accepted['alert_id']}/incident"
-        ).json()
-        response = client.post(
-            f"/api/v1/admin/incidents/{incident['id']}/ack",
-            headers=ADMIN_HEADERS,
-            json={"actor": "dba-operator"},
-        )
-        assert response.status_code == 200
-        assert response.json()["state"] == "ACKNOWLEDGED"
-        assert response.json()["acknowledged_by"] == "dba-operator"
-
-
 def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     tmp_path: Path,
 ) -> None:
     client, runtime = create_admin_client(tmp_path)
     secret = "ai-key-that-must-never-be-returned"
-    webhook_secret = "webhook-token-that-must-never-be-returned"
     with client:
         initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
         response = client.patch(
@@ -135,7 +107,6 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "ai_base_url": "https://models.example.test/v1",
                 "ai_api_key": secret,
                 "ai_model": "example-model-v2",
-                "management_webhook_bearer_token": webhook_secret,
                 "runbook_limit": 7,
                 "validation_enabled": False,
             },
@@ -143,19 +114,15 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert response.status_code == 200
         body = response.json()
         assert body["ai_api_key_configured"] is True
-        assert body["management_webhook_bearer_token_configured"] is True
         assert body["ai_model"] == "example-model-v2"
         assert body["runbook_limit"] == 7
         assert body["apply_status"] == "applied"
         assert body["worker_refresh_mode"] == "before_each_job"
         assert secret not in response.text
-        assert webhook_secret not in response.text
         assert "ai_api_key" not in body
-        assert "management_webhook_bearer_token" not in body
 
         current = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS)
         assert secret not in current.text
-        assert webhook_secret not in current.text
 
         unchanged = client.patch(
             "/api/v1/admin/settings",
@@ -180,7 +147,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
             "RUNTIME_SETTINGS_REVISION_CONFLICT"
         )
 
-        unusable_notifier = client.patch(
+        removed_notifier_fields = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
             json={
@@ -189,8 +156,8 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "management_webhook_url": "",
             },
         )
-        assert unusable_notifier.status_code == 422
-        assert unusable_notifier.json()["detail"]["code"] == (
+        assert removed_notifier_fields.status_code == 422
+        assert removed_notifier_fields.json()["code"] == (
             "INVALID_RUNTIME_SETTINGS"
         )
 
@@ -229,7 +196,6 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     assert persisted["ai_api_key"] == secret
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert secret not in audit
-    assert webhook_secret not in audit
     assert "ai_api_key" in audit
 
 
@@ -246,13 +212,11 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
             headers=ADMIN_HEADERS,
             json={
                 "expected_revision": initial["revision"],
-                "notifier_mode": "wecom",
                 "wecom_webhook_url": wecom_url,
             },
         )
         assert response.status_code == 200
         body = response.json()
-        assert body["notifier_mode"] == "wecom"
         assert body["wecom_webhook_url_configured"] is True
         assert "wecom_webhook_url" not in body
         assert wecom_url not in response.text

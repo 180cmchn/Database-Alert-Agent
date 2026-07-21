@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from app.domain.errors import InvalidAlertPayloadError, UnknownAlertSourceError
 from app.domain.models import (
-    AlertSignalState,
     DatabaseTarget,
     NormalizedAlert,
     Severity,
@@ -29,7 +28,6 @@ class CanonicalAlertPayload(BaseModel):
     error_pattern: str | None = None
     error_summary: str | None = None
     severity: str
-    status: str = "firing"
     alert_name: str | None = None
     resource_type: str | None = None
     cluster: str | None = None
@@ -58,23 +56,6 @@ class CanonicalAlertPayload(BaseModel):
         if not value:
             raise ValueError("value cannot be empty or whitespace")
         return value
-
-    @field_validator("status")
-    @classmethod
-    def normalize_status(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        aliases = {
-            "firing": "firing",
-            "alerting": "firing",
-            "active": "firing",
-            "resolved": "resolved",
-            "recovered": "resolved",
-            "ok": "resolved",
-        }
-        if normalized not in aliases:
-            raise ValueError("status must be firing/alerting/active or resolved/recovered/ok")
-        return aliases[normalized]
-
 
 def _stable_hash(prefix: str, identity: dict[str, Any]) -> str:
     encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()
@@ -123,28 +104,6 @@ def incident_fingerprint(
         "error_pattern": normalize_error_pattern(pattern),
     }
     return _stable_hash("incident-v1", identity)
-
-
-def alert_dedup_key(
-    source: str,
-    *,
-    alert_name: str,
-    cluster: str | None,
-    instance: str | None,
-    environment: str,
-) -> str:
-    """Group repeated firing/resolved signals into one active alert incident."""
-
-    return _stable_hash(
-        "dedup-v1",
-        {
-            "source": source.casefold(),
-            "alert_name": alert_name.casefold(),
-            "cluster": (cluster or "").casefold(),
-            "instance": (instance or "").casefold(),
-            "environment": environment.casefold(),
-        },
-    )
 
 
 class EnvironmentResolver:
@@ -215,11 +174,6 @@ class CanonicalAlertSourceAdapter:
             or parsed.labels.get("cluster")
             or parsed.attributes.get("cluster")
         )
-        instance = (
-            (parsed.database.instance if parsed.database else None)
-            or parsed.labels.get("instance")
-            or parsed.attributes.get("instance")
-        )
         alarm_type = (
             parsed.alarm_type
             or parsed.labels.get("alarm_type")
@@ -233,24 +187,11 @@ class CanonicalAlertSourceAdapter:
             service_name=service_name,
             alert_type=alert_type,
         )
-        dedup_key = alert_dedup_key(
-            self.source,
-            alert_name=alert_name,
-            cluster=cluster,
-            instance=instance,
-            environment=environment,
-        )
         return NormalizedAlert(
             external_id=external_id,
             source=self.source,
             raw_severity=parsed.severity,
             severity=severity,
-            signal_state=(
-                AlertSignalState.RESOLVED
-                if parsed.status == "resolved"
-                else AlertSignalState.FIRING
-            ),
-            dedup_key=dedup_key,
             incident_fingerprint=fingerprint,
             fingerprint_version="v1",
             environment=environment,

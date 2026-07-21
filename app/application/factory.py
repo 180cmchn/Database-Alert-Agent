@@ -9,7 +9,6 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
-from app.adapters.escalation import EnterpriseWeComDirectory, EscalationDispatcher
 from app.adapters.investigation import (
     DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
@@ -18,14 +17,11 @@ from app.adapters.investigation import (
 )
 from app.adapters.notification import (
     LogManagementNotifier,
-    WebhookManagementNotifier,
     WeComManagementNotifier,
 )
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.adapters.runbook_store import LocalMarkdownRunbookStore
 from app.adapters.web_runbooks import AuthenticatedWebRunbookProvider
-from app.application.escalation import AlertRoutingService, DurableEscalationScheduler
-from app.application.routing_policy import RoutingPolicyEngine, RoutingPolicyLoader
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
 from app.config import Settings
@@ -47,8 +43,6 @@ class Runtime:
     service: AlertAnalysisService
     runbook_provider: RunbookProvider
     runbook_store: RunbookStore
-    routing_service: AlertRoutingService | None = None
-    escalation_scheduler: DurableEscalationScheduler | None = None
 
 
 def _build_advisor(settings: Settings) -> AIAdvisor:
@@ -77,16 +71,9 @@ def _build_conclusion_validator(settings: Settings) -> ConclusionValidator:
 
 
 def _build_notifier(settings: Settings) -> ManagementNotifier:
-    if settings.notifier_mode == "wecom":
+    if settings.wecom_webhook_url:
         return WeComManagementNotifier(settings.wecom_webhook_url)
-    if settings.notifier_mode == "webhook":
-        return WebhookManagementNotifier(
-            settings.management_webhook_url,
-            settings.management_webhook_bearer_token,
-        )
-    if settings.notifier_mode == "log":
-        return LogManagementNotifier()
-    raise ValueError(f"Unsupported notifier mode: {settings.notifier_mode}")
+    return LogManagementNotifier()
 
 
 def _resolve_runbook_adapters(
@@ -136,12 +123,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.conclusion_validator = conclusion_validator
     service.notifier = notifier
     service.strategy_provider = strategy_provider
-    service.escalation_severities = {
-        item.value.upper() for item in settings.escalation_severities
-    }
     service.runbook_limit = settings.runbook_limit
-    service.notification_max_attempts = settings.notification_max_attempts
-    service.notification_backoff_seconds = settings.notification_retry_backoff_seconds
     service.react_enabled = settings.react_enabled
     service.validation_enabled = settings.validation_enabled
     runtime.settings = settings
@@ -165,45 +147,6 @@ def build_runtime(
         settings, runbook_provider, runbook_store
     )
     repository = repository or SQLAlchemyAlertRepository(settings.database_url)
-    routing_service: AlertRoutingService | None = None
-    escalation_scheduler: DurableEscalationScheduler | None = None
-    if settings.alert_routing_enabled and isinstance(
-        repository, SQLAlchemyAlertRepository
-    ):
-        policy_set = RoutingPolicyLoader(settings.alert_routing_policy_path).load()
-        policy_engine = RoutingPolicyEngine(policy_set)
-        directory = EnterpriseWeComDirectory(
-            settings.wecom_oncall_api_url,
-            settings.wecom_oncall_api_bearer_token.get_secret_value(),
-            settings.fallback_oncall,
-            timezone=settings.alert_routing_timezone,
-        )
-        dispatcher = EscalationDispatcher(
-            group_webhook_urls=settings.alert_group_webhook_urls,
-            card_api_url=settings.wecom_card_api_url,
-            card_api_bearer_token=(
-                settings.wecom_card_api_bearer_token.get_secret_value()
-            ),
-            ack_callback_base_url=settings.wecom_ack_callback_base_url,
-            ack_callback_token=settings.wecom_ack_callback_token.get_secret_value(),
-            phone_api_url=settings.phone_notification_api_url,
-            phone_api_bearer_token=(
-                settings.phone_notification_api_bearer_token.get_secret_value()
-            ),
-            directory=directory,
-        )
-        routing_service = AlertRoutingService(
-            repository=repository,
-            policy_engine=policy_engine,
-            directory=directory,
-        )
-        escalation_scheduler = DurableEscalationScheduler(
-            routing_repository=repository,
-            alert_repository=repository,
-            routing_service=routing_service,
-            dispatcher=dispatcher,
-            poll_seconds=settings.alert_routing_poll_seconds,
-        )
     source_registry = source_registry or AlertSourceRegistry(
         [
             CanonicalAlertSourceAdapter(settings.environment_aliases)
@@ -236,14 +179,10 @@ def build_runtime(
         tool_executor=tool_executor,
         rule_validator=rule_validator,
         conclusion_validator=conclusion_validator,
-        escalation_severities={item.value for item in settings.escalation_severities},
         runbook_limit=settings.runbook_limit,
-        notification_max_attempts=settings.notification_max_attempts,
-        notification_backoff_seconds=settings.notification_retry_backoff_seconds,
         investigation_lease_seconds=settings.investigation_lease_seconds,
         react_enabled=settings.react_enabled,
         validation_enabled=settings.validation_enabled,
-        signal_router=routing_service,
     )
     return Runtime(
         settings=settings,
@@ -251,6 +190,4 @@ def build_runtime(
         service=service,
         runbook_provider=runbook_provider,
         runbook_store=runbook_store,
-        routing_service=routing_service,
-        escalation_scheduler=escalation_scheduler,
     )
