@@ -7,9 +7,7 @@ import type {
   ApiProblem,
   CanonicalAlertPayload,
   DashboardSummary,
-  RunbookCreateInput,
   RunbookRecord,
-  RunbookUpdateInput,
   Severity,
   StoredAlert,
 } from "../types/api";
@@ -116,27 +114,6 @@ export const api = {
     );
     return Array.isArray(data) ? data : data.items;
   },
-
-  createRunbook: (input: RunbookCreateInput, token: string) =>
-    request<RunbookRecord>(
-      "/api/v1/admin/runbooks",
-      { method: "POST", body: JSON.stringify(input) },
-      token,
-    ),
-
-  updateRunbook: (runbookId: string, input: RunbookUpdateInput, token: string) =>
-    request<RunbookRecord>(
-      `/api/v1/admin/runbooks/${encodeURIComponent(runbookId)}`,
-      { method: "PUT", body: JSON.stringify(input) },
-      token,
-    ),
-
-  deleteRunbook: (runbookId: string, token: string) =>
-    request<void>(
-      `/api/v1/admin/runbooks/${encodeURIComponent(runbookId)}`,
-      { method: "DELETE" },
-      token,
-    ),
 
   getSettings: (token: string) =>
     request<AdminSettings>("/api/v1/admin/settings", {}, token),

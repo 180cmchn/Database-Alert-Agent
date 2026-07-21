@@ -3,7 +3,7 @@
 本项目只负责一条告警分析链路：
 
 1. 接收并规范化数据库告警；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
-2. 通过公司内网/VPN和公司账号凭据读取告警手册网页并完成匹配。
+2. 读取项目内的本地 PDF 告警手册并完成全文匹配。
 3. 由 AI Agent 结合告警信息生成可能原因、判断依据和只读核查建议。
 4. 判断依据严格按“命中手册在前、AI 分析在后”输出。
 5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
@@ -17,7 +17,7 @@
           ↓
 三等级规范化与脱敏
           ↓
-内网告警手册匹配（首要依据）
+本地 PDF 告警手册匹配（首要依据）
           ↓
 AI 分析（次要依据）+ 规则校验
           ↓
@@ -30,42 +30,23 @@ AI 分析（次要依据）+ 规则校验
 
 ## 告警手册
 
-`runbooks/*.md` 只是网页目录记录，不保存旧版本地手册正文。每条记录必须在 front matter 中提供 `source_url`；分析时正文始终从该内网页面实时或按短期缓存读取。
+`runbooks/pdfs/*.pdf` 是唯一手册数据源。当前目录包含随本项目提供的 10 份告警处理手册。
+服务从 PDF 文字层提取标题与正文，并依次使用告警原因、告警名称、指标名、告警类型、故障
+摘要、标题等字段进行匹配。文件名（不含 `.pdf`）作为手册 ID，引用章节统一为 `PDF`。
 
-示例：
-
-```markdown
----
-id: mysql-replication-delay
-title: MySQL 从库延迟
-section: diagnosis
-reasons:
-  - replication_delay
-keywords:
-  - Seconds_Behind_Master
-severities:
-  - CRITICAL
-  - WARNING
-source_url: https://runbook.corp.example/database/mysql-replication-delay
-content_selector: main
----
-该文件正文不会参与匹配或分析。
-```
+PDF 必须未加密且带可提取文字层；纯扫描件需先 OCR。手册目录为只读运行数据，更新方式是
+替换目录内 PDF 后重启 API 和 Worker，不支持通过管理 API 在线增删改。
 
 相关环境变量：
 
 ```dotenv
-RUNBOOK_DIR=./runbooks
+RUNBOOK_PDF_DIR=./runbooks/pdfs
 RUNBOOK_LIMIT=5
-RUNBOOK_WEB_ALLOWED_HOSTS=["runbook.corp.example"]
-RUNBOOK_WEB_AUTH_MODE=cookie
-RUNBOOK_WEB_AUTH_SECRET=session=replace-me
-RUNBOOK_WEB_TIMEOUT_SECONDS=15
-RUNBOOK_WEB_CACHE_TTL_SECONDS=300
-RUNBOOK_WEB_VERIFY_TLS=true
+RUNBOOK_PDF_MAX_FILE_BYTES=20000000
+RUNBOOK_PDF_MAX_TEXT_CHARS=200000
 ```
 
-`RUNBOOK_WEB_AUTH_MODE` 支持 `cookie`、`bearer`、`none`。凭据只能放在部署环境或秘密管理系统中，不得写入手册目录。
+网页抓取、内网域名白名单、Cookie/Bearer 登录和 Markdown 手册索引均已删除。
 
 ## AI 与企微配置
 
@@ -86,7 +67,7 @@ AI_MODEL=replace-me
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 ```
 
-`AI_API_KEY`、`RUNBOOK_WEB_AUTH_SECRET` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
+`AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
 
 企微消息包含：
 
@@ -128,7 +109,7 @@ docker compose up --build
 - `GET /api/v1/alerts/{id}`：查看手册匹配、分析进度、可能原因和有序依据。
 - `GET /api/v1/alerts`：分页查询告警。
 - `GET /api/v1/dashboard/summary`：查看分析概览。
-- `GET|POST|PUT|DELETE /api/v1/admin/runbooks`：维护内网手册网页目录。
+- `GET /api/v1/admin/runbooks`、`GET /api/v1/admin/runbooks/{id}`：只读查看本地 PDF 手册及提取正文。
 - `GET|PATCH /api/v1/admin/settings`：维护模型与企微机器人运行配置。
 - `GET /health/live`、`GET /health/ready`：存活与就绪检查。
 
@@ -168,7 +149,7 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 ]
 ```
 
-当命中手册时，所有 `RUNBOOK` 项必须先于 `AI` 项；手册引用必须对应本次实际召回的页面。没有命中手册时，只允许输出明确标注的 AI 依据，并降低置信度。
+当命中手册时，所有 `RUNBOOK` 项必须先于 `AI` 项；手册引用必须对应本次实际召回的 PDF。没有命中手册时，只允许输出明确标注的 AI 依据，并降低置信度。
 
 ## 验证
 

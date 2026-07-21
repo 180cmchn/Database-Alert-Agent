@@ -18,9 +18,7 @@ from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
-    RunbookCreate,
     RunbookListResponse,
-    RunbookUpdate,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
 )
@@ -41,7 +39,6 @@ from app.domain.errors import (
     AnalysisFailedError,
     InvalidAlertPayloadError,
     InvalidRunbookIdError,
-    RunbookConflictError,
     RunbookNotFoundError,
     UnknownAlertSourceError,
 )
@@ -95,7 +92,7 @@ def create_app(
     app = FastAPI(
         title="Database Alert AI Agent",
         version="0.1.0",
-        description="数据库告警接入、内网手册匹配、AI 分析与企微结果发送服务。",
+        description="数据库告警接入、本地 PDF 手册匹配、AI 分析与企微结果发送服务。",
         lifespan=lifespan,
     )
     app.state.runtime = runtime
@@ -107,7 +104,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=settings.cors_allowed_origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -319,23 +316,6 @@ def create_app(
         items = await runbook_store.list()
         return RunbookListResponse(items=items, total=len(items))
 
-    @app.post(
-        "/api/v1/admin/runbooks",
-        response_model=RunbookDocument,
-        status_code=201,
-        tags=["admin"],
-        dependencies=[Depends(require_admin)],
-    )
-    async def create_runbook(payload: RunbookCreate) -> RunbookDocument:
-        try:
-            saved = await runbook_store.create(payload.to_document())
-        except InvalidRunbookIdError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except RunbookConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await audit_logger.record(action="create", target=f"runbook:{saved.id}")
-        return saved
-
     @app.get(
         "/api/v1/admin/runbooks/{runbook_id}",
         response_model=RunbookDocument,
@@ -349,46 +329,6 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RunbookNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.put(
-        "/api/v1/admin/runbooks/{runbook_id}",
-        response_model=RunbookDocument,
-        tags=["admin"],
-        dependencies=[Depends(require_admin)],
-    )
-    async def update_runbook(
-        runbook_id: str, payload: RunbookUpdate
-    ) -> RunbookDocument:
-        try:
-            saved = await runbook_store.update(
-                runbook_id,
-                payload.to_document(runbook_id),
-                expected_version=payload.expected_version,
-            )
-        except InvalidRunbookIdError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except RunbookNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except RunbookConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await audit_logger.record(action="update", target=f"runbook:{saved.id}")
-        return saved
-
-    @app.delete(
-        "/api/v1/admin/runbooks/{runbook_id}",
-        status_code=204,
-        tags=["admin"],
-        dependencies=[Depends(require_admin)],
-    )
-    async def delete_runbook(runbook_id: str) -> Response:
-        try:
-            await runbook_store.delete(runbook_id)
-        except InvalidRunbookIdError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except RunbookNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        await audit_logger.record(action="delete", target=f"runbook:{runbook_id}")
-        return Response(status_code=204)
 
     @app.get(
         "/api/v1/admin/settings",

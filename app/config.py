@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_ENVIRONMENT_ALIASES = {
@@ -63,17 +63,14 @@ class Settings(BaseSettings):
     ai_max_retries: int = Field(default=2, ge=0)
     ai_json_mode: bool = True
 
-    runbook_dir: Path = Path("./runbooks")
+    runbook_pdf_dir: Path = Path("./runbooks/pdfs")
     runbook_limit: int = Field(default=5, ge=1, le=20)
-    runbook_web_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    runbook_web_auth_mode: str = "cookie"
-    runbook_web_auth_secret: SecretStr = Field(default=SecretStr(""), repr=False)
-    runbook_web_timeout_seconds: float = Field(default=15, gt=0, le=120)
-    runbook_web_cache_ttl_seconds: int = Field(default=300, ge=0, le=86400)
-    runbook_web_max_response_bytes: int = Field(
-        default=1_000_000, ge=10_000, le=10_000_000
+    runbook_pdf_max_file_bytes: int = Field(
+        default=20_000_000, ge=100_000, le=200_000_000
     )
-    runbook_web_verify_tls: bool = True
+    runbook_pdf_max_text_chars: int = Field(
+        default=200_000, ge=10_000, le=1_000_000
+    )
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
@@ -97,7 +94,6 @@ class Settings(BaseSettings):
     @field_validator(
         "ai_provider",
         "http_scheduler",
-        "runbook_web_auth_mode",
     )
     @classmethod
     def normalize_mode(cls, value: str) -> str:
@@ -106,18 +102,6 @@ class Settings(BaseSettings):
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def normalize_cors_origins(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return []
-            if stripped.startswith("["):
-                return json.loads(stripped)
-            return [item.strip() for item in stripped.split(",") if item.strip()]
-        return value
-
-    @field_validator("runbook_web_allowed_hosts", mode="before")
-    @classmethod
-    def normalize_runbook_hosts(cls, value: Any) -> Any:
         if isinstance(value, str):
             stripped = value.strip()
             if not stripped:
@@ -163,33 +147,6 @@ class Settings(BaseSettings):
             and self.ai_provider == "fake"
         ):
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
-        if self.runbook_web_auth_mode not in {"bearer", "cookie", "none"}:
-            raise ValueError("runbook_web_auth_mode must be bearer, cookie, or none")
-        for host in self.runbook_web_allowed_hosts:
-            parsed_host = urlsplit(f"//{host}")
-            try:
-                valid_port = parsed_host.port
-            except ValueError:
-                valid_port = -1
-            if not parsed_host.hostname or any(
-                (
-                    parsed_host.username is not None,
-                    parsed_host.password is not None,
-                    bool(parsed_host.path),
-                    bool(parsed_host.query),
-                    bool(parsed_host.fragment),
-                    valid_port in {-1, 0},
-                )
-            ):
-                raise ValueError(
-                    "runbook_web_allowed_hosts entries must be hostnames (optional ports) "
-                    "without schemes or paths"
-                )
-        if (
-            self.app_env.lower() in {"production", "prod"}
-            and not self.runbook_web_verify_tls
-        ):
-            raise ValueError("RUNBOOK_WEB_VERIFY_TLS must be true in production")
         return self
 
     def readiness_issues(self) -> list[str]:
@@ -210,15 +167,12 @@ class Settings(BaseSettings):
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
-        if not self.runbook_dir.exists():
-            issues.append(f"Runbook directory does not exist: {self.runbook_dir}")
-        if not self.runbook_web_allowed_hosts:
-            issues.append("RUNBOOK_WEB_ALLOWED_HOSTS is required")
-        if (
-            self.runbook_web_auth_mode != "none"
-            and not self.runbook_web_auth_secret.get_secret_value()
-        ):
-            issues.append("RUNBOOK_WEB_AUTH_SECRET is required for authenticated runbooks")
+        if not self.runbook_pdf_dir.exists():
+            issues.append(f"PDF runbook directory does not exist: {self.runbook_pdf_dir}")
+        elif not self.runbook_pdf_dir.is_dir():
+            issues.append(f"PDF runbook path is not a directory: {self.runbook_pdf_dir}")
+        elif not any(self.runbook_pdf_dir.glob("*.pdf")):
+            issues.append(f"No PDF runbooks found in: {self.runbook_pdf_dir}")
         return issues
 
 

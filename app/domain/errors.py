@@ -31,10 +31,6 @@ class RunbookNotFoundError(RunbookError, LookupError):
     pass
 
 
-class RunbookConflictError(RunbookError, RuntimeError):
-    pass
-
-
 class NotificationError(AlertAgentError):
     pass
 
