@@ -145,6 +145,7 @@ class RunbookProbe(BaseModel):
 class RunbookCause(BaseModel):
     cause_id: str
     hypothesis: str
+    section_ids: list[str] = Field(default_factory=list)
     supporting_evidence: list[str] = Field(default_factory=list)
     contradicting_evidence: list[str] = Field(default_factory=list)
     probes: list[RunbookProbe] = Field(default_factory=list)
@@ -152,6 +153,8 @@ class RunbookCause(BaseModel):
 
 class RunbookAction(BaseModel):
     action: str
+    cause_id: str | None = None
+    section_ids: list[str] = Field(default_factory=list)
     execution_class: ExecutionClass = ExecutionClass.READ_ONLY
     expected_result: str | None = None
     approval_required: bool = False
@@ -167,7 +170,17 @@ class RunbookSection(BaseModel):
     id: str = Field(min_length=1, max_length=200)
     title: str = Field(min_length=1, max_length=300)
     pages: list[int] = Field(default_factory=list)
+    match_terms: list[str] = Field(default_factory=list)
     content: str = ""
+
+
+class RunbookVisualEvidence(BaseModel):
+    page: int = Field(ge=1)
+    kind: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=10_000)
+    keywords: list[str] = Field(default_factory=list)
+    section_ids: list[str] = Field(default_factory=list)
+    review_status: RunbookQualityStatus = RunbookQualityStatus.REVIEW_REQUIRED
 
 
 class RunbookExcerpt(BaseModel):
@@ -183,6 +196,7 @@ class RunbookExcerpt(BaseModel):
     quality_status: RunbookQualityStatus = RunbookQualityStatus.DRAFT
     causes: list[RunbookCause] = Field(default_factory=list)
     actions: list[RunbookAction] = Field(default_factory=list)
+    visual_evidence: list[RunbookVisualEvidence] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -199,6 +213,7 @@ class RunbookDocument(BaseModel):
     sections: list[RunbookSection] = Field(default_factory=list)
     causes: list[RunbookCause] = Field(default_factory=list)
     actions: list[RunbookAction] = Field(default_factory=list)
+    visual_evidence: list[RunbookVisualEvidence] = Field(default_factory=list)
     content: str = Field(min_length=1, max_length=1_000_000)
     metadata: dict[str, Any] = Field(default_factory=dict)
     version: int = Field(default=1, ge=1)
