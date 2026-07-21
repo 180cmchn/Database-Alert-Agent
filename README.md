@@ -81,6 +81,33 @@ WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-m
 
 `AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
 
+## FlashDuty 只读接入
+
+项目可选接入 [FlashDuty Open API](https://docs.flashduty.com/zh/openapi/api-catalog)。客户端采用显式只读白名单；虽然 FlashDuty 的查询与诊断接口多数使用 `POST`，项目不会调用创建、更新、删除、认领、恢复等写接口。
+
+```dotenv
+FLASHDUTY_ENABLED=true
+FLASHDUTY_BASE_URL=https://api.flashcat.cloud
+FLASHDUTY_APP_KEY=replace-me
+FLASHDUTY_TIMEOUT_SECONDS=40
+FLASHDUTY_MAX_RETRIES=2
+FLASHDUTY_CONTEXT_ITEM_LIMIT=20
+FLASHDUTY_METRICS_DS_NAME=prod-prometheus
+FLASHDUTY_LOGS_DS_NAME=prod-loki
+FLASHDUTY_LOGS_DS_TYPE=loki
+```
+
+`FLASHDUTY_APP_KEY` 是部署级秘密值，不可通过管理 API 修改或读取。Base URL 固定为官方 HTTPS Endpoint，客户端禁止跟随重定向，错误和证据中不会保留 APP Key。建议在 FlashDuty 中为此项目创建最小权限的独立 APP Key。
+
+启用后：
+
+- `alert_context` 读取告警详情、原始事件、告警动态，以及关联故障的详情、时间线和告警；
+- `query_changes` 与 `query_similar_incidents` 分别读取时间窗内变更和历史相似故障，这两类历史/平台上下文不会单独支撑“已验证根因”；
+- `query_metrics`、`query_logs` 使用 Monitors 诊断接口，`query_trace`、`query_endpoint_errors` 使用原始行查询接口；
+- `query_database_diagnostics` 先读取目标工具清单，再调用其中匹配的只读 monit-agent 工具，单次最多 8 个。
+
+数据源查询需要 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由手册探针/动态调查参数显式提供 `expr`；缺少必要绑定时工具会失败并让结论进入人工复核，不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
+
 影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `REVIEW_REQUIRED`，建议
 标记为 `analysis_mode=shadow`。收集到足够专家反馈且生产门槛通过前，建议保持开启。
 生产环境只有在部署侧显式设置 `PRODUCTION_GATE_APPROVED=true` 后才允许关闭影子模式；该开关
@@ -123,6 +150,7 @@ docker compose up --build
 ## API
 
 - `POST /api/v1/alerts/canonical/analyze`：接收告警并异步开始分析。
+- `POST /api/v1/alerts/flashduty/analyze`：接收 FlashDuty `/alert/info` 的 `data` 对象或完整成功响应并异步开始分析。
 - `GET /api/v1/alerts/{id}`：查看手册匹配、分析进度、可能原因和有序依据。
 - `GET /api/v1/alerts`：分页查询告警。
 - `GET /api/v1/dashboard/summary`：查看分析概览。

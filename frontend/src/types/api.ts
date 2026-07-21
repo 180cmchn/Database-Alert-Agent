@@ -309,6 +309,9 @@ export interface AdminSettings {
   production_gate_approved: boolean;
   ai_api_key_configured: boolean;
   wecom_webhook_url_configured: boolean;
+  flashduty_enabled: boolean;
+  flashduty_base_url: string;
+  flashduty_app_key_configured: boolean;
   revision: string;
   apply_status: "applied";
   worker_refresh_mode: "before_each_job";

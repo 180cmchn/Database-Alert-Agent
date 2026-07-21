@@ -84,6 +84,37 @@ def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:
         assert scheduler.jobs == []
 
 
+def test_flashduty_alert_info_payload_is_accepted(tmp_path: Path) -> None:
+    client, _, scheduler = create_test_client(tmp_path)
+    with client:
+        response = client.post(
+            "/api/v1/alerts/flashduty/analyze",
+            json={
+                "request_id": "flashduty-request-1",
+                "data": {
+                    "alert_id": "663a1b2c3d4e5f6789abcdef",
+                    "title": "Database latency",
+                    "description": "Latency is above threshold",
+                    "alert_severity": "Warning",
+                    "alert_status": "Warning",
+                    "alert_key": "database-latency",
+                    "start_time": 1712650000,
+                    "labels": {"env": "prod", "service": "orders-db"},
+                },
+            },
+        )
+
+        assert response.status_code == 202
+        body = response.json()
+        assert body["event_id"] == "663a1b2c3d4e5f6789abcdef"
+        assert scheduler.jobs == [body["alert_id"]]
+
+        detail = client.get(body["detail_url"]).json()
+        assert detail["alert"]["source"] == "flashduty"
+        assert detail["alert"]["severity"] == "WARNING"
+        assert detail["alert"]["service_name"] == "orders-db"
+
+
 def test_readiness_reports_configuration(tmp_path: Path) -> None:
     client, _, _ = create_test_client(tmp_path)
     with client:
