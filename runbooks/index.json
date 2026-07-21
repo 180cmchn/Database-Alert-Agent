@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "review_policy": "All entries are conservative initial annotations and require a database SME to approve them before production gating can pass.",
+  "schema_version": 2,
+  "review_policy": "All entries remain review_required or draft until a database SME approves both the PDF text and image-derived visual evidence.",
   "runbooks": [
     {
       "runbook_id": "INFRA-201503239-210726-1007-4077",
@@ -10,28 +10,53 @@
       "match": {
         "alert_names": [],
         "metric_names": [],
-        "aliases": ["pt-archiver 归档报错", "Character set mismatch", "Invalid utf8 character string"],
-        "keywords": ["pt-archiver", "utf8mb4", "bulk-insert", "no-check-charset"],
+        "aliases": ["pt-archiver 归档报错"],
+        "keywords": ["pt-archiver", "Archery 归档", "OceanBase 归档"],
         "required_conditions": [],
         "exclusion_conditions": []
       },
       "sections": [
-        {"id": "charset-failures", "title": "字符集相关归档失败", "pages": [1, 2]}
+        {"id": "chinese-condition-encoding", "title": "原因一：归档条件含中文时生成 SQL 乱码", "pages": [1], "match_terms": ["归档条件存在中文", "生成 SQL 乱码", "use encoding utf8"]},
+        {"id": "bulk-insert-special-character", "title": "原因二：特殊字符触发 bulk-insert 字符集报错", "pages": [1], "match_terms": ["Invalid utf8 character string", "LOAD DATA LOCAL INFILE", "bulk-insert", "CHARACTER SET utf8mb4"]},
+        {"id": "ob-charset-mismatch", "title": "原因三：Archery 归档 OceanBase 字符集检查不一致", "pages": [1, 2], "match_terms": ["Character set mismatch", "source DSN uses utf8mb4", "--no-check-charset", "OceanBase"]}
       ],
       "causes": [
         {
-          "cause_id": "archive_charset_mismatch",
-          "hypothesis": "归档工具、连接或目标表使用的字符集不一致",
-          "supporting_evidence": ["错误包含 Character set mismatch", "错误包含 Invalid utf8 character string"],
-          "contradicting_evidence": ["源端、目标端和工具显式字符集完全一致"],
-          "probes": [{"tool_name": "query_database_diagnostics", "objective": "核对错误文本、表字符集和归档参数", "read_only": true}]
+          "cause_id": "archive_condition_chinese_encoding",
+          "hypothesis": "归档条件包含中文，但 pt-archiver Perl 脚本未声明 UTF-8 源码编码，导致生成 SQL 执行时乱码",
+          "section_ids": ["chinese-condition-encoding"],
+          "supporting_evidence": ["归档条件包含中文", "生成 SQL 中的中文出现乱码"],
+          "contradicting_evidence": ["归档条件不含中文", "脚本已声明 use encoding \"utf8\" 且生成 SQL 无乱码"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "核对归档条件、生成 SQL 和 pt-archiver 脚本编码声明", "read_only": true}]
+        },
+        {
+          "cause_id": "archive_bulk_insert_special_character_charset",
+          "hypothesis": "数据含特殊字符时，bulk-insert 生成的 LOAD DATA 使用 utf8 而非 utf8mb4，pt-archiver 无法识别该字符",
+          "section_ids": ["bulk-insert-special-character"],
+          "supporting_evidence": ["错误包含 Invalid utf8 character string", "报错 SQL 为 LOAD DATA LOCAL INFILE 且 CHARACTER SET utf8", "任务启用了 bulk-insert"],
+          "contradicting_evidence": ["未启用 bulk-insert", "LOAD DATA 已显式使用 utf8mb4 且数据中无异常字符"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "核对 Invalid utf8 报错、LOAD DATA 字符集和异常数据字符", "read_only": true}]
+        },
+        {
+          "cause_id": "archive_ob_dsn_table_charset_mismatch",
+          "hypothesis": "Archery 配置归档 OceanBase 数据时，来源 DSN 与表字符集检查结果不一致",
+          "section_ids": ["ob-charset-mismatch"],
+          "supporting_evidence": ["错误包含 Character set mismatch", "错误指出 source DSN uses utf8mb4, table uses 空值或不同字符集"],
+          "contradicting_evidence": ["告警不是 OceanBase 归档", "来源 DSN 与表字符集一致且没有 Character set mismatch"],
+          "probes": [{"tool_name": "query_database_diagnostics", "objective": "核对 OceanBase 来源 DSN、表字符集和 pt-archiver 字符集检查报错", "read_only": true}]
         }
       ],
       "actions": [
-        {"action": "核对源表、目标表和归档命令的字符集配置", "execution_class": "read_only", "expected_result": "定位字符集不一致的位置", "approval_required": false},
-        {"action": "调整归档脚本字符集参数", "execution_class": "change", "expected_result": "归档任务不再出现字符集错误", "approval_required": true}
+        {"action": "原因一确认后，在 pt-archiver Perl 脚本中增加 use encoding \"utf8\"", "cause_id": "archive_condition_chinese_encoding", "section_ids": ["chinese-condition-encoding"], "execution_class": "change", "expected_result": "含中文归档条件生成的 SQL 不再乱码", "approval_required": true},
+        {"action": "原因二确认后，将 bulk-insert 的 LOAD DATA 字符集固定为 CHARACTER SET utf8mb4", "cause_id": "archive_bulk_insert_special_character_charset", "section_ids": ["bulk-insert-special-character"], "execution_class": "change", "expected_result": "特殊字符数据可被正确归档", "approval_required": true},
+        {"action": "原因三确认后，在 Archery 的 pt-archiver 参数中增加 --no-check-charset", "cause_id": "archive_ob_dsn_table_charset_mismatch", "section_ids": ["ob-charset-mismatch"], "execution_class": "change", "expected_result": "OceanBase 归档不再因字符集检查不一致退出", "approval_required": true}
       ],
-      "review_notes": ["经验总结类资料，不应在缺少具体错误文本时作为告警根因金标准。"]
+      "visual_evidence": [
+        {"page": 1, "kind": "highlighted_code", "text": "截图标出了 pt-archiver Perl 脚本新增语句：use encoding \"utf8\";", "keywords": ["use encoding utf8", "归档条件中文乱码"], "section_ids": ["chinese-condition-encoding"], "review_status": "review_required"},
+        {"page": 1, "kind": "boxed_error", "text": "DBD::mysql::st execute failed: Invalid utf8 character string；对应 LOAD DATA LOCAL INFILE ... CHARACTER SET utf8。", "keywords": ["Invalid utf8 character string", "LOAD DATA LOCAL INFILE", "CHARACTER SET utf8"], "section_ids": ["bulk-insert-special-character"], "review_status": "review_required"},
+        {"page": 1, "kind": "boxed_code", "text": "截图红框标出 bulk-insert 的 LOAD DATA 语句应固定为 CHARACTER SET utf8mb4。", "keywords": ["CHARACTER SET utf8mb4", "bulk-insert"], "section_ids": ["bulk-insert-special-character"], "review_status": "review_required"}
+      ],
+      "review_notes": ["已按用户审核意见修正为三个独立原因及三个对应方案；图片证据仍需数据库专家逐项复核后才能 approved。"]
     },
     {
       "runbook_id": "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073",
@@ -42,7 +67,7 @@
         "alert_names": ["TiKV_server_report_failure_msg_total"],
         "metric_names": ["tikv_server_report_failure_msg_total"],
         "aliases": ["TiKV server report failure", "TiKV 无法连接远端", "TiKV unreachable"],
-        "keywords": ["server_report_failure_msg_total", "unreachable", "TiKV"],
+        "keywords": ["server_report_failure_msg_total", "type=unreachable", "Out of memory", "Killed process", "status=9/KILL", "Dashboard 慢查询", "最大内存"],
         "required_conditions": ["type=unreachable"],
         "exclusion_conditions": []
       },
@@ -68,16 +93,23 @@
         {
           "cause_id": "tikv_oom_kill",
           "hypothesis": "TiKV 进程因系统 OOM 被终止",
-          "supporting_evidence": ["系统日志存在 OOM 或 killed process 记录", "内存先升高后进程退出"],
+          "supporting_evidence": ["系统日志存在 Out of memory 或 Killed process 记录", "服务日志出现 code=killed, status=9/KILL 或 entered failed state", "内存先升高后进程退出"],
           "contradicting_evidence": ["系统日志无 OOM 记录且进程未发生退出"],
           "probes": [{"tool_name": "query_logs", "objective": "核查系统 OOM 事件和进程退出记录", "read_only": true}]
         }
       ],
       "actions": [
         {"action": "核查集群节点、服务状态和资源指标", "execution_class": "read_only", "expected_result": "区分宕机、资源压力和 OOM 分支", "approval_required": false},
-        {"action": "分析告警时段的高内存 SQL", "execution_class": "read_only", "expected_result": "识别可能触发内存压力的 SQL", "approval_required": false}
+        {"action": "核查系统日志中的 Out of memory、Killed process、status=9/KILL 和服务 failed state，确认是否为系统 OOM Kill", "execution_class": "read_only", "expected_result": "仅在系统 OOM Kill 证据成立时进入内存突增分析", "approval_required": false},
+        {"action": "确认系统 OOM Kill 后，打开 Dashboard 慢查询页并选择对应告警时间点，按最大内存降序排列", "execution_class": "read_only", "expected_result": "定位该时间点内存占用最高的 SQL", "approval_required": false},
+        {"action": "分析排序靠前的高内存 SQL 及其执行特征", "execution_class": "read_only", "expected_result": "识别触发内存突然升高的 SQL 与原因", "approval_required": false}
       ],
-      "review_notes": ["手册列出多条原因分支，任何单一分支都必须由实时证据确认。"]
+      "visual_evidence": [
+        {"page": 1, "kind": "boxed_alert_rule", "text": "告警规则截图标出 sum(rate(tikv_server_report_failure_msg_total{type=\"unreachable\"}[10m])) BY (store_id) > 10。", "keywords": ["tikv_server_report_failure_msg_total", "type=unreachable", "store_id"], "review_status": "review_required"},
+        {"page": 2, "kind": "boxed_system_log", "text": "系统日志截图高亮 Out of memory: Kill process、Killed process、tiflash service code=killed status=9/KILL、entered failed state 和 service failed。", "keywords": ["Out of memory", "Kill process", "Killed process", "code=killed", "status=9/KILL", "entered failed state"], "review_status": "review_required"},
+        {"page": 3, "kind": "dashboard_fields", "text": "Dashboard 截图用箭头标出慢查询入口、查询时间范围以及按“最大内存”列定位高内存 SQL。", "keywords": ["Dashboard 慢查询", "查询时间范围", "最大内存", "内存降序"], "review_status": "review_required"}
+      ],
+      "review_notes": ["已按用户审核意见补齐原 PDF 第六点：确认系统 OOM Kill 后，在 Dashboard 慢查询页选择对应时间并按最大内存降序；其它原因分支仍需实时证据确认。"]
     },
     {
       "runbook_id": "INFRA-224075463-210726-1007-4075",
@@ -88,7 +120,7 @@
         "alert_names": ["URMAN_TASK_FAILED"],
         "metric_names": [],
         "aliases": ["DMP URMAN_TASK_FAILED", "urman agent handshake failure"],
-        "keywords": ["URMAN_TASK_FAILED", "握手协议", "文件权限"],
+        "keywords": ["URMAN_TASK_FAILED", "ssh handshake failed", "connection reset by peer", "Permission denied", "10022"],
         "required_conditions": [],
         "exclusion_conditions": []
       },
@@ -99,12 +131,17 @@
         {
           "cause_id": "urman_file_permission",
           "hypothesis": "urman-agent 文件权限异常",
-          "supporting_evidence": ["端口连通但握手失败", "文件权限核查异常"],
+          "supporting_evidence": ["任务错误包含 ssh: handshake failed 或 connection reset by peer", "目标 10022 端口可连通", "agent 日志包含 cp: cannot access 和 Permission denied"],
           "contradicting_evidence": ["端口不可达", "文件权限与正常节点一致"],
           "probes": [{"tool_name": "query_logs", "objective": "核对端口连通性和 agent 文件权限", "read_only": true}]
         }
       ],
       "actions": [{"action": "核对网络连通性和 urman-agent 文件权限", "execution_class": "read_only", "expected_result": "确认故障位于网络还是 agent 权限", "approval_required": false}],
+      "visual_evidence": [
+        {"page": 1, "kind": "alert_screenshot", "text": "任务失败截图包含 transport failed, get client got error, ssh: handshake failed，以及 read tcp ...:10022: connection reset by peer。", "keywords": ["ssh handshake failed", "connection reset by peer", "10022"], "review_status": "review_required"},
+        {"page": 1, "kind": "connectivity_screenshot", "text": "telnet 截图显示已连接目标主机的 10022 端口，说明 TCP 端口连通。", "keywords": ["Connected", "10022", "端口连通"], "review_status": "review_required"},
+        {"page": 1, "kind": "boxed_agent_log", "text": "agent 日志红框反复出现 cp: cannot access '/data/urman-agent/tmp/backup-...': Permission denied。", "keywords": ["cp: cannot access", "Permission denied", "urman-agent/tmp/backup"], "review_status": "review_required"}
+      ],
       "review_notes": ["单次事故案例，只能提供候选原因，不能泛化为所有同名告警的固定根因。"]
     },
     {
@@ -123,6 +160,9 @@
       "sections": [{"id": "template", "title": "未完成 KB 模板", "pages": [1]}],
       "causes": [],
       "actions": [],
+      "visual_evidence": [
+        {"page": 1, "kind": "decision_flow", "text": "流程图显示：告警触发后确认统计作业；若需要 Kill 会话，则终止作业并通知业务，否则优化执行计划。", "keywords": ["确认统计作业", "Kill会话", "终止作业", "优化执行计划"], "review_status": "review_required"}
+      ],
       "review_notes": ["模板内容不完整，检索时必须排除。"]
     },
     {
@@ -163,7 +203,7 @@
         "alert_names": [],
         "metric_names": [],
         "aliases": ["TiDB 批量删除越删越慢", "TiDB delete slowdown"],
-        "keywords": ["批量删除", "copr-cache", "tombstone", "delete limit"],
+        "keywords": ["批量删除", "copr-cache", "tombstone", "delete limit", "耗时逐批增长", "20秒", "3分钟"],
         "required_conditions": [],
         "exclusion_conditions": []
       },
@@ -184,6 +224,9 @@
         {"action": "比较批量删除各批次的耗时和扫描行数", "execution_class": "read_only", "expected_result": "确认是否存在扫描放大", "approval_required": false},
         {"action": "评估并调整 Coprocessor Cache 配置", "execution_class": "change", "expected_result": "减少重复下推计算开销", "approval_required": true}
       ],
+      "visual_evidence": [
+        {"page": 1, "kind": "timing_screenshot", "text": "终端截图显示同一批量删除操作耗时从约 20 秒逐批增长到 3 分钟以上。", "keywords": ["批量删除耗时逐批增长", "20秒", "3分钟", "delete limit"], "review_status": "review_required"}
+      ],
       "review_notes": ["配置建议存在版本适用性，执行前必须核对当前 TiDB 版本。"]
     },
     {
@@ -195,7 +238,7 @@
         "alert_names": ["HostSwapIsFillingUp"],
         "metric_names": [],
         "aliases": ["主机 Swap 使用率过高", "MongoDB swap filling up"],
-        "keywords": ["HostSwapIsFillingUp", "swappiness", "swap", "mongod"],
+        "keywords": ["HostSwapIsFillingUp", "swappiness", "swap", "mongod", "Swap 7.4Gi", "available 20Gi", "vm.swappiness=0", "runtime swappiness 30"],
         "required_conditions": ["swap usage > 80%"],
         "exclusion_conditions": []
       },
@@ -216,6 +259,11 @@
       "actions": [
         {"action": "核对集群各主机的内存、Swap 和 swappiness", "execution_class": "read_only", "expected_result": "确认配置漂移及影响范围", "approval_required": false},
         {"action": "滚动处理副本并关闭 Swap", "execution_class": "change", "expected_result": "恢复数据库主机基线配置", "approval_required": true}
+      ],
+      "visual_evidence": [
+        {"page": 1, "kind": "alert_screenshot", "text": "告警截图显示 HostSwapIsFillingUp，主机 Swap 使用率超过阈值。", "keywords": ["HostSwapIsFillingUp", "swap usage > 80%"], "review_status": "review_required"},
+        {"page": 2, "kind": "resource_screenshot", "text": "资源截图标出 mongod 进程；表格显示物理内存约 31GiB、available 约 20GiB，而 Swap 已使用约 7.4/8GiB。", "keywords": ["mongod", "available 20Gi", "Swap 7.4Gi", "Swap 8Gi"], "review_status": "review_required"},
+        {"page": 3, "kind": "configuration_screenshot", "text": "命令截图显示运行时 /proc/sys/vm/swappiness 为 30，而 /etc/sysctl.conf 配置 vm.swappiness = 0，且 fstab 的 swap 行已注释。", "keywords": ["/proc/sys/vm/swappiness 30", "vm.swappiness = 0", "fstab swap commented", "配置漂移"], "review_status": "review_required"}
       ],
       "review_notes": ["包含重启与关闭 Swap，必须经人工审批并由现有变更流程执行。"]
     },
@@ -293,7 +341,7 @@
         "alert_names": [],
         "metric_names": [],
         "aliases": ["TiDB Prometheus 日志增长", "Prometheus 监控数据快速增长"],
-        "keywords": ["tiflash", "thread_id", "metric_relabel_configs", "prometheus.yml"],
+        "keywords": ["tiflash", "thread_id", "metric_relabel_configs", "prometheus.yml", "action: drop", "node_interrupts_total"],
         "required_conditions": [],
         "exclusion_conditions": []
       },
@@ -313,6 +361,10 @@
       "actions": [
         {"action": "统计 Prometheus 中增长最快的指标和标签基数", "execution_class": "read_only", "expected_result": "确认是否由 TiFlash 线程指标造成", "approval_required": false},
         {"action": "配置指标过滤或升级到修复版本", "execution_class": "change", "expected_result": "控制监控数据增长", "approval_required": true}
+      ],
+      "visual_evidence": [
+        {"page": 1, "kind": "boxed_configuration", "text": "prometheus.yml 截图红框标出 tiflash job 的 metric_relabel_configs，通过 regex 匹配 TiFlash thread 指标并设置 action: drop。", "keywords": ["job_name tiflash", "metric_relabel_configs", "tiflash_proxy_thread", "action: drop"], "review_status": "review_required"},
+        {"page": 2, "kind": "boxed_configuration", "text": "配置截图红框标出 overwritten-nodes job 对 node_interrupts_total 设置 metric_relabel_configs 和 action: drop。", "keywords": ["overwritten-nodes", "node_interrupts_total", "metric_relabel_configs", "action: drop"], "review_status": "review_required"}
       ],
       "review_notes": ["临时修改可能被 tiup 操作覆盖，执行前需明确长期维护方案。"]
     }

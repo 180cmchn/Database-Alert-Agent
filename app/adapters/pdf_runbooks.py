@@ -24,6 +24,7 @@ from app.domain.models import (
     RunbookKnowledgeType,
     RunbookQualityStatus,
     RunbookSection,
+    RunbookVisualEvidence,
 )
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -65,6 +66,11 @@ def _normalize_pdf_text(value: str) -> str:
 
 def _normalized_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _normalized_log_signature(value: str) -> str:
+    normalized = _normalized_match_text(value)
+    return re.sub(r"[^a-z0-9_\u4e00-\u9fff]+", " ", normalized).strip()
 
 
 def _title_from_text(text: str, fallback: str) -> str:
@@ -149,6 +155,43 @@ def _scope_matches(document: RunbookDocument, alert: NormalizedAlert) -> bool:
     return not engines or not alert_engine or alert_engine in engines
 
 
+def _section_visual_evidence(
+    document: RunbookDocument, section: RunbookSection
+) -> list[RunbookVisualEvidence]:
+    pages = set(section.pages)
+    return [
+        item
+        for item in document.visual_evidence
+        if item.page in pages and (not item.section_ids or section.id in item.section_ids)
+    ]
+
+
+def _section_causes(
+    document: RunbookDocument, section: RunbookSection
+) -> list[RunbookCause]:
+    return [
+        item
+        for item in document.causes
+        if not item.section_ids or section.id in item.section_ids
+    ]
+
+
+def _section_actions(
+    document: RunbookDocument, section: RunbookSection
+) -> list[RunbookAction]:
+    return [
+        item
+        for item in document.actions
+        if not item.section_ids or section.id in item.section_ids
+    ]
+
+
+def _visual_search_text(items: list[RunbookVisualEvidence]) -> str:
+    return "\n".join(
+        [part for item in items for part in (item.text, *item.keywords) if part]
+    )
+
+
 def _bm25_score(
     query_terms: Counter[str],
     document_terms: Counter[str],
@@ -189,14 +232,25 @@ def _score_section(
         return 0, []
 
     match_metadata = document.metadata.get("match") or {}
+    visual_evidence = _section_visual_evidence(document, section)
+    visual_searchable = _normalized_match_text(_visual_search_text(visual_evidence))
     annotations = [
         *match_metadata.get("alert_names", []),
         *match_metadata.get("metric_names", []),
         *match_metadata.get("aliases", []),
         *match_metadata.get("keywords", []),
+        *section.match_terms,
     ]
     searchable = _normalized_match_text(
-        "\n".join([document.title, section.title, section.content, *annotations])
+        "\n".join(
+            [
+                document.title,
+                section.title,
+                section.content,
+                *annotations,
+                visual_searchable,
+            ]
+        )
     )
     title = _normalized_match_text(f"{document.title} {section.title}")
     weighted_values = _alert_weighted_values(alert)
@@ -206,11 +260,20 @@ def _score_section(
     reasons: list[str] = []
     direct_match = False
     for value, weight, label in weighted_values:
-        if len(value) >= 4 and value in searchable:
+        visual_hit = value in visual_searchable or (
+            len(_normalized_log_signature(value)) >= 4
+            and _normalized_log_signature(value)
+            in _normalized_log_signature(visual_searchable)
+        )
+        if len(value) >= 4 and (value in searchable or visual_hit):
             score += weight
             if value in title:
                 score += 4
-            reasons.append(f"{label}精确命中")
+            if visual_hit:
+                score += 6
+                reasons.append(f"{label}命中图片关键报错")
+            else:
+                reasons.append(f"{label}精确命中")
             direct_match = True
 
     if not direct_match:
@@ -256,6 +319,25 @@ def _score_section(
             score += 16
             reasons.append("手册别名命中")
             direct_match = True
+            break
+
+    for match_term in section.match_terms:
+        normalized_term = _normalized_match_text(match_term)
+        if normalized_term and normalized_term in query_blob:
+            score += 24
+            reasons.append("章节结构化特征命中")
+            direct_match = True
+            break
+
+    for item in visual_evidence:
+        for keyword in item.keywords:
+            normalized_keyword = _normalized_match_text(keyword)
+            if normalized_keyword and normalized_keyword in query_blob:
+                score += 14
+                reasons.append("图片关键词命中")
+                direct_match = True
+                break
+        if "图片关键词命中" in reasons:
             break
 
     query_counter = Counter(_lexical_terms(query_blob))
@@ -358,7 +440,20 @@ class LocalPDFRunbookLibrary:
             and document.quality_status != RunbookQualityStatus.DEPRECATED
         ]
         term_counters = [
-            Counter(_lexical_terms(f"{document.title} {section.title} {section.content}"))
+            Counter(
+                _lexical_terms(
+                    " ".join(
+                        [
+                            document.title,
+                            section.title,
+                            section.content,
+                            _visual_search_text(
+                                _section_visual_evidence(document, section)
+                            ),
+                        ]
+                    )
+                )
+            )
             for document, section in candidates
         ]
         document_frequency: Counter[str] = Counter()
@@ -396,12 +491,16 @@ class LocalPDFRunbookLibrary:
                 page_refs=section.pages,
                 knowledge_type=document.knowledge_type,
                 quality_status=document.quality_status,
-                causes=document.causes,
-                actions=document.actions,
+                causes=_section_causes(document, section),
+                actions=_section_actions(document, section),
+                visual_evidence=_section_visual_evidence(document, section),
                 metadata={
                     **document.metadata,
                     "section_title": section.title,
-                    "retrieval": "structured_exact+bm25_char_ngram+quality_rerank",
+                    "retrieval": (
+                        "structured_exact+visual_evidence+bm25_char_ngram"
+                        "+quality_rerank"
+                    ),
                 },
             )
             current = best_by_runbook.get(document.id)
@@ -444,8 +543,10 @@ class LocalPDFRunbookLibrary:
             raise RunbookError(
                 f"Cannot read runbook annotation index: {self._annotation_path}"
             ) from exc
-        if payload.get("schema_version") != 1 or not isinstance(payload.get("runbooks"), list):
-            raise RunbookError("Runbook annotation index must use schema_version=1")
+        if payload.get("schema_version") not in {1, 2} or not isinstance(
+            payload.get("runbooks"), list
+        ):
+            raise RunbookError("Runbook annotation index must use schema_version=1 or 2")
         annotations: dict[str, dict[str, Any]] = {}
         for item in payload["runbooks"]:
             if not isinstance(item, dict) or not _SAFE_RUNBOOK_ID.fullmatch(
@@ -517,9 +618,12 @@ class LocalPDFRunbookLibrary:
             if reader.is_encrypted:
                 raise RunbookError(f"Encrypted PDF runbook is not supported: {path.name}")
             page_texts: list[str] = []
+            image_pages: list[int] = []
             for page_number, page in enumerate(reader.pages, start=1):
                 try:
                     page_texts.append(_normalize_pdf_text(page.extract_text() or ""))
+                    if len(page.images) > 0:
+                        image_pages.append(page_number)
                 except Exception as exc:
                     raise RunbookError(
                         f"Cannot extract text from {path.name} page {page_number}"
@@ -549,6 +653,14 @@ class LocalPDFRunbookLibrary:
             actions = [
                 RunbookAction.model_validate(item) for item in annotation.get("actions", [])
             ]
+            visual_evidence = [
+                RunbookVisualEvidence.model_validate(item)
+                for item in annotation.get("visual_evidence", [])
+            ]
+            if any(item.page > len(page_texts) for item in visual_evidence):
+                raise RunbookError(
+                    f"Runbook annotation has invalid visual evidence pages for {path.name}"
+                )
             sections: list[RunbookSection] = []
             for raw_section in annotation.get("sections", []):
                 pages = list(dict.fromkeys(int(page) for page in raw_section.get("pages", [])))
@@ -564,6 +676,9 @@ class LocalPDFRunbookLibrary:
                         id=str(raw_section["id"]),
                         title=str(raw_section["title"]),
                         pages=pages,
+                        match_terms=[
+                            str(item) for item in raw_section.get("match_terms", [])
+                        ],
                         content=section_content[: self._max_text_chars],
                     )
                 )
@@ -579,7 +694,44 @@ class LocalPDFRunbookLibrary:
                     content=content,
                 )
             ]
+        section_ids = {section.id for section in sections}
+        referenced_section_ids = {
+            section_id
+            for item in [*causes, *actions, *visual_evidence]
+            for section_id in item.section_ids
+        }
+        unknown_section_ids = referenced_section_ids - section_ids
+        if unknown_section_ids:
+            raise RunbookError(
+                f"Runbook annotation references unknown sections for {path.name}: "
+                f"{sorted(unknown_section_ids)}"
+            )
+        cause_ids = {cause.cause_id for cause in causes}
+        unknown_action_causes = {
+            action.cause_id
+            for action in actions
+            if action.cause_id and action.cause_id not in cause_ids
+        }
+        if unknown_action_causes:
+            raise RunbookError(
+                f"Runbook annotation actions reference unknown causes for {path.name}: "
+                f"{sorted(unknown_action_causes)}"
+            )
         match_metadata = annotation.get("match") or {}
+        visual_annotated_pages = sorted({item.page for item in visual_evidence})
+        unannotated_image_pages = sorted(set(image_pages) - set(visual_annotated_pages))
+        if quality_status == RunbookQualityStatus.APPROVED and unannotated_image_pages:
+            raise RunbookError(
+                f"Approved runbook has unannotated image pages for {path.name}: "
+                f"{unannotated_image_pages}"
+            )
+        if quality_status == RunbookQualityStatus.APPROVED and any(
+            item.review_status != RunbookQualityStatus.APPROVED
+            for item in visual_evidence
+        ):
+            raise RunbookError(
+                f"Approved runbook has unapproved visual evidence: {path.name}"
+            )
         document = RunbookDocument(
             id=path.stem,
             title=_title_from_text(content, path.stem),
@@ -603,6 +755,7 @@ class LocalPDFRunbookLibrary:
             sections=sections,
             causes=causes,
             actions=actions,
+            visual_evidence=visual_evidence,
             content=content,
             metadata={
                 "source_type": "local_pdf",
@@ -610,6 +763,17 @@ class LocalPDFRunbookLibrary:
                 "page_count": len(reader.pages),
                 "file_size_bytes": file_stat.st_size,
                 "text_truncated": truncated,
+                "image_pages": image_pages,
+                "visual_annotated_pages": visual_annotated_pages,
+                "unannotated_image_pages": unannotated_image_pages,
+                "visual_coverage_complete": not unannotated_image_pages,
+                "visual_review_complete": (
+                    not unannotated_image_pages
+                    and all(
+                        item.review_status == RunbookQualityStatus.APPROVED
+                        for item in visual_evidence
+                    )
+                ),
                 "annotation_source": (
                     str(self._annotation_path) if annotation else None
                 ),
