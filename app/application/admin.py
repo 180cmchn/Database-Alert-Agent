@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +13,52 @@ from pathlib import Path
 from typing import Any
 
 from app.config import RUNTIME_SETTINGS_KEYS, Settings, load_runtime_overrides
+
+try:  # Unix file locking.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    _fcntl = None
+
+try:  # Windows file locking.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on Unix
+    _msvcrt = None
+
+_FCHMOD = getattr(os, "fchmod", None)
+
+
+def _restrict_file_descriptor(file_descriptor: int) -> None:
+    """Apply owner-only permissions where the operating system supports them."""
+
+    if _FCHMOD is not None:
+        _FCHMOD(file_descriptor, 0o600)
+
+
+def _acquire_file_lock(file_descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(file_descriptor, _fcntl.LOCK_EX)
+        return
+    if _msvcrt is not None:
+        # msvcrt locks a byte range starting at the current file position. Keep a
+        # stable byte in the lock file so every Windows process locks the same range.
+        if os.fstat(file_descriptor).st_size == 0:
+            os.write(file_descriptor, b"\0")
+            os.fsync(file_descriptor)
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(file_descriptor, _msvcrt.LK_LOCK, 1)
+        return
+    raise RuntimeError("No supported file-locking backend is available")
+
+
+def _release_file_lock(file_descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(file_descriptor, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(file_descriptor, _msvcrt.LK_UNLCK, 1)
+        return
+    raise RuntimeError("No supported file-locking backend is available")
 
 
 def _revision_for(overrides: dict[str, Any]) -> str:
@@ -150,14 +195,17 @@ class RuntimeSettingsManager:
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         file_descriptor = os.open(lock_path, flags, 0o600)
+        locked = False
         try:
             if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
                 raise ValueError("Runtime settings lock is not a regular file")
-            os.fchmod(file_descriptor, 0o600)
-            fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+            _restrict_file_descriptor(file_descriptor)
+            _acquire_file_lock(file_descriptor)
+            locked = True
             yield
         finally:
-            fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            if locked:
+                _release_file_lock(file_descriptor)
             os.close(file_descriptor)
 
     @staticmethod
@@ -196,7 +244,7 @@ class RuntimeSettingsManager:
         )
         temporary_path = Path(temporary_name)
         try:
-            os.fchmod(file_descriptor, 0o600)
+            _restrict_file_descriptor(file_descriptor)
             with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.write("\n")
@@ -241,7 +289,7 @@ class AdminAuditLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         file_descriptor = os.open(self.path, flags, 0o600)
-        os.fchmod(file_descriptor, 0o600)
+        _restrict_file_descriptor(file_descriptor)
         with os.fdopen(file_descriptor, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
             handle.write("\n")
