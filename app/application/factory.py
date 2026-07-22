@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.adapters.ai import (
+    ConservativeFallbackAdvisor,
     FakeAIAdvisor,
     FakeConclusionValidator,
     OpenAICompatibleAdvisor,
@@ -47,6 +48,16 @@ class Runtime:
     service: AlertAnalysisService
     runbook_provider: RunbookProvider
     runbook_store: RunbookStore
+    flashduty_client: FlashDutyClient | None = None
+
+
+def _flashduty_tool_timeout(settings: Settings) -> float:
+    retry_backoff = sum(min(2**attempt, 10) for attempt in range(settings.flashduty_max_retries))
+    return min(
+        120,
+        settings.flashduty_timeout_seconds * (settings.flashduty_max_retries + 1)
+        + retry_backoff,
+    )
 
 
 def _build_advisor(settings: Settings) -> AIAdvisor:
@@ -71,6 +82,7 @@ def _build_conclusion_validator(settings: Settings) -> ConclusionValidator:
         model=settings.ai_model,
         timeout_seconds=settings.ai_timeout_seconds,
         max_retries=settings.ai_max_retries,
+        json_mode=settings.ai_json_mode,
     )
 
 
@@ -80,17 +92,23 @@ def _build_notifier(settings: Settings) -> ManagementNotifier:
     return LogManagementNotifier()
 
 
-def _build_tool_registry(settings: Settings) -> InvestigationToolRegistry:
-    registry = build_default_tool_registry()
+def _build_flashduty_client(settings: Settings) -> FlashDutyClient | None:
     if not settings.flashduty_enabled or not settings.flashduty_app_key:
-        return registry
-
-    client = FlashDutyClient(
+        return None
+    return FlashDutyClient(
         settings.flashduty_app_key,
         base_url=settings.flashduty_base_url,
         timeout_seconds=settings.flashduty_timeout_seconds,
         max_retries=settings.flashduty_max_retries,
     )
+
+
+def _build_tool_registry(
+    settings: Settings, client: FlashDutyClient | None = None
+) -> InvestigationToolRegistry:
+    registry = build_default_tool_registry()
+    if client is None:
+        return registry
     for tool in build_flashduty_tools(
         client,
         item_limit=settings.flashduty_context_item_limit,
@@ -137,7 +155,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     notifier = _build_notifier(settings)
     strategy_provider = DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
-        external_tool_timeout_seconds=settings.flashduty_timeout_seconds,
+        external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
     )
 
     service.advisor = advisor
@@ -148,6 +166,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.react_enabled = settings.react_enabled
     service.validation_enabled = settings.validation_enabled
     service.shadow_enabled = settings.shadow_enabled
+    service.ai_fallback_enabled = settings.ai_fallback_enabled
     runtime.settings = settings
 
 
@@ -184,10 +203,11 @@ def build_runtime(
     if notifier is None:
         notifier = _build_notifier(settings)
 
-    tool_registry = tool_registry or _build_tool_registry(settings)
+    flashduty_client = _build_flashduty_client(settings)
+    tool_registry = tool_registry or _build_tool_registry(settings, flashduty_client)
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
-        external_tool_timeout_seconds=settings.flashduty_timeout_seconds,
+        external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
     )
     rule_validator = rule_validator or RuleConclusionValidator()
     tool_executor = ToolExecutor(tool_registry, settings.tool_max_result_chars)
@@ -203,11 +223,13 @@ def build_runtime(
         tool_executor=tool_executor,
         rule_validator=rule_validator,
         conclusion_validator=conclusion_validator,
+        fallback_advisor=ConservativeFallbackAdvisor(),
         runbook_limit=settings.runbook_limit,
         investigation_lease_seconds=settings.investigation_lease_seconds,
         react_enabled=settings.react_enabled,
         validation_enabled=settings.validation_enabled,
         shadow_enabled=settings.shadow_enabled,
+        ai_fallback_enabled=settings.ai_fallback_enabled,
     )
     return Runtime(
         settings=settings,
@@ -215,4 +237,5 @@ def build_runtime(
         service=service,
         runbook_provider=runbook_provider,
         runbook_store=runbook_store,
+        flashduty_client=flashduty_client,
     )

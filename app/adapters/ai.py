@@ -417,6 +417,42 @@ class FakeAIAdvisor:
         return InvestigationDecision(action="finish", reason="Fake advisor uses the strategy plan")
 
 
+class ConservativeFallbackAdvisor(FakeAIAdvisor):
+    """Produce a bounded candidate when the configured model cannot finish.
+
+    This is a continuity guard, not a replacement for the model.  The service
+    records why it was used and forces the final result to human review.
+    """
+
+    async def advise(
+        self,
+        alert: NormalizedAlert,
+        runbooks: list[RunbookExcerpt],
+        evidence: list[EvidenceRecord] | None = None,
+        knowledge_cases: list[KnowledgeCase] | None = None,
+        strategy: InvestigationStrategy | None = None,
+    ) -> tuple[Recommendation, AdvisorMetadata]:
+        recommendation, _ = await super().advise(
+            alert,
+            runbooks,
+            evidence=evidence,
+            knowledge_cases=knowledge_cases,
+            strategy=strategy,
+        )
+        recommendation = recommendation.model_copy(
+            update={
+                "summary": f"AI 主分析暂不可用；已生成保守候选建议：{recommendation.summary}",
+                "requires_human": True,
+                "confidence": min(recommendation.confidence, 0.35),
+            }
+        )
+        return recommendation, AdvisorMetadata(
+            provider="conservative_fallback",
+            model="deterministic-safety-net",
+            prompt_version=f"{PROMPT_VERSION}-fallback-v1",
+        )
+
+
 class OpenAICompatibleConclusionValidator:
     def __init__(
         self,
@@ -426,8 +462,10 @@ class OpenAICompatibleConclusionValidator:
         model: str,
         timeout_seconds: float,
         max_retries: int,
+        json_mode: bool = True,
     ) -> None:
         self._model = model
+        self._json_mode = json_mode
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
             base_url=base_url,
@@ -451,14 +489,18 @@ class OpenAICompatibleConclusionValidator:
             "runbook_ids": [f"{item.runbook_id}/{item.section}" for item in runbooks],
         }
         try:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=[
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "messages": [
                     {"role": "system", "content": VALIDATION_PROMPT},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
-                temperature=0,
-                response_format={"type": "json_object"},
+                "temperature": 0,
+            }
+            if self._json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = await self._client.chat.completions.create(
+                **kwargs
             )
             content = response.choices[0].message.content or ""
             parsed = _extract_json(content)

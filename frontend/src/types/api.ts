@@ -301,6 +301,7 @@ export interface AdminSettings {
   ai_timeout_seconds: number;
   ai_max_retries: number;
   ai_json_mode: boolean;
+  ai_fallback_enabled: boolean;
   runbook_limit: number;
   react_enabled: boolean;
   react_max_dynamic_turns: number;
@@ -312,6 +313,13 @@ export interface AdminSettings {
   flashduty_enabled: boolean;
   flashduty_base_url: string;
   flashduty_app_key_configured: boolean;
+  flashduty_webhook_enabled: boolean;
+  flashduty_webhook_token_configured: boolean;
+  flashduty_polling_enabled: boolean;
+  flashduty_poll_interval_seconds: number;
+  flashduty_poll_lookback_seconds: number;
+  flashduty_poll_channel_ids: number[];
+  flashduty_poll_integration_ids: number[];
   revision: string;
   apply_status: "applied";
   worker_refresh_mode: "before_each_job";
@@ -326,6 +334,7 @@ export interface AdminSettingsPatch {
   ai_timeout_seconds?: number;
   ai_max_retries?: number;
   ai_json_mode?: boolean;
+  ai_fallback_enabled?: boolean;
   runbook_limit?: number;
   wecom_webhook_url?: string;
   react_enabled?: boolean;

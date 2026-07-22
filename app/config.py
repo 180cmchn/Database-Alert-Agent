@@ -28,6 +28,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_timeout_seconds",
         "ai_max_retries",
         "ai_json_mode",
+        "ai_fallback_enabled",
         "runbook_limit",
         "wecom_webhook_url",
         "react_enabled",
@@ -60,9 +61,13 @@ class Settings(BaseSettings):
     ai_base_url: str = "https://api.openai.com/v1"
     ai_api_key: str = ""
     ai_model: str = ""
-    ai_timeout_seconds: float = Field(default=30, gt=0)
+    ai_timeout_seconds: float = Field(default=60, gt=0)
     ai_max_retries: int = Field(default=2, ge=0)
     ai_json_mode: bool = True
+    # Keep the investigation auditable when an OpenAI-compatible gateway is
+    # temporarily unavailable or returns an invalid structure.  The fallback is
+    # deliberately conservative and always forces REVIEW_REQUIRED.
+    ai_fallback_enabled: bool = True
 
     runbook_pdf_dir: Path = Path("./runbooks/pdfs")
     runbook_limit: int = Field(default=5, ge=1, le=20)
@@ -88,6 +93,17 @@ class Settings(BaseSettings):
     flashduty_timeout_seconds: float = Field(default=40, ge=35, le=120)
     flashduty_max_retries: int = Field(default=2, ge=0, le=5)
     flashduty_context_item_limit: int = Field(default=20, ge=1, le=100)
+    flashduty_webhook_enabled: bool = True
+    flashduty_webhook_token: str = Field(default="", repr=False)
+    flashduty_polling_enabled: bool = True
+    flashduty_poll_interval_seconds: int = Field(default=300, ge=300, le=86400)
+    flashduty_poll_lookback_seconds: int = Field(default=900, ge=300, le=2678400)
+    flashduty_poll_channel_ids: Annotated[list[int], NoDecode] = Field(
+        default_factory=list
+    )
+    flashduty_poll_integration_ids: Annotated[list[int], NoDecode] = Field(
+        default_factory=list
+    )
     flashduty_metrics_ds_name: str = ""
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
@@ -128,6 +144,21 @@ class Settings(BaseSettings):
             if stripped.startswith("["):
                 return json.loads(stripped)
             return [item.strip() for item in stripped.split(",") if item.strip()]
+        return value
+
+    @field_validator(
+        "flashduty_poll_channel_ids",
+        "flashduty_poll_integration_ids",
+        mode="before",
+    )
+    @classmethod
+    def normalize_integer_lists(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            raw = json.loads(stripped) if stripped.startswith("[") else stripped.split(",")
+            return [int(item) for item in raw if str(item).strip()]
         return value
 
     @model_validator(mode="after")
@@ -198,6 +229,15 @@ class Settings(BaseSettings):
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.flashduty_enabled and not self.flashduty_app_key:
             issues.append("FLASHDUTY_APP_KEY is required when FlashDuty is enabled")
+        if (
+            self.flashduty_enabled
+            and self.flashduty_webhook_enabled
+            and self.app_env.lower() in {"production", "prod"}
+            and not self.flashduty_webhook_token
+        ):
+            issues.append(
+                "FLASHDUTY_WEBHOOK_TOKEN is required for the production FlashDuty webhook"
+            )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:

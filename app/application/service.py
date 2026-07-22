@@ -58,11 +58,13 @@ class AlertAnalysisService:
         tool_executor: ToolExecutor,
         rule_validator: ConclusionValidator,
         conclusion_validator: ConclusionValidator,
+        fallback_advisor: AIAdvisor | None = None,
         runbook_limit: int = 5,
         investigation_lease_seconds: int = 300,
         react_enabled: bool = False,
         validation_enabled: bool = True,
         shadow_enabled: bool = False,
+        ai_fallback_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
     ) -> None:
         self.source_registry = source_registry
@@ -75,11 +77,13 @@ class AlertAnalysisService:
         self.tool_executor = tool_executor
         self.rule_validator = rule_validator
         self.conclusion_validator = conclusion_validator
+        self.fallback_advisor = fallback_advisor
         self.runbook_limit = runbook_limit
         self.investigation_lease_seconds = investigation_lease_seconds
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
         self.shadow_enabled = shadow_enabled
+        self.ai_fallback_enabled = ai_fallback_enabled
         self.alert_sanitizer = alert_sanitizer
 
     async def ingest(
@@ -175,9 +179,22 @@ class AlertAnalysisService:
                 await self.repository.save_evidence(alert_id, result)
 
             if self.react_enabled and strategy.max_dynamic_turns:
-                await self._run_dynamic_investigation(
-                    alert_id, run, context, evidence, strategy.max_dynamic_turns
-                )
+                try:
+                    await self._run_dynamic_investigation(
+                        alert_id, run, context, evidence, strategy.max_dynamic_turns
+                    )
+                except Exception as exc:
+                    # Dynamic planning is an optional enrichment step. A malformed
+                    # planner response must not discard the deterministic tool plan.
+                    await self.repository.append_progress(
+                        alert_id,
+                        ProgressRecord(
+                            run_id=run.id,
+                            stage=InvestigationStage.INVESTIGATING,
+                            message="动态调查未完成，继续使用已采集证据。",
+                            details={"error_type": type(exc).__name__},
+                        ),
+                    )
 
             await self._progress(
                 alert_id,
@@ -186,13 +203,40 @@ class AlertAnalysisService:
                 "正在以命中手册为首要依据生成结构化处理建议。",
                 {"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
             )
-            recommendation, advisor_metadata = await self.advisor.advise(
-                alert,
-                runbooks,
-                evidence=evidence,
-                knowledge_cases=knowledge_cases,
-                strategy=strategy,
-            )
+            advisor_degraded = False
+            primary_advisor_error: Exception | None = None
+            try:
+                recommendation, advisor_metadata = await self.advisor.advise(
+                    alert,
+                    runbooks,
+                    evidence=evidence,
+                    knowledge_cases=knowledge_cases,
+                    strategy=strategy,
+                )
+            except Exception as exc:
+                primary_advisor_error = exc
+                if not self.ai_fallback_enabled or self.fallback_advisor is None:
+                    raise
+                advisor_degraded = True
+                recommendation, advisor_metadata = await self.fallback_advisor.advise(
+                    alert,
+                    runbooks,
+                    evidence=evidence,
+                    knowledge_cases=knowledge_cases,
+                    strategy=strategy,
+                )
+                advisor_metadata = advisor_metadata.model_copy(
+                    update={"usage": {"fallback_reason": type(exc).__name__}}
+                )
+                await self.repository.append_progress(
+                    alert_id,
+                    ProgressRecord(
+                        run_id=run.id,
+                        stage=InvestigationStage.ADVISING,
+                        message="AI 主分析未返回合规结果，已生成保守候选建议并转人工复核。",
+                        details={"error_type": type(exc).__name__},
+                    ),
+                )
 
             await self._progress(
                 alert_id,
@@ -217,7 +261,25 @@ class AlertAnalysisService:
             await self.repository.save_validation(alert_id, rule_validation)
 
             agent_validation: ValidationRecord | None = None
-            if rule_validation.passed and self.validation_enabled:
+            if advisor_degraded and self.validation_enabled:
+                agent_validation = ValidationRecord(
+                    run_id=run.id,
+                    kind=ValidationKind.AGENT,
+                    passed=False,
+                    issues=[
+                        "AI 主分析不可用，保守候选建议必须由人工复核"
+                    ],
+                    metadata={
+                        "fallback": True,
+                        "primary_error_type": (
+                            type(primary_advisor_error).__name__
+                            if primary_advisor_error
+                            else "Unknown"
+                        ),
+                    },
+                )
+                await self.repository.save_validation(alert_id, agent_validation)
+            elif rule_validation.passed and self.validation_enabled:
                 try:
                     agent_validation = await self.conclusion_validator.validate(
                         run, alert, recommendation, evidence, runbooks
@@ -243,6 +305,7 @@ class AlertAnalysisService:
                 validation_passed
                 and not self.shadow_enabled
                 and not unapproved_runbook
+                and not advisor_degraded
             )
             final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
             run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
@@ -286,6 +349,7 @@ class AlertAnalysisService:
                         "validation_passed": validation_passed,
                         "shadow_enabled": self.shadow_enabled,
                         "unapproved_runbook": unapproved_runbook,
+                        "advisor_degraded": advisor_degraded,
                     },
                 ),
             )

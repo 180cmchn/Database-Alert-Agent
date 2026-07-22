@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,8 @@ from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
+    FlashDutyAlertWebhookEvent,
+    FlashDutyWebhookReceipt,
     RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
@@ -29,6 +31,7 @@ from app.application.admin import (
 )
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
 from app.application.scheduler import (
+    FlashDutyAlertPoller,
     InMemoryAnalysisScheduler,
     KafkaAnalysisScheduler,
     ManualAnalysisScheduler,
@@ -76,6 +79,9 @@ def create_app(
             scheduler = InMemoryAnalysisScheduler(
                 runtime.service, workers=settings.scheduler_workers
             )
+    flashduty_poller = FlashDutyAlertPoller(
+        settings, runtime.service, scheduler, runtime.flashduty_client
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -83,11 +89,16 @@ def create_app(
         await runtime.repository.initialize()
         app.state.runtime = runtime
         app.state.scheduler = scheduler
+        app.state.flashduty_poller = flashduty_poller
         await scheduler.start()
-        yield
-        await scheduler.stop()
-        if isinstance(runtime.repository, SQLAlchemyAlertRepository):
-            await runtime.repository.close()
+        await flashduty_poller.start()
+        try:
+            yield
+        finally:
+            await flashduty_poller.stop()
+            await scheduler.stop()
+            if isinstance(runtime.repository, SQLAlchemyAlertRepository):
+                await runtime.repository.close()
 
     app = FastAPI(
         title="Database Alert AI Agent",
@@ -100,6 +111,7 @@ def create_app(
     app.state.runtime_settings = runtime_settings
     app.state.runbook_store = runbook_store
     app.state.audit_logger = audit_logger
+    app.state.flashduty_poller = flashduty_poller
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allowed_origins,
@@ -211,6 +223,64 @@ def create_app(
         return JSONResponse(
             status_code=status_code,
             content={"status": "ready" if not issues else "not_ready", "issues": issues},
+        )
+
+    @app.post(
+        "/api/v1/webhooks/flashduty/alerts",
+        response_model=FlashDutyWebhookReceipt,
+        status_code=200,
+        tags=["integrations"],
+    )
+    async def receive_flashduty_alert_webhook(
+        payload: FlashDutyAlertWebhookEvent,
+        webhook_token: Annotated[
+            str | None, Header(alias="X-FlashDuty-Token")
+        ] = None,
+    ) -> FlashDutyWebhookReceipt:
+        if not runtime.settings.flashduty_enabled or not runtime.settings.flashduty_webhook_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "FLASHDUTY_WEBHOOK_DISABLED",
+                    "message": "FlashDuty alert webhook intake is disabled",
+                },
+            )
+        expected = runtime.settings.flashduty_webhook_token
+        if expected and (
+            webhook_token is None
+            or not secrets.compare_digest(
+                webhook_token.encode("utf-8"), expected.encode("utf-8")
+            )
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "INVALID_FLASHDUTY_WEBHOOK_TOKEN",
+                    "message": "Invalid FlashDuty webhook token",
+                },
+            )
+
+        if payload.event_type == "a_close":
+            return FlashDutyWebhookReceipt(
+                event_id=payload.event_id,
+                event_type=payload.event_type,
+                accepted=False,
+                message="Close event acknowledged; no new analysis was scheduled.",
+            )
+
+        stored, created = await runtime.service.ingest(
+            "flashduty", payload.model_dump(mode="json")
+        )
+        if created or stored.status in {AlertStatus.QUEUED, AlertStatus.FAILED}:
+            await scheduler.enqueue(str(stored.alert.id))
+        return FlashDutyWebhookReceipt(
+            event_id=payload.event_id,
+            event_type=payload.event_type,
+            accepted=True,
+            alert_id=stored.alert.id,
+            status=stored.status,
+            deduplicated=not created,
+            message="FlashDuty alert accepted for asynchronous analysis.",
         )
 
     @app.post(

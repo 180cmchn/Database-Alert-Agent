@@ -169,6 +169,25 @@ def test_settings_validation_error_hides_invalid_wecom_url_secret() -> None:
     assert secret not in str(caught.value)
 
 
+def test_flashduty_polling_interval_and_scope_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            flashduty_poll_interval_seconds=299,
+        )
+
+    monkeypatch.setenv("FLASHDUTY_POLL_CHANNEL_IDS", "7,8")
+    monkeypatch.setenv("FLASHDUTY_POLL_INTEGRATION_IDS", "[42,43]")
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.flashduty_poll_interval_seconds == 300
+    assert settings.flashduty_poll_channel_ids == [7, 8]
+    assert settings.flashduty_poll_integration_ids == [42, 43]
+
+
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
@@ -312,6 +331,10 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["ready"] is True
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
+    assert body["ai_fallback_enabled"] is True
+    assert body["flashduty_webhook_token_configured"] is False
+    assert body["flashduty_polling_enabled"] is True
+    assert body["flashduty_poll_interval_seconds"] == 300
     assert "ai_api_key" not in body
     assert "wecom_webhook_url" not in body
 

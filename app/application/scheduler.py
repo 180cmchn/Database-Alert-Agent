@@ -3,14 +3,164 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from aiokafka import AIOKafkaProducer
 
+from app.adapters.flashduty import FlashDutyClient
 from app.application.service import AlertAnalysisService
 from app.config import Settings
 from app.domain.models import AlertStatus
 
 logger = logging.getLogger(__name__)
+
+
+class FlashDutyAlertPoller:
+    """Use `/alert/list` as a loss-recovery path for FlashDuty webhooks."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        service: AlertAnalysisService,
+        scheduler: InMemoryAnalysisScheduler | KafkaAnalysisScheduler | ManualAnalysisScheduler,
+        client: FlashDutyClient | None,
+    ) -> None:
+        self.settings = settings
+        self.service = service
+        self.scheduler = scheduler
+        self.client = client
+        self._task: asyncio.Task[None] | None = None
+        self._watermark: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.settings.flashduty_enabled
+            and self.settings.flashduty_polling_enabled
+            and self.client is not None
+        )
+
+    async def start(self) -> None:
+        if not self.enabled or self._task is not None:
+            return
+        self._task = asyncio.create_task(
+            self._loop(), name="flashduty-alert-poller"
+        )
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    async def run_once(self, *, now: int | None = None) -> int:
+        if not self.enabled or self.client is None:
+            return 0
+        end_time = int(time.time()) if now is None else now
+        overlap = self.settings.flashduty_poll_lookback_seconds
+        start_time = (
+            end_time - overlap
+            if self._watermark is None
+            else max(0, self._watermark - overlap)
+        )
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        created_count = 0
+
+        for _page in range(100):
+            response = await self.client.list_alerts(
+                start_time=start_time,
+                end_time=end_time,
+                limit=100,
+                search_after_ctx=cursor,
+                channel_ids=self.settings.flashduty_poll_channel_ids,
+                integration_ids=self.settings.flashduty_poll_integration_ids,
+                is_active=True,
+                by_updated_at=True,
+            )
+            data = response.data if isinstance(response.data, dict) else {}
+            items = data.get("items")
+            if not isinstance(items, list):
+                raise RuntimeError("FlashDuty /alert/list response did not contain items")
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                alert_id = item.get("alert_id")
+                if not isinstance(alert_id, str):
+                    continue
+                try:
+                    try:
+                        detail = await self.client.alert_info(alert_id)
+                        ingest_payload = {
+                            "request_id": detail.request_id,
+                            "data": detail.data,
+                        }
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # AlertItem is documented as a complete alert object. Use it
+                        # when the per-item detail request is transiently unavailable
+                        # so polling still fulfills its loss-recovery purpose.
+                        logger.warning(
+                            "flashduty_poll_alert_info_failed_using_list_item "
+                            "external_alert_id=%s error_type=%s",
+                            alert_id,
+                            type(exc).__name__,
+                        )
+                        ingest_payload = {
+                            "request_id": response.request_id,
+                            "data": item,
+                        }
+                    stored, created = await self.service.ingest(
+                        "flashduty", ingest_payload
+                    )
+                    if created or stored.status in {
+                        AlertStatus.QUEUED,
+                        AlertStatus.FAILED,
+                    }:
+                        await self.scheduler.enqueue(str(stored.alert.id))
+                    created_count += int(created)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "flashduty_poll_alert_ingest_failed external_alert_id=%s",
+                        alert_id,
+                    )
+
+            next_cursor = data.get("search_after_ctx")
+            has_next = data.get("has_next_page") is True
+            if not has_next or not isinstance(next_cursor, str) or not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                raise RuntimeError("FlashDuty /alert/list returned a repeated cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            raise RuntimeError("FlashDuty /alert/list exceeded the 100-page safety limit")
+
+        self._watermark = end_time
+        logger.info(
+            "flashduty_poll_completed start_time=%s end_time=%s created=%s",
+            start_time,
+            end_time,
+            created_count,
+        )
+        return created_count
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Keep the prior watermark so the next successful pass retries the
+                # complete overlap window rather than silently advancing past loss.
+                logger.exception("flashduty_poll_failed")
+            await asyncio.sleep(self.settings.flashduty_poll_interval_seconds)
 
 
 class InMemoryAnalysisScheduler:
