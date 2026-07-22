@@ -9,6 +9,7 @@ htmlcov/
 .env
 data/*.db
 data/*.db-*
+data/*.bak
 data/runtime-settings.json
 data/*.audit.jsonl
 data/.*.lock
