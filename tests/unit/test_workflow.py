@@ -122,28 +122,31 @@ async def test_every_severity_sends_one_final_ai_result(
 
 
 @pytest.mark.asyncio
-async def test_ai_failure_does_not_send_a_fake_final_result(tmp_path: Path) -> None:
+async def test_ai_failure_finishes_with_review_required_fallback(tmp_path: Path) -> None:
     events: list[str] = []
     runtime = build_runtime(
         settings_for(tmp_path), advisor=FailingAdvisor(), notifier=RecordingNotifier(events)
     )
     await runtime.repository.initialize()
 
-    with pytest.raises(AnalysisFailedError) as caught:
-        await runtime.service.analyze(
-            "canonical",
-            {
-                "external_id": "failed",
-                "severity": "CRITICAL",
-                "title": "Critical",
-                "reason": "x",
-            },
-        )
+    stored = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "failed",
+            "severity": "CRITICAL",
+            "title": "Critical",
+            "reason": "x",
+        },
+    )
 
-    stored = await runtime.service.get(caught.value.alert_id)
-    assert stored.status == AlertStatus.FAILED
-    assert "provider unavailable" in (stored.error or "")
-    assert events == []
+    assert stored.status == AlertStatus.REVIEW_REQUIRED
+    assert stored.error is None
+    assert stored.recommendation is not None
+    assert stored.recommendation.requires_human is True
+    assert stored.advisor_metadata is not None
+    assert stored.advisor_metadata.provider == "conservative_fallback"
+    assert any(item.metadata.get("fallback") is True for item in stored.validations)
+    assert events == ["RESULT:CRITICAL"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -174,9 +177,8 @@ async def test_wecom_send_failure_does_not_change_completed_analysis(tmp_path: P
 async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Path) -> None:
     events: list[str] = []
     advisor = FlakyAdvisor()
-    runtime = build_runtime(
-        settings_for(tmp_path), advisor=advisor, notifier=RecordingNotifier(events)
-    )
+    settings = settings_for(tmp_path).model_copy(update={"ai_fallback_enabled": False})
+    runtime = build_runtime(settings, advisor=advisor, notifier=RecordingNotifier(events))
     await runtime.repository.initialize()
     payload = {
         "external_id": "retry-critical",

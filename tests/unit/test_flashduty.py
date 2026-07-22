@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -126,6 +127,44 @@ async def test_client_retries_rate_limit_and_redacts_secret_from_errors() -> Non
 
 
 @pytest.mark.asyncio
+async def test_client_alert_list_uses_documented_updated_at_cursor_shape() -> None:
+    request_body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "request_id": "req-list",
+                "data": {"items": [], "has_next_page": False},
+            },
+        )
+
+    client = FlashDutyClient(
+        "test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep
+    )
+    await client.list_alerts(
+        start_time=1712650000,
+        end_time=1712650300,
+        channel_ids=[7],
+        integration_ids=[42],
+    )
+
+    assert request_body == {
+        "start_time": 1712650000,
+        "end_time": 1712650300,
+        "limit": 100,
+        "orderby": "updated_at",
+        "asc": True,
+        "by_updated_at": True,
+        "p": 1,
+        "channel_ids": [7],
+        "integration_ids": [42],
+        "is_active": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_client_treats_http_200_monitor_business_error_as_failure() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -196,6 +235,32 @@ def test_flashduty_alert_adapter_normalizes_alert_info_envelope() -> None:
     assert alert.incident_fingerprint.startswith("incident-v1-")
 
 
+def test_flashduty_alert_adapter_normalizes_official_webhook_envelope() -> None:
+    webhook = {
+        "event_id": "delivery-1",
+        "event_time": 1712650300000,
+        "event_type": "a_new",
+        "alert": {
+            **flashduty_alert_payload()["data"],
+            "integration_id": None,
+            "integration_name": None,
+            "integration_type": None,
+            "data_source_id": 42,
+            "data_source_name": "Monitors",
+            "data_source_type": "monit.alert",
+        },
+    }
+
+    alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(webhook)
+
+    assert alert.external_id == ALERT_ID
+    assert alert.attributes["flashduty_webhook_event_id"] == "delivery-1"
+    assert alert.attributes["flashduty_webhook_event_type"] == "a_new"
+    assert alert.attributes["integration_id"] == 42
+    assert alert.attributes["integration_name"] == "Monitors"
+    assert alert.attributes["integration_type"] == "monit.alert"
+
+
 def make_context() -> InvestigationContext:
     alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(
         flashduty_alert_payload()
@@ -254,6 +319,51 @@ async def test_alert_context_reads_alert_and_incident_context() -> None:
         "/incident/alert/list",
     }
     assert data["flashduty"]["incident"]["info"]["incident_id"] == INCIDENT_ID
+
+
+@pytest.mark.asyncio
+async def test_alert_context_keeps_partial_data_when_auxiliary_feed_fails() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/alert/info":
+            data = flashduty_alert_payload()["data"]
+        elif request.url.path == "/alert/feed":
+            return httpx.Response(
+                503,
+                json={
+                    "request_id": "req-feed-error",
+                    "error": {"code": "Unavailable", "message": "try later"},
+                },
+            )
+        elif request.url.path == "/incident/info":
+            data = {"incident_id": INCIDENT_ID, "title": "Database incident"}
+        else:
+            data = {"items": [], "has_next_page": False}
+        return httpx.Response(
+            200, json={"request_id": f"req-{request.url.path}", "data": data}
+        )
+
+    client = FlashDutyClient(
+        "test-app-key",
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    summary, structured_data = await FlashDutyAlertContextTool(client).execute(
+        ToolExecutionRequest(tool_name="alert_context"), make_context()
+    )
+
+    assert "部分辅助" in summary
+    assert structured_data["flashduty"]["alert"]["alert_id"] == ALERT_ID
+    assert structured_data["flashduty"]["events"] == {
+        "items": [],
+        "has_next_page": False,
+    }
+    assert structured_data["flashduty"]["feed"] is None
+    assert structured_data["flashduty"]["partial_errors"] == {
+        "alert_feed": "FlashDutyAPIError"
+    }
+    assert structured_data["flashduty"]["incident"]["info"]["incident_id"] == INCIDENT_ID
 
 
 class RecordingMonitorClient:
@@ -397,7 +507,7 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     normalized = runtime.service.source_registry.normalize("flashduty", flashduty_alert_payload())
     assert normalized.source == "flashduty"
     assert isinstance(runtime.service.tool_registry.get("query_metrics"), FlashDutyDataSourceTool)
-    assert runtime.service.strategy_provider.external_tool_timeout_seconds == 40  # type: ignore[attr-defined]
+    assert runtime.service.strategy_provider.external_tool_timeout_seconds == 120  # type: ignore[attr-defined]
 
 
 def test_flashduty_settings_require_official_endpoint_and_key_when_enabled(

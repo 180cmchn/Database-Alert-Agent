@@ -18,6 +18,7 @@ SOURCE_PDF = (
 
 def create_test_client(
     tmp_path: Path,
+    **setting_overrides: object,
 ) -> tuple[TestClient, Runtime, ManualAnalysisScheduler]:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
@@ -27,6 +28,7 @@ def create_test_client(
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
         runbook_pdf_dir=runbooks,
+        **setting_overrides,
     )
     runtime = build_runtime(settings)
     scheduler = ManualAnalysisScheduler()
@@ -114,6 +116,63 @@ def test_flashduty_alert_info_payload_is_accepted(tmp_path: Path) -> None:
         assert detail["alert"]["source"] == "flashduty"
         assert detail["alert"]["severity"] == "WARNING"
         assert detail["alert"]["service_name"] == "orders-db"
+
+
+def test_flashduty_alert_webhook_authenticates_acks_and_deduplicates(
+    tmp_path: Path,
+) -> None:
+    client, _, scheduler = create_test_client(
+        tmp_path,
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_webhook_token="test-webhook-token",
+        flashduty_polling_enabled=False,
+    )
+    payload = {
+        "event_id": "webhook-event-1",
+        "event_time": 1712650300000,
+        "event_type": "a_new",
+        "alert": {
+            "alert_id": "663a1b2c3d4e5f6789abcdef",
+            "title": "Database latency",
+            "description": "Latency is above threshold",
+            "alert_severity": "Warning",
+            "alert_status": "Warning",
+            "alert_key": "database-latency",
+            "start_time": 1712650000,
+            "data_source_id": 42,
+            "data_source_name": "Monitors",
+            "data_source_type": "monit.alert",
+            "channel_id": 7,
+            "channel_name": "Database",
+            "labels": {"env": "prod", "service": "orders-db"},
+        },
+    }
+
+    with client:
+        unauthorized = client.post(
+            "/api/v1/webhooks/flashduty/alerts", json=payload
+        )
+        assert unauthorized.status_code == 401
+
+        first = client.post(
+            "/api/v1/webhooks/flashduty/alerts",
+            json=payload,
+            headers={"X-FlashDuty-Token": "test-webhook-token"},
+        )
+        assert first.status_code == 200
+        assert first.json()["accepted"] is True
+        assert first.json()["deduplicated"] is False
+        assert first.json()["status"] == "QUEUED"
+
+        duplicate = client.post(
+            "/api/v1/webhooks/flashduty/alerts",
+            json=payload,
+            headers={"X-FlashDuty-Token": "test-webhook-token"},
+        )
+        assert duplicate.status_code == 200
+        assert duplicate.json()["deduplicated"] is True
+        assert scheduler.jobs == [first.json()["alert_id"]]
 
 
 def test_readiness_reports_configuration(tmp_path: Path) -> None:

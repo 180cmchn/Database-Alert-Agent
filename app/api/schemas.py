@@ -23,6 +23,25 @@ class AlertAccepted(BaseModel):
     deduplicated: bool
 
 
+class FlashDutyAlertWebhookEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    event_id: str = Field(min_length=1, max_length=255)
+    event_time: int = Field(ge=0)
+    event_type: Literal["a_new", "a_update", "a_merge", "a_close"]
+    alert: dict[str, Any]
+
+
+class FlashDutyWebhookReceipt(BaseModel):
+    event_id: str
+    event_type: str
+    accepted: bool
+    alert_id: UUID | None = None
+    status: AlertStatus | None = None
+    deduplicated: bool = False
+    message: str
+
+
 class FeedbackRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     verdict: FeedbackVerdict
@@ -59,6 +78,7 @@ class RuntimeSettingsPatch(BaseModel):
     ai_timeout_seconds: float | None = Field(default=None, gt=0, le=600)
     ai_max_retries: int | None = Field(default=None, ge=0, le=20)
     ai_json_mode: bool | None = None
+    ai_fallback_enabled: bool | None = None
     react_enabled: bool | None = None
     react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
     validation_enabled: bool | None = None
@@ -84,6 +104,7 @@ class RuntimeSettingsResponse(BaseModel):
     ai_timeout_seconds: float
     ai_max_retries: int
     ai_json_mode: bool
+    ai_fallback_enabled: bool
     react_enabled: bool
     react_max_dynamic_turns: int
     validation_enabled: bool
@@ -94,6 +115,13 @@ class RuntimeSettingsResponse(BaseModel):
     flashduty_enabled: bool
     flashduty_base_url: str
     flashduty_app_key_configured: bool
+    flashduty_webhook_enabled: bool
+    flashduty_webhook_token_configured: bool
+    flashduty_polling_enabled: bool
+    flashduty_poll_interval_seconds: int
+    flashduty_poll_lookback_seconds: int
+    flashduty_poll_channel_ids: list[int]
+    flashduty_poll_integration_ids: list[int]
     revision: str
     apply_status: Literal["applied"] = "applied"
     worker_refresh_mode: Literal["before_each_job"] = "before_each_job"
@@ -120,6 +148,7 @@ class RuntimeSettingsResponse(BaseModel):
             ai_timeout_seconds=settings.ai_timeout_seconds,
             ai_max_retries=settings.ai_max_retries,
             ai_json_mode=settings.ai_json_mode,
+            ai_fallback_enabled=settings.ai_fallback_enabled,
             react_enabled=settings.react_enabled,
             react_max_dynamic_turns=settings.react_max_dynamic_turns,
             validation_enabled=settings.validation_enabled,
@@ -130,6 +159,15 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,
             flashduty_app_key_configured=bool(settings.flashduty_app_key),
+            flashduty_webhook_enabled=settings.flashduty_webhook_enabled,
+            flashduty_webhook_token_configured=bool(
+                settings.flashduty_webhook_token
+            ),
+            flashduty_polling_enabled=settings.flashduty_polling_enabled,
+            flashduty_poll_interval_seconds=settings.flashduty_poll_interval_seconds,
+            flashduty_poll_lookback_seconds=settings.flashduty_poll_lookback_seconds,
+            flashduty_poll_channel_ids=settings.flashduty_poll_channel_ids,
+            flashduty_poll_integration_ids=settings.flashduty_poll_integration_ids,
             revision=revision,
             changed_fields=changed_fields or [],
         )

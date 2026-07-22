@@ -83,6 +83,7 @@ export function SettingsPage() {
         ai_timeout_seconds: numberField(form, "ai_timeout_seconds"),
         ai_max_retries: numberField(form, "ai_max_retries"),
         ai_json_mode: form.get("ai_json_mode") === "on",
+        ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
         react_enabled: form.get("react_enabled") === "on",
         react_max_dynamic_turns: numberField(form, "react_max_dynamic_turns"),
         validation_enabled: form.get("validation_enabled") === "on",
@@ -153,9 +154,13 @@ export function SettingsPage() {
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
 
-        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty 只读连接" description="APP Key 与数据源绑定由部署环境管理；控制台仅显示状态，不能在线改写。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读连接已启用" : "APP Key 未配置") : "未启用"}</span>}>
+        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty 实时接收与轮询补偿" description="告警 Webhook 负责实时入站，Open API 每 5 分钟或更久轮询一次；APP Key、回调令牌与范围由部署环境管理。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读连接已启用" : "APP Key 未配置") : "未启用"}</span>}>
           <div className="form-grid two-cols">
             <label className="field span-2"><span>官方 API Endpoint</span><input value={settings.flashduty_base_url} readOnly /></label>
+            <label className="field"><span>告警 Webhook</span><input value={settings.flashduty_webhook_enabled ? (settings.flashduty_webhook_token_configured ? "已启用 · 回调令牌已配置" : "已启用 · 回调令牌未配置") : "未启用"} readOnly /></label>
+            <label className="field"><span>轮询补偿</span><input value={settings.flashduty_polling_enabled ? `${settings.flashduty_poll_interval_seconds} 秒/轮 · 回看 ${settings.flashduty_poll_lookback_seconds} 秒` : "未启用"} readOnly /></label>
+            <label className="field"><span>协作空间范围</span><input value={settings.flashduty_poll_channel_ids.length ? settings.flashduty_poll_channel_ids.join(", ") : "全部协作空间"} readOnly /></label>
+            <label className="field"><span>集成范围</span><input value={settings.flashduty_poll_integration_ids.length ? settings.flashduty_poll_integration_ids.join(", ") : "全部集成"} readOnly /></label>
           </div>
         </SectionCard>
 
@@ -163,6 +168,7 @@ export function SettingsPage() {
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>启用有界 ReAct</strong><small>允许模型在已注册工具内追加有限次数的证据采集</small></span></span><input name="react_enabled" type="checkbox" defaultChecked={settings.react_enabled} /><i /></label>
             <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则与独立模型的双重校验</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
+            <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，但强制进入人工复核</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
             <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并强制进入人工复核，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">

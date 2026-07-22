@@ -263,6 +263,42 @@ class FlashDutyClient:
         _require_object_id(alert_id, "alert_id")
         return await self.call("alert_info", {"alert_id": alert_id})
 
+    async def list_alerts(
+        self,
+        *,
+        start_time: int,
+        end_time: int,
+        limit: int = 100,
+        search_after_ctx: str | None = None,
+        channel_ids: list[int] | None = None,
+        integration_ids: list[int] | None = None,
+        is_active: bool | None = True,
+        by_updated_at: bool = True,
+    ) -> FlashDutyResponse:
+        if end_time <= start_time:
+            raise FlashDutyConfigurationError("end_time must be greater than start_time")
+        if end_time - start_time > 31 * 86400:
+            raise FlashDutyConfigurationError("FlashDuty alert list window cannot exceed 31 days")
+        payload: dict[str, Any] = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": min(max(limit, 1), 100),
+            "orderby": "updated_at",
+            "asc": True,
+            "by_updated_at": by_updated_at,
+        }
+        if search_after_ctx:
+            payload["search_after_ctx"] = search_after_ctx
+        else:
+            payload["p"] = 1
+        if channel_ids:
+            payload["channel_ids"] = channel_ids
+        if integration_ids:
+            payload["integration_ids"] = integration_ids
+        if is_active is not None:
+            payload["is_active"] = is_active
+        return await self.call("alert_list", payload)
+
     async def alert_events(self, alert_id: str, *, limit: int = 20) -> FlashDutyResponse:
         _require_object_id(alert_id, "alert_id")
         return await self.call(
@@ -350,7 +386,7 @@ def _validate_read_only_expression(ds_type: str, expression: str, args: Any = No
 
 
 class FlashDutyAlertSourceAdapter:
-    """Normalize `/alert/info` data (or its success envelope) into an alert."""
+    """Normalize `/alert/info`, `/alert/list`, or Alert Webhook data."""
 
     source = "flashduty"
 
@@ -365,6 +401,11 @@ class FlashDutyAlertSourceAdapter:
         if "data" in payload:
             request_id = str(payload.get("request_id") or "") or None
             item = payload["data"]
+        elif "alert" in payload:
+            # Official Alert Webhook envelope. event_id is the delivery id used
+            # for retry de-duplication; alert_id remains the stable local identity.
+            request_id = str(payload.get("event_id") or "") or None
+            item = payload["alert"]
         if not isinstance(item, dict):
             raise InvalidAlertPayloadError("FlashDuty alert payload must contain an object")
 
@@ -433,11 +474,15 @@ class FlashDutyAlertSourceAdapter:
             "flashduty_alert_id": alert_id,
             "flashduty_incident_id": incident_id,
             "flashduty_request_id": request_id,
-            "integration_id": item.get("integration_id"),
-            "integration_name": item.get("integration_name"),
-            "integration_type": item.get("integration_type"),
+            "integration_id": item.get("integration_id") or item.get("data_source_id"),
+            "integration_name": item.get("integration_name")
+            or item.get("data_source_name"),
+            "integration_type": item.get("integration_type")
+            or item.get("data_source_type"),
             "channel_id": item.get("channel_id"),
             "channel_name": item.get("channel_name"),
+            "flashduty_webhook_event_id": payload.get("event_id"),
+            "flashduty_webhook_event_type": payload.get("event_type"),
         }
         for key in (
             "flashduty_metrics",
@@ -461,7 +506,9 @@ class FlashDutyAlertSourceAdapter:
             "metric_name": labels.get("metric") or labels.get("metric_name"),
             "severity": severity,
             "alert_name": labels.get("alertname") or labels.get("alert_name") or reason,
-            "resource_type": labels.get("resource_type") or item.get("integration_type"),
+            "resource_type": labels.get("resource_type")
+            or item.get("integration_type")
+            or item.get("data_source_type"),
             "cluster": labels.get("cluster"),
             "alarm_type": labels.get("alarm_type"),
             "title": title,
@@ -540,9 +587,10 @@ class FlashDutyAlertContextTool:
             )
 
         info = await self.client.alert_info(alert_id)
-        events, feed = await asyncio.gather(
+        events_result, feed_result = await asyncio.gather(
             self.client.alert_events(alert_id, limit=self.item_limit),
             self.client.alert_feed(alert_id, limit=self.item_limit),
+            return_exceptions=True,
         )
         incident_id = _flashduty_identifier(alert, "flashduty_incident_id")
         if not incident_id and isinstance(info.data, dict):
@@ -551,39 +599,48 @@ class FlashDutyAlertContextTool:
                 incident_id = incident["incident_id"]
 
         incident_data: dict[str, Any] | None = None
-        request_ids = {
-            "alert_info": info.request_id,
-            "alert_events": events.request_id,
-            "alert_feed": feed.request_id,
-        }
+        request_ids = {"alert_info": info.request_id}
+        partial_errors: dict[str, str] = {}
+
+        def optional_data(name: str, result: Any) -> Any:
+            if isinstance(result, Exception):
+                partial_errors[name] = type(result).__name__
+                return None
+            if not isinstance(result, FlashDutyResponse):
+                partial_errors[name] = "InvalidResponse"
+                return None
+            request_ids[name] = result.request_id
+            return result.data
+
+        events_data = optional_data("alert_events", events_result)
+        feed_data = optional_data("alert_feed", feed_result)
         if incident_id:
-            incident_info, incident_feed, incident_alerts = await asyncio.gather(
+            incident_results = await asyncio.gather(
                 self.client.incident_info(incident_id),
                 self.client.incident_feed(incident_id, limit=self.item_limit),
                 self.client.incident_alerts(incident_id, limit=self.item_limit),
+                return_exceptions=True,
             )
             incident_data = {
-                "info": incident_info.data,
-                "feed": incident_feed.data,
-                "alerts": incident_alerts.data,
+                "info": optional_data("incident_info", incident_results[0]),
+                "feed": optional_data("incident_feed", incident_results[1]),
+                "alerts": optional_data("incident_alerts", incident_results[2]),
             }
-            request_ids.update(
-                {
-                    "incident_info": incident_info.request_id,
-                    "incident_feed": incident_feed.request_id,
-                    "incident_alerts": incident_alerts.request_id,
-                }
-            )
 
         return (
-            "已通过 FlashDuty 只读接口补全告警详情、原始事件、动态和关联故障上下文。",
+            (
+                "已通过 FlashDuty 只读接口补全告警和关联故障上下文。"
+                if not partial_errors
+                else "已取得 FlashDuty 核心告警详情；部分辅助只读查询暂不可用。"
+            ),
             {
                 "local": _local_alert_context(alert),
                 "flashduty": {
                     "request_ids": request_ids,
+                    "partial_errors": partial_errors,
                     "alert": info.data,
-                    "events": events.data,
-                    "feed": feed.data,
+                    "events": events_data,
+                    "feed": feed_data,
                     "incident": incident_data,
                 },
             },
