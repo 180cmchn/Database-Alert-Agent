@@ -238,9 +238,26 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 ## 验证
 
 ```bash
-pytest
+pytest -m "not live"
 ruff check app tests migrations
 cd frontend && npm run build
 ```
+
+普通测试使用临时数据库、Fake AI 和模拟 FlashDuty 响应，不读取工作区 `.env`，用于稳定验证
+状态机、鉴权、重试、只读边界和数据转换。真实部署配置由显式启用的 `live` 测试验证；它会产生
+真实模型调用，并仅调用 FlashDuty 只读接口。Windows PowerShell：
+
+```powershell
+$env:RUN_LIVE_TESTS = "1"
+$env:FLASHDUTY_TEST_ALERT_ID = "替换为真实的24位告警ID"
+$Py = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+& $Py -m pytest -m live -vv
+Remove-Item Env:RUN_LIVE_TESTS
+Remove-Item Env:FLASHDUTY_TEST_ALERT_ID
+```
+
+未设置 `RUN_LIVE_TESTS=1` 时不会访问外部服务。Live 测试读取真实 `.env`，验证模型结构化响应
+和请求 ID、FlashDuty 告警/事件/动态/关联故障的请求 ID，以及完整影子分析链路。端到端用例会
+强制使用日志通知器，不会向企业微信发送消息。
 
 数据库升级使用 Alembic。`0006_training_feedback` 增加手册匹配、证据引用和步骤采纳等训练反馈字段。

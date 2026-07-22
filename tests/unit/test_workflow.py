@@ -86,6 +86,7 @@ def settings_for(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
     return Settings(
+        _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         runbook_pdf_dir=runbooks,

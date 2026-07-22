@@ -23,6 +23,7 @@ def create_test_client(
     runbooks.mkdir(exist_ok=True)
     copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     settings = Settings(
+        _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
         runbook_pdf_dir=runbooks,
