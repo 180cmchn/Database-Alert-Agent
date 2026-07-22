@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from shutil import copy2
 
 import pytest
 from pydantic import ValidationError
 
+import app.application.admin as admin_module
 from app.api.schemas import RuntimeSettingsPatch, RuntimeSettingsResponse
 from app.application.admin import (
     RuntimeSettingsConflictError,
@@ -20,6 +22,34 @@ SOURCE_PDF = (
     / "pdfs"
     / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
 )
+
+
+def test_windows_file_lock_backend_uses_a_stable_lock_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def locking(self, _file_descriptor: int, mode: int, count: int) -> None:
+            self.calls.append((mode, count))
+
+    backend = FakeMsvcrt()
+    monkeypatch.setattr(admin_module, "_fcntl", None)
+    monkeypatch.setattr(admin_module, "_msvcrt", backend)
+    lock_path = tmp_path / "runtime-settings.lock"
+    file_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        admin_module._acquire_file_lock(file_descriptor)
+        admin_module._release_file_lock(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+    assert lock_path.stat().st_size == 1
+    assert backend.calls == [(backend.LK_LOCK, 1), (backend.LK_UNLCK, 1)]
 
 
 def test_get_settings_loads_only_persisted_runtime_whitelist(
