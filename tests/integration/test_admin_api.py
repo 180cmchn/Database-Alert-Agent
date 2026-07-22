@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 from shutil import copy2
@@ -33,6 +34,7 @@ def create_admin_client(
     runbooks.mkdir(parents=True, exist_ok=True)
     copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
     settings = Settings(
+        _env_file=None,
         ai_provider="fake",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'admin.db'}",
@@ -181,7 +183,11 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert rejected_secret.json()["code"] == "INVALID_RUNTIME_SETTINGS"
 
     settings_path = tmp_path / "runtime-settings.json"
-    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
+    else:
+        # Windows exposes inherited ACLs rather than POSIX owner/group mode bits.
+        assert settings_path.is_file()
     persisted = json.loads(settings_path.read_text(encoding="utf-8"))
     assert persisted["ai_api_key"] == secret
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")

@@ -17,6 +17,33 @@ TIKV_PDF = (
 DMP_PDF = SOURCE_PDFS / "INFRA-224075463-210726-1007-4075.pdf"
 MYSQL_CRASH_PDF = SOURCE_PDFS / "INFRA-231966487-210726-1008-4079.pdf"
 PT_ARCHIVER_PDF = SOURCE_PDFS / "INFRA-201503239-210726-1007-4077.pdf"
+RUNBOOK_INDEX = SOURCE_PDFS.parent / "index.json"
+
+
+def _repository_annotations_available() -> bool:
+    if not RUNBOOK_INDEX.is_file():
+        return False
+    try:
+        payload = json.loads(RUNBOOK_INDEX.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    runbooks = payload.get("runbooks")
+    if not isinstance(runbooks, list):
+        return False
+    runbook_ids = [
+        item.get("runbook_id") for item in runbooks if isinstance(item, dict)
+    ]
+    return bool(runbook_ids) and all(
+        isinstance(runbook_id, str)
+        and (SOURCE_PDFS / f"{runbook_id}.pdf").is_file()
+        for runbook_id in runbook_ids
+    )
+
+
+requires_repository_annotations = pytest.mark.skipif(
+    not _repository_annotations_available(),
+    reason="deployment-local runbook PDFs and annotation index are not installed",
+)
 
 
 @pytest.mark.asyncio
@@ -97,6 +124,7 @@ async def test_local_pdf_runbook_get_rejects_unsafe_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@requires_repository_annotations
 async def test_repository_annotations_provide_sections_quality_and_diagnosis_graph() -> None:
     library = LocalPDFRunbookLibrary(SOURCE_PDFS)
     documents = await library.list()
@@ -134,6 +162,7 @@ async def test_repository_annotations_provide_sections_quality_and_diagnosis_gra
 
 
 @pytest.mark.asyncio
+@requires_repository_annotations
 @pytest.mark.parametrize(
     ("reason", "error_pattern", "engine", "section", "cause_id", "action_text"),
     [
@@ -192,6 +221,7 @@ async def test_pt_archiver_three_causes_map_to_distinct_sections_and_actions(
 
 
 @pytest.mark.asyncio
+@requires_repository_annotations
 async def test_visual_error_text_participates_in_matching() -> None:
     library = LocalPDFRunbookLibrary(SOURCE_PDFS)
     alert = CanonicalAlertSourceAdapter().normalize(

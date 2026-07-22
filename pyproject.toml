@@ -38,7 +38,10 @@ packages = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["integration: requires an external service such as Kafka"]
+markers = [
+  "integration: requires an external service such as Kafka",
+  "live: uses explicitly enabled real AI and FlashDuty credentials",
+]
 
 [tool.ruff]
 target-version = "py312"

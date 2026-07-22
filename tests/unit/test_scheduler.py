@@ -30,6 +30,7 @@ async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
     settings = Settings(
+        _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'scheduler.db'}",
         runbook_pdf_dir=runbooks,
