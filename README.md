@@ -114,6 +114,8 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 ### FlashDuty 告警 Webhook 配置
 
+完整的接收协议、Nginx 公网 HTTPS 反代、请求/响应示例、内部处理阶段、轮询补偿和排障步骤见 [FlashDuty 告警 Webhook 接收与后续分析](docs/flashduty-webhook/README.md)。
+
 1. 在 FlashDuty 进入“集成中心 → Webhook → 告警 Webhook”，新增集成。
 2. Endpoint 填写公网可达的 `https://<本服务域名>/api/v1/webhooks/flashduty/alerts`。
 3. 自定义 Header 添加 `X-FlashDuty-Token: <FLASHDUTY_WEBHOOK_TOKEN>`。
