@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -64,11 +65,18 @@ def live_settings() -> Settings:
 
 
 @pytest.fixture(scope="module")
-def flashduty_alert_id() -> str:
-    alert_id = os.getenv("FLASHDUTY_TEST_ALERT_ID", "").strip()
-    if not _OBJECT_ID.fullmatch(alert_id):
-        pytest.fail("FLASHDUTY_TEST_ALERT_ID must be a real 24-character FlashDuty ObjectID")
-    return alert_id
+def flashduty_channel_ids() -> list[int]:
+    raw = os.getenv("FLASHDUTY_TEST_CHANNEL_IDS", "").strip()
+    try:
+        channel_ids = [int(item.strip()) for item in raw.split(",") if item.strip()]
+    except ValueError:
+        channel_ids = []
+    if not channel_ids or any(channel_id <= 0 for channel_id in channel_ids):
+        pytest.fail(
+            "FLASHDUTY_TEST_CHANNEL_IDS must contain one or more comma-separated "
+            "integer collaboration-space IDs"
+        )
+    return list(dict.fromkeys(channel_ids))
 
 
 def _flashduty_client(settings: Settings) -> FlashDutyClient:
@@ -78,6 +86,51 @@ def _flashduty_client(settings: Settings) -> FlashDutyClient:
         timeout_seconds=settings.flashduty_timeout_seconds,
         max_retries=settings.flashduty_max_retries,
     )
+
+
+async def _latest_alert_in_channels(
+    settings: Settings, channel_ids: list[int]
+) -> tuple[FlashDutyClient, str, str]:
+    client = _flashduty_client(settings)
+    end_time = int(time.time())
+    listed = await client.call(
+        "alert_list",
+        {
+            "start_time": end_time - 30 * 24 * 60 * 60,
+            "end_time": end_time,
+            "limit": 20,
+            "channel_ids": channel_ids,
+        },
+    )
+    data = listed.data if isinstance(listed.data, dict) else {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        pytest.fail(
+            "FlashDuty returned no alerts for FLASHDUTY_TEST_CHANNEL_IDS during the last 30 days"
+        )
+    unexpected_channels = sorted(
+        {
+            item.get("channel_id")
+            for item in items
+            if isinstance(item, dict) and item.get("channel_id") not in channel_ids
+        },
+        key=str,
+    )
+    if unexpected_channels:
+        pytest.fail(
+            "FlashDuty alert/list returned alerts outside the requested channel_ids: "
+            f"{unexpected_channels}"
+        )
+    latest = max(
+        (item for item in items if isinstance(item, dict)),
+        key=lambda item: int(item.get("last_time") or item.get("start_time") or 0),
+    )
+    alert_id = latest.get("alert_id")
+    if not isinstance(alert_id, str) or not _OBJECT_ID.fullmatch(alert_id):
+        pytest.fail("FlashDuty alert/list returned an invalid alert_id")
+    if not listed.request_id or listed.request_id == "unknown":
+        pytest.fail("FlashDuty alert/list did not return a request_id")
+    return client, alert_id, listed.request_id
 
 
 @pytest.mark.asyncio
@@ -117,10 +170,12 @@ async def test_live_ai_provider_returns_valid_schema_and_request_id(
 @pytest.mark.asyncio
 async def test_live_flashduty_context_records_read_request_ids(
     live_settings: Settings,
-    flashduty_alert_id: str,
+    flashduty_channel_ids: list[int],
 ) -> None:
-    client = _flashduty_client(live_settings)
-    initial = await client.alert_info(flashduty_alert_id)
+    client, alert_id, list_request_id = await _latest_alert_in_channels(
+        live_settings, flashduty_channel_ids
+    )
+    initial = await client.alert_info(alert_id)
     alert = FlashDutyAlertSourceAdapter(live_settings.environment_aliases).normalize(
         {"request_id": initial.request_id, "data": initial.data}
     )
@@ -143,6 +198,7 @@ async def test_live_flashduty_context_records_read_request_ids(
     )
 
     request_ids = structured_data["flashduty"]["request_ids"]
+    assert list_request_id != "unknown"
     assert {"alert_info", "alert_events", "alert_feed"} <= set(request_ids)
     assert all(value and value != "unknown" for value in request_ids.values())
     if alert.attributes.get("flashduty_incident_id"):
@@ -156,7 +212,7 @@ async def test_live_flashduty_context_records_read_request_ids(
 async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
     tmp_path: Path,
     live_settings: Settings,
-    flashduty_alert_id: str,
+    flashduty_channel_ids: list[int],
 ) -> None:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
@@ -177,8 +233,10 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
             "tool_max_result_chars": 100_000,
         }
     )
-    client = _flashduty_client(settings)
-    initial = await client.alert_info(flashduty_alert_id)
+    client, alert_id, list_request_id = await _latest_alert_in_channels(
+        settings, flashduty_channel_ids
+    )
+    initial = await client.alert_info(alert_id)
     runtime = build_runtime(settings)
     await runtime.repository.initialize()
     try:
@@ -201,5 +259,6 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
     assert context_evidence.status == ToolStatus.SUCCESS
     assert context_evidence.truncated is False
     request_ids = context_evidence.structured_data["flashduty"]["request_ids"]
+    assert list_request_id != "unknown"
     assert {"alert_info", "alert_events", "alert_feed"} <= set(request_ids)
     assert all(value and value != "unknown" for value in request_ids.values())

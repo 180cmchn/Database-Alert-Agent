@@ -249,15 +249,18 @@ cd frontend && npm run build
 
 ```powershell
 $env:RUN_LIVE_TESTS = "1"
-$env:FLASHDUTY_TEST_ALERT_ID = "替换为真实的24位告警ID"
+$env:FLASHDUTY_TEST_CHANNEL_IDS = "替换为协作空间数字ID，多个用逗号分隔"
 $Py = (Resolve-Path ".\.venv\Scripts\python.exe").Path
 & $Py -m pytest -m live -vv
 Remove-Item Env:RUN_LIVE_TESTS
-Remove-Item Env:FLASHDUTY_TEST_ALERT_ID
+Remove-Item Env:FLASHDUTY_TEST_CHANNEL_IDS
 ```
 
 未设置 `RUN_LIVE_TESTS=1` 时不会访问外部服务。Live 测试读取真实 `.env`，验证模型结构化响应
-和请求 ID、FlashDuty 告警/事件/动态/关联故障的请求 ID，以及完整影子分析链路。端到端用例会
-强制使用日志通知器，不会向企业微信发送消息。
+和请求 ID；FlashDuty 测试使用 `channel_ids` 将 `/alert/list` 限定到指定协作空间，从最近 30 天
+告警中自动选择最新一条，再验证告警/事件/动态/关联故障的请求 ID 及完整影子分析链路。端到端
+用例会强制使用日志通知器，不会向企业微信发送消息。AI 客户端保持 TLS 证书校验并使用操作系统信任库，
+因此 Windows `CurrentUser`/`LocalMachine` 证书库中已受信任的内部 CA 可用于模型网关；HTTPX 仍会读取
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 等进程环境变量。
 
 数据库升级使用 Alembic。`0006_training_feedback` 增加手册匹配、证据引用和步骤采纳等训练反馈字段。

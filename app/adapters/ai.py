@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
@@ -31,6 +33,17 @@ from app.domain.models import (
 )
 
 PROMPT_VERSION = "database-alert-advisor-v3"
+
+
+def _system_trust_http_client(timeout_seconds: float) -> httpx.AsyncClient:
+    """Build an HTTPX client that keeps TLS verification and trusts the OS CA store."""
+
+    return httpx.AsyncClient(
+        verify=ssl.create_default_context(),
+        timeout=httpx.Timeout(timeout_seconds),
+        trust_env=True,
+    )
+
 
 SYSTEM_PROMPT = """你是数据库告警分析助手，只提供排查和处理建议，绝不执行数据库操作。
 quality_status=approved 的告警处理手册是首要且权威的依据；
@@ -171,6 +184,7 @@ class OpenAICompatibleAdvisor:
             base_url=base_url,
             timeout=timeout_seconds,
             max_retries=max_retries,
+            http_client=_system_trust_http_client(timeout_seconds),
         )
 
     async def advise(
@@ -419,6 +433,7 @@ class OpenAICompatibleConclusionValidator:
             base_url=base_url,
             timeout=timeout_seconds,
             max_retries=max_retries,
+            http_client=_system_trust_http_client(timeout_seconds),
         )
 
     async def validate(
