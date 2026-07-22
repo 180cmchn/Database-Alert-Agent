@@ -23,6 +23,21 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build: .
+    restart: "no"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
+      RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
+    volumes:
+      - ./data:/app/data
+      - ./runbooks:/app/runbooks:ro
+    command: ["alembic", "upgrade", "head"]
+
   api:
     build: .
     restart: unless-stopped
@@ -45,6 +60,8 @@ services:
       # alert platforms and operators through an authenticated gateway.
       - "127.0.0.1:8000:8000"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     healthcheck:
@@ -74,6 +91,8 @@ services:
       - ./data:/app/data
       - ./runbooks:/app/runbooks:ro
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
 
