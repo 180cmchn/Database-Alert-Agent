@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Literal
+from functools import partial
 
 from langgraph.graph import StateGraph, END
 
@@ -77,16 +78,17 @@ def build_investigation_graph(ctx: NodeContext) -> StateGraph:
     # Create the graph with AgentState
     graph = StateGraph(AgentState)
     
-    # Add nodes - wrap each node function with the context
-    graph.add_node(NODE_FINGERPRINT, lambda state: fingerprint_node(state, ctx))
-    graph.add_node(NODE_KNOWLEDGE, lambda state: knowledge_match_node(state, ctx))
-    graph.add_node(NODE_RUNBOOK, lambda state: runbook_match_node(state, ctx))
-    graph.add_node(NODE_STRATEGY, lambda state: select_strategy_node(state, ctx))
-    graph.add_node(NODE_EXECUTE_TOOLS, lambda state: execute_tools_node(state, ctx))
-    graph.add_node(NODE_DYNAMIC_INVESTIGATION, lambda state: dynamic_investigation_node(state, ctx))
-    graph.add_node(NODE_ADVISE, lambda state: advise_node(state, ctx))
-    graph.add_node(NODE_VALIDATE, lambda state: validate_node(state, ctx))
-    graph.add_node(NODE_REPORT, lambda state: report_node(state, ctx))
+    # Add nodes - use partial to bind context while preserving async function signature
+    # partial keeps the async nature intact, unlike lambda which returns a coroutine object
+    graph.add_node(NODE_FINGERPRINT, partial(fingerprint_node, ctx=ctx))
+    graph.add_node(NODE_KNOWLEDGE, partial(knowledge_match_node, ctx=ctx))
+    graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
+    graph.add_node(NODE_STRATEGY, partial(select_strategy_node, ctx=ctx))
+    graph.add_node(NODE_EXECUTE_TOOLS, partial(execute_tools_node, ctx=ctx))
+    graph.add_node(NODE_DYNAMIC_INVESTIGATION, partial(dynamic_investigation_node, ctx=ctx))
+    graph.add_node(NODE_ADVISE, partial(advise_node, ctx=ctx))
+    graph.add_node(NODE_VALIDATE, partial(validate_node, ctx=ctx))
+    graph.add_node(NODE_REPORT, partial(report_node, ctx=ctx))
     
     # Set entry point
     graph.set_entry_point(NODE_FINGERPRINT)
