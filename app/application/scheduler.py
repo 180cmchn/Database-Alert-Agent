@@ -77,8 +77,8 @@ class FlashDutyAlertPoller:
                 search_after_ctx=cursor,
                 channel_ids=self.settings.flashduty_poll_channel_ids,
                 integration_ids=self.settings.flashduty_poll_integration_ids,
-                is_active=True,
-                by_updated_at=True,
+                is_active=None,  # Don't filter by is_active to get all alerts
+                by_updated_at=False,  # Query by creation time to avoid large data scan
             )
             data = response.data if isinstance(response.data, dict) else {}
             items = data.get("items")
