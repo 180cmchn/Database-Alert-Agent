@@ -8,6 +8,7 @@ import pytest
 
 from app.adapters.notification import (
     WECOM_MARKDOWN_MAX_BYTES,
+    LogManagementNotifier,
     WeComManagementNotifier,
     format_wecom_markdown,
 )
@@ -103,6 +104,23 @@ def test_wecom_markdown_truncates_long_chinese_text_on_utf8_boundary() -> None:
     assert len(content.encode("utf-8")) <= WECOM_MARKDOWN_MAX_BYTES
     assert "内容已截断" in content
     content.encode("utf-8").decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_log_notifier_records_only_delivery_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    event = analysis_result_event(title="sensitive database host")
+    caplog.set_level(logging.WARNING, logger="app.adapters.notification")
+
+    delivery_id = await LogManagementNotifier().send(event)
+
+    assert delivery_id.startswith("log-")
+    assert str(event.alert.id) in caplog.text
+    assert "COMPLETED" in caplog.text
+    assert "sensitive database host" not in caplog.text
+    assert "must-not-appear" not in caplog.text
+    assert "raw_payload" not in caplog.text
 
 
 @pytest.mark.asyncio

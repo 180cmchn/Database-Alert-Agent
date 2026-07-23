@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from app.application.sanitization import sanitize, sanitize_text
+from app.application.sanitization import sanitize_text
 from app.domain.errors import NotificationError
 from app.domain.models import AnalysisBasisSource, AnalysisResultEvent
 
@@ -106,10 +106,13 @@ class LogManagementNotifier:
     async def send(self, event: AnalysisResultEvent) -> str:
         delivery_id = f"log-{uuid4()}"
         logger.warning(
-            "analysis_result delivery_id=%s alert_id=%s payload=%s",
+            "analysis_result delivery_id=%s alert_id=%s status=%s "
+            "manual_matched=%s requires_human=%s",
             delivery_id,
             event.alert.id,
-            sanitize(event.model_dump(mode="json")),
+            event.status.value,
+            event.recommendation.manual_matched,
+            event.recommendation.requires_human,
         )
         return delivery_id
 

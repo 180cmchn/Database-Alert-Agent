@@ -470,7 +470,7 @@ def create_app(
                     channel_ids=channel_ids,
                     integration_ids=runtime.settings.flashduty_poll_integration_ids or None,
                     is_active=None,  # Don't filter by is_active to get all alerts
-                    by_updated_at=True,
+                    by_updated_at=False,
                 )
                 data = response.data if isinstance(response.data, dict) else {}
                 logger.info(

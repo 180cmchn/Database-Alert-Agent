@@ -33,6 +33,7 @@ from app.domain.models import (
 )
 
 PROMPT_VERSION = "database-alert-advisor-v3"
+AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 
 
 def _system_trust_http_client(timeout_seconds: float) -> httpx.AsyncClient:
@@ -184,6 +185,7 @@ class OpenAICompatibleAdvisor:
             base_url=base_url,
             timeout=timeout_seconds,
             max_retries=max_retries,
+            default_headers={"User-Agent": AI_HTTP_USER_AGENT},
             http_client=_system_trust_http_client(timeout_seconds),
         )
 
@@ -476,6 +478,7 @@ class OpenAICompatibleConclusionValidator:
             base_url=base_url,
             timeout=timeout_seconds,
             max_retries=max_retries,
+            default_headers={"User-Agent": AI_HTTP_USER_AGENT},
             http_client=_system_trust_http_client(timeout_seconds),
         )
 

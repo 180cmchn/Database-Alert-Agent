@@ -124,6 +124,10 @@ def test_real_ai_clients_use_system_trust_http_client(
 
     assert timeout_values == [19, 23]
     assert [item["http_client"] for item in constructed] == [http_client, http_client]
+    assert [item["default_headers"] for item in constructed] == [
+        {"User-Agent": ai_module.AI_HTTP_USER_AGENT},
+        {"User-Agent": ai_module.AI_HTTP_USER_AGENT},
+    ]
 
 
 @pytest.mark.asyncio

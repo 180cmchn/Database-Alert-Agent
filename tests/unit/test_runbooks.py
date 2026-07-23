@@ -441,6 +441,29 @@ async def test_component_scope_uses_alert_values_and_identifier_boundaries(
 
 
 @pytest.mark.asyncio
+async def test_database_scope_tolerates_present_target_with_unknown_engine(
+    tmp_path: Path,
+) -> None:
+    library = _self_contained_library(
+        tmp_path,
+        scope={"database_engines": ["mysql"], "components": []},
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "database": {"instance": "database-01"},
+        }
+    )
+
+    assert [item.runbook_id for item in await library.search(alert)] == [
+        "replica-lag-runbook"
+    ]
+
+
+@pytest.mark.asyncio
 @requires_repository_annotations
 async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) -> None:
     pdf_dir = tmp_path / "pdfs"
