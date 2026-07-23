@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import (
     JSON,
+    Column,
     DateTime,
     ForeignKey,
     Integer,
+    MetaData,
     String,
+    Table,
     Text,
     UniqueConstraint,
     desc,
+    event,
+    inspect,
     select,
     text,
 )
@@ -47,8 +52,19 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+DATABASE_SCHEMA_REVISION = "0006"
+
+
 class Base(DeclarativeBase):
     pass
+
+
+_migration_metadata = MetaData()
+_alembic_version = Table(
+    "alembic_version",
+    _migration_metadata,
+    Column("version_num", String(32), primary_key=True),
+)
 
 
 class AlertRow(Base):
@@ -179,9 +195,7 @@ class FeedbackRow(Base):
     correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
     correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
     missed_runbook_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    supporting_evidence_ids_json: Mapped[list] = mapped_column(
-        JSON, nullable=False, default=list
-    )
+    supporting_evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     wrong_agent_claims_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     accepted_step_orders_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     reviewer: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -203,9 +217,7 @@ class KnowledgeCaseRow(Base):
     database_engine: Mapped[str | None] = mapped_column(String(100))
     correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
     correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
-    supporting_evidence_ids_json: Mapped[list] = mapped_column(
-        JSON, nullable=False, default=list
-    )
+    supporting_evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     final_root_cause: Mapped[str] = mapped_column(Text, nullable=False)
     actual_resolution: Mapped[str] = mapped_column(Text, nullable=False)
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
@@ -218,10 +230,25 @@ class SQLAlchemyAlertRepository:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
         self._ensure_sqlite_directory()
-        self.engine = create_async_engine(database_url, future=True)
+        engine_options: dict[str, object] = {"future": True}
+        if database_url.startswith(("sqlite+aiosqlite://", "sqlite://")):
+            engine_options["connect_args"] = {"timeout": 30}
+        self.engine = create_async_engine(database_url, **engine_options)
+        if database_url.startswith(("sqlite+aiosqlite://", "sqlite://")):
+            event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self.session_factory = async_sessionmaker(
             self.engine, expire_on_commit=False, class_=AsyncSession
         )
+
+    @staticmethod
+    def _configure_sqlite(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
 
     def _ensure_sqlite_directory(self) -> None:
         prefixes = ("sqlite+aiosqlite:///", "sqlite:///")
@@ -232,16 +259,83 @@ class SQLAlchemyAlertRepository:
                     Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self) -> None:
-        # Alembic is provided for managed environments; create_all keeps the skeleton runnable.
         async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+            snapshot = await connection.run_sync(self._schema_snapshot)
+
+            if not snapshot:
+                # Keep a brand-new local/test SQLite database convenient while still
+                # recording a real schema revision. Existing or partially initialized
+                # databases must always go through Alembic instead of being patched by
+                # create_all, which cannot apply data migrations.
+                await connection.run_sync(Base.metadata.create_all)
+                await connection.run_sync(_migration_metadata.create_all)
+                revision = await connection.scalar(select(_alembic_version.c.version_num))
+                if revision is None:
+                    await connection.execute(
+                        _alembic_version.insert().values(version_num=DATABASE_SCHEMA_REVISION)
+                    )
+
+            await self._assert_schema_current(connection)
 
     async def close(self) -> None:
         await self.engine.dispose()
 
     async def ping(self) -> None:
-        async with self.session_factory() as session:
-            await session.execute(text("SELECT 1"))
+        async with self.engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+            await self._assert_schema_current(connection)
+
+    @staticmethod
+    def _schema_snapshot(connection) -> dict[str, set[str]]:  # type: ignore[no-untyped-def]
+        inspector = inspect(connection)
+        return {
+            table_name: {str(column["name"]) for column in inspector.get_columns(table_name)}
+            for table_name in inspector.get_table_names()
+        }
+
+    async def _assert_schema_current(self, connection) -> None:  # type: ignore[no-untyped-def]
+        snapshot = await connection.run_sync(self._schema_snapshot)
+        expected_columns = {
+            table_name: {column.name for column in table.columns}
+            for table_name, table in Base.metadata.tables.items()
+        }
+        missing_tables = sorted(set(expected_columns) - set(snapshot))
+        missing_columns = {
+            table_name: sorted(columns - snapshot.get(table_name, set()))
+            for table_name, columns in expected_columns.items()
+            if columns - snapshot.get(table_name, set())
+        }
+
+        revision: str | None = None
+        if "alembic_version" in snapshot:
+            revision = await connection.scalar(select(_alembic_version.c.version_num))
+        if revision != DATABASE_SCHEMA_REVISION or missing_tables or missing_columns:
+            details: list[str] = [
+                f"revision={revision or 'unversioned'}",
+                f"expected={DATABASE_SCHEMA_REVISION}",
+            ]
+            if missing_tables:
+                details.append(f"missing_tables={','.join(missing_tables)}")
+            if missing_columns:
+                details.append(
+                    "missing_columns="
+                    + ",".join(
+                        f"{table}.{column}"
+                        for table, columns in sorted(missing_columns.items())
+                        for column in columns
+                    )
+                )
+            recovery = (
+                "Back up the database and follow the unversioned SQLite recovery "
+                "instructions in README.md."
+                if revision is None
+                else "Back up the database and run `alembic upgrade head`."
+            )
+            raise RuntimeError(
+                "Database schema is not current ("
+                + "; ".join(details)
+                + f"). {recovery}"
+            )
 
     async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]:
         async with self.session_factory() as session:
@@ -253,7 +347,7 @@ class SQLAlchemyAlertRepository:
                 id=str(alert.id),
                 source=alert.source,
                 external_id=alert.external_id,
-                status=AlertStatus.RECEIVED.value,
+                status=AlertStatus.QUEUED.value,
                 alert_json=alert.model_dump(mode="json"),
                 runbooks_json=[],
             )
@@ -358,11 +452,7 @@ class SQLAlchemyAlertRepository:
         recent = await self.list_alerts(page=1, page_size=5)
         async with self.session_factory() as session:
             rows = list(
-                (
-                    await session.execute(
-                        select(AlertRow).order_by(desc(AlertRow.created_at))
-                    )
-                )
+                (await session.execute(select(AlertRow).order_by(desc(AlertRow.created_at))))
                 .scalars()
                 .all()
             )
@@ -437,9 +527,7 @@ class SQLAlchemyAlertRepository:
                     occurred_at=alert.occurred_at,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
-                    current_stage=(
-                        InvestigationStage(run.current_stage) if run else None
-                    ),
+                    current_stage=(InvestigationStage(run.current_stage) if run else None),
                     manual_matched=bool(
                         recommendation.get("manual_matched", bool(row.runbooks_json))
                     ),
@@ -452,8 +540,6 @@ class SQLAlchemyAlertRepository:
     async def create_run(
         self, alert_id: str, lease_owner: str, lease_seconds: int
     ) -> InvestigationRun | None:
-        from datetime import timedelta
-
         async with self.session_factory() as session:
             alert_row = await session.get(AlertRow, alert_id)
             if not alert_row or alert_row.status in {
@@ -529,12 +615,21 @@ class SQLAlchemyAlertRepository:
                 row.strategy_id = strategy_id
             if error is not None:
                 row.error = error
-            row.updated_at = _utc_now()
+            now = _utc_now()
+            if row.status == RunStatus.RUNNING.value and row.lease_expires_at is not None:
+                lease_expires_at = row.lease_expires_at
+                updated_at = row.updated_at
+                if lease_expires_at.tzinfo is None:
+                    lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=UTC)
+                lease_window = lease_expires_at - updated_at
+                if lease_window.total_seconds() > 0:
+                    row.lease_expires_at = now + lease_window
+            row.updated_at = now
             await session.commit()
 
-    async def append_progress(
-        self, alert_id: str, record: ProgressRecord
-    ) -> ProgressRecord:
+    async def append_progress(self, alert_id: str, record: ProgressRecord) -> ProgressRecord:
         async with self.session_factory() as session:
             query = select(ProgressRow.sequence).where(ProgressRow.run_id == str(record.run_id))
             sequences = (await session.execute(query)).scalars().all()
@@ -651,8 +746,7 @@ class SQLAlchemyAlertRepository:
                 existing_case = (
                     await session.execute(
                         select(KnowledgeCaseRow).where(
-                            KnowledgeCaseRow.source_run_id
-                            == str(knowledge_case.source_run_id)
+                            KnowledgeCaseRow.source_run_id == str(knowledge_case.source_run_id)
                         )
                     )
                 ).scalar_one_or_none()
@@ -670,9 +764,7 @@ class SQLAlchemyAlertRepository:
                             database_engine=knowledge_case.database_engine,
                             correct_runbook_id=knowledge_case.correct_runbook_id,
                             correct_runbook_section=knowledge_case.correct_runbook_section,
-                            supporting_evidence_ids_json=(
-                                knowledge_case.supporting_evidence_ids
-                            ),
+                            supporting_evidence_ids_json=(knowledge_case.supporting_evidence_ids),
                             final_root_cause=knowledge_case.final_root_cause,
                             actual_resolution=knowledge_case.actual_resolution,
                             recommendation_json=(
@@ -702,9 +794,7 @@ class SQLAlchemyAlertRepository:
             row.updated_at = _utc_now()
             await session.commit()
 
-    async def save_runbooks(
-        self, alert_id: str, runbooks: list[RunbookExcerpt]
-    ) -> None:
+    async def save_runbooks(self, alert_id: str, runbooks: list[RunbookExcerpt]) -> None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
             if not row:
@@ -717,7 +807,7 @@ class SQLAlchemyAlertRepository:
         self,
         alert_id: str,
         status: AlertStatus,
-        runbooks: list[RunbookExcerpt],
+        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
@@ -727,7 +817,8 @@ class SQLAlchemyAlertRepository:
             if not row:
                 return
             row.status = status.value
-            row.runbooks_json = [item.model_dump(mode="json") for item in runbooks]
+            if runbooks is not None:
+                row.runbooks_json = [item.model_dump(mode="json") for item in runbooks]
             row.recommendation_json = (
                 recommendation.model_dump(mode="json") if recommendation else None
             )
@@ -767,12 +858,16 @@ class SQLAlchemyAlertRepository:
         validations: list[ValidationRecord] = []
         if run_row:
             progress_rows = (
-                await session.execute(
-                    select(ProgressRow)
-                    .where(ProgressRow.run_id == run_row.id)
-                    .order_by(ProgressRow.sequence)
+                (
+                    await session.execute(
+                        select(ProgressRow)
+                        .where(ProgressRow.run_id == run_row.id)
+                        .order_by(ProgressRow.sequence)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             progress = [
                 ProgressRecord(
                     id=item.id,
@@ -786,12 +881,16 @@ class SQLAlchemyAlertRepository:
                 for item in progress_rows
             ]
             evidence_rows = (
-                await session.execute(
-                    select(EvidenceRow)
-                    .where(EvidenceRow.run_id == run_row.id)
-                    .order_by(EvidenceRow.started_at)
+                (
+                    await session.execute(
+                        select(EvidenceRow)
+                        .where(EvidenceRow.run_id == run_row.id)
+                        .order_by(EvidenceRow.started_at)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             evidence_records = [
                 EvidenceRecord(
                     id=item.id,
@@ -811,12 +910,16 @@ class SQLAlchemyAlertRepository:
                 for item in evidence_rows
             ]
             validation_rows = (
-                await session.execute(
-                    select(ValidationRow)
-                    .where(ValidationRow.run_id == run_row.id)
-                    .order_by(ValidationRow.created_at)
+                (
+                    await session.execute(
+                        select(ValidationRow)
+                        .where(ValidationRow.run_id == run_row.id)
+                        .order_by(ValidationRow.created_at)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             validations = [
                 ValidationRecord(
                     id=item.id,
@@ -830,12 +933,16 @@ class SQLAlchemyAlertRepository:
                 for item in validation_rows
             ]
         feedback_rows = (
-            await session.execute(
-                select(FeedbackRow)
-                .where(FeedbackRow.alert_id == row.id)
-                .order_by(FeedbackRow.created_at)
+            (
+                await session.execute(
+                    select(FeedbackRow)
+                    .where(FeedbackRow.alert_id == row.id)
+                    .order_by(FeedbackRow.created_at)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         feedback = [self._feedback(item) for item in feedback_rows]
         normalized_alert = NormalizedAlert.model_validate(row.alert_json)
         knowledge_matches = await self._find_cases_in_session(

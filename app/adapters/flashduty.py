@@ -831,30 +831,129 @@ _DIAGNOSTIC_TERMS: Final[Mapping[str, set[str]]] = {
     "replication": {"replication", "replica", "slave", "lag"},
     "overview": {"overview", "health", "status"},
 }
+_MONIT_TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+_CAMEL_CASE_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
 _MUTATING_TOOL_TOKENS: Final[set[str]] = {
+    "ack",
+    "acknowledge",
     "alter",
+    "apply",
+    "cancel",
+    "close",
     "create",
     "delete",
     "disable",
     "drop",
     "enable",
+    "execute",
+    "failover",
+    "flush",
     "grant",
+    "insert",
     "kill",
+    "modify",
+    "pause",
+    "promote",
+    "purge",
+    "reboot",
+    "rebuild",
+    "reload",
     "remove",
+    "repair",
+    "replace",
     "reset",
+    "resolve",
     "restart",
+    "resume",
     "revoke",
+    "rotate",
     "set",
+    "shutdown",
+    "start",
+    "stop",
+    "switch",
+    "switchover",
     "terminate",
     "truncate",
     "update",
+    "upgrade",
     "write",
+}
+_MUTATING_TOOL_FRAGMENTS: Final[tuple[str, ...]] = tuple(
+    sorted(
+        (token for token in _MUTATING_TOOL_TOKENS if len(token) >= 4),
+        key=len,
+        reverse=True,
+    )
+)
+_READ_ONLY_TOOL_TOKENS: Final[set[str]] = {
+    "check",
+    "compare",
+    "connections",
+    "deadlocks",
+    "describe",
+    "diagnose",
+    "diagnostics",
+    "explain",
+    "fetch",
+    "get",
+    "health",
+    "info",
+    "inspect",
+    "lag",
+    "list",
+    "locks",
+    "logs",
+    "metrics",
+    "observe",
+    "overview",
+    "ping",
+    "processlist",
+    "query",
+    "read",
+    "replica",
+    "replication",
+    "report",
+    "sessions",
+    "show",
+    "snapshot",
+    "sources",
+    "statistics",
+    "stats",
+    "status",
+    "summary",
+    "variables",
+    "version",
 }
 
 
+def _tool_name_tokens(name: str) -> tuple[str, ...]:
+    if not _MONIT_TOOL_NAME.fullmatch(name):
+        return ()
+    expanded = _CAMEL_CASE_BOUNDARY.sub(" ", name)
+    return tuple(
+        item for item in re.split(r"[^A-Za-z0-9]+", expanded.casefold()) if item
+    )
+
+
+def _has_mutating_tool_token(tokens: tuple[str, ...]) -> bool:
+    for token in tokens:
+        if token in _MUTATING_TOOL_TOKENS:
+            return True
+        if token.startswith("set"):
+            return True
+        if any(fragment in token for fragment in _MUTATING_TOOL_FRAGMENTS):
+            return True
+    return False
+
+
 def _is_read_only_tool_name(name: str) -> bool:
-    tokens = {item for item in re.split(r"[^a-z0-9]+", name.casefold()) if item}
-    return not tokens.intersection(_MUTATING_TOOL_TOKENS)
+    tokens = _tool_name_tokens(name)
+    return bool(tokens) and not _has_mutating_tool_token(tokens) and bool(
+        set(tokens).intersection(_READ_ONLY_TOOL_TOKENS)
+    )
 
 
 class FlashDutyDatabaseDiagnosticsTool:

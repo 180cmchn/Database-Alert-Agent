@@ -76,6 +76,78 @@ async def test_client_uses_query_app_key_and_rejects_write_operations() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mysql.killSession",
+        "terminateConnection",
+        "mysql.killsession",
+        "mysql.terminateconnection",
+        "mysql.restartServerStatus",
+        "mysql.writeConfigReport",
+        "mysql.session_action",
+    ],
+)
+async def test_client_rejects_mutating_or_unclassified_dynamic_tool_names(
+    tool_name: str,
+) -> None:
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("unsafe tool names must be rejected before the API call")
+
+    client = FlashDutyClient(
+        "test-app-key",
+        transport=httpx.MockTransport(unexpected_request),
+    )
+
+    with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
+        await client.call(
+            "monit_tools_invoke",
+            {
+                "target_locator": "db-prod-01",
+                "tools": [{"tool": tool_name, "params": {}}],
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "net.tcp_ping",
+        "os.overview",
+        "mysql.connection_overview",
+        "mysql.showProcesslist",
+        "postgres.replicationStatus",
+        "redis.health-check",
+    ],
+)
+async def test_client_allows_explicit_read_only_dynamic_tool_names(
+    tool_name: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"request_id": "req-tool", "data": {}})
+
+    client = FlashDutyClient(
+        "test-app-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await client.call(
+        "monit_tools_invoke",
+        {
+            "target_locator": "db-prod-01",
+            "tools": [{"tool": tool_name, "params": {}}],
+        },
+    )
+
+    assert response.request_id == "req-tool"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_client_retries_rate_limit_and_redacts_secret_from_errors() -> None:
     attempts = 0
 
@@ -365,6 +437,16 @@ class RecordingMonitorClient:
                         "description": "terminates a session",
                         "input_schema": {"required": ["session_id"]},
                     },
+                    {
+                        "name": "mysql.killSession",
+                        "description": "terminates a session",
+                        "input_schema": {"required": ["session_id"]},
+                    },
+                    {
+                        "name": "terminateConnection",
+                        "description": "terminates a connection",
+                        "input_schema": {"required": ["connection_id"]},
+                    },
                 ],
             },
         )
@@ -453,14 +535,22 @@ async def test_database_tool_discovers_and_invokes_only_compatible_tools() -> No
     assert client.invoke_payload["tools"] == [{"tool": "mysql.connection_overview", "params": {}}]
     assert data["selected_tools"] == ["mysql.connection_overview"]
 
-    with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
-        await tool.execute(
-            ToolExecutionRequest(
-                tool_name="query_database_diagnostics",
-                parameters={"tools": [{"tool": "mysql.kill_session", "params": {"session_id": 1}}]},
-            ),
-            make_context(),
-        )
+    for tool_name in ("mysql.kill_session", "mysql.killSession", "terminateConnection"):
+        with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
+            await tool.execute(
+                ToolExecutionRequest(
+                    tool_name="query_database_diagnostics",
+                    parameters={
+                        "tools": [
+                            {
+                                "tool": tool_name,
+                                "params": {"session_id": 1},
+                            }
+                        ]
+                    },
+                ),
+                make_context(),
+            )
 
 
 def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:

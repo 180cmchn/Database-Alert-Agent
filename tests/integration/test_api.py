@@ -1,19 +1,13 @@
 from pathlib import Path
-from shutil import copy2
 
 from fastapi.testclient import TestClient
 
+from app.adapters.flashduty import FlashDutyResponse
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
-
-SOURCE_PDF = (
-    Path(__file__).parents[2]
-    / "runbooks"
-    / "pdfs"
-    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
-)
+from tests.pdf_fixtures import create_tikv_runbook_pdf
 
 
 def create_test_client(
@@ -21,8 +15,7 @@ def create_test_client(
     **setting_overrides: object,
 ) -> tuple[TestClient, Runtime, ManualAnalysisScheduler]:
     runbooks = tmp_path / "runbooks"
-    runbooks.mkdir(exist_ok=True)
-    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
@@ -112,3 +105,53 @@ def test_readiness_reports_configuration(tmp_path: Path) -> None:
         response = client.get("/health/ready")
         assert response.status_code == 200
         assert response.json() == {"status": "ready", "issues": []}
+
+
+def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -> None:
+    client, runtime, scheduler = create_test_client(
+        tmp_path,
+        admin_api_token="test-admin-token",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=False,
+        flashduty_poll_channel_ids=[7],
+    )
+    requests: list[dict] = []
+
+    class RecordingFlashDutyClient:
+        async def list_alerts(self, **payload):  # type: ignore[no-untyped-def]
+            requests.append(payload)
+            return FlashDutyResponse(
+                "list-request",
+                {
+                    "items": [{"alert_id": "663a1b2c3d4e5f6789abcdef"}],
+                    "has_next_page": False,
+                },
+            )
+
+        async def alert_info(self, alert_id: str) -> FlashDutyResponse:
+            return FlashDutyResponse(
+                "detail-request",
+                {
+                    "alert_id": alert_id,
+                    "title": "Database latency",
+                    "description": "Latency is above threshold",
+                    "alert_severity": "Warning",
+                    "alert_status": "Warning",
+                    "alert_key": "database-latency",
+                    "start_time": 900,
+                    "labels": {"env": "test", "service": "orders-db"},
+                },
+            )
+
+    runtime.flashduty_client = RecordingFlashDutyClient()  # type: ignore[assignment]
+    with client:
+        response = client.post(
+            "/api/v1/admin/flashduty/poll",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["new_count"] == 1
+    assert len(scheduler.jobs) == 1
+    assert requests[0]["by_updated_at"] is True

@@ -187,6 +187,11 @@ class OpenAICompatibleAdvisor:
             http_client=_system_trust_http_client(timeout_seconds),
         )
 
+    async def aclose(self) -> None:
+        """Release the OpenAI/HTTPX connection pool owned by this adapter."""
+
+        await self._client.close()
+
     async def advise(
         self,
         alert: NormalizedAlert,
@@ -473,6 +478,11 @@ class OpenAICompatibleConclusionValidator:
             max_retries=max_retries,
             http_client=_system_trust_http_client(timeout_seconds),
         )
+
+    async def aclose(self) -> None:
+        """Release the OpenAI/HTTPX connection pool owned by this adapter."""
+
+        await self._client.close()
 
     async def validate(
         self,

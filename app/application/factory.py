@@ -27,6 +27,7 @@ from app.adapters.notification import (
 )
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.adapters.persistence import SQLAlchemyAlertRepository
+from app.agents.graph import InvestigationAgent
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
 from app.config import Settings
@@ -39,7 +40,6 @@ from app.domain.ports import (
     RunbookProvider,
     RunbookStore,
 )
-from app.agents.scheduler import LangGraphScheduler, KafkaLangGraphScheduler, ManualLangGraphScheduler
 
 
 @dataclass
@@ -56,8 +56,7 @@ def _flashduty_tool_timeout(settings: Settings) -> float:
     retry_backoff = sum(min(2**attempt, 10) for attempt in range(settings.flashduty_max_retries))
     return min(
         120,
-        settings.flashduty_timeout_seconds * (settings.flashduty_max_retries + 1)
-        + retry_backoff,
+        settings.flashduty_timeout_seconds * (settings.flashduty_max_retries + 1) + retry_backoff,
     )
 
 
@@ -149,6 +148,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     """Apply a validated runtime configuration without replacing stateful components."""
 
     service = runtime.service
+    old_advisor = service.advisor
+    old_conclusion_validator = service.conclusion_validator
     # Build every replaceable adapter before mutating the live service. Constructors
     # perform no network I/O, so this synchronous swap cannot yield halfway through.
     advisor = _build_advisor(settings)
@@ -158,6 +159,18 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
     )
+    agent = InvestigationAgent(
+        repository=service.repository,
+        runbook_provider=service.runbook_provider,
+        advisor=advisor,
+        fallback_advisor=service.fallback_advisor,
+        rule_validator=service.rule_validator,
+        conclusion_validator=conclusion_validator,
+        tool_registry=service.tool_registry,
+        tool_executor=service.tool_executor,
+        strategy_provider=strategy_provider,
+        runbook_limit=settings.runbook_limit,
+    )
 
     service.advisor = advisor
     service.conclusion_validator = conclusion_validator
@@ -165,10 +178,13 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.strategy_provider = strategy_provider
     service.runbook_limit = settings.runbook_limit
     service.react_enabled = settings.react_enabled
+    service.max_dynamic_turns = settings.react_max_dynamic_turns if settings.react_enabled else 0
     service.validation_enabled = settings.validation_enabled
     service.shadow_enabled = settings.shadow_enabled
     service.ai_fallback_enabled = settings.ai_fallback_enabled
+    service.agent = agent
     runtime.settings = settings
+    service.retire_adapters(old_advisor, old_conclusion_validator)
 
 
 def build_runtime(

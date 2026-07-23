@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from shutil import copy2
 
 import pytest
 from pydantic import ValidationError
@@ -15,13 +14,7 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.config import Settings, get_settings
-
-SOURCE_PDF = (
-    Path(__file__).parents[2]
-    / "runbooks"
-    / "pdfs"
-    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
-)
+from tests.pdf_fixtures import create_tikv_runbook_pdf
 
 
 def test_windows_file_lock_backend_uses_a_stable_lock_byte(
@@ -205,8 +198,7 @@ def test_flashduty_polling_requires_a_collaboration_space_scope() -> None:
 
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
-    runbooks.mkdir(exist_ok=True)
-    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    create_tikv_runbook_pdf(runbooks)
     return Settings(
         _env_file=None,
         ai_provider="fake",
@@ -299,8 +291,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
     tmp_path: Path,
 ) -> None:
     runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
-    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         app_env="production",
@@ -380,8 +371,7 @@ def test_production_requires_gate_approval_before_shadow_mode_is_disabled(
     tmp_path: Path,
 ) -> None:
     runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
-    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    create_tikv_runbook_pdf(runbooks)
     base = {
         "_env_file": None,
         "app_env": "production",

@@ -4,7 +4,6 @@ import json
 import os
 import stat
 from pathlib import Path
-from shutil import copy2
 
 from fastapi.testclient import TestClient
 
@@ -14,15 +13,15 @@ from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
+from tests.pdf_fixtures import (
+    TIKV_METRIC_NAME,
+    TIKV_RUNBOOK_ID,
+    TIKV_RUNBOOK_PDF_NAME,
+    create_tikv_runbook_pdf,
+)
 
 ADMIN_TOKEN = "integration-admin-token"
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
-SOURCE_PDF = (
-    Path(__file__).parents[2]
-    / "runbooks"
-    / "pdfs"
-    / "INFRA-2025-07-03TiDB--TiKV_server_report_failure_msg_total-210726-1007-4073.pdf"
-)
 
 
 def create_admin_client(
@@ -31,8 +30,7 @@ def create_admin_client(
     admin_token: str = ADMIN_TOKEN,
 ) -> tuple[TestClient, Runtime]:
     runbooks = tmp_path / "runbooks"
-    runbooks.mkdir(parents=True, exist_ok=True)
-    copy2(SOURCE_PDF, runbooks / SOURCE_PDF.name)
+    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
@@ -235,16 +233,16 @@ def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
         listed = client.get("/api/v1/admin/runbooks", headers=ADMIN_HEADERS).json()
         assert listed["total"] == 1
         item = listed["items"][0]
-        assert item["id"] == SOURCE_PDF.stem
+        assert item["id"] == TIKV_RUNBOOK_ID
         assert item["section"] == "PDF"
         assert item["metadata"]["source_type"] == "local_pdf"
-        assert item["metadata"]["file_name"] == SOURCE_PDF.name
+        assert item["metadata"]["file_name"] == TIKV_RUNBOOK_PDF_NAME
 
         detail = client.get(
-            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}", headers=ADMIN_HEADERS
+            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
         )
         assert detail.status_code == 200
-        assert "TiKV_server_report_failure_msg_total" in detail.json()["content"]
+        assert TIKV_METRIC_NAME in detail.json()["content"]
         assert client.get(
             "/api/v1/admin/runbooks/../escape", headers=ADMIN_HEADERS
         ).status_code in {404, 422}
@@ -252,12 +250,12 @@ def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
             "/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json={}
         ).status_code == 405
         assert client.put(
-            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}",
+            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
             headers=ADMIN_HEADERS,
             json={},
         ).status_code == 405
         assert client.delete(
-            f"/api/v1/admin/runbooks/{SOURCE_PDF.stem}", headers=ADMIN_HEADERS
+            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
         ).status_code == 405
 
 
@@ -380,10 +378,10 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
         assert detail.status_code == 200
         body = detail.json()
         assert body["status"] == "REVIEW_REQUIRED"
-        assert body["manual_matches"][0]["runbook_id"] == SOURCE_PDF.stem
+        assert body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
         assert body["recommendation"]["manual_matched"] is True
         assert body["recommendation"]["steps"][0]["source_ref"] == {
-            "runbook_id": SOURCE_PDF.stem,
+            "runbook_id": TIKV_RUNBOOK_ID,
             "section": "PDF",
         }
         assert [item["stage"] for item in body["progress"]] == [

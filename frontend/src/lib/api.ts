@@ -7,6 +7,8 @@ import type {
   ApiProblem,
   CanonicalAlertPayload,
   DashboardSummary,
+  FeedbackRecord,
+  FeedbackRequest,
   RunbookRecord,
   Severity,
   StoredAlert,
@@ -105,6 +107,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+
+  submitFeedback: (alertId: string, payload: FeedbackRequest, token: string) =>
+    request<FeedbackRecord>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}/feedback`,
+      { method: "POST", body: JSON.stringify(payload) },
+      token,
+    ),
 
   getRunbooks: async (token: string) => {
     const data = await request<RunbookRecord[] | { items: RunbookRecord[] }>(

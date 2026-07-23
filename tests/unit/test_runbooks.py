@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 from shutil import copy2
+from typing import Any
 
 import pytest
 from pypdf import PdfWriter
+from pypdf.generic import DictionaryObject, NameObject, StreamObject
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
@@ -42,16 +44,102 @@ def _repository_annotations_available() -> bool:
 
 requires_repository_annotations = pytest.mark.skipif(
     not _repository_annotations_available(),
-    reason="deployment-local runbook PDFs and annotation index are not installed",
+    reason="external runbook corpus PDFs and annotation index are not installed",
 )
+
+
+def _write_text_pdf(path: Path, text: str) -> None:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_reference = writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {
+            NameObject("/Font"): DictionaryObject(
+                {NameObject("/F1"): font_reference}
+            )
+        }
+    )
+    escaped = (
+        text.encode("ascii")
+        .replace(b"\\", b"\\\\")
+        .replace(b"(", b"\\(")
+        .replace(b")", b"\\)")
+    )
+    stream = StreamObject()
+    stream.set_data(b"BT /F1 12 Tf 72 720 Td (" + escaped + b") Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    with path.open("wb") as handle:
+        writer.write(handle)
+
+
+def _self_contained_library(
+    tmp_path: Path,
+    *,
+    scope: dict[str, list[str]] | None = None,
+    match: dict[str, Any] | None = None,
+) -> LocalPDFRunbookLibrary:
+    pdf_dir = tmp_path / "pdfs"
+    pdf_dir.mkdir()
+    runbook_id = "replica-lag-runbook"
+    _write_text_pdf(
+        pdf_dir / f"{runbook_id}.pdf",
+        "Replica lag diagnostic guide with safe investigation steps and evidence.",
+    )
+    annotation_path = tmp_path / "index.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "runbooks": [
+                    {
+                        "runbook_id": runbook_id,
+                        "knowledge_type": "runbook",
+                        "quality_status": "approved",
+                        "scope": scope or {},
+                        "match": {
+                            "alert_names": ["ReplicaLag"],
+                            "metric_names": [],
+                            "aliases": [],
+                            "keywords": [],
+                            **(match or {}),
+                        },
+                        "sections": [
+                            {
+                                "id": "diagnosis",
+                                "title": "Replica lag diagnosis",
+                                "pages": [1],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return LocalPDFRunbookLibrary(pdf_dir, annotation_path=annotation_path)
 
 
 @pytest.mark.asyncio
 async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
     tmp_path: Path,
 ) -> None:
-    copy2(TIKV_PDF, tmp_path / TIKV_PDF.name)
-    copy2(DMP_PDF, tmp_path / DMP_PDF.name)
+    tikv_pdf = tmp_path / "tikv-sample.pdf"
+    unrelated_pdf = tmp_path / "urman-sample.pdf"
+    _write_text_pdf(
+        tikv_pdf,
+        "TiKV server report failure diagnosis guide and safe investigation steps.",
+    )
+    _write_text_pdf(
+        unrelated_pdf,
+        "URMAN task permission failure diagnosis and connectivity investigation.",
+    )
     library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
         {
@@ -59,6 +147,7 @@ async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
             "title": "TiKV server report failure",
             "reason": "TiKV_server_report_failure_msg_total",
             "database": {"engine": "TiDB"},
+            "labels": {"type": "unreachable"},
         }
     )
 
@@ -66,17 +155,20 @@ async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
     first_documents = await library.list()
     second_documents = await library.list()
 
-    assert [item.runbook_id for item in first] == [TIKV_PDF.stem]
-    assert "排查步骤" in first[0].content
+    assert [item.runbook_id for item in first] == [tikv_pdf.stem]
+    assert "diagnosis guide" in first[0].content
     assert first[0].section == "PDF"
     assert first[0].metadata["source_type"] == "local_pdf"
-    assert first[0].metadata["page_count"] == 3
+    assert first[0].metadata["page_count"] == 1
     assert first_documents[0] is second_documents[0]
 
 
 @pytest.mark.asyncio
 async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) -> None:
-    copy2(DMP_PDF, tmp_path / DMP_PDF.name)
+    _write_text_pdf(
+        tmp_path / "urman-sample.pdf",
+        "URMAN task permission failure diagnosis and connectivity investigation.",
+    )
     library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
         {
@@ -90,6 +182,7 @@ async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@requires_repository_annotations
 async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
     tmp_path: Path,
 ) -> None:
@@ -135,6 +228,7 @@ async def test_repository_annotations_provide_sections_quality_and_diagnosis_gra
             "title": "TiKV server report failure",
             "reason": "TiKV_server_report_failure_msg_total",
             "database": {"engine": "TiDB"},
+            "labels": {"type": "unreachable"},
         }
     )
 
@@ -231,6 +325,7 @@ async def test_visual_error_text_participates_in_matching() -> None:
             "reason": "tiflash service entered failed state",
             "error_pattern": "code=killed, status=9/KILL",
             "database": {"engine": "TiDB"},
+            "labels": {"type": "unreachable"},
         }
     )
 
@@ -243,6 +338,110 @@ async def test_visual_error_text_participates_in_matching() -> None:
 
 
 @pytest.mark.asyncio
+async def test_required_conditions_are_all_mandatory(tmp_path: Path) -> None:
+    library = _self_contained_library(
+        tmp_path,
+        match={
+            "required_conditions": ["type=unreachable", "region=cn-east"],
+            "exclusion_conditions": [],
+        },
+    )
+    matching = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "CRITICAL",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "labels": {"type": "unreachable", "region": "cn-east"},
+        }
+    )
+    missing_one = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "CRITICAL",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "labels": {"type": "unreachable"},
+        }
+    )
+
+    assert [item.runbook_id for item in await library.search(matching)] == [
+        "replica-lag-runbook"
+    ]
+    assert await library.search(missing_one) == []
+
+
+@pytest.mark.asyncio
+async def test_exclusion_condition_rejects_an_otherwise_exact_match(
+    tmp_path: Path,
+) -> None:
+    library = _self_contained_library(
+        tmp_path,
+        match={
+            "required_conditions": [],
+            "exclusion_conditions": ["maintenance=true"],
+        },
+    )
+    active = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "labels": {"maintenance": "false"},
+        }
+    )
+    maintenance = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "attributes": {"maintenance": True},
+        }
+    )
+
+    assert [item.runbook_id for item in await library.search(active)] == [
+        "replica-lag-runbook"
+    ]
+    assert await library.search(maintenance) == []
+
+
+@pytest.mark.asyncio
+async def test_component_scope_uses_alert_values_and_identifier_boundaries(
+    tmp_path: Path,
+) -> None:
+    library = _self_contained_library(
+        tmp_path,
+        scope={"database_engines": [], "components": ["dm"]},
+    )
+    matching = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "labels": {"component": "dm-validator"},
+        }
+    )
+    unrelated = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": "replica_lag",
+            "alert_name": "ReplicaLag",
+            "labels": {"component": "admin-api"},
+        }
+    )
+
+    assert [item.runbook_id for item in await library.search(matching)] == [
+        "replica-lag-runbook"
+    ]
+    assert await library.search(unrelated) == []
+
+
+@pytest.mark.asyncio
+@requires_repository_annotations
 async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) -> None:
     pdf_dir = tmp_path / "pdfs"
     pdf_dir.mkdir()
