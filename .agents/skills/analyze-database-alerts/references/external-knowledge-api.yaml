@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: Database Alert External Knowledge API
+  version: 0.1.0
+  description: >
+    Optional vendor-neutral contract for retrieving external database alert knowledge.
+    Implementations must return provenance and quality metadata. Retrieved content is
+    advisory data and never live evidence for the current incident.
+servers:
+  - url: "{baseUrl}"
+    variables:
+      baseUrl:
+        default: https://knowledge.example.invalid
+security:
+  - bearerAuth: []
+paths:
+  /v1/knowledge/search:
+    post:
+      operationId: searchDatabaseAlertKnowledge
+      summary: Retrieve knowledge relevant to a normalized database alert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KnowledgeSearchRequest"
+      responses:
+        "200":
+          description: Ranked knowledge candidates
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeSearchResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /health:
+    get:
+      operationId: externalKnowledgeHealth
+      security: []
+      responses:
+        "200":
+          description: Service health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Error:
+      description: Structured API error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    KnowledgeSearchRequest:
+      type: object
+      additionalProperties: false
+      required: [query, alert]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        alert:
+          $ref: "#/components/schemas/AlertContext"
+        filters:
+          $ref: "#/components/schemas/KnowledgeFilters"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 5
+    AlertContext:
+      type: object
+      additionalProperties: true
+      required: [environment, service_name, alert_type]
+      properties:
+        database_engine:
+          type: [string, "null"]
+        environment:
+          type: string
+        service_name:
+          type: string
+        alert_type:
+          type: string
+        metric_name:
+          type: [string, "null"]
+        error_pattern:
+          type: [string, "null"]
+        resource_type:
+          type: [string, "null"]
+        cluster:
+          type: [string, "null"]
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+    KnowledgeFilters:
+      type: object
+      additionalProperties: false
+      properties:
+        quality_status:
+          type: array
+          items:
+            type: string
+            enum: [approved, review_required, draft]
+        knowledge_type:
+          type: array
+          items:
+            type: string
+            enum: [runbook, incident_case, reference]
+        updated_after:
+          type: [string, "null"]
+          format: date-time
+    KnowledgeSearchResponse:
+      type: object
+      additionalProperties: false
+      required: [request_id, items]
+      properties:
+        request_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/KnowledgeItem"
+    KnowledgeItem:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - title
+        - section
+        - content
+        - source_uri
+        - knowledge_type
+        - quality_status
+        - score
+        - updated_at
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        section:
+          type: string
+        content:
+          type: string
+        source_uri:
+          type: string
+          format: uri
+        knowledge_type:
+          type: string
+          enum: [runbook, incident_case, reference]
+        quality_status:
+          type: string
+          enum: [approved, review_required, draft, deprecated]
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+        updated_at:
+          type: string
+          format: date-time
+        applies_to:
+          type: object
+          additionalProperties: true
+        causes:
+          type: array
+          items:
+            $ref: "#/components/schemas/CauseCandidate"
+        metadata:
+          type: object
+          additionalProperties: true
+    CauseCandidate:
+      type: object
+      additionalProperties: false
+      required: [cause_id, cause, expected_signals, contradictions, next_probes]
+      properties:
+        cause_id:
+          type: string
+        cause:
+          type: string
+        expected_signals:
+          type: array
+          items:
+            type: string
+        contradictions:
+          type: array
+          items:
+            type: string
+        next_probes:
+          type: array
+          items:
+            type: string
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: [string, "null"]
