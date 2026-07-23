@@ -1,3 +1,10 @@
+"""Alert analysis service using LangGraph for investigation.
+
+This service provides the public API for alert ingestion, analysis,
+and feedback submission. It delegates investigation to the LangGraph
+InvestigationAgent.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -7,30 +14,25 @@ from uuid import uuid4
 
 from app.adapters.alert_sources import AlertSourceRegistry
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.agents.graph import InvestigationAgent
+from app.agents.state import AgentState, create_initial_state
 from app.application.sanitization import sanitize, sanitize_alert
 from app.domain.errors import AlertNotFoundError, AnalysisFailedError, InvalidAlertPayloadError
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
-    AnalysisResultEvent,
     DashboardSummary,
-    EvidenceRecord,
     FeedbackRecord,
     FeedbackVerdict,
-    InvestigationContext,
     InvestigationRun,
     InvestigationStage,
     KnowledgeCase,
     NormalizedAlert,
-    ProgressRecord,
     Recommendation,
+    RunbookExcerpt,
     RunbookMatchVerdict,
-    RunbookQualityStatus,
     RunStatus,
     StoredAlert,
-    ToolStatus,
-    ValidationKind,
-    ValidationRecord,
 )
 from app.domain.ports import (
     AIAdvisor,
@@ -45,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 
 class AlertAnalysisService:
+    """Service for alert analysis using LangGraph.
+    
+    This service handles alert ingestion, enqueuing for investigation,
+    and provides query APIs for alert status and history.
+    """
+    
     def __init__(
         self,
         *,
@@ -66,6 +74,7 @@ class AlertAnalysisService:
         shadow_enabled: bool = False,
         ai_fallback_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
+        max_dynamic_turns: int = 0,
     ) -> None:
         self.source_registry = source_registry
         self.runbook_provider = runbook_provider
@@ -85,10 +94,34 @@ class AlertAnalysisService:
         self.shadow_enabled = shadow_enabled
         self.ai_fallback_enabled = ai_fallback_enabled
         self.alert_sanitizer = alert_sanitizer
-
+        self.max_dynamic_turns = max_dynamic_turns
+        
+        # Build the LangGraph agent
+        self.agent = InvestigationAgent(
+            repository=repository,
+            runbook_provider=runbook_provider,
+            advisor=advisor,
+            fallback_advisor=fallback_advisor,
+            rule_validator=rule_validator,
+            conclusion_validator=conclusion_validator,
+            tool_registry=tool_registry,
+            tool_executor=tool_executor,
+            strategy_provider=strategy_provider,
+            runbook_limit=runbook_limit,
+        )
+    
     async def ingest(
         self, source: str, payload: dict[str, Any]
     ) -> tuple[StoredAlert, bool]:
+        """Ingest an alert from a source.
+        
+        Args:
+            source: The alert source identifier
+            payload: The raw alert payload
+            
+        Returns:
+            Tuple of (stored alert, was_created)
+        """
         normalized = self.source_registry.normalize(source, payload)
         alert = self.alert_sanitizer(normalized)
         stored, created = await self.repository.create_or_get(alert)
@@ -105,6 +138,19 @@ class AlertAnalysisService:
     async def analyze(
         self, source: str, payload: dict[str, Any], *, retry_failed: bool = False
     ) -> StoredAlert:
+        """Analyze an alert synchronously (blocking).
+        
+        This method is primarily for testing and direct API calls.
+        For production, use ingest + scheduler.enqueue.
+        
+        Args:
+            source: The alert source identifier
+            payload: The raw alert payload
+            retry_failed: Whether to retry failed analyses
+            
+        Returns:
+            The stored alert after analysis
+        """
         stored, created = await self.ingest(source, payload)
         if not created and stored.status in {
             AlertStatus.COMPLETED,
@@ -116,268 +162,65 @@ class AlertAnalysisService:
         return await self.analyze_by_id(str(stored.alert.id))
 
     async def analyze_by_id(self, alert_id: str) -> StoredAlert:
+        """Analyze an alert by ID using LangGraph.
+        
+        This method runs the LangGraph investigation graph synchronously.
+        
+        Args:
+            alert_id: The alert ID to analyze
+            
+        Returns:
+            The stored alert after analysis
+        """
         stored = await self.get(alert_id)
         if stored.status in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
             return stored
 
         run = await self.repository.create_run(
             alert_id,
-            lease_owner=f"worker-{uuid4()}",
+            lease_owner=f"direct-{uuid4()}",
             lease_seconds=self.investigation_lease_seconds,
         )
         if run is None:
             return await self.get(alert_id)
 
-        alert = stored.alert
-        runbooks = []
-        evidence: list[EvidenceRecord] = []
+        # Create initial state for LangGraph
+        initial_state = create_initial_state(
+            alert_id=alert_id,
+            alert=stored.alert,
+            stored_alert=stored,
+            run=run,
+            max_dynamic_turns=self.max_dynamic_turns,
+            validation_enabled=self.validation_enabled,
+            shadow_enabled=self.shadow_enabled,
+            ai_fallback_enabled=self.ai_fallback_enabled,
+        )
+
+        # Record initial progress
+        from app.domain.models import ProgressRecord
+        await self.repository.append_progress(
+            alert_id,
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.RECEIVED,
+                message="调查 Worker 已领取任务。",
+            ),
+        )
+
         try:
-            await self._progress(
-                alert_id, run, InvestigationStage.RECEIVED, "调查 Worker 已领取任务。"
-            )
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.FINGERPRINTING,
-                "问题指纹已生成。",
-                {"incident_fingerprint": alert.incident_fingerprint},
-            )
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.KNOWLEDGE_MATCHING,
-                "正在匹配人工确认的历史案例。",
-            )
-            knowledge_cases = await self.repository.find_knowledge_cases(
-                alert.incident_fingerprint, alert.fingerprint_version, limit=3
-            )
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.RUNBOOK_MATCHING,
-                "正在检索告警处理手册。",
-                {"knowledge_matches": len(knowledge_cases)},
-            )
-            runbooks = await self.runbook_provider.search(alert, limit=self.runbook_limit)
-            await self.repository.save_runbooks(alert_id, runbooks)
-            strategy = await self.strategy_provider.select(alert, runbooks)
-            await self.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.INVESTIGATING,
-                f"执行调查策略 {strategy.strategy_id}。",
-                {"tool_count": len(strategy.tool_plan)},
-            )
-            context = InvestigationContext(run_id=run.id, alert=alert, strategy=strategy)
-            for request in strategy.tool_plan:
-                result = await self.tool_executor.execute(request, context)
-                evidence.append(result)
-                await self.repository.save_evidence(alert_id, result)
-
-            if self.react_enabled and strategy.max_dynamic_turns:
-                try:
-                    await self._run_dynamic_investigation(
-                        alert_id, run, context, evidence, strategy.max_dynamic_turns
-                    )
-                except Exception as exc:
-                    # Dynamic planning is an optional enrichment step. A malformed
-                    # planner response must not discard the deterministic tool plan.
-                    await self.repository.append_progress(
-                        alert_id,
-                        ProgressRecord(
-                            run_id=run.id,
-                            stage=InvestigationStage.INVESTIGATING,
-                            message="动态调查未完成，继续使用已采集证据。",
-                            details={"error_type": type(exc).__name__},
-                        ),
-                    )
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.ADVISING,
-                "正在以命中手册为首要依据生成结构化处理建议。",
-                {"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
-            )
-            advisor_degraded = False
-            primary_advisor_error: Exception | None = None
-            try:
-                recommendation, advisor_metadata = await self.advisor.advise(
-                    alert,
-                    runbooks,
-                    evidence=evidence,
-                    knowledge_cases=knowledge_cases,
-                    strategy=strategy,
+            # Run the LangGraph investigation
+            final_state = await self.agent.run(initial_state)
+            
+            # Send notification
+            if final_state.recommendation and final_state.alert:
+                await self._send_analysis_result(
+                    final_state.alert,
+                    status=final_state.status,
+                    recommendation=final_state.recommendation,
                 )
-            except Exception as exc:
-                primary_advisor_error = exc
-                if not self.ai_fallback_enabled or self.fallback_advisor is None:
-                    raise
-                advisor_degraded = True
-                recommendation, advisor_metadata = await self.fallback_advisor.advise(
-                    alert,
-                    runbooks,
-                    evidence=evidence,
-                    knowledge_cases=knowledge_cases,
-                    strategy=strategy,
-                )
-                advisor_metadata = advisor_metadata.model_copy(
-                    update={"usage": {"fallback_reason": type(exc).__name__}}
-                )
-                await self.repository.append_progress(
-                    alert_id,
-                    ProgressRecord(
-                        run_id=run.id,
-                        stage=InvestigationStage.ADVISING,
-                        message="AI 主分析未返回合规结果，已生成保守候选建议并转人工复核。",
-                        details={"error_type": type(exc).__name__},
-                    ),
-                )
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.VALIDATING,
-                "正在进行规则验收和独立结论验收。",
-            )
-            rule_validation = await self.rule_validator.validate(
-                run, alert, recommendation, evidence, runbooks
-            )
-            required_failures = self._required_tool_failures(strategy.tool_plan, evidence)
-            if required_failures:
-                rule_validation = rule_validation.model_copy(
-                    update={
-                        "passed": False,
-                        "issues": [
-                            *rule_validation.issues,
-                            f"必需调查工具未成功：{', '.join(required_failures)}",
-                        ],
-                    }
-                )
-            await self.repository.save_validation(alert_id, rule_validation)
-
-            agent_validation: ValidationRecord | None = None
-            if advisor_degraded and self.validation_enabled:
-                agent_validation = ValidationRecord(
-                    run_id=run.id,
-                    kind=ValidationKind.AGENT,
-                    passed=False,
-                    issues=[
-                        "AI 主分析不可用，保守候选建议必须由人工复核"
-                    ],
-                    metadata={
-                        "fallback": True,
-                        "primary_error_type": (
-                            type(primary_advisor_error).__name__
-                            if primary_advisor_error
-                            else "Unknown"
-                        ),
-                    },
-                )
-                await self.repository.save_validation(alert_id, agent_validation)
-            elif rule_validation.passed and self.validation_enabled:
-                try:
-                    agent_validation = await self.conclusion_validator.validate(
-                        run, alert, recommendation, evidence, runbooks
-                    )
-                except Exception as exc:
-                    agent_validation = ValidationRecord(
-                        run_id=run.id,
-                        kind=ValidationKind.AGENT,
-                        passed=False,
-                        issues=[f"独立验收不可用：{type(exc).__name__}: {sanitize(str(exc))}"],
-                    )
-                await self.repository.save_validation(alert_id, agent_validation)
-
-            validation_passed = rule_validation.passed and (
-                not self.validation_enabled
-                or (agent_validation is not None and agent_validation.passed)
-            )
-            unapproved_runbook = any(
-                item.quality_status != RunbookQualityStatus.APPROVED
-                for item in runbooks
-            )
-            passed = (
-                validation_passed
-                and not self.shadow_enabled
-                and not unapproved_runbook
-                and not advisor_degraded
-            )
-            final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
-            run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
-            final_stage = (
-                InvestigationStage.COMPLETED
-                if passed
-                else InvestigationStage.REVIEW_REQUIRED
-            )
-            if not passed:
-                recommendation = recommendation.model_copy(
-                    update={
-                        "requires_human": True,
-                        "confidence": min(recommendation.confidence, 0.5),
-                        "analysis_mode": (
-                            "shadow" if self.shadow_enabled else "assist"
-                        ),
-                    }
-                )
-            else:
-                recommendation = recommendation.model_copy(
-                    update={"analysis_mode": "assist"}
-                )
-
-            await self._progress(
-                alert_id,
-                run,
-                InvestigationStage.REPORTING,
-                "正在保存建议、依据和审计结果。",
-                {"final_status": final_status.value},
-            )
-            await self.repository.update_run(
-                str(run.id), status=run_status.value, stage=final_stage
-            )
-            await self.repository.append_progress(
-                alert_id,
-                ProgressRecord(
-                    run_id=run.id,
-                    stage=final_stage,
-                    message="调查完成。" if passed else "结论需要人工复核。",
-                    details={
-                        "validation_passed": validation_passed,
-                        "shadow_enabled": self.shadow_enabled,
-                        "unapproved_runbook": unapproved_runbook,
-                        "advisor_degraded": advisor_degraded,
-                    },
-                ),
-            )
-            # Publish the alert-level terminal status only after the run and its
-            # terminal progress are visible. Detail clients can never observe a
-            # completed alert whose investigation still appears to be REPORTING.
-            await self.repository.save_analysis(
-                alert_id,
-                final_status,
-                runbooks=runbooks,
-                recommendation=recommendation,
-                advisor_metadata=advisor_metadata,
-            )
-            await self._send_analysis_result(
-                alert,
-                status=final_status,
-                recommendation=recommendation,
-                message=(
-                    "数据库告警分析已完成。"
-                    if passed
-                    else (
-                        "数据库告警已生成影子分析，请人工复核。"
-                        if self.shadow_enabled
-                        else "数据库告警已生成候选分析，请人工复核。"
-                    )
-                ),
-            )
+            
             return await self.get(alert_id)
+            
         except Exception as exc:
             error = f"{type(exc).__name__}: {sanitize(str(exc))}"
             await self.repository.update_run(
@@ -396,7 +239,7 @@ class AlertAnalysisService:
                 ),
             )
             await self.repository.save_analysis(
-                alert_id, AlertStatus.FAILED, runbooks=runbooks, error=error
+                alert_id, AlertStatus.FAILED, error=error
             )
             raise AnalysisFailedError(alert_id, error) from exc
 
@@ -418,6 +261,27 @@ class AlertAnalysisService:
         wrong_agent_claims: list[str] | None = None,
         accepted_step_orders: list[int] | None = None,
     ) -> FeedbackRecord:
+        """Submit feedback for a completed investigation.
+        
+        Args:
+            alert_id: The alert ID
+            idempotency_key: Unique key for idempotency
+            verdict: The feedback verdict
+            reviewer: The reviewer name
+            final_root_cause: Confirmed root cause (required for CONFIRMED/CORRECTED)
+            actual_resolution: Actual resolution taken (required for CONFIRMED/CORRECTED)
+            recovered: Whether the issue was recovered
+            runbook_match_verdict: Verdict on runbook match quality
+            correct_runbook_id: ID of the correct runbook
+            correct_runbook_section: Section of the correct runbook
+            missed_runbook_ids: IDs of runbooks that should have been matched
+            supporting_evidence_ids: IDs of supporting evidence
+            wrong_agent_claims: Claims made by the agent that were wrong
+            accepted_step_orders: Orders of accepted recommendation steps
+            
+        Returns:
+            The saved feedback record
+        """
         stored = await self.get(alert_id)
         if stored.status not in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
             raise InvalidAlertPayloadError("Only completed investigations can receive feedback")
@@ -469,6 +333,8 @@ class AlertAnalysisService:
             raise InvalidAlertPayloadError(
                 "NOT_APPLICABLE runbook feedback cannot provide correct_runbook_id"
             )
+        
+        from app.domain.models import ToolStatus
         evidence_ids = list(dict.fromkeys(supporting_evidence_ids or []))
         evidence_by_id = {str(item.id): item for item in stored.evidence_records}
         invalid_evidence = [
@@ -481,6 +347,7 @@ class AlertAnalysisService:
             raise InvalidAlertPayloadError(
                 "supporting_evidence_ids must reference SUCCESS evidence from this investigation"
             )
+        
         accepted_orders = sorted(set(accepted_step_orders or []))
         valid_orders = {
             step.order for step in (stored.recommendation.steps if stored.recommendation else [])
@@ -489,6 +356,7 @@ class AlertAnalysisService:
             raise InvalidAlertPayloadError(
                 "accepted_step_orders must reference recommendation steps from this investigation"
             )
+        
         feedback = FeedbackRecord(
             alert_id=stored.alert.id,
             run_id=stored.latest_run.id,
@@ -506,6 +374,7 @@ class AlertAnalysisService:
             accepted_step_orders=accepted_orders,
             reviewer=sanitize(reviewer),
         )
+        
         knowledge_case = None
         if (
             verdict in {FeedbackVerdict.CONFIRMED, FeedbackVerdict.CORRECTED}
@@ -535,6 +404,17 @@ class AlertAnalysisService:
         return await self.repository.save_feedback(feedback, knowledge_case)
 
     async def get(self, alert_id: str) -> StoredAlert:
+        """Get an alert by ID.
+        
+        Args:
+            alert_id: The alert ID
+            
+        Returns:
+            The stored alert
+            
+        Raises:
+            AlertNotFoundError: If the alert doesn't exist
+        """
         stored = await self.repository.get(alert_id)
         if not stored:
             raise AlertNotFoundError(alert_id)
@@ -551,6 +431,20 @@ class AlertAnalysisService:
         environment: str | None = None,
         search: str | None = None,
     ) -> AlertListResult:
+        """List alerts with filtering and pagination.
+        
+        Args:
+            page: Page number (1-indexed)
+            page_size: Number of items per page
+            statuses: Filter by status set
+            severities: Filter by severity set
+            source: Filter by source
+            environment: Filter by environment
+            search: Search string
+            
+        Returns:
+            Alert list result with pagination info
+        """
         return await self.repository.list_alerts(
             page=page,
             page_size=page_size,
@@ -562,72 +456,12 @@ class AlertAnalysisService:
         )
 
     async def dashboard_summary(self) -> DashboardSummary:
+        """Get dashboard summary statistics.
+        
+        Returns:
+            Dashboard summary
+        """
         return await self.repository.dashboard_summary()
-
-    async def _run_dynamic_investigation(
-        self,
-        alert_id: str,
-        run: InvestigationRun,
-        context: InvestigationContext,
-        evidence: list[EvidenceRecord],
-        max_turns: int,
-    ) -> None:
-        seen_requests = {
-            (item.tool_name, str(sorted(item.request.items()))) for item in evidence
-        }
-        for _ in range(max_turns):
-            decision = await self.advisor.choose_next_tool(
-                context, evidence, self.tool_registry.names()
-            )
-            if decision.action == "finish":
-                return
-            if not decision.tool_name:
-                return
-            request_key = (decision.tool_name, str(sorted(decision.parameters.items())))
-            if request_key in seen_requests:
-                return
-            seen_requests.add(request_key)
-            from app.domain.models import ToolExecutionRequest
-
-            request = ToolExecutionRequest(
-                tool_name=decision.tool_name,
-                parameters=decision.parameters,
-                timeout_seconds=10,
-            )
-            result = await self.tool_executor.execute(request, context)
-            evidence.append(result)
-            await self.repository.save_evidence(alert_id, result)
-
-    @staticmethod
-    def _required_tool_failures(requests, evidence: list[EvidenceRecord]) -> list[str]:  # type: ignore[no-untyped-def]
-        statuses: dict[str, list[ToolStatus]] = {}
-        for item in evidence:
-            statuses.setdefault(item.tool_name, []).append(item.status)
-        return [
-            request.tool_name
-            for request in requests
-            if request.required
-            and ToolStatus.SUCCESS not in statuses.get(request.tool_name, [])
-        ]
-
-    async def _progress(
-        self,
-        alert_id: str,
-        run: InvestigationRun,
-        stage: InvestigationStage,
-        message: str,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        await self.repository.update_run(str(run.id), stage=stage)
-        await self.repository.append_progress(
-            alert_id,
-            ProgressRecord(
-                run_id=run.id,
-                stage=stage,
-                message=message,
-                details=sanitize(details or {}),
-            ),
-        )
 
     async def _send_analysis_result(
         self,
@@ -637,6 +471,9 @@ class AlertAnalysisService:
         message: str,
         recommendation: Recommendation,
     ) -> None:
+        """Send analysis result notification."""
+        from app.domain.models import AnalysisResultEvent
+        
         event = AnalysisResultEvent(
             alert=alert,
             recommendation=recommendation,
@@ -646,9 +483,6 @@ class AlertAnalysisService:
         try:
             await self.notifier.send(event)
         except Exception as exc:
-            # Delivery acknowledgement, retries and escalation are intentionally
-            # outside this project's boundary. A send failure must not rewrite the
-            # completed analysis state.
             logger.warning(
                 "wecom_analysis_result_send_failed alert_id=%s error=%s",
                 alert.id,

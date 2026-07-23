@@ -31,12 +31,12 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
-from app.application.scheduler import (
-    FlashDutyAlertPoller,
-    InMemoryAnalysisScheduler,
-    KafkaAnalysisScheduler,
-    ManualAnalysisScheduler,
+from app.agents.scheduler import (
+    LangGraphScheduler,
+    KafkaLangGraphScheduler,
+    ManualLangGraphScheduler,
 )
+from app.application.scheduler import FlashDutyAlertPoller
 from app.config import Settings, get_settings
 from app.domain.errors import (
     AlertNotFoundError,
@@ -73,12 +73,22 @@ def create_app(
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
         if settings.http_scheduler == "kafka":
-            scheduler = KafkaAnalysisScheduler(settings, runtime.service)
+            scheduler = KafkaLangGraphScheduler(settings, runtime.service.agent)
         elif settings.http_scheduler == "manual":
-            scheduler = ManualAnalysisScheduler()
+            scheduler = ManualLangGraphScheduler(runtime.service.agent)
         else:
-            scheduler = InMemoryAnalysisScheduler(
-                runtime.service, workers=settings.scheduler_workers
+            scheduler = LangGraphScheduler(
+                agent=runtime.service.agent,
+                repository=runtime.repository,
+                notifier=runtime.service.notifier,
+                source_registry=runtime.service.source_registry,
+                alert_sanitizer=runtime.service.alert_sanitizer,
+                investigation_lease_seconds=settings.investigation_lease_seconds,
+                max_dynamic_turns=settings.react_max_dynamic_turns if settings.react_enabled else 0,
+                validation_enabled=settings.validation_enabled,
+                shadow_enabled=settings.shadow_enabled,
+                ai_fallback_enabled=settings.ai_fallback_enabled,
+                workers=settings.scheduler_workers,
             )
     flashduty_poller = FlashDutyAlertPoller(
         settings, runtime.service, scheduler, runtime.flashduty_client

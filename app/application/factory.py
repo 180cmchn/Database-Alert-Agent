@@ -39,6 +39,7 @@ from app.domain.ports import (
     RunbookProvider,
     RunbookStore,
 )
+from app.agents.scheduler import LangGraphScheduler, KafkaLangGraphScheduler, ManualLangGraphScheduler
 
 
 @dataclass
@@ -230,6 +231,7 @@ def build_runtime(
         validation_enabled=settings.validation_enabled,
         shadow_enabled=settings.shadow_enabled,
         ai_fallback_enabled=settings.ai_fallback_enabled,
+        max_dynamic_turns=settings.react_max_dynamic_turns if settings.react_enabled else 0,
     )
     return Runtime(
         settings=settings,
