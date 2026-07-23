@@ -27,7 +27,9 @@ _INLINE_SECRET = re.compile(
 )
 
 
-def sanitize_text(value: str) -> str:
+def sanitize_text(value: str | None) -> str:
+    if value is None:
+        return ""
     value = _AUTHORIZATION_HEADER.sub(
         lambda match: f"{match.group(1)}={REDACTED}", value
     )
@@ -38,6 +40,8 @@ def sanitize_text(value: str) -> str:
 
 
 def sanitize(value: Any, key: str | None = None) -> Any:
+    if value is None:
+        return None
     if key and _SENSITIVE_KEY.search(key):
         return REDACTED
     if isinstance(value, dict):
