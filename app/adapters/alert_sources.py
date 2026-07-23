@@ -67,7 +67,9 @@ def stable_event_id(source: str, raw_payload: dict[str, Any]) -> str:
     return _stable_hash("generated", identity)
 
 
-def normalize_error_pattern(value: str) -> str:
+def normalize_error_pattern(value: str | None) -> str:
+    if value is None:
+        return ""
     value = value.strip().lower()
     value = re.sub(
         r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
