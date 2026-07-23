@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from app.domain.models import (
     AdvisorMetadata,
@@ -50,6 +51,34 @@ from app.domain.models import (
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Persist UTC datetimes and restore timezone data dropped by SQLite."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):  # type: ignore[no-untyped-def]
+        return dialect.type_descriptor(DateTime(timezone=True))
+
+    def process_bind_param(
+        self, value: datetime | None, _dialect  # type: ignore[no-untyped-def]
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def process_result_value(
+        self, value: datetime | None, _dialect  # type: ignore[no-untyped-def]
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 DATABASE_SCHEMA_REVISION = "0007"
@@ -81,10 +110,10 @@ class AlertRow(Base):
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now
+        UTCDateTime(), nullable=False, default=_utc_now
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now
+        UTCDateTime(), nullable=False, default=_utc_now, onupdate=_utc_now
     )
 
 
@@ -102,12 +131,12 @@ class InvestigationRunRow(Base):
     strategy_id: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(String(255))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now
+        UTCDateTime(), nullable=False, default=_utc_now
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now
+        UTCDateTime(), nullable=False, default=_utc_now
     )
 
 
@@ -127,7 +156,7 @@ class ProgressRow(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now
+        UTCDateTime(), nullable=False, default=_utc_now
     )
 
 
@@ -148,8 +177,8 @@ class EvidenceRow(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     data_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     error: Mapped[str | None] = mapped_column(Text)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     truncated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
@@ -168,7 +197,7 @@ class ValidationRow(Base):
     passed: Mapped[int] = mapped_column(Integer, nullable=False)
     issues_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class FeedbackRow(Base):
@@ -199,7 +228,7 @@ class FeedbackRow(Base):
     wrong_agent_claims_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     accepted_step_orders_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     reviewer: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class KnowledgeCaseRow(Base):
@@ -222,8 +251,8 @@ class KnowledgeCaseRow(Base):
     actual_resolution: Mapped[str] = mapped_column(Text, nullable=False)
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
     confirmed_by: Mapped[str] = mapped_column(String(255), nullable=False)
-    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class SQLAlchemyAlertRepository:
