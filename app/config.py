@@ -93,8 +93,6 @@ class Settings(BaseSettings):
     flashduty_timeout_seconds: float = Field(default=40, ge=35, le=120)
     flashduty_max_retries: int = Field(default=2, ge=0, le=5)
     flashduty_context_item_limit: int = Field(default=20, ge=1, le=100)
-    flashduty_webhook_enabled: bool = True
-    flashduty_webhook_token: str = Field(default="", repr=False)
     flashduty_polling_enabled: bool = True
     flashduty_poll_interval_seconds: int = Field(default=300, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int = Field(default=900, ge=300, le=2678400)
@@ -231,12 +229,11 @@ class Settings(BaseSettings):
             issues.append("FLASHDUTY_APP_KEY is required when FlashDuty is enabled")
         if (
             self.flashduty_enabled
-            and self.flashduty_webhook_enabled
-            and self.app_env.lower() in {"production", "prod"}
-            and not self.flashduty_webhook_token
+            and self.flashduty_polling_enabled
+            and not self.flashduty_poll_channel_ids
         ):
             issues.append(
-                "FLASHDUTY_WEBHOOK_TOKEN is required for the production FlashDuty webhook"
+                "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration space ID"
             )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

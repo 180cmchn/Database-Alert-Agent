@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +18,6 @@ from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
-    FlashDutyAlertWebhookEvent,
-    FlashDutyWebhookReceipt,
     RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
@@ -226,70 +224,20 @@ def create_app(
         )
 
     @app.post(
-        "/api/v1/webhooks/flashduty/alerts",
-        response_model=FlashDutyWebhookReceipt,
-        status_code=200,
-        tags=["integrations"],
-    )
-    async def receive_flashduty_alert_webhook(
-        payload: FlashDutyAlertWebhookEvent,
-        webhook_token: Annotated[
-            str | None, Header(alias="X-FlashDuty-Token")
-        ] = None,
-    ) -> FlashDutyWebhookReceipt:
-        if not runtime.settings.flashduty_enabled or not runtime.settings.flashduty_webhook_enabled:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "FLASHDUTY_WEBHOOK_DISABLED",
-                    "message": "FlashDuty alert webhook intake is disabled",
-                },
-            )
-        expected = runtime.settings.flashduty_webhook_token
-        if expected and (
-            webhook_token is None
-            or not secrets.compare_digest(
-                webhook_token.encode("utf-8"), expected.encode("utf-8")
-            )
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail={
-                    "code": "INVALID_FLASHDUTY_WEBHOOK_TOKEN",
-                    "message": "Invalid FlashDuty webhook token",
-                },
-            )
-
-        if payload.event_type == "a_close":
-            return FlashDutyWebhookReceipt(
-                event_id=payload.event_id,
-                event_type=payload.event_type,
-                accepted=False,
-                message="Close event acknowledged; no new analysis was scheduled.",
-            )
-
-        stored, created = await runtime.service.ingest(
-            "flashduty", payload.model_dump(mode="json")
-        )
-        if created or stored.status in {AlertStatus.QUEUED, AlertStatus.FAILED}:
-            await scheduler.enqueue(str(stored.alert.id))
-        return FlashDutyWebhookReceipt(
-            event_id=payload.event_id,
-            event_type=payload.event_type,
-            accepted=True,
-            alert_id=stored.alert.id,
-            status=stored.status,
-            deduplicated=not created,
-            message="FlashDuty alert accepted for asynchronous analysis.",
-        )
-
-    @app.post(
         "/api/v1/alerts/{source}/analyze",
         response_model=AlertAccepted,
         status_code=202,
         tags=["alerts"],
     )
     async def analyze_alert(source: str, payload: dict[str, Any]) -> AlertAccepted:
+        if source.casefold() == "flashduty":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "FLASHDUTY_POLLING_ONLY",
+                    "message": "FlashDuty alerts are ingested only by the API poller.",
+                },
+            )
         stored, created = await runtime.service.ingest(source, payload)
         if created or stored.status in {
             AlertStatus.QUEUED,

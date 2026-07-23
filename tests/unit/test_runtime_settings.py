@@ -188,6 +188,21 @@ def test_flashduty_polling_interval_and_scope_configuration(
     assert settings.flashduty_poll_integration_ids == [42, 43]
 
 
+def test_flashduty_polling_requires_a_collaboration_space_scope() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_poll_channel_ids=[],
+    )
+
+    assert (
+        "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration space ID"
+        in settings.readiness_issues()
+    )
+
+
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir(exist_ok=True)
@@ -332,7 +347,6 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
     assert body["ai_fallback_enabled"] is True
-    assert body["flashduty_webhook_token_configured"] is False
     assert body["flashduty_polling_enabled"] is True
     assert body["flashduty_poll_interval_seconds"] == 300
     assert "ai_api_key" not in body

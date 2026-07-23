@@ -23,25 +23,6 @@ class AlertAccepted(BaseModel):
     deduplicated: bool
 
 
-class FlashDutyAlertWebhookEvent(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    event_id: str = Field(min_length=1, max_length=255)
-    event_time: int = Field(ge=0)
-    event_type: Literal["a_new", "a_update", "a_merge", "a_close"]
-    alert: dict[str, Any]
-
-
-class FlashDutyWebhookReceipt(BaseModel):
-    event_id: str
-    event_type: str
-    accepted: bool
-    alert_id: UUID | None = None
-    status: AlertStatus | None = None
-    deduplicated: bool = False
-    message: str
-
-
 class FeedbackRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     verdict: FeedbackVerdict
@@ -115,8 +96,6 @@ class RuntimeSettingsResponse(BaseModel):
     flashduty_enabled: bool
     flashduty_base_url: str
     flashduty_app_key_configured: bool
-    flashduty_webhook_enabled: bool
-    flashduty_webhook_token_configured: bool
     flashduty_polling_enabled: bool
     flashduty_poll_interval_seconds: int
     flashduty_poll_lookback_seconds: int
@@ -159,10 +138,6 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,
             flashduty_app_key_configured=bool(settings.flashduty_app_key),
-            flashduty_webhook_enabled=settings.flashduty_webhook_enabled,
-            flashduty_webhook_token_configured=bool(
-                settings.flashduty_webhook_token
-            ),
             flashduty_polling_enabled=settings.flashduty_polling_enabled,
             flashduty_poll_interval_seconds=settings.flashduty_poll_interval_seconds,
             flashduty_poll_lookback_seconds=settings.flashduty_poll_lookback_seconds,

@@ -2,7 +2,7 @@
 
 本项目只负责一条告警分析链路：
 
-1. 通过 FlashDuty 告警 Webhook 实时接收并规范化数据库告警，并用只读 `/alert/list` 轮询补偿漏送；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
+1. 通过 FlashDuty 只读 Open API 定时轮询指定协作空间的告警并规范化；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
 2. 读取本地 PDF 文字层、图片视觉证据及结构化索引，完成章节级混合检索、精排和拒识。
 3. 由 AI Agent 按诊断图结合告警与实时证据，生成三态原因判断和只读核查建议。
 4. 判断依据严格按“命中手册在前、AI 分析在后”输出。
@@ -13,9 +13,9 @@
 ## 数据流
 
 ```text
-FlashDuty 告警 Webhook（实时）──────┐
-                                  ├→ 去重、规范化与异步入队
-FlashDuty /alert/list（5 分钟补偿）─┘
+FlashDuty /alert/list（定时轮询）
+             ↓
+按协作空间过滤、alert_id 去重、规范化与异步入队
                                   ↓
 三等级规范化与脱敏
           ↓
@@ -28,7 +28,7 @@ AI 分析（次要依据）+ 规则校验
 企业微信群机器人
 ```
 
-企业微信群机器人 Webhook 是**出站发送地址**，不是本服务的告警接收地址。企微发送只尝试一次；服务不会查询是否送达，也不会因发送失败改写已经完成的分析状态。实时入站应使用 FlashDuty 官方的[告警 Webhook](https://docs.flashduty.com/zh/on-call/integration/webhooks/alert-webhook)，而不是 `qyapi.weixin.qq.com/cgi-bin/webhook/send`。
+企业微信群机器人 Webhook 是**出站发送地址**，只用于发送分析结果。FlashDuty 告警由本服务通过 Open API 主动轮询，不提供任何 FlashDuty 入站 Webhook。企微发送只尝试一次；服务不会查询是否送达，也不会因发送失败改写已经完成的分析状态。
 
 ## 告警手册
 
@@ -89,7 +89,7 @@ WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-m
 
 ## FlashDuty 只读接入
 
-项目接入 [FlashDuty Open API](https://docs.flashduty.com/zh/openapi) 和[告警 Webhook](https://docs.flashduty.com/zh/on-call/integration/webhooks/alert-webhook)。客户端采用显式只读白名单；虽然 FlashDuty 的查询与诊断接口多数使用 `POST`，项目不会调用创建、更新、删除、认领、恢复等写接口。
+项目仅通过 [FlashDuty Open API](https://docs.flashduty.com/zh/openapi) 轮询和查询告警。客户端采用显式只读白名单；虽然 FlashDuty 的查询与诊断接口多数使用 `POST`，项目不会调用创建、更新、删除、认领、恢复等写接口。
 
 ```dotenv
 FLASHDUTY_ENABLED=true
@@ -98,11 +98,10 @@ FLASHDUTY_APP_KEY=replace-me
 FLASHDUTY_TIMEOUT_SECONDS=40
 FLASHDUTY_MAX_RETRIES=2
 FLASHDUTY_CONTEXT_ITEM_LIMIT=20
-FLASHDUTY_WEBHOOK_ENABLED=true
-FLASHDUTY_WEBHOOK_TOKEN=replace-with-a-long-random-value
 FLASHDUTY_POLLING_ENABLED=true
 FLASHDUTY_POLL_INTERVAL_SECONDS=300
 FLASHDUTY_POLL_LOOKBACK_SECONDS=900
+# 必填：仅轮询这些协作空间
 FLASHDUTY_POLL_CHANNEL_IDS=[123456789]
 FLASHDUTY_POLL_INTEGRATION_IDS=[]
 FLASHDUTY_METRICS_DS_NAME=prod-prometheus
@@ -110,21 +109,17 @@ FLASHDUTY_LOGS_DS_NAME=prod-loki
 FLASHDUTY_LOGS_DS_TYPE=loki
 ```
 
-`FLASHDUTY_APP_KEY` 与 `FLASHDUTY_WEBHOOK_TOKEN` 是部署级秘密值，不可通过管理 API 修改或读取。Base URL 固定为官方 HTTPS Endpoint，客户端禁止跟随重定向，错误和证据中不会保留 APP Key。建议在 FlashDuty 中为此项目创建最小权限的独立 APP Key。
+`FLASHDUTY_APP_KEY` 是部署级秘密值，不可通过管理 API 修改或读取。Base URL 固定为官方 HTTPS Endpoint，客户端禁止跟随重定向，错误和证据中不会保留 APP Key。建议在 FlashDuty 中为此项目创建最小权限的独立只读 APP Key。
 
-### FlashDuty 告警 Webhook 配置
+### FlashDuty API 轮询配置
 
-完整的接收协议、Nginx 公网 HTTPS 反代、请求/响应示例、内部处理阶段、轮询补偿和排障步骤见 [FlashDuty 告警 Webhook 接收与后续分析](docs/flashduty-webhook/README.md)。
+完整的配置、去重语义、排障和安全检查见 [FlashDuty Open API 轮询接入](docs/flashduty-polling/README.md)。
 
-1. 在 FlashDuty 进入“集成中心 → Webhook → 告警 Webhook”，新增集成。
-2. Endpoint 填写公网可达的 `https://<本服务域名>/api/v1/webhooks/flashduty/alerts`。
-3. 自定义 Header 添加 `X-FlashDuty-Token: <FLASHDUTY_WEBHOOK_TOKEN>`。
-4. 选择需要接收的协作空间，并订阅 `a_new`、`a_update`、`a_merge`；`a_close` 会快速确认但不会重复发起根因分析。
-5. 保持 TLS 校验开启。接口只做鉴权、规范化、幂等落库和异步入队，以满足 FlashDuty 要求的 2 秒内 HTTP 200 响应。
-
-FlashDuty 可能重试或乱序推送。项目以 `source + alert_id` 保证分析任务幂等；首次接收的 `event_id/event_type` 会随脱敏后的原始事件保存，后续重复投递不会创建第二个分析任务。轮询器按 `updated_at` 升序调用 `/alert/list`，每轮窗口与上一轮重叠；只有整轮成功后才推进内存水位。`FLASHDUTY_POLL_INTERVAL_SECONDS` 最小为 300 秒，默认每 5 分钟一轮；`FLASHDUTY_POLL_LOOKBACK_SECONDS=900` 用于覆盖延迟、短时中断和进程重启后的近期告警。若 `/alert/info` 暂时失败，轮询器会使用官方定义为完整对象的 `AlertItem` 继续补偿入站。
-
-若已知的地址是 `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...`，请只把它配置为 `WECOM_WEBHOOK_URL`。它负责把分析结果发进企业微信群，不能填到 FlashDuty 的 Endpoint，也不能被本服务用来读取群消息。
+1. 在 `.env` 设置 `FLASHDUTY_ENABLED=true`、最小权限的 `FLASHDUTY_APP_KEY` 和 `FLASHDUTY_POLLING_ENABLED=true`。
+2. 设置 `FLASHDUTY_POLL_CHANNEL_IDS=[<协作空间数字 ID>]`；此项在启用轮询时必填，避免拉取 APP Key 可访问的全部空间。
+3. 使用 `FLASHDUTY_POLL_INTERVAL_SECONDS` 配置轮询间隔（当前最小 300 秒），使用 `FLASHDUTY_POLL_LOOKBACK_SECONDS` 配置重叠回看窗口。
+4. 轮询器按 `updated_at` 调用 `/alert/list`，对每条记录优先调用 `/alert/info`，并以 `source + alert_id` 幂等入库；重复的 `alert_id` 不会创建第二个分析任务。
+5. 服务只需出站访问 FlashDuty HTTPS API，不需要 Endpoint、Nginx 入站反代、回调证书或 Webhook Token。
 
 启用后：
 
@@ -192,8 +187,6 @@ docker compose up --build
 ## API
 
 - `POST /api/v1/alerts/canonical/analyze`：接收告警并异步开始分析。
-- `POST /api/v1/alerts/flashduty/analyze`：接收 FlashDuty `/alert/info` 的 `data` 对象或完整成功响应并异步开始分析。
-- `POST /api/v1/webhooks/flashduty/alerts`：接收 FlashDuty 官方告警 Webhook；需 `X-FlashDuty-Token`，成功时在 2 秒内返回 HTTP 200。
 - `GET /api/v1/alerts/{id}`：查看手册匹配、分析进度、可能原因和有序依据。
 - `GET /api/v1/alerts`：分页查询告警。
 - `GET /api/v1/dashboard/summary`：查看分析概览。
