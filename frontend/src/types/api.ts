@@ -313,8 +313,6 @@ export interface AdminSettings {
   flashduty_enabled: boolean;
   flashduty_base_url: string;
   flashduty_app_key_configured: boolean;
-  flashduty_webhook_enabled: boolean;
-  flashduty_webhook_token_configured: boolean;
   flashduty_polling_enabled: boolean;
   flashduty_poll_interval_seconds: number;
   flashduty_poll_lookback_seconds: number;

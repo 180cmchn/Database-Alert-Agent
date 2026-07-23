@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class FlashDutyAlertPoller:
-    """Use `/alert/list` as a loss-recovery path for FlashDuty webhooks."""
+    """Poll scoped FlashDuty collaboration spaces through the read-only API."""
 
     def __init__(
         self,
@@ -37,6 +37,7 @@ class FlashDutyAlertPoller:
         return bool(
             self.settings.flashduty_enabled
             and self.settings.flashduty_polling_enabled
+            and bool(self.settings.flashduty_poll_channel_ids)
             and self.client is not None
         )
 

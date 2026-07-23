@@ -154,12 +154,11 @@ export function SettingsPage() {
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
 
-        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty 实时接收与轮询补偿" description="告警 Webhook 负责实时入站，Open API 每 5 分钟或更久轮询一次；APP Key、回调令牌与范围由部署环境管理。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读连接已启用" : "APP Key 未配置") : "未启用"}</span>}>
+        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty API 轮询" description="仅通过 FlashDuty Open API 拉取告警；APP Key、轮询间隔、协作空间和集成范围均由部署环境的 .env 管理。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读轮询已启用" : "APP Key 未配置") : "未启用"}</span>}>
           <div className="form-grid two-cols">
             <label className="field span-2"><span>官方 API Endpoint</span><input value={settings.flashduty_base_url} readOnly /></label>
-            <label className="field"><span>告警 Webhook</span><input value={settings.flashduty_webhook_enabled ? (settings.flashduty_webhook_token_configured ? "已启用 · 回调令牌已配置" : "已启用 · 回调令牌未配置") : "未启用"} readOnly /></label>
-            <label className="field"><span>轮询补偿</span><input value={settings.flashduty_polling_enabled ? `${settings.flashduty_poll_interval_seconds} 秒/轮 · 回看 ${settings.flashduty_poll_lookback_seconds} 秒` : "未启用"} readOnly /></label>
-            <label className="field"><span>协作空间范围</span><input value={settings.flashduty_poll_channel_ids.length ? settings.flashduty_poll_channel_ids.join(", ") : "全部协作空间"} readOnly /></label>
+            <label className="field"><span>轮询状态</span><input value={settings.flashduty_polling_enabled ? `${settings.flashduty_poll_interval_seconds} 秒/轮 · 回看 ${settings.flashduty_poll_lookback_seconds} 秒` : "未启用"} readOnly /></label>
+            <label className="field"><span>协作空间范围</span><input value={settings.flashduty_poll_channel_ids.length ? settings.flashduty_poll_channel_ids.join(", ") : "未配置（服务不会拉取）"} readOnly /></label>
             <label className="field"><span>集成范围</span><input value={settings.flashduty_poll_integration_ids.length ? settings.flashduty_poll_integration_ids.join(", ") : "全部集成"} readOnly /></label>
           </div>
         </SectionCard>

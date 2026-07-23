@@ -386,7 +386,7 @@ def _validate_read_only_expression(ds_type: str, expression: str, args: Any = No
 
 
 class FlashDutyAlertSourceAdapter:
-    """Normalize `/alert/info`, `/alert/list`, or Alert Webhook data."""
+    """Normalize FlashDuty `/alert/info` or `/alert/list` data."""
 
     source = "flashduty"
 
@@ -401,15 +401,10 @@ class FlashDutyAlertSourceAdapter:
         if "data" in payload:
             request_id = str(payload.get("request_id") or "") or None
             item = payload["data"]
-        elif "alert" in payload:
-            # Official Alert Webhook envelope. event_id is the delivery id used
-            # for retry de-duplication; alert_id remains the stable local identity.
-            request_id = str(payload.get("event_id") or "") or None
-            item = payload["alert"]
         if not isinstance(item, dict):
             raise InvalidAlertPayloadError("FlashDuty alert payload must contain an object")
 
-        alert_id = item.get("alert_id") or item.get("event_id")
+        alert_id = item.get("alert_id")
         if not isinstance(alert_id, str) or not _OBJECT_ID.fullmatch(alert_id):
             raise InvalidAlertPayloadError("FlashDuty alert_id must be a 24-character ObjectID")
         title = str(item.get("title") or "").strip()
@@ -481,8 +476,6 @@ class FlashDutyAlertSourceAdapter:
             or item.get("data_source_type"),
             "channel_id": item.get("channel_id"),
             "channel_name": item.get("channel_name"),
-            "flashduty_webhook_event_id": payload.get("event_id"),
-            "flashduty_webhook_event_type": payload.get("event_type"),
         }
         for key in (
             "flashduty_metrics",

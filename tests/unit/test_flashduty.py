@@ -235,32 +235,6 @@ def test_flashduty_alert_adapter_normalizes_alert_info_envelope() -> None:
     assert alert.incident_fingerprint.startswith("incident-v1-")
 
 
-def test_flashduty_alert_adapter_normalizes_official_webhook_envelope() -> None:
-    webhook = {
-        "event_id": "delivery-1",
-        "event_time": 1712650300000,
-        "event_type": "a_new",
-        "alert": {
-            **flashduty_alert_payload()["data"],
-            "integration_id": None,
-            "integration_name": None,
-            "integration_type": None,
-            "data_source_id": 42,
-            "data_source_name": "Monitors",
-            "data_source_type": "monit.alert",
-        },
-    }
-
-    alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(webhook)
-
-    assert alert.external_id == ALERT_ID
-    assert alert.attributes["flashduty_webhook_event_id"] == "delivery-1"
-    assert alert.attributes["flashduty_webhook_event_type"] == "a_new"
-    assert alert.attributes["integration_id"] == 42
-    assert alert.attributes["integration_name"] == "Monitors"
-    assert alert.attributes["integration_type"] == "monit.alert"
-
-
 def make_context() -> InvestigationContext:
     alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(
         flashduty_alert_payload()
