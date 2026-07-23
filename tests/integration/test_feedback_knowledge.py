@@ -66,6 +66,8 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         reviewed_detail = client.get(first["detail_url"]).json()
         assert reviewed_detail["status"] == "COMPLETED"
         assert len(reviewed_detail["feedback"]) == 1
+        assert reviewed_detail["feedback"][0]["created_at"].endswith(("+00:00", "Z"))
+        assert reviewed_detail["updated_at"].endswith(("+00:00", "Z"))
         duplicate = client.post(
             f"/api/v1/alerts/{first['alert_id']}/feedback",
             headers={"Authorization": "Bearer test-admin-token"},
