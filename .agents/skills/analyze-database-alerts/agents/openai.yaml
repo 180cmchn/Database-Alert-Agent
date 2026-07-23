@@ -1,0 +1,4 @@
+interface:
+  display_name: "数据库告警根因分析"
+  short_description: "结合实时证据、本地PDF手册与外部知识准确定位数据库告警根因"
+  default_prompt: "Use $analyze-database-alerts to identify the alert semantics, test root-cause hypotheses, and return an evidence-grounded database diagnosis."
