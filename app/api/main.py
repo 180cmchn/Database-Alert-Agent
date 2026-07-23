@@ -41,6 +41,7 @@ from app.config import Settings, get_settings
 from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
+    FeedbackAlreadySubmittedError,
     InvalidAlertPayloadError,
     InvalidRunbookIdError,
     RunbookNotFoundError,
@@ -171,6 +172,20 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"code": "INVALID_ALERT_PAYLOAD", "message": str(exc)},
+        )
+
+    @app.exception_handler(FeedbackAlreadySubmittedError)
+    async def feedback_already_submitted_handler(
+        _request: Request, exc: FeedbackAlreadySubmittedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "FEEDBACK_ALREADY_SUBMITTED",
+                "message": str(exc),
+                "alert_id": exc.alert_id,
+                "run_id": exc.run_id,
+            },
         )
 
     @app.exception_handler(AlertNotFoundError)

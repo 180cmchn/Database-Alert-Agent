@@ -15,6 +15,13 @@ class InvalidAlertPayloadError(AlertAgentError):
     pass
 
 
+class FeedbackAlreadySubmittedError(AlertAgentError):
+    def __init__(self, alert_id: str, run_id: str) -> None:
+        super().__init__("Human review for this investigation has already been submitted")
+        self.alert_id = alert_id
+        self.run_id = run_id
+
+
 class AdvisorError(AlertAgentError):
     pass
 

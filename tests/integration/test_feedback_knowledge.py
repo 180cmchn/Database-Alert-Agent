@@ -63,6 +63,9 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         assert feedback.status_code == 201
         assert feedback.json()["runbook_match_verdict"] == "NOT_APPLICABLE"
         assert feedback.json()["supporting_evidence_ids"] == [evidence_id]
+        reviewed_detail = client.get(first["detail_url"]).json()
+        assert reviewed_detail["status"] == "COMPLETED"
+        assert len(reviewed_detail["feedback"]) == 1
         duplicate = client.post(
             f"/api/v1/alerts/{first['alert_id']}/feedback",
             headers={"Authorization": "Bearer test-admin-token"},
@@ -75,7 +78,22 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
                 "recovered": True,
             },
         )
+        assert duplicate.status_code == 201
         assert duplicate.json()["id"] == feedback.json()["id"]
+        conflicting = client.post(
+            f"/api/v1/alerts/{first['alert_id']}/feedback",
+            headers={"Authorization": "Bearer test-admin-token"},
+            json={
+                "idempotency_key": "feedback-2",
+                "verdict": "REJECTED",
+            },
+        )
+        assert conflicting.status_code == 409
+        assert conflicting.json()["code"] == "FEEDBACK_ALREADY_SUBMITTED"
+        fixed_detail = client.get(first["detail_url"]).json()
+        assert fixed_detail["status"] == "COMPLETED"
+        assert len(fixed_detail["feedback"]) == 1
+        assert fixed_detail["feedback"][0]["id"] == feedback.json()["id"]
 
         second = client.post(
             "/api/v1/alerts/canonical/analyze",

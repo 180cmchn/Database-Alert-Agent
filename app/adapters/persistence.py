@@ -52,7 +52,7 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0006"
+DATABASE_SCHEMA_REVISION = "0007"
 
 
 class Base(DeclarativeBase):
@@ -708,11 +708,19 @@ class SQLAlchemyAlertRepository:
         self, feedback: FeedbackRecord, knowledge_case: KnowledgeCase | None = None
     ) -> FeedbackRecord:
         async with self.session_factory() as session:
-            query = select(FeedbackRow).where(
-                FeedbackRow.alert_id == str(feedback.alert_id),
-                FeedbackRow.idempotency_key == feedback.idempotency_key,
+            alert_row = (
+                await session.execute(
+                    select(AlertRow)
+                    .where(AlertRow.id == str(feedback.alert_id))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            run_query = (
+                select(FeedbackRow)
+                .where(FeedbackRow.run_id == str(feedback.run_id))
+                .order_by(FeedbackRow.created_at, FeedbackRow.id)
             )
-            existing = (await session.execute(query)).scalar_one_or_none()
+            existing = (await session.execute(run_query)).scalars().first()
             if existing:
                 return self._feedback(existing)
             session.add(
@@ -742,6 +750,9 @@ class SQLAlchemyAlertRepository:
                     created_at=feedback.created_at,
                 )
             )
+            if alert_row is not None:
+                alert_row.status = AlertStatus.COMPLETED.value
+                alert_row.updated_at = _utc_now()
             if knowledge_case:
                 existing_case = (
                     await session.execute(
@@ -781,7 +792,13 @@ class SQLAlchemyAlertRepository:
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                existing = (await session.execute(query)).scalar_one()
+                existing = (await session.execute(run_query)).scalars().first()
+                if existing is None:
+                    idempotency_query = select(FeedbackRow).where(
+                        FeedbackRow.alert_id == str(feedback.alert_id),
+                        FeedbackRow.idempotency_key == feedback.idempotency_key,
+                    )
+                    existing = (await session.execute(idempotency_query)).scalar_one()
                 return self._feedback(existing)
             return feedback
 
