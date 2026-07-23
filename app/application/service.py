@@ -211,11 +211,17 @@ class AlertAnalysisService:
             # Run the LangGraph investigation
             final_state = await self.agent.run(initial_state)
             
+            # Check if the investigation ended with FAILED status
+            if final_state.status == AlertStatus.FAILED:
+                error = final_state.error or "Investigation failed"
+                raise AnalysisFailedError(alert_id, error)
+            
             # Send notification
             if final_state.recommendation and final_state.alert:
                 await self._send_analysis_result(
                     final_state.alert,
                     status=final_state.status,
+                    message="数据库告警分析已完成。",
                     recommendation=final_state.recommendation,
                 )
             
@@ -239,7 +245,7 @@ class AlertAnalysisService:
                 ),
             )
             await self.repository.save_analysis(
-                alert_id, AlertStatus.FAILED, error=error
+                alert_id, AlertStatus.FAILED, runbooks=[], error=error
             )
             raise AnalysisFailedError(alert_id, error) from exc
 

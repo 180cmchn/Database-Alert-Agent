@@ -176,7 +176,7 @@ class LangGraphScheduler:
                 self._create_progress(run.id, InvestigationStage.FAILED, "调查执行失败。", {"error": error_msg}),
             )
             await self.repository.save_analysis(
-                alert_id, AlertStatus.FAILED, error=error_msg
+                alert_id, AlertStatus.FAILED, runbooks=[], error=error_msg
             )
     
     def _schedule_lease_retry(self, alert_id: str) -> None:

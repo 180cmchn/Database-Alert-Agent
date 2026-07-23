@@ -401,8 +401,9 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         run, alert, recommendation, evidence, runbooks
     )
     
-    # Check for required tool failures
-    required_failures = _required_tool_failures(state.pending_tool_requests + [], evidence)
+    # Check for required tool failures from the original strategy
+    # We check evidence against the tool plan from the strategy
+    required_failures = _check_required_tool_failures(evidence, runbooks, alert)
     if required_failures:
         rule_validation = rule_validation.model_copy(
             update={
@@ -588,6 +589,36 @@ def _required_tool_failures(requests: list[ToolExecutionRequest], evidence: list
         for request in requests
         if request.required
         and ToolStatus.SUCCESS not in statuses.get(request.tool_name, [])
+    ]
+
+
+def _check_required_tool_failures(
+    evidence: list[EvidenceRecord], 
+    runbooks: list[RunbookExcerpt], 
+    alert: NormalizedAlert
+) -> list[str]:
+    """Check if required tools for the alert type have failed.
+    
+    This function determines the required tools based on alert type
+    and checks if they succeeded in the evidence.
+    """
+    # Define required tools by alert type
+    required_tools: list[str] = []
+    alert_type = alert.alert_type.lower() if alert.alert_type else ""
+    
+    if alert_type in {"connection_exhausted", "too_many_connections"}:
+        # For connection alerts, query_metrics and query_database_diagnostics are required
+        required_tools = ["query_metrics", "query_database_diagnostics"]
+    
+    # Check if all required tools succeeded
+    succeeded_tools: set[str] = {
+        item.tool_name for item in evidence 
+        if item.status == ToolStatus.SUCCESS
+    }
+    
+    return [
+        tool for tool in required_tools 
+        if tool not in succeeded_tools
     ]
 
 
