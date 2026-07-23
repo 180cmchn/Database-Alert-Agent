@@ -25,7 +25,15 @@ import { api, ApiError } from "../lib/api";
 import type { AdminSettings, AdminSettingsPatch } from "../types/api";
 
 function numberField(form: FormData, name: string): number {
-  return Number(form.get(name));
+  const rawValue = form.get(name);
+  if (typeof rawValue !== "string" || !rawValue.trim()) {
+    throw new Error("请填写所有数值配置项。");
+  }
+  const value = Number(rawValue);
+  if (!Number.isFinite(value)) {
+    throw new Error("数值配置项格式不正确。");
+  }
+  return value;
 }
 
 export function SettingsPage() {
@@ -148,8 +156,8 @@ export function SettingsPage() {
             <label className="field"><span>Model {selectedProvider === "openai_compatible" && <b>*</b>}</span><input name="ai_model" defaultValue={settings.ai_model} required={selectedProvider === "openai_compatible"} placeholder={selectedProvider === "fake" ? "Fake 模式可留空" : "模型标识"} /></label>
             <label className="field span-2"><span>Base URL <b>*</b></span><input name="ai_base_url" type="url" defaultValue={settings.ai_base_url} required placeholder="https://api.openai.com/v1" /></label>
             <label className="field span-2"><span>API Key（只写） {selectedProvider === "openai_compatible" && !settings.ai_api_key_configured && <b>*</b>}</span><div className="secret-field"><input name="ai_api_key" type={showApiKey ? "text" : "password"} autoComplete="new-password" required={selectedProvider === "openai_compatible" && !settings.ai_api_key_configured} placeholder={settings.ai_api_key_configured ? "已配置 · 留空保持不变" : "输入新的 API Key"} /><button type="button" onClick={() => setShowApiKey((value) => !value)} aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
-            <label className="field"><span>请求超时（秒）</span><input name="ai_timeout_seconds" type="number" min="1" step="1" defaultValue={settings.ai_timeout_seconds} /></label>
-            <label className="field"><span>失败重试次数</span><input name="ai_max_retries" type="number" min="0" max="10" defaultValue={settings.ai_max_retries} /></label>
+            <label className="field"><span>请求超时（秒）</span><input name="ai_timeout_seconds" type="number" min="1" max="600" step="1" required defaultValue={settings.ai_timeout_seconds} /></label>
+            <label className="field"><span>失败重试次数</span><input name="ai_max_retries" type="number" min="0" max="20" required defaultValue={settings.ai_max_retries} /></label>
           </div>
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
@@ -171,8 +179,8 @@ export function SettingsPage() {
             <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并强制进入人工复核，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
-            <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" defaultValue={settings.react_max_dynamic_turns} /></label>
-            <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" defaultValue={settings.runbook_limit} /></label>
+            <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" required defaultValue={settings.react_max_dynamic_turns} /></label>
+            <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>
           </div>
         </SectionCard>
 

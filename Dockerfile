@@ -9,7 +9,7 @@ COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
 COPY runbooks ./runbooks
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir '.[postgres,mysql]'
 
 RUN useradd --create-home appuser && mkdir -p /app/data && chown -R appuser:appuser /app
 USER appuser

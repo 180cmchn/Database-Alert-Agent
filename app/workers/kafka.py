@@ -196,6 +196,7 @@ async def main() -> None:
     try:
         await worker.run()
     finally:
+        await runtime.service.close()
         close = getattr(runtime.repository, "close", None)
         if close:
             await close()

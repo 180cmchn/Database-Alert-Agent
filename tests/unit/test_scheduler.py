@@ -168,4 +168,5 @@ async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     assert list_payloads[0]["start_time"] == 100
     assert list_payloads[1]["start_time"] == 100
     assert list_payloads[0]["channel_ids"] == [7]
+    assert list_payloads[0]["by_updated_at"] is True
     await runtime.repository.close()  # type: ignore[attr-defined]

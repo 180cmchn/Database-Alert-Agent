@@ -36,7 +36,7 @@ export interface AlertListItem {
   updated_at: string;
   current_stage: InvestigationStage | null;
   manual_matched: boolean;
-  requires_human: boolean;
+  requires_human: boolean | null;
   confidence: number | null;
 }
 
@@ -209,6 +209,50 @@ export interface KnowledgeCase {
   confirmed_at: string;
 }
 
+export type FeedbackVerdict = "CONFIRMED" | "CORRECTED" | "REJECTED";
+
+export type RunbookMatchVerdict =
+  | "CORRECT"
+  | "INCORRECT"
+  | "MISSED"
+  | "NOT_APPLICABLE"
+  | "UNKNOWN";
+
+export interface FeedbackRecord {
+  id: string;
+  alert_id: string;
+  run_id: string;
+  idempotency_key: string;
+  verdict: FeedbackVerdict;
+  final_root_cause: string | null;
+  actual_resolution: string | null;
+  recovered: boolean | null;
+  runbook_match_verdict: RunbookMatchVerdict;
+  correct_runbook_id: string | null;
+  correct_runbook_section: string | null;
+  missed_runbook_ids: string[];
+  supporting_evidence_ids: string[];
+  wrong_agent_claims: string[];
+  accepted_step_orders: number[];
+  reviewer: string;
+  created_at: string;
+}
+
+export interface FeedbackRequest {
+  idempotency_key: string;
+  verdict: FeedbackVerdict;
+  final_root_cause?: string;
+  actual_resolution?: string;
+  recovered?: boolean;
+  runbook_match_verdict?: RunbookMatchVerdict;
+  correct_runbook_id?: string;
+  correct_runbook_section?: string;
+  missed_runbook_ids?: string[];
+  supporting_evidence_ids?: string[];
+  wrong_agent_claims?: string[];
+  accepted_step_orders?: number[];
+}
+
 export interface StoredAlert {
   alert: NormalizedAlert;
   status: AlertStatus;
@@ -226,7 +270,7 @@ export interface StoredAlert {
   progress: ProgressRecord[];
   evidence_records: EvidenceRecord[];
   validations: ValidationRecord[];
-  feedback: unknown[];
+  feedback: FeedbackRecord[];
   knowledge_matches: KnowledgeCase[];
   created_at: string;
   updated_at: string;

@@ -19,8 +19,8 @@ from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
-    FlashDutyPollResponse,
     FlashDutyPollAlertItem,
+    FlashDutyPollResponse,
     RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
@@ -31,12 +31,12 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
-from app.agents.scheduler import (
-    LangGraphScheduler,
-    KafkaLangGraphScheduler,
-    ManualLangGraphScheduler,
+from app.application.scheduler import (
+    FlashDutyAlertPoller,
+    InMemoryAnalysisScheduler,
+    KafkaAnalysisScheduler,
+    ManualAnalysisScheduler,
 )
-from app.application.scheduler import FlashDutyAlertPoller
 from app.config import Settings, get_settings
 from app.domain.errors import (
     AlertNotFoundError,
@@ -73,22 +73,12 @@ def create_app(
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
         if settings.http_scheduler == "kafka":
-            scheduler = KafkaLangGraphScheduler(settings, runtime.service.agent)
+            scheduler = KafkaAnalysisScheduler(settings, runtime.service)
         elif settings.http_scheduler == "manual":
-            scheduler = ManualLangGraphScheduler(runtime.service.agent)
+            scheduler = ManualAnalysisScheduler()
         else:
-            scheduler = LangGraphScheduler(
-                agent=runtime.service.agent,
-                repository=runtime.repository,
-                notifier=runtime.service.notifier,
-                source_registry=runtime.service.source_registry,
-                alert_sanitizer=runtime.service.alert_sanitizer,
-                investigation_lease_seconds=settings.investigation_lease_seconds,
-                max_dynamic_turns=settings.react_max_dynamic_turns if settings.react_enabled else 0,
-                validation_enabled=settings.validation_enabled,
-                shadow_enabled=settings.shadow_enabled,
-                ai_fallback_enabled=settings.ai_fallback_enabled,
-                workers=settings.scheduler_workers,
+            scheduler = InMemoryAnalysisScheduler(
+                runtime.service, workers=settings.scheduler_workers
             )
     flashduty_poller = FlashDutyAlertPoller(
         settings, runtime.service, scheduler, runtime.flashduty_client
@@ -108,6 +98,7 @@ def create_app(
         finally:
             await flashduty_poller.stop()
             await scheduler.stop()
+            await runtime.service.close()
             if isinstance(runtime.repository, SQLAlchemyAlertRepository):
                 await runtime.repository.close()
 
@@ -190,9 +181,7 @@ def create_app(
         )
 
     @app.exception_handler(AnalysisFailedError)
-    async def analysis_failed_handler(
-        _request: Request, exc: AnalysisFailedError
-    ) -> JSONResponse:
+    async def analysis_failed_handler(_request: Request, exc: AnalysisFailedError) -> JSONResponse:
         return JSONResponse(
             status_code=502,
             content={
@@ -204,9 +193,7 @@ def create_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def request_validation_handler(
-        request: Request, exc: RequestValidationError
-    ) -> Response:
+    async def request_validation_handler(request: Request, exc: RequestValidationError) -> Response:
         # FastAPI's default 422 body includes the rejected input. Runtime settings
         # contain write-only secrets, so their validation errors must never echo it.
         if request.url.path == "/api/v1/admin/settings":
@@ -253,6 +240,7 @@ def create_app(
             )
         stored, created = await runtime.service.ingest(source, payload)
         if created or stored.status in {
+            AlertStatus.RECEIVED,
             AlertStatus.QUEUED,
             AlertStatus.FAILED,
         }:
@@ -273,16 +261,10 @@ def create_app(
     async def list_alerts(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-        statuses: Annotated[
-            list[AlertStatus] | None, Query(alias="status")
-        ] = None,
-        severities: Annotated[
-            list[Severity] | None, Query(alias="severity")
-        ] = None,
+        statuses: Annotated[list[AlertStatus] | None, Query(alias="status")] = None,
+        severities: Annotated[list[Severity] | None, Query(alias="severity")] = None,
         source: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
-        environment: Annotated[
-            str | None, Query(min_length=1, max_length=100)
-        ] = None,
+        environment: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
         search: Annotated[str | None, Query(max_length=300)] = None,
     ) -> AlertListResult:
         return await runtime.service.list_alerts(
@@ -303,9 +285,7 @@ def create_app(
     async def dashboard_summary() -> DashboardSummary:
         return await runtime.service.dashboard_summary()
 
-    @app.get(
-        "/api/v1/alerts/{alert_id}", response_model=StoredAlert, tags=["alerts"]
-    )
+    @app.get("/api/v1/alerts/{alert_id}", response_model=StoredAlert, tags=["alerts"])
     async def get_alert(alert_id: str) -> StoredAlert:
         return await runtime.service.get(alert_id)
 
@@ -387,14 +367,10 @@ def create_app(
         dependencies=[Depends(require_admin)],
     )
     async def read_runtime_settings() -> RuntimeSettingsResponse:
-        updated, changed, revision = await runtime_settings.reload_if_changed(
-            runtime.settings
-        )
+        updated, changed, revision = await runtime_settings.reload_if_changed(runtime.settings)
         if changed:
             apply_runtime_settings(runtime, updated)
-        return RuntimeSettingsResponse.from_settings(
-            runtime.settings, revision=revision
-        )
+        return RuntimeSettingsResponse.from_settings(runtime.settings, revision=revision)
 
     @app.patch(
         "/api/v1/admin/settings",
@@ -450,9 +426,8 @@ def create_app(
     async def poll_flashduty_alerts() -> FlashDutyPollResponse:
         """Manually poll FlashDuty for alerts in the past 900 seconds.
 
-        This endpoint fetches alerts from FlashDuty API, applies deduplication
-        and condition filtering, and returns the processed alerts without
-        persisting them to the database.
+        This endpoint fetches alerts from FlashDuty API, persists new alerts,
+        enqueues their analysis, and returns the deduplication result.
         """
         if not runtime.flashduty_client:
             raise HTTPException(
@@ -495,7 +470,7 @@ def create_app(
                     channel_ids=channel_ids,
                     integration_ids=runtime.settings.flashduty_poll_integration_ids or None,
                     is_active=None,  # Don't filter by is_active to get all alerts
-                    by_updated_at=False,  # Query by creation time to avoid large data scan
+                    by_updated_at=True,
                 )
                 data = response.data if isinstance(response.data, dict) else {}
                 logger.info(
@@ -536,6 +511,12 @@ def create_app(
 
                         # Use the service to normalize and deduplicate
                         stored, created = await runtime.service.ingest("flashduty", ingest_payload)
+                        if created or stored.status in {
+                            AlertStatus.RECEIVED,
+                            AlertStatus.QUEUED,
+                            AlertStatus.FAILED,
+                        }:
+                            await scheduler.enqueue(str(stored.alert.id))
                         total_count += 1
 
                         alert_item = FlashDutyPollAlertItem.from_normalized(

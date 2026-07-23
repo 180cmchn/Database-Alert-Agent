@@ -124,3 +124,43 @@ def test_real_ai_clients_use_system_trust_http_client(
 
     assert timeout_values == [19, 23]
     assert [item["http_client"] for item in constructed] == [http_client, http_client]
+
+
+@pytest.mark.asyncio
+async def test_real_ai_adapters_close_their_owned_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+    constructed: list[str] = []
+
+    class ClosingAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            self.kind = "advisor" if not constructed else "validator"
+            constructed.append(self.kind)
+
+        async def close(self) -> None:
+            closed.append(self.kind)
+
+    monkeypatch.setattr(ai_module, "_system_trust_http_client", lambda _: object())
+    monkeypatch.setattr(ai_module, "AsyncOpenAI", ClosingAsyncOpenAI)
+
+    advisor = ai_module.OpenAICompatibleAdvisor(
+        api_key="test-key",
+        base_url="https://models.example.test/v1",
+        model="test-model",
+        timeout_seconds=19,
+        max_retries=2,
+        json_mode=True,
+    )
+    validator = ai_module.OpenAICompatibleConclusionValidator(
+        api_key="test-key",
+        base_url="https://models.example.test/v1",
+        model="test-model",
+        timeout_seconds=19,
+        max_retries=2,
+    )
+
+    await advisor.aclose()
+    await validator.aclose()
+
+    assert closed == ["advisor", "validator"]

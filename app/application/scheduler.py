@@ -44,9 +44,7 @@ class FlashDutyAlertPoller:
     async def start(self) -> None:
         if not self.enabled or self._task is not None:
             return
-        self._task = asyncio.create_task(
-            self._loop(), name="flashduty-alert-poller"
-        )
+        self._task = asyncio.create_task(self._loop(), name="flashduty-alert-poller")
 
     async def stop(self) -> None:
         if self._task is None:
@@ -61,9 +59,7 @@ class FlashDutyAlertPoller:
         end_time = int(time.time()) if now is None else now
         overlap = self.settings.flashduty_poll_lookback_seconds
         start_time = (
-            end_time - overlap
-            if self._watermark is None
-            else max(0, self._watermark - overlap)
+            end_time - overlap if self._watermark is None else max(0, self._watermark - overlap)
         )
         cursor: str | None = None
         seen_cursors: set[str] = set()
@@ -77,8 +73,8 @@ class FlashDutyAlertPoller:
                 search_after_ctx=cursor,
                 channel_ids=self.settings.flashduty_poll_channel_ids,
                 integration_ids=self.settings.flashduty_poll_integration_ids,
-                is_active=None,  # Don't filter by is_active to get all alerts
-                by_updated_at=False,  # Query by creation time to avoid large data scan
+                is_active=None,
+                by_updated_at=True,
             )
             data = response.data if isinstance(response.data, dict) else {}
             items = data.get("items")
@@ -114,10 +110,9 @@ class FlashDutyAlertPoller:
                             "request_id": response.request_id,
                             "data": item,
                         }
-                    stored, created = await self.service.ingest(
-                        "flashduty", ingest_payload
-                    )
+                    stored, created = await self.service.ingest("flashduty", ingest_payload)
                     if created or stored.status in {
+                        AlertStatus.RECEIVED,
                         AlertStatus.QUEUED,
                         AlertStatus.FAILED,
                     }:
@@ -187,7 +182,7 @@ class InMemoryAnalysisScheduler:
             for index in range(self.workers)
         ]
         pending = await self.service.repository.list_by_status(
-            {AlertStatus.QUEUED, AlertStatus.ANALYZING}
+            {AlertStatus.RECEIVED, AlertStatus.QUEUED, AlertStatus.ANALYZING}
         )
         for stored in pending:
             await self.enqueue(str(stored.alert.id))
@@ -231,9 +226,7 @@ class InMemoryAnalysisScheduler:
             await asyncio.sleep(self.lease_retry_delay_seconds)
             await self.enqueue(alert_id)
 
-        task = asyncio.create_task(
-            retry_later(), name=f"alert-lease-retry-{alert_id}"
-        )
+        task = asyncio.create_task(retry_later(), name=f"alert-lease-retry-{alert_id}")
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
@@ -254,7 +247,7 @@ class KafkaAnalysisScheduler:
         )
         await self.producer.start()
         pending = await self.service.repository.list_by_status(
-            {AlertStatus.QUEUED, AlertStatus.ANALYZING}
+            {AlertStatus.RECEIVED, AlertStatus.QUEUED, AlertStatus.ANALYZING}
         )
         for stored in pending:
             await self.enqueue(str(stored.alert.id))

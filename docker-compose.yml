@@ -2,6 +2,7 @@ services:
   kafka:
     image: apache/kafka:3.9.1
     hostname: kafka
+    restart: unless-stopped
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -16,7 +17,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     ports:
-      - "29092:29092"
+      - "127.0.0.1:29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
       interval: 10s
@@ -30,7 +33,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
       RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
     volumes:
@@ -45,7 +48,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
       RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: "true"
@@ -54,7 +57,7 @@ services:
       CORS_ALLOWED_ORIGINS: '["http://localhost:3000","http://localhost:5173"]'
     volumes:
       - ./data:/app/data
-      - ./runbooks:/app/runbooks
+      - ./runbooks:/app/runbooks:ro
     ports:
       # Keep the unauthenticated alert/read API on the local host. Route remote
       # alert platforms and operators through an authenticated gateway.
@@ -69,7 +72,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"
       interval: 10s
       timeout: 3s
       retries: 10
@@ -82,7 +85,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: sqlite+aiosqlite:///./data/alerts.db
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
       RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       KAFKA_ENABLED: "true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -101,7 +104,10 @@ services:
       context: ./frontend
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       api:
         condition: service_healthy
+
+volumes:
+  kafka-data:

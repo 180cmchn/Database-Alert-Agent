@@ -114,15 +114,13 @@ class AlertRepository(Protocol):
 
     async def set_status(self, alert_id: str, status: AlertStatus) -> None: ...
 
-    async def save_runbooks(
-        self, alert_id: str, runbooks: list[RunbookExcerpt]
-    ) -> None: ...
+    async def save_runbooks(self, alert_id: str, runbooks: list[RunbookExcerpt]) -> None: ...
 
     async def save_analysis(
         self,
         alert_id: str,
         status: AlertStatus,
-        runbooks: list[RunbookExcerpt],
+        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,

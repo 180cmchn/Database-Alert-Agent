@@ -14,15 +14,19 @@ import {
   FileCheck2,
   Gauge,
   History,
+  KeyRound,
+  LockKeyhole,
+  MessageSquareCheck,
   Radio,
   RefreshCw,
+  Send,
   ShieldCheck,
   Siren,
   TerminalSquare,
   UserRoundCheck,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
 import {
@@ -35,19 +39,77 @@ import {
   StatusBadge,
   ToolStatusBadge,
 } from "../components/ui";
-import { api } from "../lib/api";
+import { useAdminAuth } from "../context/AdminAuthContext";
+import { api, ApiError } from "../lib/api";
 import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
-import type { AlertStatus, StoredAlert } from "../types/api";
+import type {
+  AlertStatus,
+  FeedbackRequest,
+  FeedbackVerdict,
+  RunbookMatchVerdict,
+  StoredAlert,
+} from "../types/api";
 
 const activeStatuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING"];
 const terminalStages = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
+const feedbackStatuses: AlertStatus[] = ["COMPLETED", "REVIEW_REQUIRED"];
+
+const feedbackVerdictLabel: Record<FeedbackVerdict, string> = {
+  CONFIRMED: "确认结论",
+  CORRECTED: "修正结论",
+  REJECTED: "否定结论",
+};
+
+const runbookVerdictLabel: Record<RunbookMatchVerdict, string> = {
+  CORRECT: "手册命中正确",
+  INCORRECT: "命中了错误手册",
+  MISSED: "漏掉了正确手册",
+  NOT_APPLICABLE: "本次不适用手册",
+  UNKNOWN: "暂不评价",
+};
+
+function textList(value: FormDataEntryValue | null): string[] {
+  return String(value || "")
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item, index, items) => items.indexOf(item) === index);
+}
+
+function lineList(value: FormDataEntryValue | null): string[] {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item, index, items) => items.indexOf(item) === index);
+}
+
+function optionalText(value: FormDataEntryValue | null): string | undefined {
+  return String(value || "").trim() || undefined;
+}
+
+function newFeedbackKey(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `feedback-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 export function AlertDetailPage() {
   const { alertId = "" } = useParams();
+  const { token, unlocked, unlock, lock } = useAdminAuth();
   const [record, setRecord] = useState<StoredAlert | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const [feedbackVerdict, setFeedbackVerdict] = useState<FeedbackVerdict>("CONFIRMED");
+  const [runbookFeedbackVerdict, setRunbookFeedbackVerdict] =
+    useState<RunbookMatchVerdict>("UNKNOWN");
+  const [feedbackKey, setFeedbackKey] = useState(newFeedbackKey);
+  const [feedbackSaving, setFeedbackSaving] = useState(false);
+  const [feedbackError, setFeedbackError] = useState("");
+  const [feedbackNotice, setFeedbackNotice] = useState("");
+  const [unlockToken, setUnlockToken] = useState("");
 
   const load = useCallback(async (silent = false) => {
     if (silent) setRefreshing(true);
@@ -65,6 +127,13 @@ export function AlertDetailPage() {
   }, [alertId]);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setFeedbackVerdict("CONFIRMED");
+    setRunbookFeedbackVerdict("UNKNOWN");
+    setFeedbackKey(newFeedbackKey());
+    setFeedbackError("");
+    setFeedbackNotice("");
+  }, [alertId]);
 
   const currentStage = useMemo(
     () => record?.latest_run?.current_stage || record?.progress.at(-1)?.stage || null,
@@ -97,12 +166,167 @@ export function AlertDetailPage() {
     [record],
   );
 
+  function unlockFeedback(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const nextToken = unlockToken.trim();
+    if (!nextToken) return;
+    unlock(nextToken);
+    setUnlockToken("");
+    setFeedbackError("");
+  }
+
+  async function submitFeedback(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    if (!record || !feedbackStatuses.includes(record.status)) {
+      setFeedbackError("只有已完成或待人工复核的调查可以提交反馈。");
+      return;
+    }
+    if (!token) {
+      setFeedbackError("请先解锁管理员会话。");
+      return;
+    }
+
+    setFeedbackSaving(true);
+    setFeedbackError("");
+    setFeedbackNotice("");
+    try {
+      const form = new FormData(formElement);
+      const finalRootCause = optionalText(form.get("final_root_cause"));
+      const actualResolution = optionalText(form.get("actual_resolution"));
+      const correctRunbookId = optionalText(form.get("correct_runbook_id"));
+      const correctRunbookSection = optionalText(form.get("correct_runbook_section"));
+      const missedRunbookIds = textList(form.get("missed_runbook_ids"));
+      const wrongAgentClaims = lineList(form.get("wrong_agent_claims"));
+      const supportingEvidenceIds = form.getAll("supporting_evidence_ids").map(String);
+      const acceptedStepOrders = form.getAll("accepted_step_orders").map(Number);
+      const recoveredValue = String(form.get("recovered") || "");
+
+      if (
+        ["CONFIRMED", "CORRECTED"].includes(feedbackVerdict)
+        && (!finalRootCause || !actualResolution)
+      ) {
+        throw new Error("确认或修正结论时，必须填写最终根因和实际恢复动作。");
+      }
+
+      const requiresCorrectRunbook = ["CORRECT", "INCORRECT", "MISSED"].includes(
+        runbookFeedbackVerdict,
+      );
+      if (requiresCorrectRunbook && !correctRunbookId) {
+        throw new Error("当前手册评价需要填写正确手册 ID。");
+      }
+      if (correctRunbookSection && !correctRunbookId) {
+        throw new Error("填写手册章节前，请先填写正确手册 ID。");
+      }
+
+      const retrievedRunbookIds = new Set(record.manual_matches.map((item) => item.runbook_id));
+      if (
+        runbookFeedbackVerdict === "CORRECT"
+        && correctRunbookId
+        && !retrievedRunbookIds.has(correctRunbookId)
+      ) {
+        throw new Error("“命中正确”只能引用本次实际命中的手册。");
+      }
+      if (
+        runbookFeedbackVerdict === "MISSED"
+        && correctRunbookId
+        && retrievedRunbookIds.has(correctRunbookId)
+      ) {
+        throw new Error("“漏掉手册”必须填写本次未命中的手册 ID。");
+      }
+      if (
+        runbookFeedbackVerdict === "NOT_APPLICABLE"
+        && (correctRunbookId || correctRunbookSection)
+      ) {
+        throw new Error("手册不适用时不能填写正确手册或章节。");
+      }
+
+      if (missedRunbookIds.length > 20) {
+        throw new Error("漏召回手册最多填写 20 个。");
+      }
+      if (supportingEvidenceIds.length > 50) {
+        throw new Error("支持证据最多选择 50 项。");
+      }
+      if (wrongAgentClaims.length > 20) {
+        throw new Error("错误声明最多填写 20 条。");
+      }
+      if (
+        acceptedStepOrders.length > 50
+        || acceptedStepOrders.some((order) => !Number.isInteger(order))
+      ) {
+        throw new Error("采纳步骤选择不正确。");
+      }
+
+      const successfulEvidenceIds = new Set(
+        record.evidence_records
+          .filter((item) => item.status === "SUCCESS")
+          .map((item) => item.id),
+      );
+      if (supportingEvidenceIds.some((id) => !successfulEvidenceIds.has(id))) {
+        throw new Error("只能引用本次调查中采集成功的证据。");
+      }
+
+      const validStepOrders = new Set(record.recommendation?.steps.map((step) => step.order) || []);
+      if (acceptedStepOrders.some((order) => !validStepOrders.has(order))) {
+        throw new Error("只能采纳本次建议中存在的步骤。");
+      }
+
+      const payload: FeedbackRequest = {
+        idempotency_key: feedbackKey,
+        verdict: feedbackVerdict,
+        runbook_match_verdict: runbookFeedbackVerdict,
+        missed_runbook_ids: missedRunbookIds,
+        supporting_evidence_ids: supportingEvidenceIds,
+        wrong_agent_claims: wrongAgentClaims,
+        accepted_step_orders: acceptedStepOrders,
+      };
+      if (finalRootCause) payload.final_root_cause = finalRootCause;
+      if (actualResolution) payload.actual_resolution = actualResolution;
+      if (correctRunbookId) payload.correct_runbook_id = correctRunbookId;
+      if (correctRunbookSection) payload.correct_runbook_section = correctRunbookSection;
+      if (recoveredValue === "true") payload.recovered = true;
+      if (recoveredValue === "false") payload.recovered = false;
+
+      const saved = await api.submitFeedback(alertId, payload, token);
+      setRecord((current) => {
+        if (!current) return current;
+        const exists = current.feedback.some((item) => item.id === saved.id);
+        return {
+          ...current,
+          feedback: exists
+            ? current.feedback.map((item) => (item.id === saved.id ? saved : item))
+            : [...current.feedback, saved],
+        };
+      });
+      setFeedbackNotice("人工反馈已保存，并写入本次调查的审计记录。");
+      setFeedbackKey(newFeedbackKey());
+      setFeedbackVerdict("CONFIRMED");
+      setRunbookFeedbackVerdict("UNKNOWN");
+      formElement.reset();
+    } catch (submitError) {
+      if (submitError instanceof ApiError && [401, 403].includes(submitError.status)) {
+        setFeedbackError("管理员令牌无效或已过期，请锁定后重新输入。");
+      } else {
+        setFeedbackError(
+          submitError instanceof Error ? submitError.message : "人工反馈提交失败",
+        );
+      }
+    } finally {
+      setFeedbackSaving(false);
+    }
+  }
+
   if (loading && !record) return <LoadingState label="正在读取完整排查链路…" />;
   if (error && !record) return <ErrorState message={error} onRetry={() => void load()} />;
   if (!record) return <EmptyState title="告警不存在" description="该记录可能已被删除，或链接中的 ID 不正确。" />;
 
   const { alert, recommendation } = record;
   const isActive = isTracking;
+  const feedbackAllowed = feedbackStatuses.includes(record.status);
+  const singleManualMatch = record.manual_matches.length === 1 ? record.manual_matches[0] : null;
+  const successfulEvidence = record.evidence_records.filter(
+    (evidence) => evidence.status === "SUCCESS",
+  );
 
   return (
     <div className="page-stack detail-page">
@@ -313,6 +537,361 @@ export function AlertDetailPage() {
         </SectionCard>
 
       </section>
+
+      <SectionCard
+        eyebrow="EXPERT REVIEW"
+        title="人工反馈与训练记录"
+        description="反馈由管理员提交并写入审计链路；确认或修正且已恢复的记录可形成同类历史案例。"
+        action={<span className="evidence-count">{record.feedback.length} 条反馈</span>}
+      >
+        {record.feedback.length > 0 ? (
+          <div className="feedback-history">
+            {record.feedback.map((feedback) => (
+              <article
+                key={feedback.id}
+                className={`feedback-record feedback-${feedback.verdict.toLowerCase()}`}
+              >
+                <header>
+                  <span>
+                    <MessageSquareCheck size={16} />
+                    {feedbackVerdictLabel[feedback.verdict]}
+                  </span>
+                  <time dateTime={feedback.created_at}>
+                    {feedback.reviewer} · {formatDateTime(feedback.created_at)}
+                  </time>
+                </header>
+                <dl>
+                  <div>
+                    <dt>恢复状态</dt>
+                    <dd>
+                      {feedback.recovered == null
+                        ? "未记录"
+                        : feedback.recovered ? "已恢复" : "尚未恢复"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>手册评价</dt>
+                    <dd>{runbookVerdictLabel[feedback.runbook_match_verdict]}</dd>
+                  </div>
+                  {feedback.final_root_cause && (
+                    <div className="span-2">
+                      <dt>最终根因</dt>
+                      <dd>{feedback.final_root_cause}</dd>
+                    </div>
+                  )}
+                  {feedback.actual_resolution && (
+                    <div className="span-2">
+                      <dt>实际恢复动作</dt>
+                      <dd>{feedback.actual_resolution}</dd>
+                    </div>
+                  )}
+                  {feedback.correct_runbook_id && (
+                    <div className="span-2">
+                      <dt>正确手册</dt>
+                      <dd>
+                        {feedback.correct_runbook_id}
+                        {feedback.correct_runbook_section
+                          ? ` / ${feedback.correct_runbook_section}`
+                          : ""}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+                {(feedback.supporting_evidence_ids.length > 0
+                  || feedback.accepted_step_orders.length > 0
+                  || feedback.missed_runbook_ids.length > 0) && (
+                  <div className="feedback-reference-groups">
+                    {feedback.supporting_evidence_ids.length > 0 && (
+                      <p>
+                        <span>支持证据</span>
+                        {feedback.supporting_evidence_ids.map((id) => (
+                          <code key={id}>{compactId(id, 6)}</code>
+                        ))}
+                      </p>
+                    )}
+                    {feedback.accepted_step_orders.length > 0 && (
+                      <p>
+                        <span>采纳步骤</span>
+                        {feedback.accepted_step_orders.map((order) => (
+                          <code key={order}>#{order}</code>
+                        ))}
+                      </p>
+                    )}
+                    {feedback.missed_runbook_ids.length > 0 && (
+                      <p>
+                        <span>漏召回手册</span>
+                        {feedback.missed_runbook_ids.map((id) => (
+                          <code key={id}>{id}</code>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {feedback.wrong_agent_claims.length > 0 && (
+                  <details className="feedback-wrong-claims">
+                    <summary>查看 Agent 错误声明</summary>
+                    <ul>
+                      {feedback.wrong_agent_claims.map((claim, index) => (
+                        <li key={`${claim}-${index}`}>{claim}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="feedback-empty">
+            <UserRoundCheck size={20} />
+            <span>尚未提交人工反馈</span>
+          </div>
+        )}
+
+        <div className="feedback-divider" />
+
+        {!feedbackAllowed ? (
+          <div className="feedback-not-ready">
+            <CircleAlert size={17} />
+            <span>调查完成或进入人工复核后，管理员才能提交反馈。</span>
+          </div>
+        ) : unlocked ? (
+          <form className="feedback-form" onSubmit={submitFeedback}>
+            <div className="feedback-form-heading">
+              <div>
+                <strong>提交本次调查反馈</strong>
+                <span>管理员身份由当前 Bearer Token 确认，页面不会提交 reviewer 字段。</span>
+              </div>
+              <button
+                type="button"
+                className="button secondary small"
+                onClick={() => {
+                  lock();
+                  setFeedbackError("");
+                  setFeedbackNotice("");
+                }}
+                disabled={feedbackSaving}
+              >
+                <KeyRound size={14} /> 锁定
+              </button>
+            </div>
+
+            <div className="form-grid two-cols">
+              <label className="field">
+                <span>结论评价 <b>*</b></span>
+                <select
+                  name="verdict"
+                  value={feedbackVerdict}
+                  onChange={(event) =>
+                    setFeedbackVerdict(event.target.value as FeedbackVerdict)}
+                >
+                  <option value="CONFIRMED">确认：结论准确</option>
+                  <option value="CORRECTED">修正：需要更正结论</option>
+                  <option value="REJECTED">否定：结论不可采纳</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>故障是否恢复</span>
+                <select name="recovered" defaultValue="">
+                  <option value="">未确认</option>
+                  <option value="true">已恢复</option>
+                  <option value="false">尚未恢复</option>
+                </select>
+              </label>
+              <label className="field span-2">
+                <span>
+                  最终根因 {feedbackVerdict !== "REJECTED" && <b>*</b>}
+                </span>
+                <textarea
+                  name="final_root_cause"
+                  rows={3}
+                  required={feedbackVerdict !== "REJECTED"}
+                  placeholder="由值班人员确认的最终根因"
+                />
+              </label>
+              <label className="field span-2">
+                <span>
+                  实际恢复动作 {feedbackVerdict !== "REJECTED" && <b>*</b>}
+                </span>
+                <textarea
+                  name="actual_resolution"
+                  rows={3}
+                  required={feedbackVerdict !== "REJECTED"}
+                  placeholder="实际执行并验证有效的恢复动作"
+                />
+              </label>
+              <label className="field">
+                <span>手册匹配评价</span>
+                <select
+                  name="runbook_match_verdict"
+                  value={runbookFeedbackVerdict}
+                  onChange={(event) =>
+                    setRunbookFeedbackVerdict(event.target.value as RunbookMatchVerdict)}
+                >
+                  <option value="UNKNOWN">暂不评价</option>
+                  <option value="CORRECT">命中正确</option>
+                  <option value="INCORRECT">命中错误</option>
+                  <option value="MISSED">漏召回</option>
+                  <option value="NOT_APPLICABLE">不适用手册</option>
+                </select>
+              </label>
+
+              {!["UNKNOWN", "NOT_APPLICABLE"].includes(runbookFeedbackVerdict) && (
+                <label className="field">
+                  <span>正确手册 ID <b>*</b></span>
+                  <input
+                    key={`runbook-${runbookFeedbackVerdict}`}
+                    name="correct_runbook_id"
+                    list="matched-runbook-ids"
+                    required
+                    maxLength={128}
+                    defaultValue={
+                      runbookFeedbackVerdict === "CORRECT"
+                        ? singleManualMatch?.runbook_id || ""
+                        : ""
+                    }
+                    placeholder={
+                      runbookFeedbackVerdict === "MISSED"
+                        ? "填写本次未命中的手册 ID"
+                        : "填写正确手册 ID"
+                    }
+                  />
+                  <datalist id="matched-runbook-ids">
+                    {record.manual_matches.map((match) => (
+                      <option
+                        value={match.runbook_id}
+                        key={`${match.runbook_id}-${match.section}`}
+                      >
+                        {match.title}
+                      </option>
+                    ))}
+                  </datalist>
+                </label>
+              )}
+
+              {!["UNKNOWN", "NOT_APPLICABLE"].includes(runbookFeedbackVerdict) && (
+                <label className="field">
+                  <span>正确手册章节</span>
+                  <input
+                    key={`section-${runbookFeedbackVerdict}`}
+                    name="correct_runbook_section"
+                    maxLength={200}
+                    defaultValue={
+                      runbookFeedbackVerdict === "CORRECT"
+                        ? singleManualMatch?.section || ""
+                        : ""
+                    }
+                    placeholder="可选，例如 diagnosis"
+                  />
+                </label>
+              )}
+
+              {!["UNKNOWN", "NOT_APPLICABLE"].includes(runbookFeedbackVerdict) && (
+                <label className="field span-2">
+                  <span>其他漏召回手册 ID</span>
+                  <textarea
+                    name="missed_runbook_ids"
+                    rows={2}
+                    placeholder="可选；每行或逗号分隔，最多 20 个"
+                  />
+                </label>
+              )}
+
+              <label className="field span-2">
+                <span>Agent 错误声明</span>
+                <textarea
+                  name="wrong_agent_claims"
+                  rows={3}
+                  placeholder="可选；每行填写一条需要纠正的声明，最多 20 条"
+                />
+              </label>
+            </div>
+
+            <div className="feedback-selection-grid">
+              <fieldset className="feedback-options">
+                <legend>支持最终根因的成功证据</legend>
+                {successfulEvidence.length > 0 ? (
+                  successfulEvidence.map((evidence) => (
+                    <label key={evidence.id}>
+                      <input
+                        type="checkbox"
+                        name="supporting_evidence_ids"
+                        value={evidence.id}
+                      />
+                      <span>
+                        <strong>{evidence.tool_name}</strong>
+                        <small>{evidence.summary}</small>
+                      </span>
+                    </label>
+                  ))
+                ) : (
+                  <p>本次调查没有可引用的成功证据。</p>
+                )}
+              </fieldset>
+
+              <fieldset className="feedback-options">
+                <legend>已采纳的建议步骤</legend>
+                {recommendation?.steps.length ? (
+                  recommendation.steps.map((step) => (
+                    <label key={step.order}>
+                      <input
+                        type="checkbox"
+                        name="accepted_step_orders"
+                        value={step.order}
+                      />
+                      <span>
+                        <strong>步骤 {step.order}</strong>
+                        <small>{step.action}</small>
+                      </span>
+                    </label>
+                  ))
+                ) : (
+                  <p>本次调查没有可标记的建议步骤。</p>
+                )}
+              </fieldset>
+            </div>
+
+            {feedbackError && <div className="form-error" role="alert">{feedbackError}</div>}
+            {feedbackNotice && <div className="form-success"><Check size={16} /> {feedbackNotice}</div>}
+            <div className="feedback-submit">
+              <span>提交后记录不可在控制台删除，请只引用本次调查中的证据和步骤。</span>
+              <button className="button primary" type="submit" disabled={feedbackSaving}>
+                {feedbackSaving
+                  ? "正在保存…"
+                  : <><Send size={15} /> 提交反馈</>}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="feedback-unlock">
+            <span className="feedback-unlock-icon"><LockKeyhole size={21} /></span>
+            <div>
+              <strong>管理员会话未解锁</strong>
+              <p>提交反馈会影响训练闭环和历史案例，需使用管理员 Bearer Token。</p>
+            </div>
+            <form onSubmit={unlockFeedback}>
+              <label className="sr-only" htmlFor="feedback-admin-token">
+                管理员访问令牌
+              </label>
+              <input
+                id="feedback-admin-token"
+                type="password"
+                autoComplete="current-password"
+                value={unlockToken}
+                onChange={(event) => setUnlockToken(event.target.value)}
+                placeholder="输入管理员 Bearer Token"
+                required
+              />
+              <button
+                className="button primary"
+                type="submit"
+                disabled={!unlockToken.trim()}
+              >
+                解锁并填写
+              </button>
+            </form>
+          </div>
+        )}
+      </SectionCard>
 
       <SectionCard eyebrow="TRACEABILITY" title="事件标识与审计信息">
         <dl className="traceability-grid">

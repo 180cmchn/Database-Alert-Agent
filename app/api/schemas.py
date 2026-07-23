@@ -35,9 +35,7 @@ class FeedbackRequest(BaseModel):
     recovered: bool | None = None
     runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN
     correct_runbook_id: str | None = Field(default=None, min_length=1, max_length=128)
-    correct_runbook_section: str | None = Field(
-        default=None, min_length=1, max_length=200
-    )
+    correct_runbook_section: str | None = Field(default=None, min_length=1, max_length=200)
     missed_runbook_ids: list[str] = Field(default_factory=list, max_length=20)
     supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=50)
     wrong_agent_claims: list[str] = Field(default_factory=list, max_length=20)
@@ -67,7 +65,7 @@ class FlashDutyPollAlertItem(BaseModel):
     @classmethod
     def from_normalized(
         cls, alert: NormalizedAlert, *, deduplicated: bool, created: bool
-    ) -> "FlashDutyPollAlertItem":
+    ) -> FlashDutyPollAlertItem:
         return cls(
             alert_id=alert.external_id,
             title=alert.title,
@@ -118,9 +116,7 @@ class RuntimeSettingsPatch(BaseModel):
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
 
     def updates(self) -> dict[str, Any]:
-        return self.model_dump(
-            mode="json", exclude_unset=True, exclude={"expected_revision"}
-        )
+        return self.model_dump(mode="json", exclude_unset=True, exclude={"expected_revision"})
 
 
 class RuntimeSettingsResponse(BaseModel):

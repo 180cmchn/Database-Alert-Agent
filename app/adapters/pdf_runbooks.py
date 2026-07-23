@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,9 @@ _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SEVERITY_PATTERN = re.compile(r"(?i)\[(critical|warning|info)\]")
 _LATIN_TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9_-]{2,}")
 _CHINESE_RUN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}")
+_FILTER_OPERATOR_SPACING = re.compile(r"\s*(>=|<=|!=|==|=|>|<)\s*")
+_ASCII_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_IDENTIFIER_WORD_CHAR = r"a-z0-9\u4e00-\u9fff"
 _IGNORED_VALUES = {"", "unknown", "none", "null", "n/a"}
 _STOP_TERMS = {
     "alert",
@@ -146,13 +150,168 @@ def _alert_weighted_values(alert: NormalizedAlert) -> list[tuple[str, float, str
     return result
 
 
-def _scope_matches(document: RunbookDocument, alert: NormalizedAlert) -> bool:
+def _metadata_strings(metadata: dict[str, Any], key: str) -> list[str]:
+    """Read schema string arrays while tolerating legacy singleton strings."""
+
+    value = metadata.get(key, [])
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = [str(item) for item in value if item is not None]
+    else:
+        return []
+    return [item.strip() for item in values if item.strip()]
+
+
+def _scalar_filter_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    return None
+
+
+def _flatten_alert_filter_text(
+    value: Any,
+    *,
+    path: tuple[str, ...] = (),
+) -> tuple[list[str], list[str]]:
+    """Return alert values and key/value expressions for runbook gates."""
+
+    values: list[str] = []
+    assignments: list[str] = []
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key).strip()
+            nested_path = (*path, key) if key else path
+            scalar = _scalar_filter_text(nested)
+            if scalar is not None:
+                values.append(scalar)
+                if key:
+                    assignments.append(f"{key}={scalar}")
+                if nested_path:
+                    assignments.append(f"{'.'.join(nested_path)}={scalar}")
+                continue
+            nested_values, nested_assignments = _flatten_alert_filter_text(
+                nested,
+                path=nested_path,
+            )
+            values.extend(nested_values)
+            assignments.extend(nested_assignments)
+    elif isinstance(value, (list, tuple, set)):
+        for nested in value:
+            scalar = _scalar_filter_text(nested)
+            if scalar is not None:
+                values.append(scalar)
+            else:
+                nested_values, nested_assignments = _flatten_alert_filter_text(
+                    nested,
+                    path=path,
+                )
+                values.extend(nested_values)
+                assignments.extend(nested_assignments)
+    else:
+        scalar = _scalar_filter_text(value)
+        if scalar is not None:
+            values.append(scalar)
+    return values, assignments
+
+
+def _normalized_filter_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = _FILTER_OPERATOR_SPACING.sub(r"\1", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _identifier_filter_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    value = re.sub(r"[_./:=-]+", " ", value)
+    return _normalized_filter_text(value)
+
+
+def _alert_filter_blobs(alert: NormalizedAlert) -> tuple[str, str, str]:
+    values, assignments = _flatten_alert_filter_text(
+        alert.model_dump(mode="json")
+    )
+    value_blob = _normalized_filter_text("\n".join(values))
+    condition_blob = _normalized_filter_text("\n".join([*values, *assignments]))
+    identifier_blob = _identifier_filter_text("\n".join(values))
+    return value_blob, condition_blob, identifier_blob
+
+
+def _filter_phrase_present(
+    phrase: str,
+    *blobs: str,
+    identifier_boundary: bool = False,
+) -> bool:
+    normalized = _normalized_filter_text(phrase)
+    if not normalized:
+        return False
+    candidates = [normalized]
+    signature = _normalized_log_signature(normalized)
+    if signature and signature != normalized:
+        candidates.append(signature)
+    for candidate in candidates:
+        if identifier_boundary or _ASCII_IDENTIFIER.fullmatch(candidate):
+            pattern = re.compile(
+                rf"(?<![{_IDENTIFIER_WORD_CHAR}])"
+                rf"{re.escape(candidate)}"
+                rf"(?![{_IDENTIFIER_WORD_CHAR}])"
+            )
+            if any(pattern.search(blob) for blob in blobs):
+                return True
+        elif any(candidate in blob for blob in blobs):
+            return True
+    return False
+
+
+def _scope_matches(
+    document: RunbookDocument,
+    alert: NormalizedAlert,
+    *,
+    value_blob: str,
+    identifier_blob: str,
+) -> bool:
     scope = document.metadata.get("scope") or {}
     engines = {
-        _normalized_match_text(str(item)) for item in scope.get("database_engines", [])
+        _normalized_match_text(item)
+        for item in _metadata_strings(scope, "database_engines")
     }
     alert_engine = _normalized_match_text(alert.database.engine if alert.database else "")
-    return not engines or not alert_engine or alert_engine in engines
+    if engines and alert_engine and alert_engine not in engines:
+        return False
+
+    components = _metadata_strings(scope, "components")
+    if not components:
+        return True
+    return any(
+        _filter_phrase_present(
+            component,
+            value_blob,
+            identifier_blob,
+            identifier_boundary=True,
+        )
+        for component in components
+    )
+
+
+def _match_conditions(
+    match_metadata: dict[str, Any],
+    *,
+    condition_blob: str,
+) -> bool:
+    required = _metadata_strings(match_metadata, "required_conditions")
+    excluded = _metadata_strings(match_metadata, "exclusion_conditions")
+    return all(
+        _filter_phrase_present(condition, condition_blob)
+        for condition in required
+    ) and not any(
+        _filter_phrase_present(condition, condition_blob)
+        for condition in excluded
+    )
 
 
 def _section_visual_evidence(
@@ -228,10 +387,18 @@ def _score_section(
         return 0, []
     if document.quality_status == RunbookQualityStatus.DEPRECATED:
         return 0, []
-    if not _scope_matches(document, alert):
+    value_blob, condition_blob, identifier_blob = _alert_filter_blobs(alert)
+    if not _scope_matches(
+        document,
+        alert,
+        value_blob=value_blob,
+        identifier_blob=identifier_blob,
+    ):
         return 0, []
 
     match_metadata = document.metadata.get("match") or {}
+    if not _match_conditions(match_metadata, condition_blob=condition_blob):
+        return 0, []
     visual_evidence = _section_visual_evidence(document, section)
     visual_searchable = _normalized_match_text(_visual_search_text(visual_evidence))
     annotations = [

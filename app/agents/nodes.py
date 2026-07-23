@@ -4,26 +4,21 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from uuid import uuid4
 
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
-from app.adapters.investigation import DefaultInvestigationStrategyProvider
+from app.agents.state import AgentState
 from app.application.sanitization import sanitize
 from app.domain.models import (
     AdvisorMetadata,
     AlertStatus,
     EvidenceRecord,
     InvestigationContext,
-    InvestigationDecision,
     InvestigationRun,
     InvestigationStage,
-    KnowledgeCase,
-    NormalizedAlert,
     ProgressRecord,
     Recommendation,
-    RunStatus,
-    RunbookExcerpt,
     RunbookQualityStatus,
+    RunStatus,
     ToolExecutionRequest,
     ToolStatus,
     ValidationKind,
@@ -36,18 +31,17 @@ from app.domain.ports import (
     InvestigationStrategyProvider,
     RunbookProvider,
 )
-from app.agents.state import AgentState
 
 logger = logging.getLogger(__name__)
 
 
 class NodeContext:
     """Context object holding dependencies for node execution.
-    
+
     This is injected at graph build time and provides access to all
     the external dependencies needed by nodes.
     """
-    
+
     def __init__(
         self,
         *,
@@ -79,21 +73,29 @@ async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    
+
     if not run or not alert:
         return {"error": "Missing run or alert in fingerprint node"}
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.FINGERPRINTING, 
-                          "问题指纹已生成。", {"incident_fingerprint": alert.incident_fingerprint})
-    
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.FINGERPRINTING,
+        "问题指纹已生成。",
+        {"incident_fingerprint": alert.incident_fingerprint},
+    )
+
     return {
         "current_stage": InvestigationStage.FINGERPRINTING,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.FINGERPRINTING,
-            message="问题指纹已生成。",
-            details={"incident_fingerprint": alert.incident_fingerprint},
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.FINGERPRINTING,
+                message="问题指纹已生成。",
+                details={"incident_fingerprint": alert.incident_fingerprint},
+            )
+        ],
     }
 
 
@@ -102,25 +104,32 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    
+
     if not run or not alert:
         return {"error": "Missing run or alert in knowledge match node"}
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.KNOWLEDGE_MATCHING,
-                          "正在匹配人工确认的历史案例。")
-    
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.KNOWLEDGE_MATCHING,
+        "正在匹配人工确认的历史案例。",
+    )
+
     knowledge_cases = await ctx.repository.find_knowledge_cases(
         alert.incident_fingerprint, alert.fingerprint_version, limit=3
     )
-    
+
     return {
         "current_stage": InvestigationStage.KNOWLEDGE_MATCHING,
         "knowledge_cases": knowledge_cases,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.KNOWLEDGE_MATCHING,
-            message="正在匹配人工确认的历史案例。",
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.KNOWLEDGE_MATCHING,
+                message="正在匹配人工确认的历史案例。",
+            )
+        ],
     }
 
 
@@ -129,25 +138,33 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    
+
     if not run or not alert:
         return {"error": "Missing run or alert in runbook match node"}
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.RUNBOOK_MATCHING,
-                          "正在检索告警处理手册。", {"knowledge_matches": len(state.knowledge_cases)})
-    
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.RUNBOOK_MATCHING,
+        "正在检索告警处理手册。",
+        {"knowledge_matches": len(state.knowledge_cases)},
+    )
+
     runbooks = await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit)
     await ctx.repository.save_runbooks(alert_id, runbooks)
-    
+
     return {
         "current_stage": InvestigationStage.RUNBOOK_MATCHING,
         "runbooks": runbooks,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.RUNBOOK_MATCHING,
-            message="正在检索告警处理手册。",
-            details={"knowledge_matches": len(state.knowledge_cases)},
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.RUNBOOK_MATCHING,
+                message="正在检索告警处理手册。",
+                details={"knowledge_matches": len(state.knowledge_cases)},
+            )
+        ],
     }
 
 
@@ -157,30 +174,39 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
     run = state.run
     alert = state.alert
     runbooks = state.runbooks
-    
+
     if not run or not alert:
         return {"error": "Missing run or alert in strategy selection node"}
-    
+
     strategy = await ctx.strategy_provider.select(alert, runbooks)
     await ctx.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
-    
+
     # Build tool plan from strategy
     pending_requests = list(strategy.tool_plan)
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.INVESTIGATING,
-                          f"执行调查策略 {strategy.strategy_id}。", {"tool_count": len(strategy.tool_plan)})
-    
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.INVESTIGATING,
+        f"执行调查策略 {strategy.strategy_id}。",
+        {"tool_count": len(strategy.tool_plan)},
+    )
+
     return {
         "current_stage": InvestigationStage.INVESTIGATING,
+        "strategy": strategy,
         "pending_tool_requests": pending_requests,
         "dynamic_turns_remaining": strategy.max_dynamic_turns,
         "max_dynamic_turns": strategy.max_dynamic_turns,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.INVESTIGATING,
-            message=f"执行调查策略 {strategy.strategy_id}。",
-            details={"tool_count": len(strategy.tool_plan)},
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.INVESTIGATING,
+                message=f"执行调查策略 {strategy.strategy_id}。",
+                details={"tool_count": len(strategy.tool_plan)},
+            )
+        ],
     }
 
 
@@ -189,30 +215,21 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
+    strategy = state.strategy
     pending_requests = state.pending_tool_requests
-    
-    if not run or not alert:
-        return {"error": "Missing run or alert in tool execution node"}
-    
+
+    if not run or not alert or not strategy:
+        return {"error": "Missing run, alert, or strategy in tool execution node"}
+
     new_evidence: list[EvidenceRecord] = []
-    executed_requests: list[ToolExecutionRequest] = []
-    
-    # Create investigation context for tool execution
-    from app.domain.models import InvestigationStrategy
-    strategy = InvestigationStrategy(
-        strategy_id="dynamic",
-        title="Dynamic Investigation",
-        description="Dynamic tool execution",
-        tool_plan=pending_requests,
-    )
+
     context = InvestigationContext(run_id=run.id, alert=alert, strategy=strategy)
-    
+
     for request in pending_requests:
         try:
             result = await ctx.tool_executor.execute(request, context)
             new_evidence.append(result)
             await ctx.repository.save_evidence(alert_id, result)
-            executed_requests.append(request)
         except Exception as exc:
             logger.exception("tool_execution_failed tool=%s", request.tool_name)
             # Create a failed evidence record
@@ -227,7 +244,7 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
             )
             new_evidence.append(failed_evidence)
             await ctx.repository.save_evidence(alert_id, failed_evidence)
-    
+
     return {
         "evidence": new_evidence,
         "pending_tool_requests": [],  # Clear pending requests after execution
@@ -236,35 +253,29 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
 
 async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Decide whether to continue investigation with dynamic tool selection.
-    
+
     This node implements the React pattern: if evidence is insufficient and
     dynamic turns remain, the AI advisor can choose additional tools to run.
     """
-    from app.domain.models import InvestigationStrategy as InvStrategy
-    
-    alert_id = state.alert_id
     run = state.run
     alert = state.alert
+    strategy = state.strategy
     evidence = state.evidence
     dynamic_turns_remaining = state.dynamic_turns_remaining
-    
-    if not run or not alert:
+
+    if not run or not alert or not strategy:
         return {"should_continue_investigation": False}
-    
+
     if dynamic_turns_remaining <= 0:
         return {"should_continue_investigation": False}
-    
+
     # Ask the AI advisor to choose the next tool
     try:
         decision = await ctx.advisor.choose_next_tool(
             InvestigationContext(
                 run_id=run.id,
                 alert=alert,
-                strategy=InvStrategy(
-                    strategy_id="dynamic",
-                    title="Dynamic",
-                    description="Dynamic investigation",
-                )
+                strategy=strategy,
             ),
             evidence,
             ctx.tool_registry.names(),
@@ -272,26 +283,23 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
     except Exception as exc:
         logger.warning("dynamic_tool_selection_failed error=%s", type(exc).__name__)
         return {"should_continue_investigation": False}
-    
+
     if decision.action == "finish" or not decision.tool_name:
         return {"should_continue_investigation": False}
-    
+
     # Check for duplicate tool calls
-    seen_requests = {
-        (e.tool_name, str(sorted(e.request.items()))) 
-        for e in evidence
-    }
+    seen_requests = {(e.tool_name, str(sorted(e.request.items()))) for e in evidence}
     request_key = (decision.tool_name, str(sorted(decision.parameters.items())))
     if request_key in seen_requests:
         return {"should_continue_investigation": False}
-    
+
     # Queue the new tool request
     new_request = ToolExecutionRequest(
         tool_name=decision.tool_name,
         parameters=decision.parameters,
         timeout_seconds=10,
     )
-    
+
     return {
         "pending_tool_requests": [new_request],
         "dynamic_turns_remaining": dynamic_turns_remaining - 1,
@@ -307,29 +315,26 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     runbooks = state.runbooks
     evidence = state.evidence
     knowledge_cases = state.knowledge_cases
-    validation_enabled = state.validation_enabled
+    strategy = state.strategy
     ai_fallback_enabled = state.ai_fallback_enabled
-    
-    if not run or not alert:
-        return {"error": "Missing run or alert in advise node"}
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.ADVISING,
-                          "正在以命中手册为首要依据生成结构化处理建议。",
-                          {"runbook_matches": len(runbooks), "evidence_count": len(evidence)})
-    
+
+    if not run or not alert or not strategy:
+        return {"error": "Missing run, alert, or strategy in advise node"}
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.ADVISING,
+        "正在以命中手册为首要依据生成结构化处理建议。",
+        {"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
+    )
+
     advisor_degraded = False
     primary_advisor_error: Exception | None = None
     recommendation: Recommendation | None = None
     advisor_metadata: AdvisorMetadata | None = None
-    
-    # Build strategy for context
-    from app.domain.models import InvestigationStrategy
-    strategy = InvestigationStrategy(
-        strategy_id="investigated",
-        title="Investigated",
-        description="Investigation completed",
-    )
-    
+
     try:
         recommendation, advisor_metadata = await ctx.advisor.advise(
             alert,
@@ -362,19 +367,23 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 details={"error_type": type(exc).__name__},
             ),
         )
-    
+
     return {
         "current_stage": InvestigationStage.ADVISING,
         "recommendation": recommendation,
         "advisor_metadata": advisor_metadata,
         "advisor_degraded": advisor_degraded,
-        "primary_advisor_error": str(primary_advisor_error) if primary_advisor_error else None,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.ADVISING,
-            message="正在以命中手册为首要依据生成结构化处理建议。",
-            details={"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
-        )]
+        "primary_advisor_error": (
+            type(primary_advisor_error).__name__ if primary_advisor_error else None
+        ),
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.ADVISING,
+                message="正在以命中手册为首要依据生成结构化处理建议。",
+                details={"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
+            )
+        ],
     }
 
 
@@ -385,25 +394,29 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     alert = state.alert
     runbooks = state.runbooks
     evidence = state.evidence
+    strategy = state.strategy
     recommendation = state.recommendation
     validation_enabled = state.validation_enabled
     advisor_degraded = state.advisor_degraded
     primary_advisor_error = state.primary_advisor_error
-    
-    if not run or not alert or not recommendation:
-        return {"error": "Missing run, alert, or recommendation in validate node"}
-    
-    await _update_progress(ctx.repository, alert_id, run, InvestigationStage.VALIDATING,
-                          "正在进行规则验收和独立结论验收。")
-    
+
+    if not run or not alert or not strategy or not recommendation:
+        return {"error": "Missing run, alert, strategy, or recommendation in validate node"}
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.VALIDATING,
+        "正在进行规则验收和独立结论验收。",
+    )
+
     # Rule validation
     rule_validation = await ctx.rule_validator.validate(
         run, alert, recommendation, evidence, runbooks
     )
-    
-    # Check for required tool failures from the original strategy
-    # We check evidence against the tool plan from the strategy
-    required_failures = _check_required_tool_failures(evidence, runbooks, alert)
+
+    required_failures = _required_tool_failures(strategy.tool_plan, evidence)
     if required_failures:
         rule_validation = rule_validation.model_copy(
             update={
@@ -415,7 +428,7 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             }
         )
     await ctx.repository.save_validation(alert_id, rule_validation)
-    
+
     # Agent validation
     agent_validation: ValidationRecord | None = None
     if advisor_degraded and validation_enabled:
@@ -443,29 +456,30 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 issues=[f"独立验收不可用：{type(exc).__name__}: {sanitize(str(exc))}"],
             )
         await ctx.repository.save_validation(alert_id, agent_validation)
-    
+
     # Determine validation passed
     validation_passed = rule_validation.passed and (
         not validation_enabled or (agent_validation is not None and agent_validation.passed)
     )
-    
+
     # Check for unapproved runbooks
     unapproved_runbook = any(
-        item.quality_status != RunbookQualityStatus.APPROVED
-        for item in runbooks
+        item.quality_status != RunbookQualityStatus.APPROVED for item in runbooks
     )
-    
+
     return {
         "current_stage": InvestigationStage.VALIDATING,
         "rule_validation": rule_validation,
         "agent_validation": agent_validation,
         "validation_passed": validation_passed,
         "unapproved_runbook": unapproved_runbook,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=InvestigationStage.VALIDATING,
-            message="正在进行规则验收和独立结论验收。",
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.VALIDATING,
+                message="正在进行规则验收和独立结论验收。",
+            )
+        ],
     }
 
 
@@ -477,16 +491,15 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     runbooks = state.runbooks
     recommendation = state.recommendation
     advisor_metadata = state.advisor_metadata
-    evidence = state.evidence
     validation_passed = state.validation_passed
     unapproved_runbook = state.unapproved_runbook
     advisor_degraded = state.advisor_degraded
     shadow_enabled = state.shadow_enabled
     error = state.error
-    
+
     if not run or not alert:
         return {"error": "Missing run or alert in report node"}
-    
+
     if error:
         # Handle error case
         await ctx.repository.update_run(
@@ -512,18 +525,15 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             "status": AlertStatus.FAILED,
             "run_status": RunStatus.FAILED,
         }
-    
+
     # Determine final status
     passed = (
-        validation_passed
-        and not shadow_enabled
-        and not unapproved_runbook
-        and not advisor_degraded
+        validation_passed and not shadow_enabled and not unapproved_runbook and not advisor_degraded
     )
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
     run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
     final_stage = InvestigationStage.COMPLETED if passed else InvestigationStage.REVIEW_REQUIRED
-    
+
     if not passed and recommendation:
         recommendation = recommendation.model_copy(
             update={
@@ -534,10 +544,16 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         )
     elif recommendation:
         recommendation = recommendation.model_copy(update={"analysis_mode": "assist"})
-    
-    await ctx.repository.update_run(
-        str(run.id), status=run_status.value, stage=final_stage
+
+    await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.REPORTING,
+        "正在保存建议、依据和审计结果。",
+        {"final_status": final_status.value},
     )
+    await ctx.repository.update_run(str(run.id), status=run_status.value, stage=final_stage)
     await ctx.repository.append_progress(
         alert_id,
         ProgressRecord(
@@ -559,27 +575,31 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         recommendation=recommendation,
         advisor_metadata=advisor_metadata,
     )
-    
+
     return {
         "current_stage": final_stage,
         "status": final_status,
         "run_status": run_status,
         "recommendation": recommendation,
-        "progress": [ProgressRecord(
-            run_id=run.id,
-            stage=final_stage,
-            message="调查完成。" if passed else "结论需要人工复核。",
-            details={
-                "validation_passed": validation_passed,
-                "shadow_enabled": shadow_enabled,
-                "unapproved_runbook": unapproved_runbook,
-                "advisor_degraded": advisor_degraded,
-            },
-        )]
+        "progress": [
+            ProgressRecord(
+                run_id=run.id,
+                stage=final_stage,
+                message="调查完成。" if passed else "结论需要人工复核。",
+                details={
+                    "validation_passed": validation_passed,
+                    "shadow_enabled": shadow_enabled,
+                    "unapproved_runbook": unapproved_runbook,
+                    "advisor_degraded": advisor_degraded,
+                },
+            )
+        ],
     }
 
 
-def _required_tool_failures(requests: list[ToolExecutionRequest], evidence: list[EvidenceRecord]) -> list[str]:
+def _required_tool_failures(
+    requests: list[ToolExecutionRequest], evidence: list[EvidenceRecord]
+) -> list[str]:
     """Get list of required tools that failed."""
     statuses: dict[str, list[ToolStatus]] = {}
     for item in evidence:
@@ -587,38 +607,7 @@ def _required_tool_failures(requests: list[ToolExecutionRequest], evidence: list
     return [
         request.tool_name
         for request in requests
-        if request.required
-        and ToolStatus.SUCCESS not in statuses.get(request.tool_name, [])
-    ]
-
-
-def _check_required_tool_failures(
-    evidence: list[EvidenceRecord], 
-    runbooks: list[RunbookExcerpt], 
-    alert: NormalizedAlert
-) -> list[str]:
-    """Check if required tools for the alert type have failed.
-    
-    This function determines the required tools based on alert type
-    and checks if they succeeded in the evidence.
-    """
-    # Define required tools by alert type
-    required_tools: list[str] = []
-    alert_type = alert.alert_type.lower() if alert.alert_type else ""
-    
-    if alert_type in {"connection_exhausted", "too_many_connections"}:
-        # For connection alerts, query_metrics and query_database_diagnostics are required
-        required_tools = ["query_metrics", "query_database_diagnostics"]
-    
-    # Check if all required tools succeeded
-    succeeded_tools: set[str] = {
-        item.tool_name for item in evidence 
-        if item.status == ToolStatus.SUCCESS
-    }
-    
-    return [
-        tool for tool in required_tools 
-        if tool not in succeeded_tools
+        if request.required and ToolStatus.SUCCESS not in statuses.get(request.tool_name, [])
     ]
 
 
