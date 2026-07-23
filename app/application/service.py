@@ -19,7 +19,12 @@ from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.graph import InvestigationAgent
 from app.agents.state import create_initial_state
 from app.application.sanitization import sanitize, sanitize_alert
-from app.domain.errors import AlertNotFoundError, AnalysisFailedError, InvalidAlertPayloadError
+from app.domain.errors import (
+    AlertNotFoundError,
+    AnalysisFailedError,
+    FeedbackAlreadySubmittedError,
+    InvalidAlertPayloadError,
+)
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
@@ -381,6 +386,18 @@ class AlertAnalysisService:
             raise InvalidAlertPayloadError("Only completed investigations can receive feedback")
         if not stored.latest_run:
             raise InvalidAlertPayloadError("Investigation run is missing")
+        existing_feedback = next(
+            (
+                item
+                for item in stored.feedback
+                if item.run_id == stored.latest_run.id
+            ),
+            None,
+        )
+        if existing_feedback:
+            if existing_feedback.idempotency_key == idempotency_key:
+                return existing_feedback
+            raise FeedbackAlreadySubmittedError(alert_id, str(stored.latest_run.id))
         if verdict in {FeedbackVerdict.CONFIRMED, FeedbackVerdict.CORRECTED} and (
             not final_root_cause or not actual_resolution
         ):
@@ -495,7 +512,10 @@ class AlertAnalysisService:
                 recommendation=stored.recommendation,
                 confirmed_by=sanitize(reviewer),
             )
-        return await self.repository.save_feedback(feedback, knowledge_case)
+        saved = await self.repository.save_feedback(feedback, knowledge_case)
+        if saved.id != feedback.id and saved.idempotency_key != feedback.idempotency_key:
+            raise FeedbackAlreadySubmittedError(alert_id, str(stored.latest_run.id))
+        return saved
 
     async def get(self, alert_id: str) -> StoredAlert:
         """Get an alert by ID.

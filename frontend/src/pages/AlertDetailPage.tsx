@@ -182,6 +182,13 @@ export function AlertDetailPage() {
       setFeedbackError("只有已完成或待人工复核的调查可以提交反馈。");
       return;
     }
+    if (
+      record.latest_run
+      && record.feedback.some((item) => item.run_id === record.latest_run?.id)
+    ) {
+      setFeedbackError("本次调查的人工审核已经提交，审核意见不可重复修改。");
+      return;
+    }
     if (!token) {
       setFeedbackError("请先解锁管理员会话。");
       return;
@@ -293,6 +300,7 @@ export function AlertDetailPage() {
         const exists = current.feedback.some((item) => item.id === saved.id);
         return {
           ...current,
+          status: "COMPLETED",
           feedback: exists
             ? current.feedback.map((item) => (item.id === saved.id ? saved : item))
             : [...current.feedback, saved],
@@ -304,7 +312,14 @@ export function AlertDetailPage() {
       setRunbookFeedbackVerdict("UNKNOWN");
       formElement.reset();
     } catch (submitError) {
-      if (submitError instanceof ApiError && [401, 403].includes(submitError.status)) {
+      if (
+        submitError instanceof ApiError
+        && submitError.status === 409
+        && submitError.problem?.code === "FEEDBACK_ALREADY_SUBMITTED"
+      ) {
+        setFeedbackError("本次调查的人工审核已经提交，正在载入已固定的审核意见。");
+        void load(true);
+      } else if (submitError instanceof ApiError && [401, 403].includes(submitError.status)) {
         setFeedbackError("管理员令牌无效或已过期，请锁定后重新输入。");
       } else {
         setFeedbackError(
@@ -322,7 +337,10 @@ export function AlertDetailPage() {
 
   const { alert, recommendation } = record;
   const isActive = isTracking;
-  const feedbackAllowed = feedbackStatuses.includes(record.status);
+  const currentFeedback = record.latest_run
+    ? record.feedback.find((item) => item.run_id === record.latest_run?.id)
+    : undefined;
+  const feedbackStatusAllowed = feedbackStatuses.includes(record.status);
   const singleManualMatch = record.manual_matches.length === 1 ? record.manual_matches[0] : null;
   const successfulEvidence = record.evidence_records.filter(
     (evidence) => evidence.status === "SUCCESS",
@@ -649,7 +667,14 @@ export function AlertDetailPage() {
 
         <div className="feedback-divider" />
 
-        {!feedbackAllowed ? (
+        {currentFeedback ? (
+          <div className="feedback-locked">
+            <LockKeyhole size={17} />
+            <span>
+              本次调查的人工审核已完成，审核意见已经固定，不能再次提交或覆盖。
+            </span>
+          </div>
+        ) : !feedbackStatusAllowed ? (
           <div className="feedback-not-ready">
             <CircleAlert size={17} />
             <span>调查完成或进入人工复核后，管理员才能提交反馈。</span>
