@@ -154,4 +154,4 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
     assert response.status_code == 200
     assert response.json()["new_count"] == 1
     assert len(scheduler.jobs) == 1
-    assert requests[0]["by_updated_at"] is True
+    assert requests[0]["by_updated_at"] is False

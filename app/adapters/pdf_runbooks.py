@@ -280,7 +280,9 @@ def _scope_matches(
         _normalized_match_text(item)
         for item in _metadata_strings(scope, "database_engines")
     }
-    alert_engine = _normalized_match_text(alert.database.engine if alert.database else "")
+    alert_engine = _normalized_match_text(
+        (alert.database.engine or "") if alert.database else ""
+    )
     if engines and alert_engine and alert_engine not in engines:
         return False
 

@@ -15,7 +15,7 @@ sequenceDiagram
 
     loop 每个 FLASHDUTY_POLL_INTERVAL_SECONDS
         API->>FD: POST /alert/list（指定 channel_ids）
-        FD-->>API: 按 updated_at 排序的告警列表
+        FD-->>API: 创建时间窗内的告警列表
         API->>FD: POST /alert/info（每条告警）
         FD-->>API: 完整告警详情
         API->>DB: 按 source + alert_id 幂等入库
@@ -131,7 +131,7 @@ external_id = FlashDuty alert_id
 
 1. 首轮从“当前时间减去 `FLASHDUTY_POLL_LOOKBACK_SECONDS`”开始拉取；
 2. 后续轮次从“上次成功水位减去 lookback”开始，形成重叠窗口；
-3. `/alert/list` 按 `updated_at` 升序、游标分页，单轮最多 100 页；
+3. `/alert/list` 使用创建时间窗（`by_updated_at=false`）并按游标分页，单轮最多 100 页；由于同一 `alert_id` 的后续更新本来不会触发重分析，按创建时间轮询可避免高告警量空间的更新时间索引超时；
 4. 仅整轮成功后推进内存水位；任何请求失败都保留旧水位，下轮重扫；
 5. 单条 `/alert/info` 暂时失败时，使用 `/alert/list` 中的完整 `AlertItem` 继续入库，避免单条详情请求造成漏告警。
 
