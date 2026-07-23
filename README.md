@@ -10,6 +10,38 @@
 
 值班人员查询、企微卡片确认、电话、群组分派、通知升级、等待窗口、送达确认和通知重试均不属于本项目。
 
+## 架构
+
+项目采用 **LangGraph** 框架构建告警调查工作流。调查图定义了清晰的节点和边，实现可观测、可调试的分析链路：
+
+```text
+START → fingerprint → knowledge → runbook → strategy
+     → execute_tools → dynamic_investigation ──(循环)──→ execute_tools
+                            ↓
+                          advise → validate → report → END
+```
+
+**节点说明：**
+
+| 节点 | 功能 |
+| --- | --- |
+| `fingerprint` | 生成告警指纹，用于历史案例匹配 |
+| `knowledge` | 匹配已确认的历史案例 |
+| `runbook` | 检索告警处理手册 |
+| `strategy` | 选择调查策略，生成工具执行计划 |
+| `execute_tools` | 执行调查工具，收集证据 |
+| `dynamic_investigation` | React 模式动态工具选择（可选） |
+| `advise` | AI 生成结构化建议 |
+| `validate` | 规则校验 + 独立结论验收 |
+| `report` | 生成最终报告，更新状态 |
+
+**状态管理：**
+
+使用 `AgentState` (Pydantic BaseModel) 在节点间传递状态，支持：
+- 告警信息、运行记录、证据列表
+- 动态工具选择循环（React 模式）
+- 验证、影子分析、AI 降级等配置
+
 ## 数据流
 
 ```text
@@ -21,7 +53,8 @@ FlashDuty /alert/list（定时轮询）
           ↓
 结构化字段 + 图片关键报错/关键词 + BM25/中文片段的章节级手册匹配（首要依据）
           ↓
-AI 分析（次要依据）+ 规则校验
+LangGraph 调查图：fingerprint → knowledge → runbook → strategy
+          → execute_tools → dynamic_investigation → advise → validate → report
           ↓
 结构化原因与有序依据
           ↓
