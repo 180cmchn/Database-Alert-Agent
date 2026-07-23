@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -18,6 +19,8 @@ from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
     FeedbackRequest,
+    FlashDutyPollResponse,
+    FlashDutyPollAlertItem,
     RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
@@ -426,6 +429,155 @@ def create_app(
         )
         return RuntimeSettingsResponse.from_settings(
             updated, revision=revision, changed_fields=changed_fields
+        )
+
+    @app.post(
+        "/api/v1/admin/flashduty/poll",
+        response_model=FlashDutyPollResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def poll_flashduty_alerts() -> FlashDutyPollResponse:
+        """Manually poll FlashDuty for alerts in the past 900 seconds.
+
+        This endpoint fetches alerts from FlashDuty API, applies deduplication
+        and condition filtering, and returns the processed alerts without
+        persisting them to the database.
+        """
+        if not runtime.flashduty_client:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "FLASHDUTY_NOT_CONFIGURED",
+                    "message": "FlashDuty is not enabled or app key is not configured",
+                },
+            )
+
+        end_time = int(time.time())
+        # Default to 900 seconds lookback as per requirement
+        time_range_seconds = 900
+        start_time = end_time - time_range_seconds
+
+        channel_ids = runtime.settings.flashduty_poll_channel_ids
+        if not channel_ids:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "FLASHDUTY_CHANNEL_NOT_CONFIGURED",
+                    "message": "FLASHDUTY_POLL_CHANNEL_IDS is not configured",
+                },
+            )
+
+        items: list[FlashDutyPollAlertItem] = []
+        total_count = 0
+        new_count = 0
+        deduplicated_count = 0
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        try:
+            for _page in range(100):
+                response = await runtime.flashduty_client.list_alerts(
+                    start_time=start_time,
+                    end_time=end_time,
+                    limit=100,
+                    search_after_ctx=cursor,
+                    channel_ids=channel_ids,
+                    integration_ids=runtime.settings.flashduty_poll_integration_ids or None,
+                    is_active=None,  # Don't filter by is_active to get all alerts
+                    by_updated_at=False,  # Query by creation time to avoid large data scan
+                )
+                data = response.data if isinstance(response.data, dict) else {}
+                logger.info(
+                    "flashduty_poll_response request_id=%s data_keys=%s items_type=%s",
+                    response.request_id,
+                    list(data.keys()) if isinstance(data, dict) else None,
+                    type(data.get("items")).__name__ if isinstance(data, dict) else None,
+                )
+                alert_items = data.get("items")
+                if not isinstance(alert_items, list):
+                    logger.warning(
+                        "flashduty_poll_no_items alert_items_type=%s data=%s",
+                        type(alert_items).__name__,
+                        str(data)[:500],
+                    )
+                    break
+
+                for item in alert_items:
+                    if not isinstance(item, dict):
+                        continue
+                    alert_id = item.get("alert_id")
+                    if not isinstance(alert_id, str):
+                        continue
+                    try:
+                        # Try to get alert detail for complete information
+                        try:
+                            detail = await runtime.flashduty_client.alert_info(alert_id)
+                            ingest_payload = {
+                                "request_id": detail.request_id,
+                                "data": detail.data,
+                            }
+                        except Exception:
+                            # Fall back to list item if detail request fails
+                            ingest_payload = {
+                                "request_id": response.request_id,
+                                "data": item,
+                            }
+
+                        # Use the service to normalize and deduplicate
+                        stored, created = await runtime.service.ingest("flashduty", ingest_payload)
+                        total_count += 1
+
+                        alert_item = FlashDutyPollAlertItem.from_normalized(
+                            stored.alert,
+                            deduplicated=not created,
+                            created=created,
+                        )
+                        items.append(alert_item)
+
+                        if created:
+                            new_count += 1
+                        else:
+                            deduplicated_count += 1
+
+                    except Exception as exc:
+                        logger.warning(
+                            "flashduty_poll_alert_ingest_failed external_alert_id=%s error=%s",
+                            alert_id,
+                            type(exc).__name__,
+                        )
+                        continue
+
+                next_cursor = data.get("search_after_ctx")
+                has_next = data.get("has_next_page") is True
+                if not has_next or not isinstance(next_cursor, str) or not next_cursor:
+                    break
+                if next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                logger.warning("flashduty_poll_exceeded_page_limit")
+
+        except Exception as exc:
+            logger.exception("flashduty_poll_failed error=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "FLASHDUTY_POLL_FAILED",
+                    "message": f"Failed to poll FlashDuty: {type(exc).__name__}",
+                },
+            ) from exc
+
+        return FlashDutyPollResponse(
+            total_count=total_count,
+            new_count=new_count,
+            deduplicated_count=deduplicated_count,
+            time_range_seconds=time_range_seconds,
+            start_time=start_time,
+            end_time=end_time,
+            channel_ids=channel_ids,
+            items=items,
         )
 
     return app

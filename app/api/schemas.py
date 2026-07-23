@@ -10,6 +10,7 @@ from app.config import Settings
 from app.domain.models import (
     AlertStatus,
     FeedbackVerdict,
+    NormalizedAlert,
     RunbookDocument,
     RunbookMatchVerdict,
 )
@@ -46,6 +47,55 @@ class FeedbackRequest(BaseModel):
 class RunbookListResponse(BaseModel):
     items: list[RunbookDocument]
     total: int = Field(ge=0)
+
+
+class FlashDutyPollAlertItem(BaseModel):
+    """Single alert item from FlashDuty poll response."""
+
+    alert_id: str = Field(description="FlashDuty alert ID (24-character ObjectID)")
+    title: str = Field(description="Alert title")
+    severity: str = Field(description="Normalized severity: CRITICAL, WARNING, or INFO")
+    raw_severity: str = Field(description="Original FlashDuty severity")
+    environment: str | None = Field(default=None, description="Alert environment")
+    service_name: str | None = Field(default=None, description="Service name")
+    alert_type: str | None = Field(default=None, description="Alert type/reason")
+    occurred_at: int = Field(description="Alert occurrence timestamp (Unix seconds)")
+    deduplicated: bool = Field(default=False, description="Whether this alert was deduplicated")
+    created: bool = Field(default=False, description="Whether this is a new alert in the system")
+    external_id: str | None = Field(default=None, description="External ID for tracking")
+
+    @classmethod
+    def from_normalized(
+        cls, alert: NormalizedAlert, *, deduplicated: bool, created: bool
+    ) -> "FlashDutyPollAlertItem":
+        return cls(
+            alert_id=alert.external_id,
+            title=alert.title,
+            severity=alert.severity.value,
+            raw_severity=alert.raw_severity or alert.severity.value,
+            environment=alert.environment,
+            service_name=alert.service_name,
+            alert_type=alert.alert_type,
+            occurred_at=int(alert.occurred_at.timestamp()),
+            deduplicated=deduplicated,
+            created=created,
+            external_id=alert.external_id,
+        )
+
+
+class FlashDutyPollResponse(BaseModel):
+    """Response model for FlashDuty manual poll endpoint."""
+
+    total_count: int = Field(ge=0, description="Total alerts fetched from FlashDuty")
+    new_count: int = Field(ge=0, description="Newly created alerts")
+    deduplicated_count: int = Field(ge=0, description="Deduplicated alerts (already existed)")
+    time_range_seconds: int = Field(ge=0, description="Query time range in seconds")
+    start_time: int = Field(description="Query start time (Unix timestamp)")
+    end_time: int = Field(description="Query end time (Unix timestamp)")
+    channel_ids: list[int] = Field(default_factory=list, description="Queried channel IDs")
+    items: list[FlashDutyPollAlertItem] = Field(
+        default_factory=list, description="Processed alert items"
+    )
 
 
 class RuntimeSettingsPatch(BaseModel):
