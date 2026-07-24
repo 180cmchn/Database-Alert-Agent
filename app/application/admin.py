@@ -234,6 +234,8 @@ class RuntimeSettingsManager:
             blocking.append(
                 "Production gate approval is required before disabling shadow mode"
             )
+        if settings.external_knowledge_enabled and not settings.external_knowledge_base_url.strip():
+            blocking.append("External knowledge base URL is required when external knowledge is enabled")
         if blocking:
             raise ValueError("; ".join(blocking))
 

@@ -187,6 +187,7 @@ def test_flashduty_polling_requires_a_collaboration_space_scope() -> None:
         ai_provider="fake",
         flashduty_enabled=True,
         flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=True,
         flashduty_poll_channel_ids=[],
     )
 
@@ -338,7 +339,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
     assert body["ai_fallback_enabled"] is True
-    assert body["flashduty_polling_enabled"] is True
+    assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert "ai_api_key" not in body
     assert "wecom_webhook_url" not in body
@@ -365,6 +366,65 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     )
     assert incomplete_response.ready is False
     assert any("AI_API_KEY" in issue for issue in incomplete_response.issues)
+
+
+@pytest.mark.asyncio
+async def test_runtime_patch_enables_external_knowledge_with_base_url_and_api_key(
+    tmp_path: Path,
+) -> None:
+    settings = runtime_test_settings(tmp_path)
+    manager = RuntimeSettingsManager(settings.runtime_settings_path)
+
+    # Enabling external knowledge without a base_url must be rejected.
+    with pytest.raises(ValueError, match="External knowledge base URL is required"):
+        await manager.patch(
+            settings,
+            {"external_knowledge_enabled": True, "external_knowledge_base_url": ""},
+            expected_revision=manager.revision,
+        )
+
+    # Enabling with a valid base_url and api_key succeeds. Use a non-default URL
+    # so the change is detected and persisted alongside the enabled flag.
+    configured, _, changed = await manager.patch(
+        settings,
+        {
+            "external_knowledge_enabled": True,
+            "external_knowledge_base_url": "http://127.0.0.1:8001",
+            "external_knowledge_api_key": "test-knowledge-key",
+        },
+        expected_revision=manager.revision,
+    )
+    assert configured.external_knowledge_enabled is True
+    assert configured.external_knowledge_base_url == "http://127.0.0.1:8001"
+    assert configured.external_knowledge_api_key == "test-knowledge-key"
+    assert "external_knowledge_enabled" in changed
+    assert "external_knowledge_base_url" in changed
+    assert "external_knowledge_api_key" in changed
+
+    persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
+    assert persisted["external_knowledge_enabled"] is True
+    assert persisted["external_knowledge_base_url"] == "http://127.0.0.1:8001"
+    assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
+
+
+def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
+    tmp_path: Path,
+) -> None:
+    settings = runtime_test_settings(tmp_path)
+    with_secret = settings.model_copy(
+        update={
+            "external_knowledge_enabled": True,
+            "external_knowledge_base_url": "http://localhost:8001",
+            "external_knowledge_api_key": "must-not-leak-knowledge-key",
+        }
+    )
+    response = RuntimeSettingsResponse.from_settings(with_secret, revision="0" * 16)
+    body = response.model_dump(mode="json")
+    assert body["external_knowledge_enabled"] is True
+    assert body["external_knowledge_base_url"] == "http://localhost:8001"
+    assert body["external_knowledge_api_key_configured"] is True
+    assert "external_knowledge_api_key" not in body
+    assert "must-not-leak-knowledge-key" not in response.model_dump_json()
 
 
 def test_production_requires_gate_approval_before_shadow_mode_is_disabled(

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
+from app.adapters.external_knowledge import (
+    ExternalKnowledgeClient,
+    format_items_for_advisor,
+)
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.state import AgentState
 from app.application.sanitization import sanitize
@@ -17,6 +22,7 @@ from app.domain.models import (
     InvestigationStage,
     ProgressRecord,
     Recommendation,
+    RunbookExcerpt,
     RunbookQualityStatus,
     RunStatus,
     ToolExecutionRequest,
@@ -55,6 +61,9 @@ class NodeContext:
         tool_executor: ToolExecutor,
         strategy_provider: InvestigationStrategyProvider,
         runbook_limit: int = 5,
+        external_knowledge_client: ExternalKnowledgeClient | None = None,
+        external_knowledge_limit: int = 5,
+        knowledge_sources: list[str] | None = None,
     ) -> None:
         self.repository = repository
         self.runbook_provider = runbook_provider
@@ -66,6 +75,9 @@ class NodeContext:
         self.tool_executor = tool_executor
         self.strategy_provider = strategy_provider
         self.runbook_limit = runbook_limit
+        self.external_knowledge_client = external_knowledge_client
+        self.external_knowledge_limit = external_knowledge_limit
+        self.knowledge_sources = knowledge_sources or ["local_pdf"]
 
 
 async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
@@ -100,7 +112,12 @@ async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any
 
 
 async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Match against confirmed historical cases."""
+    """Match against confirmed historical cases.
+
+    Historical cases are always queried and not controlled by ``knowledge_sources``.
+    External knowledge and local PDF runbook matching happen in the subsequent
+    ``runbook_match_node`` where they run in parallel.
+    """
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -128,13 +145,26 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
                 run_id=run.id,
                 stage=InvestigationStage.KNOWLEDGE_MATCHING,
                 message="正在匹配人工确认的历史案例。",
+                details={"knowledge_cases_count": len(knowledge_cases)},
             )
         ],
     }
 
 
 async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Search for matching runbooks."""
+    """Search local PDF runbooks and external knowledge in parallel.
+
+    Both knowledge sources are queried concurrently via ``asyncio.gather``.
+    Each source is gated by the ``knowledge_sources`` selection in the state:
+
+    - ``local_pdf``: query the local PDF runbook library.
+    - ``external_knowledge``: query the optional external knowledge API. This
+      additionally requires a configured ``ExternalKnowledgeClient``; failures
+      degrade gracefully so the investigation can continue with local results.
+
+    Historical cases are handled in the preceding ``knowledge_match_node`` and
+    are not touched here.
+    """
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -147,22 +177,77 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         alert_id,
         run,
         InvestigationStage.RUNBOOK_MATCHING,
-        "正在检索告警处理手册。",
+        "正在并行检索本地 PDF 手册与外部知识库。",
         {"knowledge_matches": len(state.knowledge_cases)},
     )
 
-    runbooks = await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit)
+    local_pdf_enabled = "local_pdf" in state.knowledge_sources
+    external_enabled = (
+        "external_knowledge" in state.knowledge_sources
+        and ctx.external_knowledge_client is not None
+    )
+
+    async def _search_local_pdf() -> list[RunbookExcerpt]:
+        if not local_pdf_enabled:
+            return []
+        return await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit)
+
+    async def _search_external_knowledge() -> list[dict[str, Any]]:
+        if not external_enabled:
+            return []
+        try:
+            response = await ctx.external_knowledge_client.search_alert(
+                alert, top_k=ctx.external_knowledge_limit
+            )
+            return format_items_for_advisor(response.items)
+        except Exception as exc:
+            logger.warning(
+                "external_knowledge_search_failed error=%s: %s",
+                type(exc).__name__,
+                sanitize(str(exc)),
+            )
+            await _update_progress(
+                ctx.repository,
+                alert_id,
+                run,
+                InvestigationStage.RUNBOOK_MATCHING,
+                "外部知识库查询失败，已降级到本地知识。",
+                {"external_knowledge_error": type(exc).__name__},
+            )
+            return []
+
+    runbooks, external_knowledge = await asyncio.gather(
+        _search_local_pdf(),
+        _search_external_knowledge(),
+    )
+
     await ctx.repository.save_runbooks(alert_id, runbooks)
+
+    if external_knowledge:
+        await _update_progress(
+            ctx.repository,
+            alert_id,
+            run,
+            InvestigationStage.RUNBOOK_MATCHING,
+            f"外部知识库返回 {len(external_knowledge)} 条候选知识（视为 draft）。",
+            {"external_knowledge_count": len(external_knowledge)},
+        )
 
     return {
         "current_stage": InvestigationStage.RUNBOOK_MATCHING,
         "runbooks": runbooks,
+        "external_knowledge": external_knowledge,
         "progress": [
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.RUNBOOK_MATCHING,
-                message="正在检索告警处理手册。",
-                details={"knowledge_matches": len(state.knowledge_cases)},
+                message="正在并行检索本地 PDF 手册与外部知识库。",
+                details={
+                    "knowledge_matches": len(state.knowledge_cases),
+                    "local_pdf_enabled": local_pdf_enabled,
+                    "external_knowledge_enabled": external_enabled,
+                    "external_knowledge_count": len(external_knowledge),
+                },
             )
         ],
     }

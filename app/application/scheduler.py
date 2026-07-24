@@ -53,6 +53,18 @@ class FlashDutyAlertPoller:
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
 
+    async def sync_settings(self, settings: Settings) -> None:
+        """Apply updated runtime settings to the poller.
+
+        Interval and lookback changes take effect on the next loop iteration.
+        A polling_enabled transition starts or stops the background task.
+        """
+        self.settings = settings
+        if self.enabled and self._task is None:
+            self._task = asyncio.create_task(self._loop(), name="flashduty-alert-poller")
+        elif not self.enabled and self._task is not None:
+            await self.stop()
+
     async def run_once(self, *, now: int | None = None) -> int:
         if not self.enabled or self.client is None:
             return 0

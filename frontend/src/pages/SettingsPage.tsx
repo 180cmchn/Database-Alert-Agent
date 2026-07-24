@@ -46,6 +46,7 @@ export function SettingsPage() {
   const [notice, setNotice] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [showWecomUrl, setShowWecomUrl] = useState(false);
+  const [showKnowledgeApiKey, setShowKnowledgeApiKey] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
 
   const load = useCallback(async () => {
@@ -83,6 +84,9 @@ export function SettingsPage() {
     setError("");
     setNotice("");
     try {
+      const knowledgeSources: string[] = [];
+      if (form.get("knowledge_local_pdf") === "on") knowledgeSources.push("local_pdf");
+      if (form.get("knowledge_external") === "on") knowledgeSources.push("external_knowledge");
       const patch: AdminSettingsPatch = {
         expected_revision: settings.revision,
         ai_provider: String(form.get("ai_provider")),
@@ -97,11 +101,19 @@ export function SettingsPage() {
         validation_enabled: form.get("validation_enabled") === "on",
         shadow_enabled: form.get("shadow_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
+        knowledge_sources: knowledgeSources,
+        flashduty_polling_enabled: form.get("flashduty_polling_enabled") === "on",
+        flashduty_poll_interval_seconds: numberField(form, "flashduty_poll_interval_seconds"),
+        flashduty_poll_lookback_seconds: numberField(form, "flashduty_poll_lookback_seconds"),
       };
       const apiKey = String(form.get("ai_api_key") || "").trim();
       if (apiKey) patch.ai_api_key = apiKey;
       const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
       if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
+      patch.external_knowledge_enabled = form.get("external_knowledge_enabled") === "on";
+      patch.external_knowledge_base_url = String(form.get("external_knowledge_base_url") || "").trim();
+      const knowledgeApiKey = String(form.get("external_knowledge_api_key") || "").trim();
+      if (knowledgeApiKey) patch.external_knowledge_api_key = knowledgeApiKey;
       const updated = await api.updateSettings(patch, token);
       setSettings(updated);
       setNotice(updated.changed_fields.length ? `已应用 ${updated.changed_fields.length} 项配置变更` : "配置已校验，当前值无需变更");
@@ -162,12 +174,30 @@ export function SettingsPage() {
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
 
-        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty API 轮询" description="仅通过 FlashDuty Open API 拉取告警；APP Key、轮询间隔、协作空间和集成范围均由部署环境的 .env 管理。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读轮询已启用" : "APP Key 未配置") : "未启用"}</span>}>
+        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty API 轮询" description="仅通过 FlashDuty Open API 拉取告警；APP Key 和协作空间范围由部署环境的 .env 管理，轮询开关、间隔和回看范围可在此页运行时调整。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读轮询已启用" : "APP Key 未配置") : "未启用"}</span>}>
+          <div className="switch-stack">
+            <label className="switch-row"><span><RefreshCw size={17} /><span><strong>启用轮询</strong><small>开启后自动按间隔拉取协作空间告警</small></span></span><input name="flashduty_polling_enabled" type="checkbox" defaultChecked={settings.flashduty_polling_enabled} disabled={!settings.flashduty_enabled} /><i /></label>
+          </div>
+          <div className="form-grid two-cols settings-inline-fields">
+            <label className="field"><span>轮询间隔（秒）</span><input name="flashduty_poll_interval_seconds" type="number" min="300" max="86400" required defaultValue={settings.flashduty_poll_interval_seconds} disabled={!settings.flashduty_polling_enabled} /></label>
+            <label className="field"><span>回看时间范围（秒）</span><input name="flashduty_poll_lookback_seconds" type="number" min="300" max="2678400" required defaultValue={settings.flashduty_poll_lookback_seconds} disabled={!settings.flashduty_polling_enabled} /></label>
+          </div>
           <div className="form-grid two-cols">
             <label className="field span-2"><span>官方 API Endpoint</span><input value={settings.flashduty_base_url} readOnly /></label>
-            <label className="field"><span>轮询状态</span><input value={settings.flashduty_polling_enabled ? `${settings.flashduty_poll_interval_seconds} 秒/轮 · 回看 ${settings.flashduty_poll_lookback_seconds} 秒` : "未启用"} readOnly /></label>
             <label className="field"><span>协作空间范围</span><input value={settings.flashduty_poll_channel_ids.length ? settings.flashduty_poll_channel_ids.join(", ") : "未配置（服务不会拉取）"} readOnly /></label>
             <label className="field"><span>集成范围</span><input value={settings.flashduty_poll_integration_ids.length ? settings.flashduty_poll_integration_ids.join(", ") : "全部集成"} readOnly /></label>
+          </div>
+        </SectionCard>
+
+        <SectionCard eyebrow="KNOWLEDGE SOURCES" title="知识来源" description="选择告警分析时使用的知识来源；历史确认案例始终启用，不受此设置控制。" action={<span className={`configured-chip ${settings.external_knowledge_api_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.external_knowledge_api_key_configured ? "Knowledge API Key 已配置" : "Knowledge API Key 未配置"}</span>}>
+          <div className="switch-stack">
+            <label className="switch-row"><span><Sparkles size={17} /><span><strong>本地 PDF 手册</strong><small>从本地 runbooks/pdfs 目录检索已审批的 PDF 处置手册</small></span></span><input name="knowledge_local_pdf" type="checkbox" defaultChecked={settings.knowledge_sources.includes("local_pdf")} /><i /></label>
+            <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用外部知识库 API</strong><small>开启后调查图谱将查询 KnowledgePack 服务获取补充知识候选（结果视为 draft 建议数据）</small></span></span><input name="external_knowledge_enabled" type="checkbox" defaultChecked={settings.external_knowledge_enabled} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>选择外部知识库作为来源</strong><small>勾选后在知识来源中加入 external_knowledge；本地 PDF 手册始终独立可选</small></span></span><input name="knowledge_external" type="checkbox" defaultChecked={settings.knowledge_sources.includes("external_knowledge")} disabled={!settings.external_knowledge_enabled} /><i /></label>
+          </div>
+          <div className="form-grid two-cols">
+            <label className="field span-2"><span>外部知识库 Base URL <b>*</b></span><input name="external_knowledge_base_url" type="url" defaultValue={settings.external_knowledge_base_url} required={settings.external_knowledge_enabled} disabled={!settings.external_knowledge_enabled} placeholder="http://localhost:8001" /></label>
+            <label className="field span-2"><span>Knowledge API Key（只写，默认留空）</span><div className="secret-field"><input name="external_knowledge_api_key" type={showKnowledgeApiKey ? "text" : "password"} autoComplete="new-password" disabled={!settings.external_knowledge_enabled} placeholder={settings.external_knowledge_api_key_configured ? "已配置 · 留空保持不变" : "有需要时填入，默认留空"} /><button type="button" onClick={() => setShowKnowledgeApiKey((value) => !value)} aria-label={showKnowledgeApiKey ? "隐藏 Knowledge API Key" : "显示 Knowledge API Key"}>{showKnowledgeApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
           </div>
         </SectionCard>
 
