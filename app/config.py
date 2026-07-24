@@ -35,6 +35,13 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "react_max_dynamic_turns",
         "validation_enabled",
         "shadow_enabled",
+        "knowledge_sources",
+        "flashduty_polling_enabled",
+        "flashduty_poll_interval_seconds",
+        "flashduty_poll_lookback_seconds",
+        "external_knowledge_enabled",
+        "external_knowledge_base_url",
+        "external_knowledge_api_key",
     }
 )
 
@@ -93,7 +100,7 @@ class Settings(BaseSettings):
     flashduty_timeout_seconds: float = Field(default=40, ge=35, le=120)
     flashduty_max_retries: int = Field(default=2, ge=0, le=5)
     flashduty_context_item_limit: int = Field(default=20, ge=1, le=100)
-    flashduty_polling_enabled: bool = True
+    flashduty_polling_enabled: bool = False
     flashduty_poll_interval_seconds: int = Field(default=300, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int = Field(default=900, ge=300, le=2678400)
     flashduty_poll_channel_ids: Annotated[list[int], NoDecode] = Field(
@@ -105,6 +112,24 @@ class Settings(BaseSettings):
     flashduty_metrics_ds_name: str = ""
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
+
+    # Optional external knowledge API (KnowledgePack / LangChain + Chroma service).
+    # When enabled, the investigation graph queries this service for supplementary
+    # knowledge candidates after local runbook matching. Results are always treated
+    # as advisory data with quality_status=draft per the analyze-database-alerts skill.
+    external_knowledge_enabled: bool = False
+    external_knowledge_base_url: str = "http://localhost:8001"
+    external_knowledge_api_key: str = Field(default="", repr=False)
+    external_knowledge_timeout_seconds: float = Field(default=30, gt=0)
+    external_knowledge_max_retries: int = Field(default=2, ge=0, le=5)
+    external_knowledge_limit: int = Field(default=5, ge=1, le=20)
+
+    # Selectable knowledge sources for alert matching. At least one source
+    # should be enabled; historical cases (DB) are always used and not
+    # controlled by this setting.  Values: "local_pdf", "external_knowledge".
+    knowledge_sources: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["local_pdf"]
+    )
 
     kafka_enabled: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
@@ -159,12 +184,27 @@ class Settings(BaseSettings):
             return [int(item) for item in raw if str(item).strip()]
         return value
 
+    @field_validator("knowledge_sources", mode="before")
+    @classmethod
+    def normalize_knowledge_sources(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                return json.loads(stripped)
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return value
+
     @model_validator(mode="after")
     def validate_admin_editable_urls(self) -> Settings:
         for field_name, required in (
             ("ai_base_url", True),
             ("wecom_webhook_url", False),
             ("flashduty_base_url", True),
+            ("external_knowledge_base_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -200,7 +240,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "flashduty_base_url must be the official HTTPS FlashDuty API endpoint"
                 )
-            if self.app_env.lower() in {"production", "prod"} and parsed.scheme != "https":
+            if (
+                field_name != "external_knowledge_base_url"
+                and self.app_env.lower() in {"production", "prod"}
+                and parsed.scheme != "https"
+            ):
                 raise ValueError(f"{field_name} must use HTTPS in production")
         if (
             self.app_env.lower() in {"production", "prod"}
@@ -209,6 +253,13 @@ class Settings(BaseSettings):
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
         if self.flashduty_logs_ds_type not in {"loki", "victorialogs"}:
             raise ValueError("FLASHDUTY_LOGS_DS_TYPE must be loki or victorialogs")
+        valid_sources = {"local_pdf", "external_knowledge"}
+        invalid_sources = set(self.knowledge_sources) - valid_sources
+        if invalid_sources:
+            raise ValueError(
+                f"KNOWLEDGE_SOURCES contains invalid values: {sorted(invalid_sources)}. "
+                f"Allowed: {sorted(valid_sources)}"
+            )
         return self
 
     def readiness_issues(self) -> list[str]:

@@ -362,6 +362,10 @@ export interface AdminSettings {
   flashduty_poll_lookback_seconds: number;
   flashduty_poll_channel_ids: number[];
   flashduty_poll_integration_ids: number[];
+  external_knowledge_enabled: boolean;
+  external_knowledge_base_url: string;
+  external_knowledge_api_key_configured: boolean;
+  knowledge_sources: string[];
   revision: string;
   apply_status: "applied";
   worker_refresh_mode: "before_each_job";
@@ -384,6 +388,13 @@ export interface AdminSettingsPatch {
   validation_enabled?: boolean;
   shadow_enabled?: boolean;
   ai_api_key?: string;
+  knowledge_sources?: string[];
+  flashduty_polling_enabled?: boolean;
+  flashduty_poll_interval_seconds?: number;
+  flashduty_poll_lookback_seconds?: number;
+  external_knowledge_enabled?: boolean;
+  external_knowledge_base_url?: string;
+  external_knowledge_api_key?: string;
 }
 
 export interface ApiProblem {

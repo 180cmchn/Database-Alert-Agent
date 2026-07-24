@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.adapters.alert_sources import AlertSourceRegistry
+from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.graph import InvestigationAgent
 from app.agents.state import create_initial_state
@@ -82,6 +83,9 @@ class AlertAnalysisService:
         ai_fallback_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
         max_dynamic_turns: int = 0,
+        external_knowledge_client: ExternalKnowledgeClient | None = None,
+        external_knowledge_limit: int = 5,
+        knowledge_sources: list[str] | None = None,
     ) -> None:
         self.source_registry = source_registry
         self.runbook_provider = runbook_provider
@@ -102,6 +106,9 @@ class AlertAnalysisService:
         self.ai_fallback_enabled = ai_fallback_enabled
         self.alert_sanitizer = alert_sanitizer
         self.max_dynamic_turns = max_dynamic_turns
+        self.external_knowledge_client = external_knowledge_client
+        self.external_knowledge_limit = external_knowledge_limit
+        self.knowledge_sources = knowledge_sources or ["local_pdf"]
         self._active_analyses = 0
         self._retired_adapters: list[object] = []
         self._retired_adapter_ids: set[int] = set()
@@ -119,6 +126,9 @@ class AlertAnalysisService:
             tool_executor=tool_executor,
             strategy_provider=strategy_provider,
             runbook_limit=runbook_limit,
+            external_knowledge_client=external_knowledge_client,
+            external_knowledge_limit=external_knowledge_limit,
+            knowledge_sources=knowledge_sources,
         )
 
     async def ingest(self, source: str, payload: dict[str, Any]) -> tuple[StoredAlert, bool]:
@@ -218,6 +228,7 @@ class AlertAnalysisService:
             validation_enabled=self.validation_enabled,
             shadow_enabled=self.shadow_enabled,
             ai_fallback_enabled=self.ai_fallback_enabled,
+            knowledge_sources=self.knowledge_sources,
         )
 
         # Record initial progress

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,6 +60,7 @@ class AgentState(BaseModel):
     # Investigation data
     runbooks: Annotated[list[RunbookExcerpt], merge_runbooks] = Field(default_factory=list)
     knowledge_cases: list[KnowledgeCase] = Field(default_factory=list)
+    external_knowledge: list[dict[str, Any]] = Field(default_factory=list)
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)
     strategy: InvestigationStrategy | None = None
 
@@ -98,6 +99,7 @@ class AgentState(BaseModel):
     validation_enabled: bool = True
     shadow_enabled: bool = False
     ai_fallback_enabled: bool = True
+    knowledge_sources: list[str] = Field(default_factory=lambda: ["local_pdf"])
 
 
 def create_initial_state(
@@ -110,6 +112,7 @@ def create_initial_state(
     validation_enabled: bool = True,
     shadow_enabled: bool = False,
     ai_fallback_enabled: bool = True,
+    knowledge_sources: list[str] | None = None,
 ) -> AgentState:
     """Create the initial state for a new investigation.
 
@@ -122,6 +125,7 @@ def create_initial_state(
         validation_enabled: Whether to enable validation
         shadow_enabled: Whether shadow mode is enabled
         ai_fallback_enabled: Whether AI fallback is enabled
+        knowledge_sources: Which knowledge sources to use for matching
 
     Returns:
         Initial AgentState for the investigation
@@ -139,4 +143,5 @@ def create_initial_state(
         validation_enabled=validation_enabled,
         shadow_enabled=shadow_enabled,
         ai_fallback_enabled=ai_fallback_enabled,
+        knowledge_sources=knowledge_sources or ["local_pdf"],
     )

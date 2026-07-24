@@ -8,6 +8,7 @@ from typing import Literal
 
 from langgraph.graph import END, StateGraph
 
+from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.nodes import (
     NodeContext,
@@ -139,6 +140,9 @@ class InvestigationAgent:
         tool_executor: ToolExecutor,
         strategy_provider: InvestigationStrategyProvider,
         runbook_limit: int = 5,
+        external_knowledge_client: ExternalKnowledgeClient | None = None,
+        external_knowledge_limit: int = 5,
+        knowledge_sources: list[str] | None = None,
     ) -> None:
         """Initialize the investigation agent.
 
@@ -153,6 +157,10 @@ class InvestigationAgent:
             tool_executor: Tool execution engine
             strategy_provider: Investigation strategy provider
             runbook_limit: Maximum runbooks to retrieve per alert
+            external_knowledge_client: Optional external knowledge API client
+            external_knowledge_limit: Maximum external knowledge items to retrieve
+            knowledge_sources: Which knowledge sources to use ("local_pdf",
+                "external_knowledge")
         """
         self.ctx = NodeContext(
             repository=repository,
@@ -165,6 +173,9 @@ class InvestigationAgent:
             tool_executor=tool_executor,
             strategy_provider=strategy_provider,
             runbook_limit=runbook_limit,
+            external_knowledge_client=external_knowledge_client,
+            external_knowledge_limit=external_knowledge_limit,
+            knowledge_sources=knowledge_sources,
         )
         self.graph = build_investigation_graph(self.ctx)
 

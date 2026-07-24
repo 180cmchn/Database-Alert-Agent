@@ -25,6 +25,7 @@ from app.adapters.notification import (
     LogManagementNotifier,
     WeComManagementNotifier,
 )
+from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.agents.graph import InvestigationAgent
@@ -103,6 +104,23 @@ def _build_flashduty_client(settings: Settings) -> FlashDutyClient | None:
     )
 
 
+def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeClient | None:
+    """Build the optional external knowledge API client.
+
+    Returns ``None`` when the feature is disabled, so downstream code can treat
+    the client as purely optional.
+    """
+
+    if not settings.external_knowledge_enabled:
+        return None
+    return ExternalKnowledgeClient(
+        base_url=settings.external_knowledge_base_url,
+        api_key=settings.external_knowledge_api_key,
+        timeout_seconds=settings.external_knowledge_timeout_seconds,
+        max_retries=settings.external_knowledge_max_retries,
+    )
+
+
 def _build_tool_registry(
     settings: Settings, client: FlashDutyClient | None = None
 ) -> InvestigationToolRegistry:
@@ -159,6 +177,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
     )
+    external_knowledge_client = _build_external_knowledge_client(settings)
     agent = InvestigationAgent(
         repository=service.repository,
         runbook_provider=service.runbook_provider,
@@ -170,6 +189,9 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         tool_executor=service.tool_executor,
         strategy_provider=strategy_provider,
         runbook_limit=settings.runbook_limit,
+        external_knowledge_client=external_knowledge_client,
+        external_knowledge_limit=settings.external_knowledge_limit,
+        knowledge_sources=settings.knowledge_sources,
     )
 
     service.advisor = advisor
@@ -182,6 +204,9 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.validation_enabled = settings.validation_enabled
     service.shadow_enabled = settings.shadow_enabled
     service.ai_fallback_enabled = settings.ai_fallback_enabled
+    service.external_knowledge_client = external_knowledge_client
+    service.external_knowledge_limit = settings.external_knowledge_limit
+    service.knowledge_sources = settings.knowledge_sources
     service.agent = agent
     runtime.settings = settings
     service.retire_adapters(old_advisor, old_conclusion_validator)
@@ -221,6 +246,7 @@ def build_runtime(
         notifier = _build_notifier(settings)
 
     flashduty_client = _build_flashduty_client(settings)
+    external_knowledge_client = _build_external_knowledge_client(settings)
     tool_registry = tool_registry or _build_tool_registry(settings, flashduty_client)
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
@@ -248,6 +274,9 @@ def build_runtime(
         shadow_enabled=settings.shadow_enabled,
         ai_fallback_enabled=settings.ai_fallback_enabled,
         max_dynamic_turns=settings.react_max_dynamic_turns if settings.react_enabled else 0,
+        external_knowledge_client=external_knowledge_client,
+        external_knowledge_limit=settings.external_knowledge_limit,
+        knowledge_sources=settings.knowledge_sources,
     )
     return Runtime(
         settings=settings,

@@ -1,20 +1,23 @@
 openapi: 3.1.0
 info:
   title: Database Alert External Knowledge API
-  version: 0.1.0
+  version: 0.2.0
   description: >
     Optional vendor-neutral contract for retrieving external database alert knowledge.
-    Implementations must return provenance and quality metadata. Retrieved content is
-    advisory data and never live evidence for the current incident.
+    This specification conforms to the KnowledgePack (LangChain + Chroma) service API.
+    Retrieved content is advisory data and never live evidence for the current incident.
+    Items returned by KnowledgePack do not carry an explicit quality_status; callers
+    MUST treat every result as `draft` per the analyze-database-alerts skill rules.
 servers:
   - url: "{baseUrl}"
     variables:
       baseUrl:
-        default: https://knowledge.example.invalid
+        default: http://localhost:8001
 security:
   - bearerAuth: []
+  - {}
 paths:
-  /v1/knowledge/search:
+  /search:
     post:
       operationId: searchDatabaseAlertKnowledge
       summary: Retrieve knowledge relevant to a normalized database alert
@@ -39,27 +42,26 @@ paths:
           $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"
-  /health:
+  /stats:
     get:
       operationId: externalKnowledgeHealth
+      summary: Knowledge base statistics (used as health check)
       security: []
       responses:
         "200":
-          description: Service health
+          description: Service health and statistics
           content:
             application/json:
               schema:
-                type: object
-                required: [status]
-                properties:
-                  status:
-                    type: string
-                    enum: [ok]
+                $ref: "#/components/schemas/StatsResponse"
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+      description: >
+        Optional. Set the KNOWLEDGE_API_KEY environment variable in KnowledgePack
+        to enable Bearer Token authentication.
   responses:
     Error:
       description: Structured API error
@@ -71,151 +73,85 @@ components:
     KnowledgeSearchRequest:
       type: object
       additionalProperties: false
-      required: [query, alert]
+      required: [query]
       properties:
         query:
           type: string
           minLength: 1
           maxLength: 2000
-        alert:
-          $ref: "#/components/schemas/AlertContext"
-        filters:
-          $ref: "#/components/schemas/KnowledgeFilters"
-        limit:
+          description: Natural-language search query built from alert context.
+        top_k:
           type: integer
           minimum: 1
           maximum: 20
           default: 5
-    AlertContext:
-      type: object
-      additionalProperties: true
-      required: [environment, service_name, alert_type]
-      properties:
-        database_engine:
-          type: [string, "null"]
-        environment:
-          type: string
-        service_name:
-          type: string
-        alert_type:
-          type: string
-        metric_name:
-          type: [string, "null"]
-        error_pattern:
-          type: [string, "null"]
-        resource_type:
-          type: [string, "null"]
-        cluster:
-          type: [string, "null"]
-        labels:
-          type: object
-          additionalProperties:
-            type: string
-    KnowledgeFilters:
-      type: object
-      additionalProperties: false
-      properties:
-        quality_status:
-          type: array
-          items:
-            type: string
-            enum: [approved, review_required, draft]
-        knowledge_type:
-          type: array
-          items:
-            type: string
-            enum: [runbook, incident_case, reference]
-        updated_after:
-          type: [string, "null"]
-          format: date-time
+          description: Maximum number of results to return.
+        with_score:
+          type: boolean
+          default: true
+          description: Whether to include similarity scores in results.
     KnowledgeSearchResponse:
       type: object
       additionalProperties: false
-      required: [request_id, items]
+      required: [query, results, total]
       properties:
-        request_id:
+        query:
           type: string
-        items:
+          description: The original query string.
+        results:
           type: array
           items:
             $ref: "#/components/schemas/KnowledgeItem"
+        total:
+          type: integer
+          minimum: 0
+          description: Number of items returned.
     KnowledgeItem:
       type: object
-      additionalProperties: false
-      required:
-        - id
-        - title
-        - section
-        - content
-        - source_uri
-        - knowledge_type
-        - quality_status
-        - score
-        - updated_at
+      additionalProperties: true
+      required: [content, metadata, score]
       properties:
-        id:
-          type: string
-        title:
-          type: string
-        section:
-          type: string
         content:
           type: string
-        source_uri:
-          type: string
-          format: uri
-        knowledge_type:
-          type: string
-          enum: [runbook, incident_case, reference]
-        quality_status:
-          type: string
-          enum: [approved, review_required, draft, deprecated]
-        score:
-          type: number
-          minimum: 0
-          maximum: 1
-        updated_at:
-          type: string
-          format: date-time
-        applies_to:
-          type: object
-          additionalProperties: true
-        causes:
-          type: array
-          items:
-            $ref: "#/components/schemas/CauseCandidate"
+          description: Chunk text from the knowledge document.
         metadata:
           type: object
           additionalProperties: true
-    CauseCandidate:
+          properties:
+            source:
+              type: string
+              description: Original document source (filename or URL).
+          description: Document metadata stored in the vector database.
+        score:
+          type: number
+          minimum: 0
+          description: >
+            Chroma L2 distance. Lower values indicate higher similarity.
+            The adapter normalizes this into a 0-1 relevance score where
+            higher is better.
+    StatsResponse:
       type: object
-      additionalProperties: false
-      required: [cause_id, cause, expected_signals, contradictions, next_probes]
+      required: [total_documents]
       properties:
-        cause_id:
+        total_documents:
+          type: integer
+        total_sources:
+          type: integer
+        sources:
+          type: object
+          additionalProperties:
+            type: integer
+        vector_db_path:
           type: string
-        cause:
+        collection_name:
           type: string
-        expected_signals:
-          type: array
-          items:
-            type: string
-        contradictions:
-          type: array
-          items:
-            type: string
-        next_probes:
-          type: array
-          items:
-            type: string
+        embedding_model:
+          type: string
     ErrorResponse:
       type: object
       additionalProperties: false
-      required: [code, message]
+      required: [detail]
       properties:
-        code:
+        detail:
           type: string
-        message:
-          type: string
-        request_id:
-          type: [string, "null"]
+          description: FastAPI-style error message.
