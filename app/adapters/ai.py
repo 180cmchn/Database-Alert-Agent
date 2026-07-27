@@ -126,7 +126,28 @@ def _validate_manual_policy(
     valid = {(item.runbook_id, item.section) for item in runbooks}
     cited = {(item.runbook_id, item.section) for item in recommendation.runbook_references}
     if not recommendation.manual_matched:
-        raise AdvisorError("Model ignored matched runbooks")
+        # Retrieval can surface candidate runbooks (especially draft ones)
+        # that the model judges irrelevant to this alert. That is a valid
+        # outcome, not a policy violation. Treat it as "no runbook matched":
+        # clear runbook citations, force human review, cap confidence.
+        return recommendation.model_copy(
+            update={
+                "manual_matched": False,
+                "runbook_references": [],
+                "confidence": min(recommendation.confidence, 0.45),
+                "requires_human": True,
+                "steps": [
+                    step.model_copy(update={"source_ref": None})
+                    for step in recommendation.steps
+                ],
+                "analysis_bases": [
+                    basis.model_copy(update={"source_ref": None})
+                    if basis.source == AnalysisBasisSource.RUNBOOK
+                    else basis
+                    for basis in recommendation.analysis_bases
+                ],
+            }
+        )
     if not cited or not cited.issubset(valid):
         raise AdvisorError("Model returned missing or unknown runbook references")
     sources = [item.source for item in recommendation.analysis_bases]
@@ -446,11 +467,21 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
             knowledge_cases=knowledge_cases,
             strategy=strategy,
         )
+        if recommendation.manual_matched:
+            fallback_summary = (
+                "AI 主分析暂不可用；已依据命中处理手册生成保守候选建议，需人工复核。"
+            )
+            fallback_confidence = min(recommendation.confidence, 0.55)
+        else:
+            fallback_summary = (
+                "AI 主分析暂不可用；未命中处理手册，已生成保守候选建议，需人工复核。"
+            )
+            fallback_confidence = min(recommendation.confidence, 0.35)
         recommendation = recommendation.model_copy(
             update={
-                "summary": f"AI 主分析暂不可用；已生成保守候选建议：{recommendation.summary}",
+                "summary": fallback_summary,
                 "requires_human": True,
-                "confidence": min(recommendation.confidence, 0.35),
+                "confidence": fallback_confidence,
             }
         )
         return recommendation, AdvisorMetadata(

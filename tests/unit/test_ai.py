@@ -67,6 +67,47 @@ def test_matched_runbook_requires_real_citations() -> None:
         _validate_manual_policy(recommendation, runbooks)
 
 
+def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None:
+    """When retrieval returns candidates but the model judges them irrelevant
+    (manual_matched=False), policy should NOT raise; it should clear citations,
+    force human review, and cap confidence."""
+    reference = RunbookReference(runbook_id="rb-1", section="triage")
+    recommendation = Recommendation(
+        summary="候选手册与本次告警无关",
+        analysis_bases=[
+            AnalysisBasis(
+                source=AnalysisBasisSource.RUNBOOK,
+                statement="手册候选",
+                source_ref=reference,
+            ),
+            AnalysisBasis(
+                source=AnalysisBasisSource.AI,
+                statement="AI basis",
+            ),
+        ],
+        steps=[
+            RecommendationStep(
+                order=1,
+                action="check",
+                source_ref=reference,
+            )
+        ],
+        requires_human=False,
+        confidence=0.9,
+        manual_matched=False,
+        runbook_references=[reference],
+    )
+    runbooks = [RunbookExcerpt(runbook_id="rb-1", title="RB", section="triage", content="approved")]
+    result = _validate_manual_policy(recommendation, runbooks)
+    assert result.manual_matched is False
+    assert result.runbook_references == []
+    assert result.requires_human is True
+    assert result.confidence <= 0.45
+    assert all(step.source_ref is None for step in result.steps)
+    runbook_bases = [b for b in result.analysis_bases if b.source == AnalysisBasisSource.RUNBOOK]
+    assert all(basis.source_ref is None for basis in runbook_bases)
+
+
 def test_system_trust_http_client_keeps_tls_verification_and_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -449,7 +449,10 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 run_id=run.id,
                 stage=InvestigationStage.ADVISING,
                 message="AI 主分析未返回合规结果，已生成保守候选建议并转人工复核。",
-                details={"error_type": type(exc).__name__},
+                details={
+                    "error_type": type(exc).__name__,
+                    "error_detail": sanitize(str(exc)),
+                },
             ),
         )
 

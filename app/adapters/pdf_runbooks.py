@@ -535,7 +535,7 @@ def _score_section(
         score *= 0.9
         reasons.append("手册待专家审核")
     elif document.quality_status == RunbookQualityStatus.DRAFT:
-        score *= 0.75
+        score *= 0.7
         reasons.append("手册仍为草稿")
     return score, list(dict.fromkeys(reasons))
 
