@@ -178,16 +178,22 @@ class RuntimeSettingsManager:
                 for key in updates
                 if serialized.get(key) != current_values.get(key)
             )
-            if not changed_fields:
-                return effective_current, latest_overrides, latest_revision, []
-
+            # Persist every admin-editable key that the caller submitted (plus
+            # any previously persisted overrides) so runtime-settings.json
+            # becomes the authoritative source for the editable surface, taking
+            # precedence over deployment (.env) values.  This makes the runtime
+            # configuration priority higher than the deployment configuration
+            # for the admin-editable whitelist.
             persisted = {
                 key: serialized[key]
-                for key in {*latest_overrides, *changed_fields}
+                for key in {*latest_overrides, *updates}
                 if key in RUNTIME_SETTINGS_KEYS
             }
+            new_revision = _revision_for(persisted)
+            if new_revision == latest_revision and not changed_fields:
+                return effective_current, latest_overrides, latest_revision, []
             self._write_atomic_sync(persisted)
-            return candidate, persisted, _revision_for(persisted), changed_fields
+            return candidate, persisted, new_revision, changed_fields
 
     @contextmanager
     def _settings_file_lock_sync(self) -> Iterator[None]:

@@ -324,6 +324,11 @@ def load_runtime_overrides(path: Path) -> dict[str, Any]:
 
 @lru_cache
 def get_settings() -> Settings:
+    # Deployment configuration (.env) is the bootstrap baseline. Runtime
+    # overrides persisted in runtime-settings.json take precedence over the
+    # deployment values for every key in RUNTIME_SETTINGS_KEYS, so changes made
+    # through the admin settings page remain authoritative until they are
+    # explicitly cleared from the runtime file.
     bootstrap = Settings()
     overrides = load_runtime_overrides(bootstrap.runtime_settings_path)
     if not overrides:
