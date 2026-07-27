@@ -189,6 +189,20 @@ export interface ValidationRecord {
   created_at: string;
 }
 
+export interface AnalysisConfigSnapshot {
+  knowledge_sources: string[];
+  external_knowledge_enabled: boolean;
+  external_knowledge_base_url: string;
+  runbook_limit: number;
+  react_enabled: boolean;
+  react_max_dynamic_turns: number;
+  validation_enabled: boolean;
+  shadow_enabled: boolean;
+  ai_fallback_enabled: boolean;
+  ai_model: string;
+  ai_provider: string;
+}
+
 export interface InvestigationRun {
   id: string;
   alert_id: string;
@@ -197,6 +211,7 @@ export interface InvestigationRun {
   current_stage: InvestigationStage;
   strategy_id?: string | null;
   error?: string | null;
+  config_snapshot?: AnalysisConfigSnapshot | null;
   created_at: string;
   updated_at: string;
 }
@@ -267,6 +282,7 @@ export interface StoredAlert {
   } | null;
   error?: string | null;
   latest_run?: InvestigationRun | null;
+  all_runs: InvestigationRun[];
   progress: ProgressRecord[];
   evidence_records: EvidenceRecord[];
   validations: ValidationRecord[];
@@ -274,6 +290,18 @@ export interface StoredAlert {
   knowledge_matches: KnowledgeCase[];
   created_at: string;
   updated_at: string;
+}
+
+export interface ReanalyzeRequest {
+  force?: boolean;
+}
+
+export interface ReanalyzeResponse {
+  alert_id: string;
+  run_id: string;
+  attempt: number;
+  config_snapshot: AnalysisConfigSnapshot;
+  message: string;
 }
 
 export interface AlertAccepted {

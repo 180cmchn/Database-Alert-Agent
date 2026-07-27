@@ -15,6 +15,7 @@ import {
   Gauge,
   History,
   KeyRound,
+  Lightbulb,
   LockKeyhole,
   MessageSquareCheck,
   Radio,
@@ -110,6 +111,8 @@ export function AlertDetailPage() {
   const [feedbackError, setFeedbackError] = useState("");
   const [feedbackNotice, setFeedbackNotice] = useState("");
   const [unlockToken, setUnlockToken] = useState("");
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalyzeError, setReanalyzeError] = useState("");
 
   const load = useCallback(async (silent = false) => {
     if (silent) setRefreshing(true);
@@ -328,6 +331,30 @@ export function AlertDetailPage() {
       }
     } finally {
       setFeedbackSaving(false);
+    }
+  }
+
+  async function handleReanalyze(force: boolean) {
+    if (!token) {
+      setReanalyzeError("请先解锁管理员会话。");
+      return;
+    }
+    setReanalyzing(true);
+    setReanalyzeError("");
+    try {
+      await api.reanalyzeAlert(alertId, { force }, token);
+      // Start tracking the new run
+      await load(true);
+    } catch (reanalyzeErr) {
+      if (reanalyzeErr instanceof ApiError && [401, 403].includes(reanalyzeErr.status)) {
+        setReanalyzeError("管理员令牌无效或已过期，请锁定后重新输入。");
+      } else {
+        setReanalyzeError(
+          reanalyzeErr instanceof Error ? reanalyzeErr.message : "重新分析失败",
+        );
+      }
+    } finally {
+      setReanalyzing(false);
     }
   }
 
@@ -917,6 +944,159 @@ export function AlertDetailPage() {
           </div>
         )}
       </SectionCard>
+
+      {/* Re-analyze Section - Admin Only */}
+      {unlocked && (
+        <SectionCard
+          eyebrow="DEBUG TOOLS"
+          title="重新分析告警"
+          description="使用当前的 runtime-settings.json 配置重新分析此告警，用于调试和对比不同配置的分析结果。"
+        >
+          {reanalyzeError && (
+            <div className="form-error" role="alert" style={{ marginBottom: "1rem" }}>
+              {reanalyzeError}
+            </div>
+          )}
+          <div className="reanalyze-panel">
+            <div className="reanalyze-info">
+              <Lightbulb size={20} />
+              <div>
+                <strong>当前配置将被记录</strong>
+                <p>
+                  重新分析会使用当前 runtime-settings.json 中的配置（知识来源、模型、参数等），
+                  并将配置快照保存到新的运行记录中，方便对比不同配置的分析结果。
+                </p>
+              </div>
+            </div>
+            <div className="reanalyze-actions">
+              <button
+                className="button primary"
+                type="button"
+                onClick={() => handleReanalyze(false)}
+                disabled={reanalyzing || isActive}
+                title={isActive ? "当前有分析正在运行，请使用强制重新分析" : "使用当前配置重新分析"}
+              >
+                {reanalyzing ? (
+                  "正在启动..."
+                ) : (
+                  <><RefreshCw size={15} /> 重新分析</>
+                )}
+              </button>
+              {isActive && (
+                <button
+                  className="button secondary"
+                  type="button"
+                  onClick={() => handleReanalyze(true)}
+                  disabled={reanalyzing}
+                  title="强制终止当前运行并重新分析"
+                >
+                  {reanalyzing ? (
+                    "正在启动..."
+                  ) : (
+                    <><RefreshCw size={15} /> 强制重新分析</>
+                  )}
+                </button>
+              )}
+            </div>
+          </div>
+        </SectionCard>
+      )}
+
+      {/* Analysis History Section */}
+      {record.all_runs.length > 1 && (
+        <SectionCard
+          eyebrow="ANALYSIS HISTORY"
+          title="分析历史记录"
+          description="此告警的所有分析运行记录，包括每次运行时使用的配置快照。"
+          action={<span className="evidence-count">{record.all_runs.length} 次运行</span>}
+        >
+          <div className="analysis-history-list">
+            {record.all_runs.map((run) => (
+              <article
+                key={run.id}
+                className={`analysis-history-item ${run.id === record.latest_run?.id ? "current" : ""}`}
+              >
+                <header>
+                  <div className="run-header-main">
+                    <span className="run-attempt">第 {run.attempt} 次运行</span>
+                    <span className={`run-status-badge run-status-${run.status.toLowerCase()}`}>
+                      {run.status === "RUNNING" ? "运行中" :
+                       run.status === "COMPLETED" ? "已完成" :
+                       run.status === "REVIEW_REQUIRED" ? "待复核" : "失败"}
+                    </span>
+                    {run.id === record.latest_run?.id && (
+                      <span className="current-badge">当前</span>
+                    )}
+                  </div>
+                  <time dateTime={run.created_at}>
+                    {formatDateTime(run.created_at)}
+                  </time>
+                </header>
+                {run.error && (
+                  <div className="run-error">
+                    <CircleAlert size={14} />
+                    {run.error}
+                  </div>
+                )}
+                {run.config_snapshot && (
+                  <details className="config-snapshot-details">
+                    <summary>查看配置快照</summary>
+                    <dl className="config-snapshot-grid">
+                      <div>
+                        <dt>知识来源</dt>
+                        <dd>{run.config_snapshot.knowledge_sources.join(", ") || "默认"}</dd>
+                      </div>
+                      <div>
+                        <dt>外部知识库</dt>
+                        <dd>
+                          {run.config_snapshot.external_knowledge_enabled
+                            ? run.config_snapshot.external_knowledge_base_url || "已启用"
+                            : "未启用"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>手册上限</dt>
+                        <dd>{run.config_snapshot.runbook_limit}</dd>
+                      </div>
+                      <div>
+                        <dt>ReAct 模式</dt>
+                        <dd>
+                          {run.config_snapshot.react_enabled
+                            ? `启用 (最多 ${run.config_snapshot.react_max_dynamic_turns} 轮)`
+                            : "禁用"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>校验</dt>
+                        <dd>{run.config_snapshot.validation_enabled ? "启用" : "禁用"}</dd>
+                      </div>
+                      <div>
+                        <dt>影子模式</dt>
+                        <dd>{run.config_snapshot.shadow_enabled ? "启用" : "禁用"}</dd>
+                      </div>
+                      <div>
+                        <dt>AI Fallback</dt>
+                        <dd>{run.config_snapshot.ai_fallback_enabled ? "启用" : "禁用"}</dd>
+                      </div>
+                      <div>
+                        <dt>AI 模型</dt>
+                        <dd>
+                          {run.config_snapshot.ai_provider}
+                          {run.config_snapshot.ai_model && ` / ${run.config_snapshot.ai_model}`}
+                        </dd>
+                      </div>
+                    </dl>
+                  </details>
+                )}
+                <div className="run-meta">
+                  <span>Run ID: {compactId(run.id)}</span>
+                  {run.strategy_id && <span>策略: {run.strategy_id}</span>}
+                </div>
+              </article>
+            ))}
+          </div>
+        </SectionCard>
+      )}
 
       <SectionCard eyebrow="TRACEABILITY" title="事件标识与审计信息">
         <dl className="traceability-grid">

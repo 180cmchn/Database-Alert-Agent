@@ -30,6 +30,7 @@ from app.domain.models import (
     AlertListResult,
     AlertStatus,
     AlertSummary,
+    AnalysisConfigSnapshot,
     DashboardSummary,
     EvidenceRecord,
     FeedbackRecord,
@@ -81,7 +82,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0007"
+DATABASE_SCHEMA_REVISION = "0008"
 
 
 class Base(DeclarativeBase):
@@ -132,6 +133,7 @@ class InvestigationRunRow(Base):
     error: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    config_snapshot_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, default=_utc_now
     )
@@ -623,6 +625,72 @@ class SQLAlchemyAlertRepository:
                 return None
             return run
 
+    async def create_run_for_reanalyze(
+        self,
+        alert_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+        config_snapshot: AnalysisConfigSnapshot,
+    ) -> InvestigationRun | None:
+        """Create a new investigation run for re-analysis with config snapshot.
+
+        Unlike create_run, this method allows re-analyzing completed/review_required alerts
+        and saves the configuration snapshot for tracking.
+        """
+        async with self.session_factory() as session:
+            alert_row = await session.get(AlertRow, alert_id)
+            if not alert_row:
+                return None
+            latest_query = (
+                select(InvestigationRunRow)
+                .where(InvestigationRunRow.alert_id == alert_id)
+                .order_by(desc(InvestigationRunRow.attempt))
+                .limit(1)
+            )
+            latest = (await session.execute(latest_query)).scalar_one_or_none()
+            now = _utc_now()
+            if latest and latest.status == RunStatus.RUNNING.value:
+                lease_expires = latest.lease_expires_at
+                if lease_expires and lease_expires.tzinfo is None:
+                    lease_expires = lease_expires.replace(tzinfo=UTC)
+                if lease_expires and lease_expires > now:
+                    return None
+                latest.status = RunStatus.FAILED.value
+                latest.current_stage = InvestigationStage.FAILED.value
+                latest.error = "Investigation lease expired"
+                latest.updated_at = now
+            attempt = (latest.attempt + 1) if latest else 1
+            run = InvestigationRun(
+                alert_id=alert_id,
+                attempt=attempt,
+                lease_owner=lease_owner,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                config_snapshot=config_snapshot,
+            )
+            session.add(
+                InvestigationRunRow(
+                    id=str(run.id),
+                    alert_id=alert_id,
+                    attempt=attempt,
+                    status=run.status.value,
+                    current_stage=run.current_stage.value,
+                    lease_owner=lease_owner,
+                    lease_expires_at=run.lease_expires_at,
+                    config_snapshot_json=config_snapshot.model_dump(mode="json"),
+                    created_at=run.created_at,
+                    updated_at=run.updated_at,
+                )
+            )
+            alert_row.status = AlertStatus.ANALYZING.value
+            alert_row.error = None  # Clear previous error
+            alert_row.updated_at = now
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return None
+            return run
+
     async def update_run(
         self,
         run_id: str,
@@ -891,6 +959,16 @@ class SQLAlchemyAlertRepository:
         return (await session.execute(query)).scalar_one_or_none()
 
     async def _to_stored(self, session: AsyncSession, row: AlertRow) -> StoredAlert:
+        # Get all runs for this alert (for history display)
+        all_runs_query = (
+            select(InvestigationRunRow)
+            .where(InvestigationRunRow.alert_id == row.id)
+            .order_by(desc(InvestigationRunRow.attempt))
+        )
+        all_run_rows = (await session.execute(all_runs_query)).scalars().all()
+        all_runs = [self._run(run_row) for run_row in all_run_rows]
+        latest_run = all_runs[0] if all_runs else None
+
         run_query = (
             select(InvestigationRunRow)
             .where(InvestigationRunRow.alert_id == row.id)
@@ -898,7 +976,6 @@ class SQLAlchemyAlertRepository:
             .limit(1)
         )
         run_row = (await session.execute(run_query)).scalar_one_or_none()
-        latest_run = self._run(run_row) if run_row else None
         progress: list[ProgressRecord] = []
         evidence_records: list[EvidenceRecord] = []
         validations: list[ValidationRecord] = []
@@ -1013,6 +1090,7 @@ class SQLAlchemyAlertRepository:
             ),
             error=row.error,
             latest_run=latest_run,
+            all_runs=all_runs,
             progress=progress,
             evidence_records=evidence_records,
             validations=validations,
@@ -1045,6 +1123,9 @@ class SQLAlchemyAlertRepository:
 
     @staticmethod
     def _run(row: InvestigationRunRow) -> InvestigationRun:
+        config_snapshot = None
+        if row.config_snapshot_json:
+            config_snapshot = AnalysisConfigSnapshot.model_validate(row.config_snapshot_json)
         return InvestigationRun(
             id=row.id,
             alert_id=row.alert_id,
@@ -1055,6 +1136,7 @@ class SQLAlchemyAlertRepository:
             error=row.error,
             lease_owner=row.lease_owner,
             lease_expires_at=row.lease_expires_at,
+            config_snapshot=config_snapshot,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )

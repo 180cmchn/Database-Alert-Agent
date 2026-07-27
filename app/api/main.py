@@ -21,6 +21,8 @@ from app.api.schemas import (
     FeedbackRequest,
     FlashDutyPollAlertItem,
     FlashDutyPollResponse,
+    ReanalyzeRequest,
+    ReanalyzeResponse,
     RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
@@ -477,6 +479,41 @@ def create_app(
             target="runtime-settings",
         )
         return RuntimeSettingsResponse.from_settings(updated, revision=revision)
+
+    @app.post(
+        "/api/v1/alerts/{alert_id}/reanalyze",
+        response_model=ReanalyzeResponse,
+        status_code=202,
+        tags=["alerts"],
+    )
+    async def reanalyze_alert(
+        alert_id: str,
+        request: ReanalyzeRequest,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> ReanalyzeResponse:
+        """Re-analyze an alert with current runtime settings.
+
+        This endpoint allows debugging by re-running analysis with different
+        runtime configurations. The configuration snapshot is saved for tracking
+        and comparison across multiple re-analyses.
+        """
+        run, config_snapshot = await runtime.service.reanalyze(
+            alert_id,
+            force=request.force,
+        )
+        await audit_logger.record(
+            action="reanalyze",
+            target=f"alert:{alert_id}",
+            fields=["force", "config_snapshot"],
+            actor=actor,
+        )
+        return ReanalyzeResponse(
+            alert_id=run.alert_id,
+            run_id=run.id,
+            attempt=run.attempt,
+            config_snapshot=config_snapshot,
+            message=f"Re-analysis started with attempt {run.attempt}",
+        )
 
     @app.post(
         "/api/v1/admin/flashduty/poll",

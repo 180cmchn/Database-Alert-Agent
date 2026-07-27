@@ -29,6 +29,7 @@ from app.domain.errors import (
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
+    AnalysisConfigSnapshot,
     DashboardSummary,
     FeedbackRecord,
     FeedbackVerdict,
@@ -588,6 +589,80 @@ class AlertAnalysisService:
             Dashboard summary
         """
         return await self.repository.dashboard_summary()
+
+    def _create_config_snapshot(self) -> AnalysisConfigSnapshot:
+        """Create a snapshot of the current analysis configuration.
+
+        This captures the key runtime settings for tracking across re-analyses.
+        """
+        return AnalysisConfigSnapshot(
+            knowledge_sources=list(self.knowledge_sources),
+            external_knowledge_enabled=self.external_knowledge_client is not None,
+            external_knowledge_base_url=(
+                self.external_knowledge_client.base_url if self.external_knowledge_client else ""
+            ),
+            runbook_limit=self.runbook_limit,
+            react_enabled=self.react_enabled,
+            react_max_dynamic_turns=self.max_dynamic_turns,
+            validation_enabled=self.validation_enabled,
+            shadow_enabled=self.shadow_enabled,
+            ai_fallback_enabled=self.ai_fallback_enabled,
+            ai_model=getattr(self.advisor, "model", ""),
+            ai_provider="fake" if hasattr(self.advisor, "__class__") and self.advisor.__class__.__name__ == "FakeAIAdvisor" else "openai_compatible",
+        )
+
+    async def reanalyze(
+        self,
+        alert_id: str,
+        *,
+        force: bool = False,
+    ) -> tuple[InvestigationRun, AnalysisConfigSnapshot]:
+        """Re-analyze an alert with current runtime settings.
+
+        This method allows re-running analysis on completed/review_required alerts
+        for debugging purposes. The configuration snapshot is saved for tracking.
+
+        Args:
+            alert_id: The alert ID to re-analyze
+            force: Force re-analysis even if a run is already in progress
+
+        Returns:
+            Tuple of (investigation run, config snapshot)
+
+        Raises:
+            AlertNotFoundError: If the alert doesn't exist
+            InvalidAlertPayloadError: If a run is already in progress and force=False
+        """
+        stored = await self.get(alert_id)
+
+        # Check if a run is already in progress
+        if stored.latest_run and stored.latest_run.status == RunStatus.RUNNING:
+            if not force:
+                raise InvalidAlertPayloadError(
+                    "An analysis is already in progress. Use force=True to override."
+                )
+
+        # Create config snapshot
+        config_snapshot = self._create_config_snapshot()
+
+        # Create a new run for re-analysis
+        run = await self.repository.create_run_for_reanalyze(
+            alert_id,
+            lease_owner=f"reanalyze-{uuid4()}",
+            lease_seconds=self.investigation_lease_seconds,
+            config_snapshot=config_snapshot,
+        )
+        if run is None:
+            raise InvalidAlertPayloadError("Failed to create investigation run")
+
+        self._active_analyses += 1
+        try:
+            await self._analyze_claimed_alert(stored, alert_id, run)
+            return run, config_snapshot
+        finally:
+            self._active_analyses -= 1
+            if self._active_analyses == 0:
+                self._schedule_retired_adapter_close()
 
     async def _send_analysis_result(
         self,

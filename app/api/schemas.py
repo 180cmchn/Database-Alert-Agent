@@ -9,6 +9,7 @@ from app.application.admin import runtime_configuration_issues
 from app.config import Settings
 from app.domain.models import (
     AlertStatus,
+    AnalysisConfigSnapshot,
     FeedbackVerdict,
     NormalizedAlert,
     RunbookDocument,
@@ -45,6 +46,28 @@ class FeedbackRequest(BaseModel):
 class RunbookListResponse(BaseModel):
     items: list[RunbookDocument]
     total: int = Field(ge=0)
+
+
+class ReanalyzeRequest(BaseModel):
+    """Request to re-analyze an alert with current runtime settings.
+
+    This allows debugging by re-running analysis with different configurations.
+    """
+
+    force: bool = Field(
+        default=False,
+        description="Force re-analysis even if a run is already in progress",
+    )
+
+
+class ReanalyzeResponse(BaseModel):
+    """Response for re-analysis request."""
+
+    alert_id: UUID
+    run_id: UUID
+    attempt: int = Field(ge=1)
+    config_snapshot: AnalysisConfigSnapshot
+    message: str
 
 
 class FlashDutyPollAlertItem(BaseModel):

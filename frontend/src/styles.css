@@ -353,3 +353,203 @@ input:disabled { color: #6d8291; background: #0b1925; cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* Re-analyze Panel */
+.reanalyze-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.reanalyze-info {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  background: rgba(72, 216, 173, 0.06);
+  border: 1px solid rgba(72, 216, 173, 0.15);
+  border-radius: var(--radius-sm);
+  color: var(--text-soft);
+}
+
+.reanalyze-info svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.reanalyze-info strong {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.reanalyze-info p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.reanalyze-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* Analysis History List */
+.analysis-history-list {
+  display: grid;
+  gap: 0.875rem;
+}
+
+.analysis-history-item {
+  padding: 0.875rem 1rem;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color 150ms ease;
+}
+
+.analysis-history-item.current {
+  border-color: rgba(72, 216, 173, 0.35);
+  background: rgba(72, 216, 173, 0.04);
+}
+
+.analysis-history-item header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.run-header-main {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+}
+
+.run-attempt {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.run-status-badge {
+  padding: 0.125rem 0.5rem;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: 4px;
+}
+
+.run-status-badge.run-status-running {
+  background: rgba(91, 196, 239, 0.15);
+  color: var(--cyan);
+}
+
+.run-status-badge.run-status-completed {
+  background: rgba(72, 216, 173, 0.15);
+  color: var(--accent);
+}
+
+.run-status-badge.run-status-review_required {
+  background: rgba(242, 200, 95, 0.15);
+  color: var(--warning);
+}
+
+.run-status-badge.run-status-failed {
+  background: rgba(255, 101, 113, 0.15);
+  color: var(--danger);
+}
+
+.current-badge {
+  padding: 0.125rem 0.5rem;
+  font-size: 9px;
+  font-weight: 600;
+  background: rgba(72, 216, 173, 0.12);
+  color: var(--accent);
+  border-radius: 4px;
+}
+
+.analysis-history-item time {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.run-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 101, 113, 0.08);
+  border: 1px solid rgba(255, 101, 113, 0.15);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.config-snapshot-details {
+  margin-top: 0.5rem;
+}
+
+.config-snapshot-details summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--muted);
+  padding: 0.25rem 0;
+}
+
+.config-snapshot-details summary:hover {
+  color: var(--text-soft);
+}
+
+.config-snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.5rem 1rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.config-snapshot-grid dt {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.125rem;
+}
+
+.config-snapshot-grid dd {
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.run-meta {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line-soft);
+  font-size: 9px;
+  color: var(--muted);
+}
+
+@media (max-width: 620px) {
+  .analysis-history-item header {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .config-snapshot-grid {
+    grid-template-columns: 1fr;
+  }
+  .reanalyze-actions {
+    flex-direction: column;
+  }
+  .reanalyze-actions .button {
+    width: 100%;
+  }
+}

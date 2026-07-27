@@ -356,6 +356,26 @@ class ValidationRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class AnalysisConfigSnapshot(BaseModel):
+    """Snapshot of configuration used for an analysis run.
+
+    This captures the key runtime settings at the time of analysis,
+    allowing comparison across multiple re-analyses of the same alert.
+    """
+
+    knowledge_sources: list[str] = Field(default_factory=list)
+    external_knowledge_enabled: bool = False
+    external_knowledge_base_url: str = ""
+    runbook_limit: int = 5
+    react_enabled: bool = False
+    react_max_dynamic_turns: int = 0
+    validation_enabled: bool = True
+    shadow_enabled: bool = False
+    ai_fallback_enabled: bool = True
+    ai_model: str = ""
+    ai_provider: str = "openai_compatible"
+
+
 class InvestigationRun(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     alert_id: UUID
@@ -366,6 +386,7 @@ class InvestigationRun(BaseModel):
     error: str | None = None
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    config_snapshot: AnalysisConfigSnapshot | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -441,6 +462,7 @@ class StoredAlert(BaseModel):
     advisor_metadata: AdvisorMetadata | None = None
     error: str | None = None
     latest_run: InvestigationRun | None = None
+    all_runs: list[InvestigationRun] = Field(default_factory=list)
     progress: list[ProgressRecord] = Field(default_factory=list)
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)
     validations: list[ValidationRecord] = Field(default_factory=list)
