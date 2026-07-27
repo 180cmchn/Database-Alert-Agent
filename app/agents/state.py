@@ -93,7 +93,6 @@ class AgentState(BaseModel):
 
     # Validation flags
     validation_passed: bool = False
-    unapproved_runbook: bool = False
 
     # Configuration
     validation_enabled: bool = True

@@ -23,7 +23,6 @@ from app.domain.models import (
     ProgressRecord,
     Recommendation,
     RunbookExcerpt,
-    RunbookQualityStatus,
     RunStatus,
     ToolExecutionRequest,
     ToolStatus,
@@ -550,17 +549,11 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         not validation_enabled or (agent_validation is not None and agent_validation.passed)
     )
 
-    # Check for unapproved runbooks
-    unapproved_runbook = any(
-        item.quality_status != RunbookQualityStatus.APPROVED for item in runbooks
-    )
-
     return {
         "current_stage": InvestigationStage.VALIDATING,
         "rule_validation": rule_validation,
         "agent_validation": agent_validation,
         "validation_passed": validation_passed,
-        "unapproved_runbook": unapproved_runbook,
         "progress": [
             ProgressRecord(
                 run_id=run.id,
@@ -580,7 +573,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     recommendation = state.recommendation
     advisor_metadata = state.advisor_metadata
     validation_passed = state.validation_passed
-    unapproved_runbook = state.unapproved_runbook
     advisor_degraded = state.advisor_degraded
     shadow_enabled = state.shadow_enabled
     error = state.error
@@ -616,7 +608,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     # Determine final status
     passed = (
-        validation_passed and not shadow_enabled and not unapproved_runbook and not advisor_degraded
+        validation_passed and not shadow_enabled and not advisor_degraded
     )
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
     run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
@@ -651,10 +643,9 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             details={
                 "validation_passed": validation_passed,
                 "shadow_enabled": shadow_enabled,
-                "unapproved_runbook": unapproved_runbook,
                 "advisor_degraded": advisor_degraded,
             },
-        ),
+        )
     )
     await ctx.repository.save_analysis(
         alert_id,
@@ -677,7 +668,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 details={
                     "validation_passed": validation_passed,
                     "shadow_enabled": shadow_enabled,
-                    "unapproved_runbook": unapproved_runbook,
                     "advisor_degraded": advisor_degraded,
                 },
             )

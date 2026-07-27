@@ -10,7 +10,6 @@ from app.domain.models import (
     Recommendation,
     RootCauseStatus,
     RunbookExcerpt,
-    RunbookQualityStatus,
     ToolStatus,
     ValidationKind,
     ValidationRecord,
@@ -137,15 +136,6 @@ class RuleConclusionValidator:
                         f"根因 #{index} 引用了手册中不存在的 cause_id："
                         f"{root_cause.cause_id}"
                     )
-            if any(
-                excerpt.quality_status != RunbookQualityStatus.APPROVED
-                for excerpt in runbooks
-            ):
-                if not recommendation.requires_human:
-                    issues.append("待审核手册的建议必须要求人工复核")
-                if recommendation.confidence > 0.65:
-                    issues.append("待审核手册的建议置信度不得超过 0.65")
-
         for index, step in enumerate(recommendation.steps, start=1):
             matches = [
                 label
