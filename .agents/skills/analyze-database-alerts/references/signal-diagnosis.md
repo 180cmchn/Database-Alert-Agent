@@ -1,8 +1,8 @@
 # Database signal diagnosis
 
 Use this reference to generate hypotheses and choose evidence that distinguishes them. The table
-does not prove a cause. Vendor-specific names vary, and an approved local PDF runbook remains the
-authoritative source for operational guidance.
+does not prove a cause. Vendor-specific names vary, and deployed local PDF and external knowledge
+sources are peer operational guidance.
 
 | Symptom family | Candidate mechanisms | Discriminating read-only evidence | Common false inference |
 | --- | --- | --- | --- |

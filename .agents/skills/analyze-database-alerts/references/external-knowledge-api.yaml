@@ -5,9 +5,8 @@ info:
   description: >
     Optional vendor-neutral contract for retrieving external database alert knowledge.
     This specification conforms to the KnowledgePack (LangChain + Chroma) service API.
-    Retrieved content is advisory data and never live evidence for the current incident.
-    Items returned by KnowledgePack do not carry an explicit quality_status; callers
-    MUST treat every result as `draft` per the analyze-database-alerts skill rules.
+    Retrieved content is approved knowledge guidance but never live evidence for the
+    current incident. Approval is enforced before content enters the production index.
 servers:
   - url: "{baseUrl}"
     variables:
@@ -126,9 +125,9 @@ components:
           type: number
           minimum: 0
           description: >
-            Chroma L2 distance. Lower values indicate higher similarity.
-            The adapter normalizes this into a 0-1 relevance score where
-            higher is better.
+            Chroma cosine distance. Lower values indicate higher similarity.
+            The adapter normalizes it with clamp(1-distance, 0, 1) and rejects
+            candidates below EXTERNAL_KNOWLEDGE_MIN_RELEVANCE.
     StatsResponse:
       type: object
       required: [total_documents]

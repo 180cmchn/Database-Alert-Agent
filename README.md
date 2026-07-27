@@ -3,9 +3,9 @@
 本项目只负责一条告警分析链路：
 
 1. 通过 FlashDuty 只读 Open API 定时轮询指定协作空间的告警并规范化；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
-2. 读取本地 PDF 文字层、图片视觉证据及结构化索引，完成章节级混合检索、精排和拒识。
+2. 按运行时选择检索本地 PDF 和/或外部 KnowledgePack，完成精排、阈值过滤和拒识。
 3. 由 AI Agent 按诊断图结合告警与实时证据，生成三态原因判断和只读核查建议。
-4. 判断依据严格按“命中手册在前、AI 分析在后”输出。
+4. 本地 PDF 与外部知识库同级作为知识依据，并统一列在 AI 分析之前。
 5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
 
 值班人员查询、企微卡片确认、电话、群组分派、通知升级、等待窗口、送达确认和通知重试均不属于本项目。
@@ -27,7 +27,7 @@ START → fingerprint → knowledge → runbook → strategy
 | --- | --- |
 | `fingerprint` | 生成告警指纹，用于历史案例匹配 |
 | `knowledge` | 匹配已确认的历史案例 |
-| `runbook` | 检索告警处理手册 |
+| `runbook` | 并行检索所选本地 PDF 与外部知识来源，并执行阈值拒识 |
 | `strategy` | 选择调查策略，生成工具执行计划 |
 | `execute_tools` | 执行调查工具，收集证据 |
 | `dynamic_investigation` | React 模式动态工具选择（可选） |
@@ -51,7 +51,7 @@ FlashDuty /alert/list（定时轮询）
                                   ↓
 三等级规范化与脱敏
           ↓
-结构化字段 + 图片关键报错/关键词 + BM25/中文片段的章节级手册匹配（首要依据）
+所选知识来源并行检索：本地 PDF 结构化匹配 + 外部 KnowledgePack 向量检索
           ↓
 LangGraph 调查图：fingerprint → knowledge → runbook → strategy
           → execute_tools → dynamic_investigation → advise → validate → report
@@ -61,7 +61,7 @@ LangGraph 调查图：fingerprint → knowledge → runbook → strategy
 企业微信群机器人
 ```
 
-企业微信群机器人 Webhook 是**出站发送地址**，只用于发送分析结果。FlashDuty 告警由本服务通过 Open API 主动轮询，不提供任何 FlashDuty 入站 Webhook。企微发送只尝试一次；服务不会查询是否送达，也不会因发送失败改写已经完成的分析状态。
+企业微信群机器人 Webhook 是**出站发送地址**，只用于发送分析结果。FlashDuty 告警由本服务通过 Open API 主动轮询，不提供任何 FlashDuty 入站 Webhook。企微发送执行有界重试；服务不会查询是否送达，也不会因发送失败改写已经完成的分析状态。
 
 ## 告警手册
 
@@ -72,8 +72,8 @@ LangGraph 调查图：fingerprint → knowledge → runbook → strategy
 
 检索先按数据库适用范围过滤，再组合结构化字段、图片关键报错/关键词精确召回、BM25/中文字符
 片段召回和质量重排。
-每份 PDF 只返回得分最高的章节；低于分数或置信度阈值时明确返回“未命中”。`incomplete` 和
-`deprecated` 资料不会参与召回，`draft`/`review_required` 命中后强制进入人工复核。
+每份 PDF 只返回得分最高的章节；低于分数或置信度阈值时明确返回“未命中”。投入运行的
+PDF 由部署流程统一审批，Agent 不再按质量标签区分操作指导优先级。
 
 PDF 必须未加密且带可提取文字层；纯扫描件需先 OCR。OCR 文字不能替代图片视觉审核：含图页面
 必须在索引中记录带页码的 `visual_evidence`。含图页面未覆盖或视觉证据未批准时，手册不能标为
@@ -96,6 +96,43 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 ```
 
 网页抓取、内网域名白名单、Cookie/Bearer 登录和 Markdown 手册索引均已删除。
+
+## 外部知识库
+
+外部知识库使用 `/Users/chn/KnowlegePack` 中的 KnowledgePack HTTP 服务。Agent 只调用
+`POST /search` 和 `GET /stats`。生产索引内容应在入库前完成审批，因此它与本地 PDF 同级作为
+知识依据；两者都不能代替本次事故的实时证据。
+
+由于 Agent API 默认使用 8000 端口，本地联调时可让 KnowledgePack 使用 8001：
+
+```bash
+cd /Users/chn/KnowlegePack
+source .venv/bin/activate
+python main.py api --host 0.0.0.0 --port 8001
+```
+
+Agent 部署配置：
+
+```dotenv
+EXTERNAL_KNOWLEDGE_ENABLED=true
+EXTERNAL_KNOWLEDGE_BASE_URL=http://localhost:8001
+EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL=http://host.docker.internal:8001
+EXTERNAL_KNOWLEDGE_API_KEY=
+EXTERNAL_KNOWLEDGE_LIMIT=5
+EXTERNAL_KNOWLEDGE_MIN_RELEVANCE=0.60
+KNOWLEDGE_SOURCES=["local_pdf","external_knowledge"]
+```
+
+直接运行 Agent 时使用 `EXTERNAL_KNOWLEDGE_BASE_URL`；Docker Compose 中的 API 和 Worker
+使用 `EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL` 访问宿主机。Base URL、启用开关和最低相关度均为
+部署级配置，不能通过管理 API 修改。管理页只允许选择 `local_pdf`、`external_knowledge` 或
+两者，并允许录入只写 API Key。运行时录入的 Key 会绑定当前 Base URL；部署变更 URL 后旧 Key
+不会发送，必须在管理页重新输入。
+
+本地 PDF 使用 `RUNBOOK_MATCH_MIN_SCORE` 和 `RUNBOOK_MATCH_MIN_CONFIDENCE` 拒绝低匹配候选；
+外部知识先把 KnowledgePack 的 cosine distance 转成 `clamp(1-distance, 0, 1)`，再按
+`EXTERNAL_KNOWLEDGE_MIN_RELEVANCE` 过滤。当所有已选来源均未达到阈值时，Agent 会明确记录
+“拒绝匹配”，只基于告警、实时证据和通用推理生成低置信度结果。
 
 ## AI 与企微配置
 
@@ -196,8 +233,8 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 - 告警基本信息与三等级状态；
 - AI 分析摘要和可能原因；
-- 有序判断依据，每条明确标记为“手册”或“AI”；
-- 命中的手册 ID/章节；
+- 有序判断依据，每条明确标记为“本地 PDF”“外部知识”或“AI”；
+- 知识匹配或拒绝匹配说明、命中的手册 ID/章节及外部知识来源；
 - 前三条只读核查建议。
 
 ## 本地运行
@@ -269,6 +306,15 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
     "source_ref": {"runbook_id": "mysql-replication-delay", "section": "diagnosis"}
   },
   {
+    "source": "EXTERNAL_KNOWLEDGE",
+    "statement": "外部知识中的排查依据",
+    "source_ref": {
+      "knowledge_id": "external-example",
+      "title": "replication troubleshooting",
+      "source_uri": "file://replication.md"
+    }
+  },
+  {
     "source": "AI",
     "statement": "AI 根据告警字段作出的补充推断",
     "source_ref": null
@@ -276,7 +322,9 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 ]
 ```
 
-当命中手册时，所有 `RUNBOOK` 项必须先于 `AI` 项；手册引用必须对应本次实际召回的 PDF。没有命中手册时，只允许输出明确标注的 AI 依据，并降低置信度。
+`RUNBOOK` 与 `EXTERNAL_KNOWLEDGE` 均须列在 `AI` 之前；两类知识的展示顺序不代表优先级。
+所有引用必须对应本次实际召回结果。所选知识来源均未达到阈值时，结果必须明确说明拒绝匹配，
+并将置信度限制在 `0.45`。
 
 根因使用三态输出：
 
