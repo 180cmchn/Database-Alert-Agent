@@ -114,6 +114,7 @@ class RuntimeSettingsPatch(BaseModel):
     shadow_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
+    wecom_enabled: bool | None = None
     knowledge_sources: list[str] | None = None
     flashduty_polling_enabled: bool | None = None
     flashduty_poll_interval_seconds: int | None = Field(default=None, ge=300, le=86400)
@@ -145,6 +146,7 @@ class RuntimeSettingsResponse(BaseModel):
     shadow_enabled: bool
     production_gate_approved: bool
     runbook_limit: int
+    wecom_enabled: bool
     wecom_webhook_url_configured: bool
     flashduty_enabled: bool
     flashduty_base_url: str
@@ -191,6 +193,7 @@ class RuntimeSettingsResponse(BaseModel):
             shadow_enabled=settings.shadow_enabled,
             production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
+            wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,

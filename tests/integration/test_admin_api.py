@@ -201,16 +201,19 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
     )
     with client:
         initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        # First, enable WeCom notifications and set the webhook URL
         response = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
             json={
                 "expected_revision": initial["revision"],
+                "wecom_enabled": True,
                 "wecom_webhook_url": wecom_url,
             },
         )
         assert response.status_code == 200
         body = response.json()
+        assert body["wecom_enabled"] is True
         assert body["wecom_webhook_url_configured"] is True
         assert "wecom_webhook_url" not in body
         assert wecom_url not in response.text

@@ -353,6 +353,7 @@ export interface AdminSettings {
   shadow_enabled: boolean;
   production_gate_approved: boolean;
   ai_api_key_configured: boolean;
+  wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
   flashduty_enabled: boolean;
   flashduty_base_url: string;
@@ -383,6 +384,7 @@ export interface AdminSettingsPatch {
   ai_fallback_enabled?: boolean;
   runbook_limit?: number;
   wecom_webhook_url?: string;
+  wecom_enabled?: boolean;
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;
   validation_enabled?: boolean;

@@ -51,6 +51,7 @@ export function SettingsPage() {
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
   const [flashdutyPollingEnabled, setFlashdutyPollingEnabled] = useState(false);
   const [externalKnowledgeEnabled, setExternalKnowledgeEnabled] = useState(false);
+  const [wecomEnabled, setWecomEnabled] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -77,6 +78,7 @@ export function SettingsPage() {
       setSelectedProvider(settings.ai_provider);
       setFlashdutyPollingEnabled(settings.flashduty_polling_enabled);
       setExternalKnowledgeEnabled(settings.external_knowledge_enabled);
+      setWecomEnabled(settings.wecom_enabled);
     }
   }, [settings]);
 
@@ -123,6 +125,7 @@ export function SettingsPage() {
       if (apiKey) patch.ai_api_key = apiKey;
       const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
       if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
+      patch.wecom_enabled = wecomEnabled;
       patch.external_knowledge_enabled = form.get("external_knowledge_enabled") === "on";
       patch.external_knowledge_base_url = String(
         form.get("external_knowledge_base_url") ?? settings.external_knowledge_base_url,
@@ -234,7 +237,10 @@ export function SettingsPage() {
           description="CRITICAL、WARNING、INFO 的最终 AI 分析结果都会发送到此机器人；本服务不跟踪送达、确认或升级。"
           action={<span className={`configured-chip ${settings.wecom_webhook_url_configured ? "yes" : "no"}`}><Webhook size={13} />{settings.wecom_webhook_url_configured ? "企业微信地址已配置" : "企业微信地址未配置"}</span>}
         >
-          <label className="field"><span>企业微信群机器人 Webhook URL（只写） {!settings.wecom_webhook_url_configured && settings.app_env === "production" && <b>*</b>}</span><div className="secret-field"><input name="wecom_webhook_url" type={showWecomUrl ? "text" : "password"} autoComplete="new-password" required={!settings.wecom_webhook_url_configured && settings.app_env === "production"} placeholder={settings.wecom_webhook_url_configured ? "已配置 · 留空保持不变" : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."} /><button type="button" onClick={() => setShowWecomUrl((value) => !value)} aria-label={showWecomUrl ? "隐藏企业微信地址" : "显示企业微信地址"}>{showWecomUrl ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
+          <div className="switch-stack">
+            <label className="switch-row"><span><Webhook size={17} /><span><strong>启用企微机器人通知</strong><small>关闭后即使已配置 Webhook URL 也不会发送通知</small></span></span><input name="wecom_enabled" type="checkbox" checked={wecomEnabled} onChange={(event) => setWecomEnabled(event.target.checked)} /><i /></label>
+          </div>
+          <label className="field"><span>企业微信群机器人 Webhook URL（只写） {wecomEnabled && !settings.wecom_webhook_url_configured && settings.app_env === "production" && <b>*</b>}</span><div className="secret-field"><input name="wecom_webhook_url" type={showWecomUrl ? "text" : "password"} autoComplete="new-password" required={wecomEnabled && !settings.wecom_webhook_url_configured && settings.app_env === "production"} placeholder={settings.wecom_webhook_url_configured ? "已配置 · 留空保持不变" : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."} /><button type="button" onClick={() => setShowWecomUrl((value) => !value)} aria-label={showWecomUrl ? "隐藏企业微信地址" : "显示企业微信地址"}>{showWecomUrl ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
         </SectionCard>
 
         {error && <div className="form-error" role="alert">{error}</div>}

@@ -31,6 +31,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_fallback_enabled",
         "runbook_limit",
         "wecom_webhook_url",
+        "wecom_enabled",
         "react_enabled",
         "react_max_dynamic_turns",
         "validation_enabled",
@@ -90,6 +91,10 @@ class Settings(BaseSettings):
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
     wecom_webhook_url: str = Field(default="", repr=False)
+    # Master switch for WeCom group robot notifications. When false, no messages
+    # are sent even if a webhook URL is configured; when true, a valid URL is
+    # required (in production) before notifications can be delivered.
+    wecom_enabled: bool = False
 
     # FlashDuty credentials and data-source bindings are deployment settings.
     # They intentionally remain outside RUNTIME_SETTINGS_KEYS so an admin API
@@ -272,8 +277,14 @@ class Settings(BaseSettings):
         elif self.ai_provider != "fake":
             issues.append(f"Unsupported AI_PROVIDER: {self.ai_provider}")
 
-        if self.app_env.lower() in {"production", "prod"} and not self.wecom_webhook_url:
-            issues.append("WECOM_WEBHOOK_URL is required in production")
+        if (
+            self.app_env.lower() in {"production", "prod"}
+            and self.wecom_enabled
+            and not self.wecom_webhook_url
+        ):
+            issues.append(
+                "WECOM_WEBHOOK_URL is required when WeCom notifications are enabled in production"
+            )
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.flashduty_enabled and not self.flashduty_app_key:
