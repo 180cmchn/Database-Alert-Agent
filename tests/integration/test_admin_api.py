@@ -275,6 +275,54 @@ def test_runtime_settings_persist_flashduty_polling_and_external_knowledge(
     assert persisted["knowledge_sources"] == ["local_pdf", "external_knowledge"]
 
 
+def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
+    tmp_path: Path,
+) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        patched = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": initial["revision"],
+                "ai_model": "override-model",
+                "runbook_limit": 9,
+            },
+        )
+        assert patched.status_code == 200
+        body = patched.json()
+        assert body["ai_model"] == "override-model"
+        assert body["runbook_limit"] == 9
+        assert runtime.service.runbook_limit == 9
+
+        reset = client.delete(
+            "/api/v1/admin/settings/runtime-overrides",
+            headers=ADMIN_HEADERS,
+            params={"expected_revision": body["revision"]},
+        )
+        assert reset.status_code == 200
+        reset_body = reset.json()
+        # Defaults come from the Settings() built in create_admin_client.
+        assert reset_body["ai_model"] == ""
+        assert reset_body["runbook_limit"] == 5
+        assert runtime.service.runbook_limit == 5
+
+        persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
+        assert persisted == {}
+
+        conflict = client.delete(
+            "/api/v1/admin/settings/runtime-overrides",
+            headers=ADMIN_HEADERS,
+            params={"expected_revision": "0" * 16},
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "RUNTIME_SETTINGS_REVISION_CONFLICT"
+
+        audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
+        assert '"action": "reset"' in audit
+
+
 def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
     client, _ = create_admin_client(tmp_path)
     with client:

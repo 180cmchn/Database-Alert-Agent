@@ -121,12 +121,11 @@ def _validate_manual_policy(
         )
 
     valid = {(item.runbook_id, item.section) for item in runbooks}
-    cited = {(item.runbook_id, item.section) for item in recommendation.runbook_references}
     if not recommendation.manual_matched:
-        # Retrieval can surface candidate runbooks (especially draft ones)
-        # that the model judges irrelevant to this alert. That is a valid
-        # outcome, not a policy violation. Treat it as "no runbook matched":
-        # clear runbook citations, force human review, cap confidence.
+        # Retrieval can surface candidate runbooks that the model judges
+        # irrelevant to this alert. That is a valid outcome, not a policy
+        # violation. Treat it as "no runbook matched": clear runbook
+        # citations, force human review, cap confidence.
         return recommendation.model_copy(
             update={
                 "manual_matched": False,
@@ -145,34 +144,79 @@ def _validate_manual_policy(
                 ],
             }
         )
-    if not cited or not cited.issubset(valid):
-        raise AdvisorError("Model returned missing or unknown runbook references")
-    sources = [item.source for item in recommendation.analysis_bases]
-    if AnalysisBasisSource.RUNBOOK not in sources:
-        raise AdvisorError("Model omitted runbook analysis basis")
-    if AnalysisBasisSource.AI not in sources:
-        raise AdvisorError("Model omitted AI analysis basis")
-    first_ai = sources.index(AnalysisBasisSource.AI)
-    if any(source == AnalysisBasisSource.RUNBOOK for source in sources[first_ai:]):
-        raise AdvisorError("Runbook bases must precede AI bases")
+
+    # manual_matched=True: auto-repair invalid references instead of
+    # raising AdvisorError. Models occasionally emit slightly malformed
+    # runbook citations; degrading to fallback for every such case is too
+    # aggressive. We sanitize the output in place and force human review
+    # whenever any repair was needed.
+    repaired = False
+
+    # 1. Runbook references: keep only valid ones.
+    valid_refs = [
+        ref for ref in recommendation.runbook_references
+        if (ref.runbook_id, ref.section) in valid
+    ]
+    if len(valid_refs) != len(recommendation.runbook_references):
+        repaired = True
+
+    # 2. Analysis bases: drop unknown RUNBOOK bases, ensure RUNBOOK before AI.
+    kept_runbook_bases: list[AnalysisBasis] = []
+    kept_ai_bases: list[AnalysisBasis] = []
     for basis in recommendation.analysis_bases:
         if basis.source == AnalysisBasisSource.RUNBOOK:
-            assert basis.source_ref is not None
-            if (basis.source_ref.runbook_id, basis.source_ref.section) not in valid:
-                raise AdvisorError("Model returned unknown runbook analysis basis")
+            if basis.source_ref is None or (
+                basis.source_ref.runbook_id, basis.source_ref.section
+            ) not in valid:
+                repaired = True
+                continue
+            kept_runbook_bases.append(basis)
+        elif basis.source == AnalysisBasisSource.AI:
+            kept_ai_bases.append(basis)
+        else:
+            repaired = True  # drop non-standard basis types
+    # Ensure at least one AI basis exists.
+    if not kept_ai_bases:
+        repaired = True
+        kept_ai_bases = [
+            AnalysisBasis(
+                source=AnalysisBasisSource.AI,
+                statement="AI 根据告警特征与手册候选补充分析依据。",
+            )
+        ]
+    if not kept_runbook_bases:
+        repaired = True  # manual_matched but no valid runbook basis
+    new_bases = [*kept_runbook_bases, *kept_ai_bases]
+
+    # 3. Steps: keep only steps with valid source_ref.
+    valid_steps: list[RecommendationStep] = []
     for step in recommendation.steps:
-        if (
-            not step.source_ref
-            or (step.source_ref.runbook_id, step.source_ref.section) not in valid
-        ):
-            raise AdvisorError("Every recommendation step must cite a matched runbook")
+        if step.source_ref and (step.source_ref.runbook_id, step.source_ref.section) in valid:
+            valid_steps.append(step)
+        else:
+            repaired = True
+
+    # 4. Root causes: clear invalid cause_id.
     known_cause_ids = {
         cause.cause_id for runbook in runbooks for cause in runbook.causes
     }
+    new_root_causes: list[RootCauseAssessment] = []
     for root_cause in recommendation.root_causes:
         if root_cause.cause_id and root_cause.cause_id not in known_cause_ids:
-            raise AdvisorError("Model returned an unknown runbook cause_id")
-    return recommendation
+            repaired = True
+            new_root_causes.append(root_cause.model_copy(update={"cause_id": None}))
+        else:
+            new_root_causes.append(root_cause)
+
+    update: dict[str, Any] = {
+        "runbook_references": valid_refs,
+        "analysis_bases": new_bases,
+        "steps": valid_steps,
+        "root_causes": new_root_causes,
+    }
+    if repaired:
+        update["requires_human"] = True
+    return recommendation.model_copy(update=update)
 
 
 class OpenAICompatibleAdvisor:

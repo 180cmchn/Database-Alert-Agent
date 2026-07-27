@@ -70,6 +70,9 @@ def create_app(
     settings = settings or get_settings()
     runtime = runtime or build_runtime(settings)
     runtime_settings = RuntimeSettingsManager(settings.runtime_settings_path)
+    # Snapshot the deployment (.env) baseline before any runtime overrides are
+    # applied so the reset endpoint can revert editable keys to it.
+    deployment_baseline = settings.model_copy(deep=True)
     runbook_store = runtime.runbook_store
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
@@ -119,7 +122,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=settings.cors_allowed_origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -433,6 +436,47 @@ def create_app(
         return RuntimeSettingsResponse.from_settings(
             updated, revision=revision, changed_fields=changed_fields
         )
+
+    @app.delete(
+        "/api/v1/admin/settings/runtime-overrides",
+        response_model=RuntimeSettingsResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def reset_runtime_settings(
+        expected_revision: Annotated[str, Query(min_length=1)],
+    ) -> RuntimeSettingsResponse:
+        try:
+            updated, revision = await runtime_settings.reset(
+                deployment_baseline,
+                expected_revision=expected_revision,
+            )
+        except RuntimeSettingsConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RUNTIME_SETTINGS_REVISION_CONFLICT",
+                    "message": "Runtime settings changed; reload before retrying",
+                    "expected_revision": exc.expected_revision,
+                    "current_revision": exc.current_revision,
+                },
+            ) from exc
+        except (ValidationError, ValueError) as exc:
+            logger.info("Rejected invalid runtime settings reset: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INVALID_RUNTIME_SETTINGS",
+                    "message": "Runtime settings validation failed",
+                },
+            ) from exc
+        apply_runtime_settings(runtime, updated)
+        await flashduty_poller.sync_settings(updated)
+        await audit_logger.record(
+            action="reset",
+            target="runtime-settings",
+        )
+        return RuntimeSettingsResponse.from_settings(updated, revision=revision)
 
     @app.post(
         "/api/v1/admin/flashduty/poll",

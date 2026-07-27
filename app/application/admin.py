@@ -148,6 +148,30 @@ class RuntimeSettingsManager:
             self._overrides = overrides
             return updated, True, revision
 
+    async def reset(
+        self,
+        deployment_baseline: Settings,
+        *,
+        expected_revision: str,
+    ) -> tuple[Settings, str]:
+        """Clear all runtime overrides, reverting to deployment (.env) baseline.
+
+        ``deployment_baseline`` is the Settings captured at bootstrap before any
+        runtime overrides were applied; it preserves the deployment (.env) values
+        for editable keys.  The caller must provide ``expected_revision`` so
+        concurrent edits are rejected.  Returns the reverted ``Settings`` and
+        the new (empty) revision.
+        """
+
+        async with self._lock:
+            new_settings, new_revision = await asyncio.to_thread(
+                self._reset_locked_sync,
+                deployment_baseline,
+                expected_revision,
+            )
+            self._overrides = {}
+            return new_settings, new_revision
+
     def _patch_locked_sync(
         self,
         current: Settings,
@@ -194,6 +218,24 @@ class RuntimeSettingsManager:
                 return effective_current, latest_overrides, latest_revision, []
             self._write_atomic_sync(persisted)
             return candidate, persisted, new_revision, changed_fields
+
+    def _reset_locked_sync(
+        self,
+        current: Settings,
+        expected_revision: str,
+    ) -> tuple[Settings, str]:
+        with self._settings_file_lock_sync():
+            latest_overrides = load_runtime_overrides(self.path)
+            latest_revision = _revision_for(latest_overrides)
+            if expected_revision != latest_revision:
+                raise RuntimeSettingsConflictError(
+                    expected_revision=expected_revision,
+                    current_revision=latest_revision,
+                )
+            self._write_atomic_sync({})
+            reverted = Settings.model_validate(current.model_dump(mode="python"))
+            self._validate_runnable(reverted)
+            return reverted, _revision_for({})
 
     @contextmanager
     def _settings_file_lock_sync(self) -> Iterator[None]:

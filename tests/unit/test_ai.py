@@ -3,7 +3,6 @@ import pytest
 import app.adapters.ai as ai_module
 from app.adapters.ai import FakeAIAdvisor, _validate_manual_policy
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.domain.errors import AdvisorError
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
@@ -48,7 +47,11 @@ async def test_matched_runbook_bases_are_ordered_before_ai() -> None:
     )
 
 
-def test_matched_runbook_requires_real_citations() -> None:
+def test_matched_runbook_auto_repairs_invalid_citations() -> None:
+    """manual_matched=True with invalid/missing citations must auto-repair:
+    drop invalid RUNBOOK bases, keep AI bases, drop steps without valid source_ref,
+    clear invalid runbook_references, and force requires_human=True rather than
+    raising AdvisorError."""
     recommendation = Recommendation(
         summary="test",
         analysis_bases=[
@@ -61,10 +64,29 @@ def test_matched_runbook_requires_real_citations() -> None:
         requires_human=True,
         confidence=0.9,
         manual_matched=True,
+        runbook_references=[
+            RunbookReference(runbook_id="unknown-rb", section="PDF")
+        ],
     )
-    runbooks = [RunbookExcerpt(runbook_id="rb-1", title="RB", content="approved")]
-    with pytest.raises(AdvisorError, match="references"):
-        _validate_manual_policy(recommendation, runbooks)
+    runbooks = [RunbookExcerpt(runbook_id="rb-1", title="RB", section="PDF", content="approved")]
+    result = _validate_manual_policy(recommendation, runbooks)
+
+    # Invalid runbook reference dropped, valid references kept.
+    assert result.runbook_references == []
+
+    # AI basis preserved; no RUNBOOK basis (none were valid), but one AI basis
+    # ensures the ordering invariant.
+    assert [basis.source for basis in result.analysis_bases] == [
+        AnalysisBasisSource.AI
+    ]
+
+    # Step without valid source_ref dropped.
+    assert result.steps == []
+
+    # Repair triggered human review.
+    assert result.requires_human is True
+
+    # No AdvisorError raised — that is the new behavior.
 
 
 def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None:
