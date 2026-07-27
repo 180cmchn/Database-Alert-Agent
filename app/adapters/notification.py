@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
+from collections import deque
 from typing import Any
 from uuid import uuid4
 
@@ -15,12 +17,50 @@ from app.domain.models import AnalysisBasisSource, AnalysisResultEvent
 logger = logging.getLogger(__name__)
 
 WECOM_MARKDOWN_MAX_BYTES = 3800
+WECOM_RATE_LIMIT_PER_MINUTE = 20
+WECOM_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _WHITESPACE = re.compile(r"\s+")
 
 
 def _safe_line(value: Any, *, limit: int = 500) -> str:
     cleaned = _WHITESPACE.sub(" ", sanitize_text(str(value))).strip()
-    return html.escape(cleaned[:limit], quote=False)
+    escaped = html.escape(cleaned, quote=False)
+    return escaped[:limit]
+
+
+class _WeComRateLimiter:
+    """Sliding-window rate limiter for WeCom group robot messages.
+
+    WeCom enforces a hard limit of 20 messages per minute per webhook. This
+    limiter tracks send timestamps in a deque and blocks callers when the
+    window is full, releasing them once the oldest entry expires.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_per_window: int = WECOM_RATE_LIMIT_PER_MINUTE,
+        window_seconds: float = WECOM_RATE_LIMIT_WINDOW_SECONDS,
+    ) -> None:
+        self._max = max_per_window
+        self._window = window_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            while True:
+                now = loop.time()
+                threshold = now - self._window
+                while self._timestamps and self._timestamps[0] <= threshold:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._max:
+                    self._timestamps.append(now)
+                    return
+                wait = self._timestamps[0] + self._window - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
 
 
 def _truncate_utf8(value: str, max_bytes: int) -> str:
@@ -96,8 +136,8 @@ def format_wecom_markdown(event: AnalysisResultEvent) -> str:
             )
     if recommendation.steps:
         lines.extend(["", "**建议核查步骤（前 3 条）**"])
-        for step in recommendation.steps[:3]:
-            lines.append(f"{step.order}. {_safe_line(step.action, limit=700)}")
+        for index, step in enumerate(recommendation.steps[:3], start=1):
+            lines.append(f"{index}. {_safe_line(step.action, limit=700)}")
 
     return _truncate_utf8("\n".join(lines), WECOM_MARKDOWN_MAX_BYTES)
 
@@ -124,10 +164,16 @@ class WeComManagementNotifier:
         timeout_seconds: float = 10,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        max_retries: int = 1,
+        retry_delay_seconds: float = 1.0,
+        rate_limit_per_minute: int = WECOM_RATE_LIMIT_PER_MINUTE,
     ) -> None:
         self._url = url
         self._timeout = timeout_seconds
         self._transport = transport
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay_seconds
+        self._rate_limiter = _WeComRateLimiter(max_per_window=rate_limit_per_minute)
 
     async def send(self, event: AnalysisResultEvent) -> str | None:
         if not self._url:
@@ -142,22 +188,41 @@ class WeComManagementNotifier:
             "msgtype": "markdown",
             "markdown": {"content": format_wecom_markdown(event)},
         }
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout, transport=self._transport
-            ) as client:
-                response = await client.post(self._url, json=payload, headers=headers)
-                response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise NotificationError("WeCom webhook timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            raise NotificationError(
-                f"WeCom webhook returned HTTP {exc.response.status_code}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise NotificationError(
-                f"WeCom webhook request failed: {type(exc).__name__}"
-            ) from exc
+
+        response: httpx.Response | None = None
+        for attempt in range(self._max_retries + 1):
+            await self._rate_limiter.acquire()
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._timeout, transport=self._transport
+                ) as client:
+                    response = await client.post(
+                        self._url, json=payload, headers=headers
+                    )
+                    response.raise_for_status()
+                break
+            except httpx.HTTPStatusError as exc:
+                # Non-retryable: WeCom returned an HTTP error status.
+                raise NotificationError(
+                    f"WeCom webhook returned HTTP {exc.response.status_code}"
+                ) from exc
+            except (httpx.TimeoutException, httpx.HTTPError) as exc:
+                if attempt < self._max_retries:
+                    logger.warning(
+                        "wecom_send_retry alert_id=%s attempt=%s error=%s",
+                        event.alert.id,
+                        attempt + 1,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(self._retry_delay)
+                    continue
+                if isinstance(exc, httpx.TimeoutException):
+                    raise NotificationError("WeCom webhook timed out") from exc
+                raise NotificationError(
+                    f"WeCom webhook request failed: {type(exc).__name__}"
+                ) from exc
+
+        assert response is not None  # noqa: S101 - reached only on success
 
         try:
             result = response.json()
@@ -167,8 +232,9 @@ class WeComManagementNotifier:
             raise NotificationError("WeCom webhook response is missing errcode")
         if result["errcode"] != 0:
             error_code = _safe_line(result["errcode"], limit=40)
+            errmsg = _safe_line(result.get("errmsg", ""), limit=200)
             raise NotificationError(
-                f"WeCom webhook rejected message: errcode={error_code}"
+                f"WeCom webhook rejected message: errcode={error_code} errmsg={errmsg}"
             )
         message_id = result.get("msgid")
         if message_id is not None:

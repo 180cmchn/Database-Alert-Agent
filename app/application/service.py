@@ -12,7 +12,7 @@ import inspect
 import logging
 from collections.abc import Callable
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app.adapters.alert_sources import AlertSourceRegistry
 from app.adapters.external_knowledge import ExternalKnowledgeClient
@@ -260,6 +260,7 @@ class AlertAnalysisService:
                     message = "数据库告警已生成候选分析，请人工复核。"
                 await self._send_analysis_result(
                     final_state.alert,
+                    run_id=run.id,
                     status=final_state.status,
                     message=message,
                     recommendation=final_state.recommendation,
@@ -592,11 +593,12 @@ class AlertAnalysisService:
         self,
         alert: NormalizedAlert,
         *,
+        run_id: UUID,
         status: AlertStatus,
         message: str,
         recommendation: Recommendation,
     ) -> None:
-        """Send analysis result notification."""
+        """Send analysis result notification and persist delivery status."""
         from app.domain.models import AnalysisResultEvent
 
         event = AnalysisResultEvent(
@@ -607,9 +609,27 @@ class AlertAnalysisService:
         )
         try:
             await self.notifier.send(event)
+            await self.repository.append_progress(
+                str(alert.id),
+                ProgressRecord(
+                    run_id=run_id,
+                    stage=InvestigationStage.REPORTING,
+                    message="企微机器人通知已发送",
+                ),
+            )
         except Exception as exc:
+            error_msg = sanitize(f"{type(exc).__name__}: {exc}")
             logger.warning(
                 "wecom_analysis_result_send_failed alert_id=%s error=%s",
                 alert.id,
-                sanitize(f"{type(exc).__name__}: {exc}"),
+                error_msg,
+            )
+            await self.repository.append_progress(
+                str(alert.id),
+                ProgressRecord(
+                    run_id=run_id,
+                    stage=InvestigationStage.REPORTING,
+                    message="企微机器人通知失败",
+                    details={"error": error_msg},
+                ),
             )

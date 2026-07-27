@@ -270,7 +270,13 @@ async def test_shadow_mode_always_requires_review(tmp_path: Path) -> None:
     assert result.recommendation is not None
     assert result.recommendation.analysis_mode == "shadow"
     assert result.recommendation.requires_human is True
-    assert result.progress[-1].details["shadow_enabled"] is True
+    # The notification step appends a REPORTING progress record after the
+    # REVIEW_REQUIRED record. Find the shadow progress record explicitly.
+    shadow_records = [
+        record for record in result.progress
+        if record.details.get("shadow_enabled") is True
+    ]
+    assert shadow_records, "expected a progress record with shadow_enabled=True"
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

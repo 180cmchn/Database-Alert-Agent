@@ -442,4 +442,5 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
             "VALIDATING",
             "REPORTING",
             "REVIEW_REQUIRED",
+            "REPORTING",
         ]
