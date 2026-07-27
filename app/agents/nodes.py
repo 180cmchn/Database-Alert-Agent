@@ -335,6 +335,36 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     }
 
 
+async def _record_react_outcome(
+    ctx: NodeContext,
+    *,
+    alert_id: str,
+    run: InvestigationRun,
+    outcome: str,
+    message: str,
+    turns_remaining: int,
+    evidence_count: int,
+    details: dict[str, Any] | None = None,
+) -> ProgressRecord:
+    """Persist one sanitized ReAct planning outcome without storing tool parameters."""
+    outcome_details: dict[str, Any] = {
+        "event": "react_decision",
+        "outcome": outcome,
+        "turns_remaining": max(0, turns_remaining),
+        "evidence_count": evidence_count,
+    }
+    if details:
+        outcome_details.update(details)
+    return await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.INVESTIGATING,
+        message,
+        sanitize(outcome_details),
+    )
+
+
 async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Decide whether to continue investigation with dynamic tool selection.
 
@@ -366,16 +396,64 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
         )
     except Exception as exc:
         logger.warning("dynamic_tool_selection_failed error=%s", type(exc).__name__)
-        return {"should_continue_investigation": False}
+        progress = await _record_react_outcome(
+            ctx,
+            alert_id=state.alert_id,
+            run=run,
+            outcome="planner_error",
+            message=(
+                "ReAct 动态调查规划失败，已停止追加工具并基于现有证据继续分析。"
+            ),
+            turns_remaining=dynamic_turns_remaining,
+            evidence_count=len(evidence),
+            details={"error_type": type(exc).__name__},
+        )
+        return {
+            "should_continue_investigation": False,
+            "progress": [progress],
+        }
 
     if decision.action == "finish" or not decision.tool_name:
-        return {"should_continue_investigation": False}
+        progress = await _record_react_outcome(
+            ctx,
+            alert_id=state.alert_id,
+            run=run,
+            outcome="finish",
+            message="ReAct 判定无需追加只读工具，结束动态调查。",
+            turns_remaining=dynamic_turns_remaining,
+            evidence_count=len(evidence),
+            details={
+                "decision_action": decision.action,
+                "reason": str(sanitize(decision.reason))[:500],
+            },
+        )
+        return {
+            "should_continue_investigation": False,
+            "progress": [progress],
+        }
 
     # Check for duplicate tool calls
     seen_requests = {(e.tool_name, str(sorted(e.request.items()))) for e in evidence}
     request_key = (decision.tool_name, str(sorted(decision.parameters.items())))
+    safe_tool_name = str(sanitize(decision.tool_name))[:128]
     if request_key in seen_requests:
-        return {"should_continue_investigation": False}
+        progress = await _record_react_outcome(
+            ctx,
+            alert_id=state.alert_id,
+            run=run,
+            outcome="duplicate_rejected",
+            message="ReAct 拒绝重复工具调用，结束动态调查。",
+            turns_remaining=dynamic_turns_remaining,
+            evidence_count=len(evidence),
+            details={
+                "tool_name": safe_tool_name,
+                "reason": str(sanitize(decision.reason))[:500],
+            },
+        )
+        return {
+            "should_continue_investigation": False,
+            "progress": [progress],
+        }
 
     # Queue the new tool request
     new_request = ToolExecutionRequest(
@@ -383,11 +461,26 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
         parameters=decision.parameters,
         timeout_seconds=10,
     )
+    remaining_after_selection = dynamic_turns_remaining - 1
+    progress = await _record_react_outcome(
+        ctx,
+        alert_id=state.alert_id,
+        run=run,
+        outcome="tool_selected",
+        message=f"ReAct 选择追加只读工具 {safe_tool_name}。",
+        turns_remaining=remaining_after_selection,
+        evidence_count=len(evidence),
+        details={
+            "tool_name": safe_tool_name,
+            "reason": str(sanitize(decision.reason))[:500],
+        },
+    )
 
     return {
         "pending_tool_requests": [new_request],
-        "dynamic_turns_remaining": dynamic_turns_remaining - 1,
+        "dynamic_turns_remaining": remaining_after_selection,
         "should_continue_investigation": True,
+        "progress": [progress],
     }
 
 
@@ -696,10 +789,10 @@ async def _update_progress(
     stage: InvestigationStage,
     message: str,
     details: dict[str, Any] | None = None,
-) -> None:
+) -> ProgressRecord:
     """Update run stage and append progress record."""
     await repository.update_run(str(run.id), stage=stage)
-    await repository.append_progress(
+    return await repository.append_progress(
         alert_id,
         ProgressRecord(
             run_id=run.id,

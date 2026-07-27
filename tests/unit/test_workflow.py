@@ -108,6 +108,25 @@ class DynamicAdvisor(FakeAIAdvisor):
         return InvestigationDecision(action="finish", reason="Evidence is sufficient")
 
 
+class FailingDynamicPlanner(FakeAIAdvisor):
+    async def choose_next_tool(  # type: ignore[no-untyped-def]
+        self, context, evidence, available_tools
+    ):
+        raise AdvisorError("planner unavailable token=planner-secret")
+
+
+class DuplicateDynamicAdvisor(FakeAIAdvisor):
+    async def choose_next_tool(  # type: ignore[no-untyped-def]
+        self, context, evidence, available_tools
+    ):
+        return InvestigationDecision(
+            action="tool",
+            tool_name="alert_context",
+            parameters={},
+            reason="The alert context should be collected again",
+        )
+
+
 class RecordingDynamicTool:
     name = "query_logs"
     source_system = "test_logs"
@@ -318,6 +337,95 @@ async def test_dynamic_investigation_executes_selected_tool_and_preserves_strate
         "alert_context",
         "query_logs",
     ]
+    react_progress = [
+        item
+        for item in result.progress
+        if item.details.get("event") == "react_decision"
+    ]
+    assert [item.details["outcome"] for item in react_progress] == [
+        "tool_selected",
+        "finish",
+    ]
+    assert react_progress[0].details == {
+        "event": "react_decision",
+        "outcome": "tool_selected",
+        "turns_remaining": 1,
+        "evidence_count": 1,
+        "tool_name": "query_logs",
+        "reason": "Collect one additional log sample",
+    }
+    assert react_progress[1].details["reason"] == "Evidence is sufficient"
+    assert all(item.sequence > 0 for item in react_progress)
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_investigation_persists_sanitized_planner_failure(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path).model_copy(
+        update={"react_enabled": True, "react_max_dynamic_turns": 1}
+    )
+    runtime = build_runtime(settings, advisor=FailingDynamicPlanner())
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "dynamic-investigation-planner-failure",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    react_progress = [
+        item
+        for item in result.progress
+        if item.details.get("event") == "react_decision"
+    ]
+    assert len(react_progress) == 1
+    assert react_progress[0].details == {
+        "event": "react_decision",
+        "outcome": "planner_error",
+        "turns_remaining": 1,
+        "evidence_count": 1,
+        "error_type": "AdvisorError",
+    }
+    assert "planner-secret" not in str(react_progress[0].details)
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_investigation_persists_duplicate_rejection(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path).model_copy(
+        update={"react_enabled": True, "react_max_dynamic_turns": 1}
+    )
+    runtime = build_runtime(settings, advisor=DuplicateDynamicAdvisor())
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "dynamic-investigation-duplicate",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    assert [item.tool_name for item in result.evidence_records] == ["alert_context"]
+    react_progress = [
+        item
+        for item in result.progress
+        if item.details.get("event") == "react_decision"
+    ]
+    assert len(react_progress) == 1
+    assert react_progress[0].details["outcome"] == "duplicate_rejected"
+    assert react_progress[0].details["tool_name"] == "alert_context"
+    assert react_progress[0].details["turns_remaining"] == 1
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
