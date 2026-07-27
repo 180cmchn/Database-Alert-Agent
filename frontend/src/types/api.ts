@@ -99,6 +99,23 @@ export interface RunbookReference {
   section: string;
 }
 
+export interface ExternalKnowledgeReference {
+  knowledge_id: string;
+  title: string;
+  source_uri: string;
+}
+
+export interface ExternalKnowledgeExcerpt {
+  knowledge_id: string;
+  title: string;
+  content: string;
+  source_uri: string;
+  score: number;
+  raw_score: number;
+  quality_status: "draft" | "review_required" | "approved" | "deprecated";
+  metadata: Record<string, unknown>;
+}
+
 export interface RunbookExcerpt {
   runbook_id: string;
   title: string;
@@ -118,13 +135,13 @@ export interface RecommendationStep {
   action: string;
   expected_result?: string | null;
   caution?: string | null;
-  source_ref?: RunbookReference | null;
+  source_ref?: RunbookReference | ExternalKnowledgeReference | null;
 }
 
 export interface AnalysisBasis {
-  source: "RUNBOOK" | "AI";
+  source: "RUNBOOK" | "EXTERNAL_KNOWLEDGE" | "AI";
   statement: string;
-  source_ref?: RunbookReference | null;
+  source_ref?: RunbookReference | ExternalKnowledgeReference | null;
 }
 
 export interface RootCauseAssessment {
@@ -139,6 +156,7 @@ export interface RootCauseAssessment {
 
 export interface Recommendation {
   summary: string;
+  knowledge_match_summary: string;
   likely_causes: string[];
   analysis_bases: AnalysisBasis[];
   steps: RecommendationStep[];
@@ -147,6 +165,7 @@ export interface Recommendation {
   confidence: number;
   manual_matched: boolean;
   runbook_references: RunbookReference[];
+  external_knowledge_matches: ExternalKnowledgeExcerpt[];
   root_causes: RootCauseAssessment[];
   analysis_mode: "assist" | "shadow";
 }
@@ -194,6 +213,9 @@ export interface AnalysisConfigSnapshot {
   external_knowledge_enabled: boolean;
   external_knowledge_base_url: string;
   runbook_limit: number;
+  runbook_match_min_score: number;
+  runbook_match_min_confidence: number;
+  external_knowledge_min_relevance: number;
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
@@ -394,6 +416,8 @@ export interface AdminSettings {
   external_knowledge_enabled: boolean;
   external_knowledge_base_url: string;
   external_knowledge_api_key_configured: boolean;
+  external_knowledge_min_relevance: number;
+  runbook_match_min_confidence: number;
   knowledge_sources: string[];
   revision: string;
   apply_status: "applied";
@@ -422,8 +446,6 @@ export interface AdminSettingsPatch {
   flashduty_polling_enabled?: boolean;
   flashduty_poll_interval_seconds?: number;
   flashduty_poll_lookback_seconds?: number;
-  external_knowledge_enabled?: boolean;
-  external_knowledge_base_url?: string;
   external_knowledge_api_key?: string;
 }
 

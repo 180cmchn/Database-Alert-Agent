@@ -44,6 +44,7 @@ import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
 import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
 import type {
+  AnalysisBasis,
   AlertStatus,
   FeedbackRequest,
   FeedbackVerdict,
@@ -94,6 +95,20 @@ function newFeedbackKey(): string {
     return globalThis.crypto.randomUUID();
   }
   return `feedback-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function basisLabel(source: AnalysisBasis["source"]): string {
+  if (source === "RUNBOOK") return "本地 PDF";
+  if (source === "EXTERNAL_KNOWLEDGE") return "外部知识";
+  return "AI";
+}
+
+function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | null {
+  if (!reference) return null;
+  if ("runbook_id" in reference) {
+    return `${reference.runbook_id} / ${reference.section}`;
+  }
+  return reference.title;
 }
 
 export function AlertDetailPage() {
@@ -414,9 +429,9 @@ export function AlertDetailPage() {
         </SectionCard>
 
         <SectionCard
-          eyebrow="RUNBOOK FIRST"
-          title="手册匹配"
-          description="手册是建议生成的首要依据"
+          eyebrow="LOCAL PDF"
+          title="本地 PDF 匹配"
+          description="启用本地来源时展示达到匹配阈值的手册"
           action={record.manual_matches.length ? <span className="match-score"><BookCheck size={14} /> 命中 {record.manual_matches.length} 条</span> : undefined}
         >
           {record.manual_matches.length ? (
@@ -428,7 +443,7 @@ export function AlertDetailPage() {
                     <span className="score-chip">置信度 {formatPercent(match.match_confidence)}</span>
                   </summary>
                   <div className="runbook-content">
-                    <p>页码：{match.page_refs.join("、") || "未标注"} · 质量：{match.quality_status} · {match.match_reasons.join("；")}</p>
+                    <p>页码：{match.page_refs.join("、") || "未标注"} · {match.match_reasons.join("；")}</p>
                     {match.content}
                   </div>
                 </details>
@@ -442,6 +457,40 @@ export function AlertDetailPage() {
         </SectionCard>
 
       </section>
+
+      {recommendation?.external_knowledge_matches.length ? (
+        <SectionCard
+          eyebrow="EXTERNAL KNOWLEDGE"
+          title="外部知识库匹配"
+          description="外部知识与本地 PDF 同级作为知识依据，但均不能单独证明本次事故根因。"
+          action={<span className="match-score"><ExternalLink size={14} /> 命中 {recommendation.external_knowledge_matches.length} 条</span>}
+        >
+          <div className="runbook-evidence-list">
+            {recommendation.external_knowledge_matches.map((match) => (
+              <details key={match.knowledge_id} className="runbook-evidence" open={recommendation.external_knowledge_matches.length === 1}>
+                <summary>
+                  <div><strong>{match.title}</strong><span>{match.knowledge_id}</span></div>
+                  <span className="score-chip">相关度 {formatPercent(match.score)}</span>
+                </summary>
+                <div className="runbook-content">
+                  <p>来源：{match.source_uri}</p>
+                  {match.content}
+                </div>
+              </details>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {recommendation?.knowledge_match_summary && (
+        <div className="knowledge-match-summary">
+          <CircleAlert size={18} />
+          <div>
+            <strong>知识匹配说明</strong>
+            <span>{recommendation.knowledge_match_summary}</span>
+          </div>
+        </div>
+      )}
 
       {record.knowledge_matches.length > 0 && (
         <SectionCard
@@ -499,7 +548,7 @@ export function AlertDetailPage() {
           <div className="recommendation-hero">
             <div className="recommendation-mark"><BrainCircuit size={27} /></div>
             <div className="recommendation-copy">
-              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.analysis_mode === "shadow" && <span className="manual-proof"><Eye size={13} /> 影子分析</span>}{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 手册约束</span>}</div>
+              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.analysis_mode === "shadow" && <span className="manual-proof"><Eye size={13} /> 影子分析</span>}{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 本地 PDF 命中</span>}{recommendation.external_knowledge_matches.length > 0 && <span className="manual-proof"><ExternalLink size={13} /> 外部知识命中</span>}</div>
               <h2>{recommendation.summary}</h2>
               <div className="recommendation-meta">
                 <span><Gauge size={15} /> 置信度 <strong>{formatPercent(recommendation.confidence)}</strong></span>
@@ -534,7 +583,7 @@ export function AlertDetailPage() {
                       <strong>{step.action}</strong>
                       {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
                       {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
-                      {step.source_ref && <span className="source-ref"><BookCheck size={13} /> {step.source_ref.runbook_id} / {step.source_ref.section}</span>}
+                      {step.source_ref && <span className="source-ref">{"knowledge_id" in step.source_ref ? <ExternalLink size={13} /> : <BookCheck size={13} />} {knowledgeReference(step.source_ref)}</span>}
                     </div>
                   </li>
                 ))}
@@ -551,8 +600,8 @@ export function AlertDetailPage() {
                   </ol>
                 </SectionCard>
               )}
-              <SectionCard eyebrow="BASIS" title="判断依据" description="顺序固定为手册依据优先、AI 分析依据其次">
-                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basis.source === "RUNBOOK" ? "手册" : "AI"}</strong> · {basis.statement}{basis.source_ref && <small className="source-ref"><BookCheck size={13} /> {basis.source_ref.runbook_id} / {basis.source_ref.section}</small>}</div></li>)}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
+              <SectionCard eyebrow="BASIS" title="判断依据" description="已审批知识依据同级展示，AI 分析列在其后">
+                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref">{basis.source === "EXTERNAL_KNOWLEDGE" ? <ExternalLink size={13} /> : <BookCheck size={13} />} {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
               </SectionCard>
               <SectionCard eyebrow="RISK GUARD" title="风险提示" className="risk-card">
                 {recommendation.risks.length ? <ul className="risk-points">{recommendation.risks.map((risk) => <li key={risk}><Siren size={14} /> {risk}</li>)}</ul> : <p className="muted-copy">没有额外风险提示。</p>}
@@ -1057,6 +1106,14 @@ export function AlertDetailPage() {
                       <div>
                         <dt>手册上限</dt>
                         <dd>{run.config_snapshot.runbook_limit}</dd>
+                      </div>
+                      <div>
+                        <dt>PDF 最低置信度</dt>
+                        <dd>{formatPercent(run.config_snapshot.runbook_match_min_confidence)}</dd>
+                      </div>
+                      <div>
+                        <dt>外部知识最低相关度</dt>
+                        <dd>{formatPercent(run.config_snapshot.external_knowledge_min_relevance)}</dd>
                       </div>
                       <div>
                         <dt>ReAct 模式</dt>

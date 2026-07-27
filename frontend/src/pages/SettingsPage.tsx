@@ -50,7 +50,6 @@ export function SettingsPage() {
   const [showKnowledgeApiKey, setShowKnowledgeApiKey] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
   const [flashdutyPollingEnabled, setFlashdutyPollingEnabled] = useState(false);
-  const [externalKnowledgeEnabled, setExternalKnowledgeEnabled] = useState(false);
   const [wecomEnabled, setWecomEnabled] = useState(false);
 
   const load = useCallback(async () => {
@@ -77,7 +76,6 @@ export function SettingsPage() {
     if (settings) {
       setSelectedProvider(settings.ai_provider);
       setFlashdutyPollingEnabled(settings.flashduty_polling_enabled);
-      setExternalKnowledgeEnabled(settings.external_knowledge_enabled);
       setWecomEnabled(settings.wecom_enabled);
     }
   }, [settings]);
@@ -94,6 +92,9 @@ export function SettingsPage() {
       const knowledgeSources: string[] = [];
       if (form.get("knowledge_local_pdf") === "on") knowledgeSources.push("local_pdf");
       if (form.get("knowledge_external") === "on") knowledgeSources.push("external_knowledge");
+      if (!knowledgeSources.length) {
+        throw new Error("请至少选择一种 Agent 知识参考来源。");
+      }
       const patch: AdminSettingsPatch = {
         expected_revision: settings.revision,
         ai_provider: String(form.get("ai_provider")),
@@ -126,10 +127,6 @@ export function SettingsPage() {
       const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
       if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
       patch.wecom_enabled = wecomEnabled;
-      patch.external_knowledge_enabled = form.get("external_knowledge_enabled") === "on";
-      patch.external_knowledge_base_url = String(
-        form.get("external_knowledge_base_url") ?? settings.external_knowledge_base_url,
-      ).trim();
       const knowledgeApiKey = String(form.get("external_knowledge_api_key") || "").trim();
       if (knowledgeApiKey) patch.external_knowledge_api_key = knowledgeApiKey;
       const updated = await api.updateSettings(patch, token);
@@ -206,15 +203,16 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        <SectionCard eyebrow="KNOWLEDGE SOURCES" title="知识来源" description="选择告警分析时使用的知识来源；历史确认案例始终启用，不受此设置控制。" action={<span className={`configured-chip ${settings.external_knowledge_api_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.external_knowledge_api_key_configured ? "Knowledge API Key 已配置" : "Knowledge API Key 未配置"}</span>}>
+        <SectionCard eyebrow="KNOWLEDGE SOURCES" title="Agent 参考依据" description="本地 PDF 与外部知识库可独立选择或同时使用；低于各自阈值的候选会被拒绝。" action={<span className={`configured-chip ${settings.external_knowledge_enabled ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.external_knowledge_enabled ? "外部知识库已部署" : "外部知识库未部署"}</span>}>
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>本地 PDF 手册</strong><small>从本地 runbooks/pdfs 目录检索已审批的 PDF 处置手册</small></span></span><input name="knowledge_local_pdf" type="checkbox" defaultChecked={settings.knowledge_sources.includes("local_pdf")} /><i /></label>
-            <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用外部知识库 API</strong><small>开启后调查图谱将查询 KnowledgePack 服务获取补充知识候选（结果视为 draft 建议数据）</small></span></span><input name="external_knowledge_enabled" type="checkbox" checked={externalKnowledgeEnabled} onChange={(event) => setExternalKnowledgeEnabled(event.target.checked)} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>选择外部知识库作为来源</strong><small>勾选后在知识来源中加入 external_knowledge；本地 PDF 手册始终独立可选</small></span></span><input name="knowledge_external" type="checkbox" defaultChecked={settings.knowledge_sources.includes("external_knowledge")} disabled={!externalKnowledgeEnabled} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>外部知识库</strong><small>检索已审批的 KnowledgePack 内容，与本地 PDF 同级作为知识依据</small></span></span><input name="knowledge_external" type="checkbox" defaultChecked={settings.knowledge_sources.includes("external_knowledge")} disabled={!settings.external_knowledge_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols">
-            <label className="field span-2"><span>外部知识库 Base URL <b>*</b></span><input name="external_knowledge_base_url" type="url" defaultValue={settings.external_knowledge_base_url} required={externalKnowledgeEnabled} disabled={!externalKnowledgeEnabled} placeholder="http://localhost:8001" /></label>
-            <label className="field span-2"><span>Knowledge API Key（只写，默认留空）</span><div className="secret-field"><input name="external_knowledge_api_key" type={showKnowledgeApiKey ? "text" : "password"} autoComplete="new-password" disabled={!externalKnowledgeEnabled} placeholder={settings.external_knowledge_api_key_configured ? "已配置 · 留空保持不变" : "有需要时填入，默认留空"} /><button type="button" onClick={() => setShowKnowledgeApiKey((value) => !value)} aria-label={showKnowledgeApiKey ? "隐藏 Knowledge API Key" : "显示 Knowledge API Key"}>{showKnowledgeApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
+            <label className="field"><span>本地 PDF 最低匹配置信度（部署配置）</span><input value={settings.runbook_match_min_confidence.toFixed(2)} readOnly /></label>
+            <label className="field"><span>外部知识最低相关度（部署配置）</span><input value={settings.external_knowledge_min_relevance.toFixed(2)} readOnly /></label>
+            <label className="field span-2"><span>外部知识库 Base URL（部署配置，只读）</span><input value={settings.external_knowledge_base_url} readOnly /></label>
+            <label className="field span-2"><span>Knowledge API Key（只写，URL 变更后必须重新输入）</span><div className="secret-field"><input name="external_knowledge_api_key" type={showKnowledgeApiKey ? "text" : "password"} autoComplete="new-password" disabled={!settings.external_knowledge_enabled} placeholder={settings.external_knowledge_api_key_configured ? "已绑定当前 URL · 留空保持不变" : "认证可选；如服务启用认证请重新输入"} /><button type="button" onClick={() => setShowKnowledgeApiKey((value) => !value)} aria-label={showKnowledgeApiKey ? "隐藏 Knowledge API Key" : "显示 Knowledge API Key"}>{showKnowledgeApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
           </div>
         </SectionCard>
 

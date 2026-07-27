@@ -82,7 +82,7 @@ export function CreateAlertPage() {
       <PageHeader
         eyebrow="CANONICAL INGRESS"
         title="发起测试告警"
-        description="使用统一告警格式验证从接入、手册检索到 AI 建议的完整链路。"
+        description="使用统一告警格式验证从接入、所选知识来源检索到 AI 建议的完整链路。"
       />
       <div className="safety-banner"><Beaker size={18} /><div><strong>仅用于分析验证</strong><span>此操作不会连接数据库或执行任何处置命令。</span></div></div>
 
