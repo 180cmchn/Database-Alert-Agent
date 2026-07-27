@@ -17,6 +17,7 @@ from app.domain.models import (
     AdvisorMetadata,
     AlertStatus,
     EvidenceRecord,
+    ExternalKnowledgeExcerpt,
     InvestigationContext,
     InvestigationRun,
     InvestigationStage,
@@ -62,6 +63,7 @@ class NodeContext:
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
+        external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
     ) -> None:
         self.repository = repository
@@ -76,7 +78,10 @@ class NodeContext:
         self.runbook_limit = runbook_limit
         self.external_knowledge_client = external_knowledge_client
         self.external_knowledge_limit = external_knowledge_limit
-        self.knowledge_sources = knowledge_sources or ["local_pdf"]
+        self.external_knowledge_min_relevance = external_knowledge_min_relevance
+        self.knowledge_sources = (
+            knowledge_sources if knowledge_sources is not None else ["local_pdf"]
+        )
 
 
 async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
@@ -153,13 +158,16 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
 async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Search local PDF runbooks and external knowledge in parallel.
 
-    Both knowledge sources are queried concurrently via ``asyncio.gather``.
+    Selected knowledge sources are queried concurrently via ``asyncio.gather``.
     Each source is gated by the ``knowledge_sources`` selection in the state:
 
     - ``local_pdf``: query the local PDF runbook library.
     - ``external_knowledge``: query the optional external knowledge API. This
-      additionally requires a configured ``ExternalKnowledgeClient``; failures
-      degrade gracefully so the investigation can continue with local results.
+      additionally requires a configured ``ExternalKnowledgeClient``.
+
+    A failed source is reported as unavailable evidence, not as a negative
+    diagnostic signal. Candidates below the configured relevance threshold are
+    explicitly rejected and never reach the advisor.
 
     Historical cases are handled in the preceding ``knowledge_match_node`` and
     are not touched here.
@@ -176,7 +184,7 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         alert_id,
         run,
         InvestigationStage.RUNBOOK_MATCHING,
-        "正在并行检索本地 PDF 手册与外部知识库。",
+        "正在检索已选择的知识来源。",
         {"knowledge_matches": len(state.knowledge_cases)},
     )
 
@@ -186,19 +194,46 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         and ctx.external_knowledge_client is not None
     )
 
-    async def _search_local_pdf() -> list[RunbookExcerpt]:
+    async def _search_local_pdf() -> tuple[list[RunbookExcerpt], str | None]:
         if not local_pdf_enabled:
-            return []
-        return await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit)
+            return [], None
+        try:
+            return (
+                await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit),
+                None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "local_runbook_search_failed error=%s: %s",
+                type(exc).__name__,
+                sanitize(str(exc)),
+            )
+            return [], type(exc).__name__
 
-    async def _search_external_knowledge() -> list[dict[str, Any]]:
+    async def _search_external_knowledge() -> tuple[
+        list[ExternalKnowledgeExcerpt], int, str | None
+    ]:
         if not external_enabled:
-            return []
+            missing_client = (
+                "NotConfigured"
+                if "external_knowledge" in state.knowledge_sources
+                else None
+            )
+            return [], 0, missing_client
         try:
             response = await ctx.external_knowledge_client.search_alert(
                 alert, top_k=ctx.external_knowledge_limit
             )
-            return format_items_for_advisor(response.items)
+            accepted = [
+                item
+                for item in response.items
+                if item.relevance >= ctx.external_knowledge_min_relevance
+            ]
+            return (
+                format_items_for_advisor(accepted),
+                max(0, len(response.items) - len(accepted)),
+                None,
+            )
         except Exception as exc:
             logger.warning(
                 "external_knowledge_search_failed error=%s: %s",
@@ -210,15 +245,50 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
                 alert_id,
                 run,
                 InvestigationStage.RUNBOOK_MATCHING,
-                "外部知识库查询失败，已降级到本地知识。",
+                "外部知识库查询失败，已忽略该来源并继续分析。",
                 {"external_knowledge_error": type(exc).__name__},
             )
-            return []
+            return [], 0, type(exc).__name__
 
-    runbooks, external_knowledge = await asyncio.gather(
+    local_result, external_result = await asyncio.gather(
         _search_local_pdf(),
         _search_external_knowledge(),
     )
+    runbooks, local_error = local_result
+    external_knowledge, external_rejected_count, external_error = external_result
+
+    source_summaries: list[str] = []
+    if local_pdf_enabled:
+        if local_error:
+            source_summaries.append(
+                f"本地 PDF 查询失败（{local_error}），未作为分析依据"
+            )
+        elif runbooks:
+            source_summaries.append(f"本地 PDF 命中 {len(runbooks)} 条")
+        else:
+            source_summaries.append("本地 PDF 候选未达到匹配阈值，已拒绝匹配")
+    if "external_knowledge" in state.knowledge_sources:
+        if external_error:
+            source_summaries.append(
+                f"外部知识库查询失败（{external_error}），未作为分析依据"
+            )
+        elif external_knowledge:
+            source_summaries.append(
+                f"外部知识库命中 {len(external_knowledge)} 条"
+            )
+            if external_rejected_count:
+                source_summaries.append(
+                    f"另有 {external_rejected_count} 条低于相关度阈值，已拒绝匹配"
+                )
+        else:
+            source_summaries.append(
+                "外部知识库候选未达到相关度阈值，已拒绝匹配"
+            )
+    knowledge_match_summary = "知识匹配结果：" + "；".join(source_summaries) + "。"
+    if not runbooks and not external_knowledge:
+        knowledge_match_summary += (
+            "所选知识来源均未命中，Agent 将仅使用告警、实时证据和通用推理。"
+        )
 
     await ctx.repository.save_runbooks(alert_id, runbooks)
 
@@ -228,7 +298,7 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
             alert_id,
             run,
             InvestigationStage.RUNBOOK_MATCHING,
-            f"外部知识库返回 {len(external_knowledge)} 条候选知识（视为 draft）。",
+            f"外部知识库返回 {len(external_knowledge)} 条匹配知识。",
             {"external_knowledge_count": len(external_knowledge)},
         )
 
@@ -236,16 +306,19 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         "current_stage": InvestigationStage.RUNBOOK_MATCHING,
         "runbooks": runbooks,
         "external_knowledge": external_knowledge,
+        "knowledge_match_summary": knowledge_match_summary,
         "progress": [
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.RUNBOOK_MATCHING,
-                message="正在并行检索本地 PDF 手册与外部知识库。",
+                message="正在检索已选择的知识来源。",
                 details={
                     "knowledge_matches": len(state.knowledge_cases),
                     "local_pdf_enabled": local_pdf_enabled,
                     "external_knowledge_enabled": external_enabled,
                     "external_knowledge_count": len(external_knowledge),
+                    "external_knowledge_rejected_count": external_rejected_count,
+                    "knowledge_match_summary": knowledge_match_summary,
                 },
             )
         ],
@@ -492,6 +565,8 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     runbooks = state.runbooks
     evidence = state.evidence
     knowledge_cases = state.knowledge_cases
+    external_knowledge = state.external_knowledge
+    knowledge_match_summary = state.knowledge_match_summary
     strategy = state.strategy
     ai_fallback_enabled = state.ai_fallback_enabled
 
@@ -503,8 +578,12 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         alert_id,
         run,
         InvestigationStage.ADVISING,
-        "正在以命中手册为首要依据生成结构化处理建议。",
-        {"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
+        "正在结合已命中的知识来源生成结构化处理建议。",
+        {
+            "runbook_matches": len(runbooks),
+            "external_knowledge_matches": len(external_knowledge),
+            "evidence_count": len(evidence),
+        },
     )
 
     advisor_degraded = False
@@ -518,6 +597,8 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             runbooks,
             evidence=evidence,
             knowledge_cases=knowledge_cases,
+            external_knowledge=external_knowledge,
+            knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
         )
     except Exception as exc:
@@ -530,6 +611,8 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             runbooks,
             evidence=evidence,
             knowledge_cases=knowledge_cases,
+            external_knowledge=external_knowledge,
+            knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
         )
         advisor_metadata = advisor_metadata.model_copy(
@@ -548,6 +631,21 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ),
         )
 
+    recommendation = recommendation.model_copy(
+        update={
+            "knowledge_match_summary": knowledge_match_summary,
+            "external_knowledge_matches": external_knowledge,
+        }
+    )
+    if not runbooks and not external_knowledge:
+        recommendation = recommendation.model_copy(
+            update={
+                "summary": f"{knowledge_match_summary} {recommendation.summary}".strip(),
+                "confidence": min(recommendation.confidence, 0.45),
+                "requires_human": True,
+            }
+        )
+
     return {
         "current_stage": InvestigationStage.ADVISING,
         "recommendation": recommendation,
@@ -560,8 +658,12 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.ADVISING,
-                message="正在以命中手册为首要依据生成结构化处理建议。",
-                details={"runbook_matches": len(runbooks), "evidence_count": len(evidence)},
+                message="正在结合已命中的知识来源生成结构化处理建议。",
+                details={
+                    "runbook_matches": len(runbooks),
+                    "external_knowledge_matches": len(external_knowledge),
+                    "evidence_count": len(evidence),
+                },
             )
         ],
     }

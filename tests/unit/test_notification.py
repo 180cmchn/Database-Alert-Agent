@@ -79,14 +79,14 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
     )
 
 
-def test_wecom_markdown_contains_causes_and_orders_runbook_before_ai() -> None:
+def test_wecom_markdown_contains_causes_and_traceable_bases() -> None:
     content = format_wecom_markdown(analysis_result_event())
 
     assert "AI 分析结果" in content
     assert "可能原因" in content
     assert "连接池回收异常" in content
-    assert "判断依据（手册优先，AI 其次）" in content
-    assert content.index("[手册]") < content.index("[AI]")
+    assert "判断依据（本地 PDF、外部知识、AI）" in content
+    assert content.index("[本地 PDF]") < content.index("[AI]")
     assert "connection-limit/initial-triage" in content
     assert "must-not-appear" not in content
     assert "***REDACTED***" in content

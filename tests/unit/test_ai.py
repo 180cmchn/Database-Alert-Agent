@@ -6,6 +6,8 @@ from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
+    ExternalKnowledgeExcerpt,
+    ExternalKnowledgeReference,
     Recommendation,
     RecommendationStep,
     RunbookExcerpt,
@@ -128,6 +130,58 @@ def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None
     assert all(step.source_ref is None for step in result.steps)
     runbook_bases = [b for b in result.analysis_bases if b.source == AnalysisBasisSource.RUNBOOK]
     assert all(basis.source_ref is None for basis in runbook_bases)
+
+
+def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
+    external = ExternalKnowledgeExcerpt(
+        knowledge_id="external-1",
+        title="Replica guide",
+        content="Check replica apply rate.",
+        source_uri="file://replica.md",
+        score=0.9,
+        raw_score=0.1,
+    )
+    recommendation = Recommendation(
+        summary="test",
+        analysis_bases=[
+            AnalysisBasis(
+                source=AnalysisBasisSource.EXTERNAL_KNOWLEDGE,
+                statement="External basis",
+                source_ref=ExternalKnowledgeReference(
+                    knowledge_id="external-1",
+                    title="altered title",
+                    source_uri="https://untrusted.invalid",
+                ),
+            ),
+            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis"),
+        ],
+        steps=[
+            RecommendationStep(
+                order=1,
+                action="check",
+                source_ref=ExternalKnowledgeReference(
+                    knowledge_id="external-1",
+                    title="altered title",
+                    source_uri="https://untrusted.invalid",
+                ),
+            )
+        ],
+        requires_human=False,
+        confidence=0.8,
+        manual_matched=False,
+    )
+
+    result = _validate_manual_policy(recommendation, [], [external])
+
+    exact = ExternalKnowledgeReference(
+        knowledge_id=external.knowledge_id,
+        title=external.title,
+        source_uri=external.source_uri,
+    )
+    assert result.analysis_bases[0].source_ref == exact
+    assert result.steps[0].source_ref == exact
+    assert result.requires_human is True
+    assert result.confidence == 0.8
 
 
 def test_system_trust_http_client_keeps_tls_verification_and_environment(

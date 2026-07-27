@@ -117,6 +117,11 @@ class RuntimeSettingsManager:
         unexpected = set(updates) - RUNTIME_SETTINGS_KEYS
         if unexpected:
             raise ValueError(f"Runtime setting is not editable: {sorted(unexpected)[0]}")
+        if "external_knowledge_api_key" in updates:
+            api_key = updates["external_knowledge_api_key"]
+            updates["external_knowledge_api_key_base_url"] = (
+                current.external_knowledge_base_url if api_key else ""
+            )
 
         async with self._lock:
             candidate, persisted, revision, changed_fields = await asyncio.to_thread(
@@ -285,8 +290,20 @@ class RuntimeSettingsManager:
             blocking.append(
                 "Production gate approval is required before disabling shadow mode"
             )
-        if settings.external_knowledge_enabled and not settings.external_knowledge_base_url.strip():
-            blocking.append("External knowledge base URL is required when external knowledge is enabled")
+        if (
+            settings.external_knowledge_enabled
+            and not settings.external_knowledge_base_url.strip()
+        ):
+            blocking.append(
+                "External knowledge base URL is required when external knowledge is enabled"
+            )
+        if (
+            settings.external_knowledge_api_key
+            and not settings.external_knowledge_api_key_is_current()
+        ):
+            blocking.append(
+                "External knowledge API key must be re-entered after the base URL changes"
+            )
         if blocking:
             raise ValueError("; ".join(blocking))
 

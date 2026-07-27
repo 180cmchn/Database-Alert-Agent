@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,6 +10,7 @@ from app.domain.models import (
     AdvisorMetadata,
     AlertStatus,
     EvidenceRecord,
+    ExternalKnowledgeExcerpt,
     InvestigationRun,
     InvestigationStage,
     InvestigationStrategy,
@@ -60,7 +61,8 @@ class AgentState(BaseModel):
     # Investigation data
     runbooks: Annotated[list[RunbookExcerpt], merge_runbooks] = Field(default_factory=list)
     knowledge_cases: list[KnowledgeCase] = Field(default_factory=list)
-    external_knowledge: list[dict[str, Any]] = Field(default_factory=list)
+    external_knowledge: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
+    knowledge_match_summary: str = ""
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)
     strategy: InvestigationStrategy | None = None
 
@@ -142,5 +144,7 @@ def create_initial_state(
         validation_enabled=validation_enabled,
         shadow_enabled=shadow_enabled,
         ai_fallback_enabled=ai_fallback_enabled,
-        knowledge_sources=knowledge_sources or ["local_pdf"],
+        knowledge_sources=(
+            knowledge_sources if knowledge_sources is not None else ["local_pdf"]
+        ),
     )

@@ -142,8 +142,6 @@ class RuntimeSettingsPatch(BaseModel):
     flashduty_polling_enabled: bool | None = None
     flashduty_poll_interval_seconds: int | None = Field(default=None, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int | None = Field(default=None, ge=300, le=2678400)
-    external_knowledge_enabled: bool | None = None
-    external_knowledge_base_url: str | None = Field(default=None, max_length=2048)
     external_knowledge_api_key: str | None = Field(default=None, max_length=8192, repr=False)
 
     def updates(self) -> dict[str, Any]:
@@ -169,6 +167,7 @@ class RuntimeSettingsResponse(BaseModel):
     shadow_enabled: bool
     production_gate_approved: bool
     runbook_limit: int
+    runbook_match_min_confidence: float
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
     flashduty_enabled: bool
@@ -182,6 +181,7 @@ class RuntimeSettingsResponse(BaseModel):
     external_knowledge_enabled: bool
     external_knowledge_base_url: str
     external_knowledge_api_key_configured: bool
+    external_knowledge_min_relevance: float
     knowledge_sources: list[str]
     revision: str
     apply_status: Literal["applied"] = "applied"
@@ -216,6 +216,7 @@ class RuntimeSettingsResponse(BaseModel):
             shadow_enabled=settings.shadow_enabled,
             production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
+            runbook_match_min_confidence=settings.runbook_match_min_confidence,
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             flashduty_enabled=settings.flashduty_enabled,
@@ -228,7 +229,12 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_poll_integration_ids=settings.flashduty_poll_integration_ids,
             external_knowledge_enabled=settings.external_knowledge_enabled,
             external_knowledge_base_url=settings.external_knowledge_base_url,
-            external_knowledge_api_key_configured=bool(settings.external_knowledge_api_key),
+            external_knowledge_api_key_configured=(
+                settings.external_knowledge_api_key_is_current()
+            ),
+            external_knowledge_min_relevance=(
+                settings.external_knowledge_min_relevance
+            ),
             knowledge_sources=settings.knowledge_sources,
             revision=revision,
             changed_fields=changed_fields or [],

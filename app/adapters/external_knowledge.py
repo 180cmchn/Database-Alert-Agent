@@ -4,17 +4,19 @@ This adapter bridges the project's analyze-database-alerts skill contract with t
 actual KnowledgePack HTTP API. It follows the same defensive patterns as the
 FlashDuty adapter: typed errors, bounded retries, and graceful degradation.
 
-Per the skill rules (SKILL.md §4):
+Per the deployment and skill contracts:
 - Results are advisory data, never live evidence.
-- KnowledgePack does not return an explicit ``quality_status``; every result is
-  treated as ``draft``.
-- API failure or an empty response degrades gracefully to local knowledge.
+- KnowledgePack content is approved before indexing, so results are treated as
+  approved knowledge guidance just like the configured local PDFs.
+- API failure or an empty response degrades gracefully to other selected sources.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -22,8 +24,8 @@ from urllib.parse import quote
 
 import httpx
 
-from app.application.sanitization import sanitize_text
-from app.domain.models import NormalizedAlert
+from app.application.sanitization import sanitize, sanitize_text
+from app.domain.models import ExternalKnowledgeExcerpt, NormalizedAlert
 
 logger = logging.getLogger(__name__)
 
@@ -73,26 +75,20 @@ class KnowledgeSearchResponse:
     total: int
 
 
-# Chroma returns an L2 distance where *lower* means *more similar*.
-# We invert and squash it into a 0-1 relevance score where higher is better.
-# The transformation ``1 / (1 + distance)`` maps 0 → 1.0 and decays toward 0.
+# KnowledgePack uses Chroma cosine distance, where lower is more similar.
+# Convert it to a bounded relevance score where higher is better.
 
 
 def _distance_to_relevance(distance: float) -> float:
-    """Convert a Chroma L2 distance into a 0-1 relevance score.
-
-    The transformation is ``1 / (1 + distance)`` which maps 0 → 1.0 and
-    decays smoothly toward 0 as distance grows. This is intentionally simple
-    and does not claim to be a calibrated probability.
-    """
+    """Convert Chroma cosine distance into a bounded 0-1 relevance score."""
 
     try:
         d = float(distance)
     except (TypeError, ValueError):
         return 0.0
-    if d < 0:
+    if not math.isfinite(d) or d < 0:
         return 0.0
-    return 1.0 / (1.0 + d)
+    return max(0.0, min(1.0, 1.0 - d))
 
 
 def build_search_query(alert: NormalizedAlert) -> str:
@@ -247,9 +243,12 @@ class ExternalKnowledgeClient:
     def _retry_delay(response: httpx.Response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After", "")
         try:
-            return min(max(float(retry_after), 0), 10)
+            retry_after_seconds = float(retry_after)
         except ValueError:
             return min(2**attempt, 10)
+        if not math.isfinite(retry_after_seconds):
+            return min(2**attempt, 10)
+        return min(max(retry_after_seconds, 0), 10)
 
     def _decode_response(self, response: httpx.Response) -> Any:
         if response.is_error:
@@ -289,48 +288,63 @@ class ExternalKnowledgeClient:
         for entry in results:
             if not isinstance(entry, dict):
                 continue
-            content = str(entry.get("content") or "")
+            content = sanitize_text(str(entry.get("content") or "")).strip()
+            if not content:
+                continue
             metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-            source = str(metadata.get("source") or "")
-            raw_score = float(entry.get("score") or 0.0)
+            source = sanitize_text(str(metadata.get("source") or "")).strip()
+            try:
+                raw_score = float(entry.get("score") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(raw_score) or raw_score < 0:
+                continue
             relevance = _distance_to_relevance(raw_score)
             items.append(
                 KnowledgeSearchResult(
-                    content=content,
+                    content=content[:20_000],
                     source=source,
                     raw_score=raw_score,
                     relevance=relevance,
-                    metadata=metadata,
+                    metadata=sanitize(metadata),
                 )
             )
-        total = int(body.get("total") or len(items))
+        try:
+            total = max(0, int(body.get("total") or len(items)))
+        except (TypeError, ValueError):
+            total = len(items)
         query = str(body.get("query") or original_query)
         return KnowledgeSearchResponse(query=query, items=items, total=total)
 
 
-def format_items_for_advisor(items: list[KnowledgeSearchResult]) -> list[dict[str, Any]]:
-    """Convert search results into the dict shape expected by the AI advisor.
+def format_items_for_advisor(
+    items: list[KnowledgeSearchResult],
+) -> list[ExternalKnowledgeExcerpt]:
+    """Create stable, bounded excerpts suitable for persisted citations."""
 
-    The advisor receives a list of plain dicts to keep the domain model decoupled
-    from the external API. Every item is tagged with ``quality_status: draft``
-    and ``knowledge_type: reference`` because KnowledgePack does not provide
-    these fields.
-    """
-
-    formatted: list[dict[str, Any]] = []
+    formatted: list[ExternalKnowledgeExcerpt] = []
+    seen_ids: set[str] = set()
     for index, item in enumerate(items):
+        content = sanitize_text(item.content).strip()[:20_000]
+        if not content:
+            continue
+        source = sanitize_text(item.source).strip()
+        digest = hashlib.sha256(f"{source}\0{content}".encode()).hexdigest()[:24]
+        knowledge_id = f"external-{digest}"
+        if knowledge_id in seen_ids:
+            continue
+        seen_ids.add(knowledge_id)
         formatted.append(
-            {
-                "id": f"ext-knowledge-{index}",
-                "title": item.source or f"External knowledge chunk {index + 1}",
-                "section": "main",
-                "content": item.content,
-                "source_uri": _safe_source_uri(item.source),
-                "knowledge_type": "reference",
-                "quality_status": "draft",
-                "score": round(item.relevance, 4),
-                "metadata": item.metadata,
-            }
+            ExternalKnowledgeExcerpt(
+                knowledge_id=knowledge_id,
+                title=source or f"External knowledge chunk {index + 1}",
+                content=content,
+                source_uri=_safe_source_uri(source),
+                score=round(item.relevance, 4),
+                raw_score=item.raw_score,
+                quality_status="approved",
+                metadata=sanitize(item.metadata),
+            )
         )
     return formatted
 

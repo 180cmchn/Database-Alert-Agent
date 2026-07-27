@@ -39,6 +39,8 @@ class RecordingAdvisor(FakeAIAdvisor):
         runbooks,
         evidence=None,
         knowledge_cases=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
         strategy=None,
     ):
         self.events.append("ADVISOR")
@@ -48,6 +50,8 @@ class RecordingAdvisor(FakeAIAdvisor):
             runbooks,
             evidence=evidence,
             knowledge_cases=knowledge_cases,
+            external_knowledge=external_knowledge,
+            knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
         )
 
@@ -59,6 +63,8 @@ class FailingAdvisor:
         runbooks,
         evidence=None,
         knowledge_cases=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
         strategy=None,
     ):
         raise AdvisorError("provider unavailable")
@@ -74,6 +80,8 @@ class FlakyAdvisor(FakeAIAdvisor):
         runbooks,
         evidence=None,
         knowledge_cases=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
         strategy=None,
     ):
         self.calls += 1
@@ -84,6 +92,8 @@ class FlakyAdvisor(FakeAIAdvisor):
             runbooks,
             evidence=evidence,
             knowledge_cases=knowledge_cases,
+            external_knowledge=external_knowledge,
+            knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
         )
 

@@ -10,6 +10,7 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
+from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.flashduty import (
     FlashDutyAlertSourceAdapter,
     FlashDutyClient,
@@ -25,7 +26,6 @@ from app.adapters.notification import (
     LogManagementNotifier,
     WeComManagementNotifier,
 )
-from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.agents.graph import InvestigationAgent
@@ -115,7 +115,7 @@ def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeCli
         return None
     return ExternalKnowledgeClient(
         base_url=settings.external_knowledge_base_url,
-        api_key=settings.external_knowledge_api_key,
+        api_key=settings.effective_external_knowledge_api_key(),
         timeout_seconds=settings.external_knowledge_timeout_seconds,
         max_retries=settings.external_knowledge_max_retries,
     )
@@ -191,6 +191,9 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         runbook_limit=settings.runbook_limit,
         external_knowledge_client=external_knowledge_client,
         external_knowledge_limit=settings.external_knowledge_limit,
+        external_knowledge_min_relevance=(
+            settings.external_knowledge_min_relevance
+        ),
         knowledge_sources=settings.knowledge_sources,
     )
 
@@ -206,6 +209,11 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.ai_fallback_enabled = settings.ai_fallback_enabled
     service.external_knowledge_client = external_knowledge_client
     service.external_knowledge_limit = settings.external_knowledge_limit
+    service.external_knowledge_min_relevance = (
+        settings.external_knowledge_min_relevance
+    )
+    service.runbook_match_min_score = settings.runbook_match_min_score
+    service.runbook_match_min_confidence = settings.runbook_match_min_confidence
     service.knowledge_sources = settings.knowledge_sources
     service.agent = agent
     runtime.settings = settings
@@ -276,6 +284,11 @@ def build_runtime(
         max_dynamic_turns=settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_knowledge_client=external_knowledge_client,
         external_knowledge_limit=settings.external_knowledge_limit,
+        external_knowledge_min_relevance=(
+            settings.external_knowledge_min_relevance
+        ),
+        runbook_match_min_score=settings.runbook_match_min_score,
+        runbook_match_min_confidence=settings.runbook_match_min_confidence,
         knowledge_sources=settings.knowledge_sources,
     )
     return Runtime(

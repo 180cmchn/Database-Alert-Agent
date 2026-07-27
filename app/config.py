@@ -40,9 +40,8 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "flashduty_polling_enabled",
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
-        "external_knowledge_enabled",
-        "external_knowledge_base_url",
         "external_knowledge_api_key",
+        "external_knowledge_api_key_base_url",
     }
 )
 
@@ -118,16 +117,17 @@ class Settings(BaseSettings):
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
 
-    # Optional external knowledge API (KnowledgePack / LangChain + Chroma service).
-    # When enabled, the investigation graph queries this service for supplementary
-    # knowledge candidates after local runbook matching. Results are always treated
-    # as advisory data with quality_status=draft per the analyze-database-alerts skill.
+    # External knowledge deployment coordinates are intentionally not runtime
+    # editable. Production content is approved before it enters the index, so it
+    # is a peer of the approved local PDFs rather than a lower-priority source.
     external_knowledge_enabled: bool = False
     external_knowledge_base_url: str = "http://localhost:8001"
     external_knowledge_api_key: str = Field(default="", repr=False)
+    external_knowledge_api_key_base_url: str = Field(default="", repr=False)
     external_knowledge_timeout_seconds: float = Field(default=30, gt=0)
     external_knowledge_max_retries: int = Field(default=2, ge=0, le=5)
     external_knowledge_limit: int = Field(default=5, ge=1, le=20)
+    external_knowledge_min_relevance: float = Field(default=0.60, ge=0, le=1)
 
     # Selectable knowledge sources for alert matching. At least one source
     # should be enabled; historical cases (DB) are always used and not
@@ -197,10 +197,25 @@ class Settings(BaseSettings):
             if not stripped:
                 return []
             if stripped.startswith("["):
-                return json.loads(stripped)
-            return [item.strip() for item in stripped.split(",") if item.strip()]
+                raw = json.loads(stripped)
+                if not isinstance(raw, list):
+                    return raw
+                return list(
+                    dict.fromkeys(
+                        str(item).strip() for item in raw if str(item).strip()
+                    )
+                )
+            return list(
+                dict.fromkeys(
+                    item.strip() for item in stripped.split(",") if item.strip()
+                )
+            )
         if isinstance(value, (list, tuple)):
-            return [str(item).strip() for item in value if str(item).strip()]
+            return list(
+                dict.fromkeys(
+                    str(item).strip() for item in value if str(item).strip()
+                )
+            )
         return value
 
     @model_validator(mode="after")
@@ -265,7 +280,33 @@ class Settings(BaseSettings):
                 f"KNOWLEDGE_SOURCES contains invalid values: {sorted(invalid_sources)}. "
                 f"Allowed: {sorted(valid_sources)}"
             )
+        if not self.knowledge_sources:
+            raise ValueError("KNOWLEDGE_SOURCES must contain at least one source")
+        if (
+            "external_knowledge" in self.knowledge_sources
+            and not self.external_knowledge_enabled
+        ):
+            raise ValueError(
+                "EXTERNAL_KNOWLEDGE_ENABLED must be true when external_knowledge "
+                "is selected"
+            )
         return self
+
+    def external_knowledge_api_key_is_current(self) -> bool:
+        """Return whether the secret is bound to the active deployment URL."""
+
+        return bool(self.external_knowledge_api_key) and (
+            not self.external_knowledge_api_key_base_url
+            or self.external_knowledge_api_key_base_url
+            == self.external_knowledge_base_url
+        )
+
+    def effective_external_knowledge_api_key(self) -> str:
+        """Do not send a secret after its bound external URL changes."""
+
+        if not self.external_knowledge_api_key_is_current():
+            return ""
+        return self.external_knowledge_api_key
 
     def readiness_issues(self) -> list[str]:
         issues: list[str] = []
@@ -310,12 +351,33 @@ class Settings(BaseSettings):
                 "PRODUCTION_GATE_APPROVED must be true before disabling shadow mode "
                 "in production"
             )
-        if not self.runbook_pdf_dir.exists():
-            issues.append(f"PDF runbook directory does not exist: {self.runbook_pdf_dir}")
-        elif not self.runbook_pdf_dir.is_dir():
-            issues.append(f"PDF runbook path is not a directory: {self.runbook_pdf_dir}")
-        elif not any(self.runbook_pdf_dir.glob("*.pdf")):
-            issues.append(f"No PDF runbooks found in: {self.runbook_pdf_dir}")
+        if "local_pdf" in self.knowledge_sources:
+            if not self.runbook_pdf_dir.exists():
+                issues.append(
+                    f"PDF runbook directory does not exist: {self.runbook_pdf_dir}"
+                )
+            elif not self.runbook_pdf_dir.is_dir():
+                issues.append(
+                    f"PDF runbook path is not a directory: {self.runbook_pdf_dir}"
+                )
+            elif not any(self.runbook_pdf_dir.glob("*.pdf")):
+                issues.append(f"No PDF runbooks found in: {self.runbook_pdf_dir}")
+        if (
+            "external_knowledge" in self.knowledge_sources
+            and not self.external_knowledge_base_url.strip()
+        ):
+            issues.append(
+                "EXTERNAL_KNOWLEDGE_BASE_URL is required when external knowledge "
+                "is selected"
+            )
+        if (
+            self.external_knowledge_api_key
+            and not self.external_knowledge_api_key_is_current()
+        ):
+            issues.append(
+                "EXTERNAL_KNOWLEDGE_API_KEY must be re-entered after "
+                "EXTERNAL_KNOWLEDGE_BASE_URL changes"
+            )
         return issues
 
 

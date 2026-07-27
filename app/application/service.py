@@ -86,6 +86,9 @@ class AlertAnalysisService:
         max_dynamic_turns: int = 0,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
+        external_knowledge_min_relevance: float = 0.60,
+        runbook_match_min_score: float = 12,
+        runbook_match_min_confidence: float = 0.35,
         knowledge_sources: list[str] | None = None,
     ) -> None:
         self.source_registry = source_registry
@@ -109,7 +112,12 @@ class AlertAnalysisService:
         self.max_dynamic_turns = max_dynamic_turns
         self.external_knowledge_client = external_knowledge_client
         self.external_knowledge_limit = external_knowledge_limit
-        self.knowledge_sources = knowledge_sources or ["local_pdf"]
+        self.external_knowledge_min_relevance = external_knowledge_min_relevance
+        self.runbook_match_min_score = runbook_match_min_score
+        self.runbook_match_min_confidence = runbook_match_min_confidence
+        self.knowledge_sources = (
+            knowledge_sources if knowledge_sources is not None else ["local_pdf"]
+        )
         self._active_analyses = 0
         self._retired_adapters: list[object] = []
         self._retired_adapter_ids: set[int] = set()
@@ -129,6 +137,7 @@ class AlertAnalysisService:
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
             external_knowledge_limit=external_knowledge_limit,
+            external_knowledge_min_relevance=external_knowledge_min_relevance,
             knowledge_sources=knowledge_sources,
         )
 
@@ -602,13 +611,22 @@ class AlertAnalysisService:
                 self.external_knowledge_client.base_url if self.external_knowledge_client else ""
             ),
             runbook_limit=self.runbook_limit,
+            runbook_match_min_score=self.runbook_match_min_score,
+            runbook_match_min_confidence=self.runbook_match_min_confidence,
+            external_knowledge_min_relevance=(
+                self.external_knowledge_min_relevance
+            ),
             react_enabled=self.react_enabled,
             react_max_dynamic_turns=self.max_dynamic_turns,
             validation_enabled=self.validation_enabled,
             shadow_enabled=self.shadow_enabled,
             ai_fallback_enabled=self.ai_fallback_enabled,
             ai_model=getattr(self.advisor, "model", ""),
-            ai_provider="fake" if hasattr(self.advisor, "__class__") and self.advisor.__class__.__name__ == "FakeAIAdvisor" else "openai_compatible",
+            ai_provider=(
+                "fake"
+                if self.advisor.__class__.__name__ == "FakeAIAdvisor"
+                else "openai_compatible"
+            ),
         )
 
     async def reanalyze(

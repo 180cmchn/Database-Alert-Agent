@@ -200,6 +200,19 @@ class RunbookExcerpt(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExternalKnowledgeExcerpt(BaseModel):
+    """Approved excerpt returned by the configured external knowledge service."""
+
+    knowledge_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1, max_length=20_000)
+    source_uri: str = Field(min_length=1, max_length=2048)
+    score: float = Field(ge=0, le=1)
+    raw_score: float = Field(ge=0)
+    quality_status: RunbookQualityStatus = RunbookQualityStatus.APPROVED
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunbookDocument(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=300)
@@ -236,20 +249,35 @@ class RunbookReference(BaseModel):
     section: str = "main"
 
 
+class ExternalKnowledgeReference(BaseModel):
+    knowledge_id: str
+    title: str
+    source_uri: str
+
+
 class AnalysisBasisSource(StrEnum):
     RUNBOOK = "RUNBOOK"
+    EXTERNAL_KNOWLEDGE = "EXTERNAL_KNOWLEDGE"
     AI = "AI"
 
 
 class AnalysisBasis(BaseModel):
     source: AnalysisBasisSource
     statement: str = Field(min_length=1)
-    source_ref: RunbookReference | None = None
+    source_ref: RunbookReference | ExternalKnowledgeReference | None = None
 
     @model_validator(mode="after")
     def validate_source_reference(self) -> AnalysisBasis:
-        if self.source == AnalysisBasisSource.RUNBOOK and self.source_ref is None:
-            raise ValueError("RUNBOOK analysis basis requires source_ref")
+        if self.source == AnalysisBasisSource.RUNBOOK and not isinstance(
+            self.source_ref, RunbookReference
+        ):
+            raise ValueError("RUNBOOK analysis basis requires a runbook source_ref")
+        if self.source == AnalysisBasisSource.EXTERNAL_KNOWLEDGE and not isinstance(
+            self.source_ref, ExternalKnowledgeReference
+        ):
+            raise ValueError(
+                "EXTERNAL_KNOWLEDGE analysis basis requires an external source_ref"
+            )
         if self.source == AnalysisBasisSource.AI and self.source_ref is not None:
             raise ValueError("AI analysis basis must not contain source_ref")
         return self
@@ -260,7 +288,7 @@ class RecommendationStep(BaseModel):
     action: str
     expected_result: str | None = None
     caution: str | None = None
-    source_ref: RunbookReference | None = None
+    source_ref: RunbookReference | ExternalKnowledgeReference | None = None
 
 
 class RootCauseAssessment(BaseModel):
@@ -287,6 +315,7 @@ class RootCauseAssessment(BaseModel):
 
 class Recommendation(BaseModel):
     summary: str
+    knowledge_match_summary: str = ""
     likely_causes: list[str] = Field(default_factory=list)
     analysis_bases: list[AnalysisBasis] = Field(default_factory=list)
     steps: list[RecommendationStep]
@@ -295,6 +324,9 @@ class Recommendation(BaseModel):
     confidence: float = Field(ge=0, le=1)
     manual_matched: bool
     runbook_references: list[RunbookReference] = Field(default_factory=list)
+    external_knowledge_matches: list[ExternalKnowledgeExcerpt] = Field(
+        default_factory=list
+    )
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
     analysis_mode: Literal["assist", "shadow"] = "assist"
 
@@ -367,6 +399,9 @@ class AnalysisConfigSnapshot(BaseModel):
     external_knowledge_enabled: bool = False
     external_knowledge_base_url: str = ""
     runbook_limit: int = 5
+    runbook_match_min_score: float = 12
+    runbook_match_min_confidence: float = 0.35
+    external_knowledge_min_relevance: float = 0.60
     react_enabled: bool = False
     react_max_dynamic_turns: int = 0
     validation_enabled: bool = True

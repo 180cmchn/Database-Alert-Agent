@@ -190,7 +190,7 @@ class DefaultInvestigationStrategyProvider:
                 strategy_id="database-connection-exhausted-v1",
                 title="数据库连接数耗尽调查策略",
                 description=(
-                    "手册为首要依据；核对连接使用率和趋势，并通过只读诊断确认连接来源与长会话。"
+                    "结合已命中知识核对连接使用率和趋势，并通过只读诊断确认连接来源与长会话。"
                 ),
                 tool_plan=[
                     ToolExecutionRequest(

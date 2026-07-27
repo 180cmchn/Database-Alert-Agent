@@ -142,6 +142,7 @@ class InvestigationAgent:
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
+        external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
     ) -> None:
         """Initialize the investigation agent.
@@ -159,6 +160,7 @@ class InvestigationAgent:
             runbook_limit: Maximum runbooks to retrieve per alert
             external_knowledge_client: Optional external knowledge API client
             external_knowledge_limit: Maximum external knowledge items to retrieve
+            external_knowledge_min_relevance: Minimum accepted external relevance
             knowledge_sources: Which knowledge sources to use ("local_pdf",
                 "external_knowledge")
         """
@@ -175,6 +177,7 @@ class InvestigationAgent:
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
             external_knowledge_limit=external_knowledge_limit,
+            external_knowledge_min_relevance=external_knowledge_min_relevance,
             knowledge_sources=knowledge_sources,
         )
         self.graph = build_investigation_graph(self.ctx)

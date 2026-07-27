@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -111,7 +112,7 @@ def create_app(
     app = FastAPI(
         title="Database Alert AI Agent",
         version="0.1.0",
-        description="数据库告警接入、结构化 PDF 手册匹配、证据化 AI 分析与企微结果发送服务。",
+        description="数据库告警接入、多知识源匹配、证据化 AI 分析与企微结果发送服务。",
         lifespan=lifespan,
     )
     app.state.runtime = runtime
@@ -237,6 +238,27 @@ def create_app(
             await runtime.repository.ping()
         except Exception as exc:
             issues.append(f"Database unavailable: {exc}")
+        if "external_knowledge" in runtime.settings.knowledge_sources:
+            client = runtime.service.external_knowledge_client
+            if client is None:
+                issues.append("External knowledge client is unavailable")
+            else:
+                try:
+                    stats = await asyncio.wait_for(client.health(), timeout=5)
+                except TimeoutError:
+                    stats = {}
+                if not stats:
+                    issues.append("External knowledge service is unavailable")
+                else:
+                    total_documents = stats.get("total_documents")
+                    if (
+                        not isinstance(total_documents, int)
+                        or isinstance(total_documents, bool)
+                        or total_documents < 1
+                    ):
+                        issues.append(
+                            "External knowledge index contains no documents"
+                        )
         status_code = 200 if not issues else 503
         return JSONResponse(
             status_code=status_code,

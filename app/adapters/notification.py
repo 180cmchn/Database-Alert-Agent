@@ -12,7 +12,12 @@ import httpx
 
 from app.application.sanitization import sanitize_text
 from app.domain.errors import NotificationError
-from app.domain.models import AnalysisBasisSource, AnalysisResultEvent
+from app.domain.models import (
+    AnalysisBasisSource,
+    AnalysisResultEvent,
+    ExternalKnowledgeReference,
+    RunbookReference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,18 +127,32 @@ def format_wecom_markdown(event: AnalysisResultEvent) -> str:
         for index, cause in enumerate(recommendation.likely_causes[:5], start=1):
             lines.append(f"{index}. {_safe_line(cause, limit=700)}")
     if recommendation.analysis_bases:
-        lines.extend(["", "**判断依据（手册优先，AI 其次）**"])
+        lines.extend(["", "**判断依据（本地 PDF、外部知识、AI）**"])
         for index, basis in enumerate(recommendation.analysis_bases[:8], start=1):
-            label = "手册" if basis.source == AnalysisBasisSource.RUNBOOK else "AI"
+            label = {
+                AnalysisBasisSource.RUNBOOK: "本地 PDF",
+                AnalysisBasisSource.EXTERNAL_KNOWLEDGE: "外部知识",
+                AnalysisBasisSource.AI: "AI",
+            }[basis.source]
             reference = ""
-            if basis.source_ref:
+            if isinstance(basis.source_ref, RunbookReference):
                 reference = (
                     f"（{_safe_line(basis.source_ref.runbook_id)}/"
                     f"{_safe_line(basis.source_ref.section)}）"
                 )
+            elif isinstance(basis.source_ref, ExternalKnowledgeReference):
+                reference = f"（{_safe_line(basis.source_ref.title)}）"
             lines.append(
                 f"{index}. [{label}]{reference} {_safe_line(basis.statement, limit=700)}"
             )
+    if recommendation.knowledge_match_summary:
+        lines.extend(
+            [
+                "",
+                "**知识匹配说明**",
+                _safe_line(recommendation.knowledge_match_summary, limit=1000),
+            ]
+        )
     if recommendation.steps:
         lines.extend(["", "**建议核查步骤（前 3 条）**"])
         for index, step in enumerate(recommendation.steps[:3], start=1):

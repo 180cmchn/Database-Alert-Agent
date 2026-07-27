@@ -39,6 +39,8 @@ def create_admin_client(
         runbook_pdf_dir=runbooks,
         admin_api_token=admin_token,
         runtime_settings_path=tmp_path / "runtime-settings.json",
+        external_knowledge_enabled=True,
+        external_knowledge_base_url="http://127.0.0.1:8001",
     )
     runtime = build_runtime(settings)
     app = create_app(settings, runtime, ManualAnalysisScheduler())
@@ -230,7 +232,7 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
     assert wecom_url not in audit
 
 
-def test_runtime_settings_persist_flashduty_polling_and_external_knowledge(
+def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     tmp_path: Path,
 ) -> None:
     client, runtime = create_admin_client(tmp_path)
@@ -244,8 +246,7 @@ def test_runtime_settings_persist_flashduty_polling_and_external_knowledge(
                 "flashduty_polling_enabled": True,
                 "flashduty_poll_interval_seconds": 600,
                 "flashduty_poll_lookback_seconds": 1200,
-                "external_knowledge_enabled": True,
-                "external_knowledge_base_url": "http://127.0.0.1:8001",
+                "external_knowledge_api_key": "test-knowledge-key",
                 "knowledge_sources": ["local_pdf", "external_knowledge"],
             },
         )
@@ -257,10 +258,11 @@ def test_runtime_settings_persist_flashduty_polling_and_external_knowledge(
     assert body["flashduty_poll_lookback_seconds"] == 1200
     assert body["external_knowledge_enabled"] is True
     assert body["external_knowledge_base_url"] == "http://127.0.0.1:8001"
+    assert body["external_knowledge_api_key_configured"] is True
     assert body["knowledge_sources"] == ["local_pdf", "external_knowledge"]
     assert set(body["changed_fields"]) == {
-        "external_knowledge_base_url",
-        "external_knowledge_enabled",
+        "external_knowledge_api_key",
+        "external_knowledge_api_key_base_url",
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
         "flashduty_polling_enabled",
@@ -273,8 +275,13 @@ def test_runtime_settings_persist_flashduty_polling_and_external_knowledge(
     assert persisted["flashduty_polling_enabled"] is True
     assert persisted["flashduty_poll_interval_seconds"] == 600
     assert persisted["flashduty_poll_lookback_seconds"] == 1200
-    assert persisted["external_knowledge_enabled"] is True
-    assert persisted["external_knowledge_base_url"] == "http://127.0.0.1:8001"
+    assert "external_knowledge_enabled" not in persisted
+    assert "external_knowledge_base_url" not in persisted
+    assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
+    assert (
+        persisted["external_knowledge_api_key_base_url"]
+        == "http://127.0.0.1:8001"
+    )
     assert persisted["knowledge_sources"] == ["local_pdf", "external_knowledge"]
 
 

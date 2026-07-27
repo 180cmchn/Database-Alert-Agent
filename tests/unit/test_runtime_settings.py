@@ -125,6 +125,42 @@ def test_pdf_runbook_readiness_requires_directory_and_pdf(
     assert any("No PDF runbooks found" in issue for issue in settings.readiness_issues())
 
 
+def test_knowledge_sources_are_deduplicated_and_cannot_be_empty() -> None:
+    with pytest.raises(ValidationError, match="at least one source"):
+        Settings(_env_file=None, ai_provider="fake", knowledge_sources=[])
+
+    with pytest.raises(
+        ValidationError, match="EXTERNAL_KNOWLEDGE_ENABLED must be true"
+    ):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            knowledge_sources=["external_knowledge"],
+        )
+
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        external_knowledge_enabled=True,
+        knowledge_sources=["local_pdf", "external_knowledge", "local_pdf"],
+    )
+    assert settings.knowledge_sources == ["local_pdf", "external_knowledge"]
+
+
+def test_external_only_source_does_not_require_local_pdf_directory(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        runbook_pdf_dir=tmp_path / "missing",
+        external_knowledge_enabled=True,
+        knowledge_sources=["external_knowledge"],
+    )
+
+    assert not any("PDF runbook" in issue for issue in settings.readiness_issues())
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -211,6 +247,11 @@ def runtime_test_settings(tmp_path: Path) -> Settings:
 def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -> None:
     with pytest.raises(ValidationError):
         RuntimeSettingsPatch(runbook_limit=7)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            external_knowledge_base_url="http://other.test",
+        )
 
     payload = RuntimeSettingsPatch(
         expected_revision="0123456789abcdef", runbook_limit=7
@@ -302,6 +343,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         ai_base_url="https://models.example.test/v1",
         admin_api_token="configured-admin-token",
         production_gate_approved=True,
+        wecom_enabled=True,
         runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
@@ -369,42 +411,44 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
 
 
 @pytest.mark.asyncio
-async def test_runtime_patch_enables_external_knowledge_with_base_url_and_api_key(
+async def test_external_base_url_is_deployment_only_and_runtime_key_is_url_bound(
     tmp_path: Path,
 ) -> None:
-    settings = runtime_test_settings(tmp_path)
+    settings = runtime_test_settings(tmp_path).model_copy(
+        update={
+            "external_knowledge_enabled": True,
+            "external_knowledge_base_url": "http://127.0.0.1:8001",
+        }
+    )
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
-    # Enabling external knowledge without a base_url must be rejected.
-    with pytest.raises(ValueError, match="External knowledge base URL is required"):
+    with pytest.raises(ValueError, match="not editable"):
         await manager.patch(
             settings,
-            {"external_knowledge_enabled": True, "external_knowledge_base_url": ""},
+            {"external_knowledge_base_url": "http://other.test"},
             expected_revision=manager.revision,
         )
 
-    # Enabling with a valid base_url and api_key succeeds. Use a non-default URL
-    # so the change is detected and persisted alongside the enabled flag.
     configured, _, changed = await manager.patch(
         settings,
-        {
-            "external_knowledge_enabled": True,
-            "external_knowledge_base_url": "http://127.0.0.1:8001",
-            "external_knowledge_api_key": "test-knowledge-key",
-        },
+        {"external_knowledge_api_key": "test-knowledge-key"},
         expected_revision=manager.revision,
     )
     assert configured.external_knowledge_enabled is True
     assert configured.external_knowledge_base_url == "http://127.0.0.1:8001"
     assert configured.external_knowledge_api_key == "test-knowledge-key"
-    assert "external_knowledge_enabled" in changed
-    assert "external_knowledge_base_url" in changed
     assert "external_knowledge_api_key" in changed
+    assert "external_knowledge_api_key_base_url" in changed
+    assert configured.external_knowledge_api_key_is_current() is True
 
     persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
-    assert persisted["external_knowledge_enabled"] is True
-    assert persisted["external_knowledge_base_url"] == "http://127.0.0.1:8001"
+    assert "external_knowledge_enabled" not in persisted
+    assert "external_knowledge_base_url" not in persisted
     assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
+    assert (
+        persisted["external_knowledge_api_key_base_url"]
+        == "http://127.0.0.1:8001"
+    )
 
 
 def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
@@ -416,6 +460,7 @@ def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
             "external_knowledge_enabled": True,
             "external_knowledge_base_url": "http://localhost:8001",
             "external_knowledge_api_key": "must-not-leak-knowledge-key",
+            "external_knowledge_api_key_base_url": "http://localhost:8001",
         }
     )
     response = RuntimeSettingsResponse.from_settings(with_secret, revision="0" * 16)
@@ -425,6 +470,15 @@ def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
     assert body["external_knowledge_api_key_configured"] is True
     assert "external_knowledge_api_key" not in body
     assert "must-not-leak-knowledge-key" not in response.model_dump_json()
+
+    changed_url = with_secret.model_copy(
+        update={"external_knowledge_base_url": "http://localhost:9001"}
+    )
+    changed_response = RuntimeSettingsResponse.from_settings(
+        changed_url, revision="1" * 16
+    )
+    assert changed_response.external_knowledge_api_key_configured is False
+    assert any("must be re-entered" in issue for issue in changed_response.issues)
 
 
 def test_production_requires_gate_approval_before_shadow_mode_is_disabled(

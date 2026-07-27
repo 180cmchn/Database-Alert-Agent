@@ -9,6 +9,7 @@ from app.domain.models import (
     AnalysisResultEvent,
     DashboardSummary,
     EvidenceRecord,
+    ExternalKnowledgeExcerpt,
     FeedbackRecord,
     InvestigationContext,
     InvestigationDecision,
@@ -53,6 +54,8 @@ class AIAdvisor(Protocol):
         runbooks: list[RunbookExcerpt],
         evidence: list[EvidenceRecord] | None = None,
         knowledge_cases: list[KnowledgeCase] | None = None,
+        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
+        knowledge_match_summary: str = "",
         strategy: InvestigationStrategy | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]: ...
 
