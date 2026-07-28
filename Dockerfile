@@ -11,6 +11,7 @@ COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
 COPY runbooks ./runbooks
+COPY entrypoint.sh ./
 
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir '.[postgres,mysql]'
@@ -26,8 +27,12 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
 
-RUN useradd --create-home appuser && mkdir -p /app/data && chown -R appuser:appuser /app
+RUN chmod +x /app/entrypoint.sh \
+    && useradd --create-home appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
+ENTRYPOINT ["./entrypoint.sh"]
 CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
