@@ -278,7 +278,6 @@ class OpenAICompatibleAdvisor:
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
             base_url=base_url,
-            timeout=timeout_seconds,
             max_retries=max_retries,
             default_headers={"User-Agent": AI_HTTP_USER_AGENT},
             http_client=_system_trust_http_client(timeout_seconds),
@@ -673,7 +672,6 @@ class OpenAICompatibleConclusionValidator:
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
             base_url=base_url,
-            timeout=timeout_seconds,
             max_retries=max_retries,
             default_headers={"User-Agent": AI_HTTP_USER_AGENT},
             http_client=_system_trust_http_client(timeout_seconds),
