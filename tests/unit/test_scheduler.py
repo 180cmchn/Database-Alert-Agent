@@ -170,7 +170,7 @@ async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     assert await poller.run_once(now=1300) == 0
     assert len(scheduler.jobs) == 1
     assert list_payloads[0]["start_time"] == 100
-    assert list_payloads[1]["start_time"] == 100
+    assert list_payloads[1]["start_time"] == 400
     assert list_payloads[0]["channel_ids"] == [7]
     assert list_payloads[0]["by_updated_at"] is False
     await runtime.repository.close()  # type: ignore[attr-defined]

@@ -129,11 +129,9 @@ external_id = FlashDuty alert_id
 
 ### 水位和故障恢复
 
-1. 首轮从“当前时间减去 `FLASHDUTY_POLL_LOOKBACK_SECONDS`”开始拉取；
-2. 后续轮次从“上次成功水位减去 lookback”开始，形成重叠窗口；
-3. `/alert/list` 使用创建时间窗（`by_updated_at=false`）并按游标分页，单轮最多 100 页；由于同一 `alert_id` 的后续更新本来不会触发重分析，按创建时间轮询可避免高告警量空间的更新时间索引超时；
-4. 仅整轮成功后推进内存水位；任何请求失败都保留旧水位，下轮重扫；
-5. 单条 `/alert/info` 暂时失败时，使用 `/alert/list` 中的完整 `AlertItem` 继续入库，避免单条详情请求造成漏告警。
+1. 每轮均从“本轮当前时间减去 `FLASHDUTY_POLL_LOOKBACK_SECONDS`”开始拉取；查询窗口不会因上一轮延迟、失败或服务停顿而扩大；
+2. `/alert/list` 使用创建时间窗（`by_updated_at=false`）并按游标分页，单轮最多 100 页；由于同一 `alert_id` 的后续更新本来不会触发重分析，按创建时间轮询可避免高告警量空间的更新时间索引超时；
+3. 单条 `/alert/info` 暂时失败时，使用 `/alert/list` 中的完整 `AlertItem` 继续入库，避免单条详情请求造成漏告警。
 
 ## 五、运行与排障
 

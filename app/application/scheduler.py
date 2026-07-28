@@ -30,7 +30,6 @@ class FlashDutyAlertPoller:
         self.scheduler = scheduler
         self.client = client
         self._task: asyncio.Task[None] | None = None
-        self._watermark: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -70,9 +69,7 @@ class FlashDutyAlertPoller:
             return 0
         end_time = int(time.time()) if now is None else now
         overlap = self.settings.flashduty_poll_lookback_seconds
-        start_time = (
-            end_time - overlap if self._watermark is None else max(0, self._watermark - overlap)
-        )
+        start_time = max(0, end_time - overlap)
         cursor: str | None = None
         seen_cursors: set[str] = set()
         created_count = 0
@@ -149,7 +146,6 @@ class FlashDutyAlertPoller:
         else:
             raise RuntimeError("FlashDuty /alert/list exceeded the 100-page safety limit")
 
-        self._watermark = end_time
         logger.info(
             "flashduty_poll_completed start_time=%s end_time=%s created=%s",
             start_time,
@@ -165,8 +161,7 @@ class FlashDutyAlertPoller:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # Keep the prior watermark so the next successful pass retries the
-                # complete overlap window rather than silently advancing past loss.
+                # The next pass uses its own complete lookback window.
                 logger.exception("flashduty_poll_failed")
             await asyncio.sleep(self.settings.flashduty_poll_interval_seconds)
 
