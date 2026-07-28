@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_ENVIRONMENT_ALIASES = {
@@ -120,7 +120,6 @@ class Settings(BaseSettings):
     # External knowledge deployment coordinates are intentionally not runtime
     # editable. Production content is approved before it enters the index, so it
     # is a peer of the approved local PDFs rather than a lower-priority source.
-    external_knowledge_enabled: bool = False
     external_knowledge_base_url: str = "http://localhost:8001"
     external_knowledge_api_key: str = Field(default="", repr=False)
     external_knowledge_api_key_base_url: str = Field(default="", repr=False)
@@ -282,15 +281,14 @@ class Settings(BaseSettings):
             )
         if not self.knowledge_sources:
             raise ValueError("KNOWLEDGE_SOURCES must contain at least one source")
-        if (
-            "external_knowledge" in self.knowledge_sources
-            and not self.external_knowledge_enabled
-        ):
-            raise ValueError(
-                "EXTERNAL_KNOWLEDGE_ENABLED must be true when external_knowledge "
-                "is selected"
-            )
         return self
+
+    @computed_field
+    @property
+    def external_knowledge_enabled(self) -> bool:
+        """Expose the selected source as a compatibility/read-model flag."""
+
+        return "external_knowledge" in self.knowledge_sources
 
     def external_knowledge_api_key_is_current(self) -> bool:
         """Return whether the secret is bound to the active deployment URL."""

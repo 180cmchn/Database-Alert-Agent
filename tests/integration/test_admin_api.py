@@ -39,7 +39,6 @@ def create_admin_client(
         runbook_pdf_dir=runbooks,
         admin_api_token=admin_token,
         runtime_settings_path=tmp_path / "runtime-settings.json",
-        external_knowledge_enabled=True,
         external_knowledge_base_url="http://127.0.0.1:8001",
     )
     runtime = build_runtime(settings)
@@ -270,6 +269,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     }
     assert runtime.settings.flashduty_polling_enabled is True
     assert runtime.settings.external_knowledge_enabled is True
+    assert runtime.service.external_knowledge_client is not None
 
     persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
     assert persisted["flashduty_polling_enabled"] is True
@@ -283,6 +283,42 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
         == "http://127.0.0.1:8001"
     )
     assert persisted["knowledge_sources"] == ["local_pdf", "external_knowledge"]
+
+
+def test_runtime_knowledge_selection_disables_external_client(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        enabled = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": initial["revision"],
+                "knowledge_sources": ["local_pdf", "external_knowledge"],
+            },
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["external_knowledge_enabled"] is True
+        assert runtime.service.external_knowledge_client is not None
+
+        disabled = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": enabled.json()["revision"],
+                "knowledge_sources": ["local_pdf"],
+            },
+        )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["external_knowledge_enabled"] is False
+    assert disabled.json()["knowledge_sources"] == ["local_pdf"]
+    assert runtime.settings.external_knowledge_enabled is False
+    assert runtime.service.external_knowledge_client is None
+
+    persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
+    assert persisted["knowledge_sources"] == ["local_pdf"]
+    assert "external_knowledge_enabled" not in persisted
 
 
 def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(

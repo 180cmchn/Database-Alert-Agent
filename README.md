@@ -8,7 +8,6 @@
 4. 本地 PDF 与外部知识库同级作为知识依据，并统一列在 AI 分析之前。
 5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
 
-值班人员查询、企微卡片确认、电话、群组分派、通知升级、等待窗口、送达确认和通知重试均不属于本项目。
 
 ## 架构
 
@@ -118,7 +117,6 @@ python main.py api --host 0.0.0.0 --port 8001
 Agent 部署配置：
 
 ```dotenv
-EXTERNAL_KNOWLEDGE_ENABLED=true
 EXTERNAL_KNOWLEDGE_BASE_URL=http://localhost:8001
 EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL=http://host.docker.internal:8001
 EXTERNAL_KNOWLEDGE_API_KEY=
@@ -128,10 +126,11 @@ KNOWLEDGE_SOURCES=["local_pdf","external_knowledge"]
 ```
 
 直接运行 Agent 时使用 `EXTERNAL_KNOWLEDGE_BASE_URL`；Docker Compose 中的 API 和 Worker
-使用 `EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL` 访问宿主机。Base URL、启用开关和最低相关度均为
-部署级配置，不能通过管理 API 修改。管理页只允许选择 `local_pdf`、`external_knowledge` 或
-两者，并允许录入只写 API Key。运行时录入的 Key 会绑定当前 Base URL；部署变更 URL 后旧 Key
-不会发送，必须在管理页重新输入。
+使用 `EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL` 访问宿主机。Base URL 和最低相关度均为部署级配置，
+不能通过管理 API 修改。管理页可选择 `local_pdf`、`external_knowledge` 或两者；“外部知识库”
+参考来源按钮就是连接开关，选中并保存后创建外部知识客户端，取消并保存后停用连接。管理页还
+允许录入只写 API Key。运行时录入的 Key 会绑定当前 Base URL；部署变更 URL 后旧 Key不会发送，
+必须在管理页重新输入。
 
 本地 PDF 使用 `RUNBOOK_MATCH_MIN_SCORE` 和 `RUNBOOK_MATCH_MIN_CONFIDENCE` 拒绝低匹配候选；
 外部知识先把 KnowledgePack 的 cosine distance 转成 `clamp(1-distance, 0, 1)`，再按

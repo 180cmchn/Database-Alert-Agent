@@ -129,22 +129,28 @@ def test_knowledge_sources_are_deduplicated_and_cannot_be_empty() -> None:
     with pytest.raises(ValidationError, match="at least one source"):
         Settings(_env_file=None, ai_provider="fake", knowledge_sources=[])
 
-    with pytest.raises(
-        ValidationError, match="EXTERNAL_KNOWLEDGE_ENABLED must be true"
-    ):
-        Settings(
-            _env_file=None,
-            ai_provider="fake",
-            knowledge_sources=["external_knowledge"],
-        )
+    external_only = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        knowledge_sources=["external_knowledge"],
+    )
+    assert external_only.external_knowledge_enabled is True
 
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        external_knowledge_enabled=True,
         knowledge_sources=["local_pdf", "external_knowledge", "local_pdf"],
     )
     assert settings.knowledge_sources == ["local_pdf", "external_knowledge"]
+    assert settings.external_knowledge_enabled is True
+
+    local_only = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        external_knowledge_enabled=True,
+        knowledge_sources=["local_pdf"],
+    )
+    assert local_only.external_knowledge_enabled is False
 
 
 def test_external_only_source_does_not_require_local_pdf_directory(
@@ -154,7 +160,6 @@ def test_external_only_source_does_not_require_local_pdf_directory(
         _env_file=None,
         ai_provider="fake",
         runbook_pdf_dir=tmp_path / "missing",
-        external_knowledge_enabled=True,
         knowledge_sources=["external_knowledge"],
     )
 
@@ -251,6 +256,11 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         RuntimeSettingsPatch(
             expected_revision="0123456789abcdef",
             external_knowledge_base_url="http://other.test",
+        )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            external_knowledge_enabled=True,
         )
 
     payload = RuntimeSettingsPatch(
@@ -416,10 +426,11 @@ async def test_external_base_url_is_deployment_only_and_runtime_key_is_url_bound
 ) -> None:
     settings = runtime_test_settings(tmp_path).model_copy(
         update={
-            "external_knowledge_enabled": True,
             "external_knowledge_base_url": "http://127.0.0.1:8001",
+            "knowledge_sources": ["external_knowledge"],
         }
     )
+    settings = Settings.model_validate(settings.model_dump(mode="python"))
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
     with pytest.raises(ValueError, match="not editable"):
@@ -451,16 +462,44 @@ async def test_external_base_url_is_deployment_only_and_runtime_key_is_url_bound
     )
 
 
+@pytest.mark.asyncio
+async def test_runtime_knowledge_selection_is_the_external_connection_switch(
+    tmp_path: Path,
+) -> None:
+    settings = runtime_test_settings(tmp_path)
+    manager = RuntimeSettingsManager(settings.runtime_settings_path)
+
+    enabled, enabled_revision, changed = await manager.patch(
+        settings,
+        {"knowledge_sources": ["local_pdf", "external_knowledge"]},
+        expected_revision=manager.revision,
+    )
+    assert enabled.external_knowledge_enabled is True
+    assert changed == ["knowledge_sources"]
+
+    disabled, _, changed = await manager.patch(
+        enabled,
+        {"knowledge_sources": ["local_pdf"]},
+        expected_revision=enabled_revision,
+    )
+    assert disabled.external_knowledge_enabled is False
+    assert changed == ["knowledge_sources"]
+
+    persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
+    assert persisted["knowledge_sources"] == ["local_pdf"]
+    assert "external_knowledge_enabled" not in persisted
+
+
 def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
     tmp_path: Path,
 ) -> None:
     settings = runtime_test_settings(tmp_path)
     with_secret = settings.model_copy(
         update={
-            "external_knowledge_enabled": True,
             "external_knowledge_base_url": "http://localhost:8001",
             "external_knowledge_api_key": "must-not-leak-knowledge-key",
             "external_knowledge_api_key_base_url": "http://localhost:8001",
+            "knowledge_sources": ["external_knowledge"],
         }
     )
     response = RuntimeSettingsResponse.from_settings(with_secret, revision="0" * 16)
