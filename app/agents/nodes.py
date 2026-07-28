@@ -129,6 +129,9 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
     if not run or not alert:
         return {"error": "Missing run or alert in knowledge match node"}
 
+    if state.error:
+        return {}
+
     await _update_progress(
         ctx.repository,
         alert_id,
@@ -178,6 +181,9 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
 
     if not run or not alert:
         return {"error": "Missing run or alert in runbook match node"}
+
+    if state.error:
+        return {}
 
     await _update_progress(
         ctx.repository,
@@ -335,6 +341,9 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
     if not run or not alert:
         return {"error": "Missing run or alert in strategy selection node"}
 
+    if state.error:
+        return {}
+
     strategy = await ctx.strategy_provider.select(alert, runbooks)
     await ctx.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
 
@@ -377,6 +386,9 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
 
     if not run or not alert or not strategy:
         return {"error": "Missing run, alert, or strategy in tool execution node"}
+
+    if state.error:
+        return {}
 
     new_evidence: list[EvidenceRecord] = []
 
@@ -573,6 +585,9 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     if not run or not alert or not strategy:
         return {"error": "Missing run, alert, or strategy in advise node"}
 
+    if state.error:
+        return {}
+
     await _update_progress(
         ctx.repository,
         alert_id,
@@ -604,6 +619,11 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     except Exception as exc:
         primary_advisor_error = exc
         if not ai_fallback_enabled or ctx.fallback_advisor is None:
+            logger.warning(
+                "advise_failed_no_fallback error=%s: %s",
+                type(exc).__name__,
+                sanitize(str(exc)),
+            )
             return {"error": f"AI advisor failed: {type(exc).__name__}: {exc}"}
         advisor_degraded = True
         recommendation, advisor_metadata = await ctx.fallback_advisor.advise(
@@ -684,6 +704,9 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     if not run or not alert or not strategy or not recommendation:
         return {"error": "Missing run, alert, strategy, or recommendation in validate node"}
+
+    if state.error:
+        return {}
 
     await _update_progress(
         ctx.repository,
