@@ -122,15 +122,15 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
     External knowledge and local PDF runbook matching happen in the subsequent
     ``runbook_match_node`` where they run in parallel.
     """
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
 
     if not run or not alert:
         return {"error": "Missing run or alert in knowledge match node"}
-
-    if state.error:
-        return {}
 
     await _update_progress(
         ctx.repository,
@@ -175,15 +175,15 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     Historical cases are handled in the preceding ``knowledge_match_node`` and
     are not touched here.
     """
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
 
     if not run or not alert:
         return {"error": "Missing run or alert in runbook match node"}
-
-    if state.error:
-        return {}
 
     await _update_progress(
         ctx.repository,
@@ -333,6 +333,9 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
 
 async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Select investigation strategy based on alert and runbooks."""
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -340,9 +343,6 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
 
     if not run or not alert:
         return {"error": "Missing run or alert in strategy selection node"}
-
-    if state.error:
-        return {}
 
     strategy = await ctx.strategy_provider.select(alert, runbooks)
     await ctx.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
@@ -378,6 +378,9 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
 
 async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Execute pending tool requests and collect evidence."""
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -386,9 +389,6 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
 
     if not run or not alert or not strategy:
         return {"error": "Missing run, alert, or strategy in tool execution node"}
-
-    if state.error:
-        return {}
 
     new_evidence: list[EvidenceRecord] = []
 
@@ -456,6 +456,9 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
     This node implements the React pattern: if evidence is insufficient and
     dynamic turns remain, the AI advisor can choose additional tools to run.
     """
+    if state.error:
+        return {"should_continue_investigation": False}
+
     run = state.run
     alert = state.alert
     strategy = state.strategy
@@ -571,6 +574,9 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
 
 async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Generate recommendation using AI advisor."""
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -584,9 +590,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     if not run or not alert or not strategy:
         return {"error": "Missing run, alert, or strategy in advise node"}
-
-    if state.error:
-        return {}
 
     await _update_progress(
         ctx.repository,
@@ -691,6 +694,9 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
 async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Validate the recommendation using rule and agent validators."""
+    if state.error:
+        return {}
+
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
@@ -704,9 +710,6 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     if not run or not alert or not strategy or not recommendation:
         return {"error": "Missing run, alert, strategy, or recommendation in validate node"}
-
-    if state.error:
-        return {}
 
     await _update_progress(
         ctx.repository,

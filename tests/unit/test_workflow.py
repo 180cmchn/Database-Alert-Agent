@@ -268,8 +268,17 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
         "title": "Critical",
         "reason": "x",
     }
-    with pytest.raises(AnalysisFailedError):
+    with pytest.raises(AnalysisFailedError) as exc_info:
         await runtime.service.analyze("canonical", payload)
+
+    error_message = str(exc_info.value)
+    assert "AI advisor failed: AdvisorError: temporary failure" in error_message
+    assert "Missing run, alert, strategy, or recommendation in validate node" not in error_message
+
+    failed = await runtime.service.get(exc_info.value.alert_id)
+    assert failed.status == AlertStatus.FAILED
+    assert failed.error is not None
+    assert "AI advisor failed: AdvisorError: temporary failure" in failed.error
 
     result = await runtime.service.analyze("canonical", payload, retry_failed=True)
 
