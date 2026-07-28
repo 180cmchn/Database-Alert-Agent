@@ -20,7 +20,6 @@ dist/
 build/
 tmp/
 certs/
-KnowledgePack/
 runbooks/*
 !runbooks/README.md
 evaluation/datasets/

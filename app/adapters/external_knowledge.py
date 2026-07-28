@@ -129,7 +129,7 @@ class ExternalKnowledgeClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8001",
+        base_url: str = "http://knowledge:8000",
         *,
         api_key: str = "",
         timeout_seconds: float = 30,

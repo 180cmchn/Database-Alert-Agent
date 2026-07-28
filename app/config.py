@@ -120,7 +120,7 @@ class Settings(BaseSettings):
     # External knowledge deployment coordinates are intentionally not runtime
     # editable. Production content is approved before it enters the index, so it
     # is a peer of the approved local PDFs rather than a lower-priority source.
-    external_knowledge_base_url: str = "http://localhost:8001"
+    external_knowledge_base_url: str = "http://knowledge:8000"
     external_knowledge_api_key: str = Field(default="", repr=False)
     external_knowledge_api_key_base_url: str = Field(default="", repr=False)
     external_knowledge_timeout_seconds: float = Field(default=30, gt=0)

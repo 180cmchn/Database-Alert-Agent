@@ -102,35 +102,34 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 
 ## 外部知识库
 
-外部知识库使用 `/Users/chn/KnowlegePack` 中的 KnowledgePack HTTP 服务。Agent 只调用
+KnowledgePack 作为独立项目和独立镜像部署。它与 Agent 的 Compose 项目加入同一个预创建的
+Docker 网络，并通过网络别名 `knowledge` 提供接口；不向宿主机发布端口。Agent 只调用
 `POST /search` 和 `GET /stats`。生产索引内容应在入库前完成审批，因此它与本地 PDF 同级作为
 知识依据；两者都不能代替本次事故的实时证据。
 
-由于 Agent API 默认使用 8000 端口，本地联调时可让 KnowledgePack 使用 8001：
+在同一 Docker Engine 上只需创建一次共享网络，两个项目可随后独立启动、停止和升级：
 
 ```bash
-cd /Users/chn/KnowlegePack
-source .venv/bin/activate
-python main.py api --host 0.0.0.0 --port 8001
+docker network create database-alert-knowledge
 ```
 
 Agent 部署配置：
 
 ```dotenv
-EXTERNAL_KNOWLEDGE_BASE_URL=http://localhost:8001
-EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL=http://host.docker.internal:8001
-EXTERNAL_KNOWLEDGE_API_KEY=
+KNOWLEDGE_NETWORK_NAME=database-alert-knowledge
+EXTERNAL_KNOWLEDGE_BASE_URL=http://knowledge:8000
+EXTERNAL_KNOWLEDGE_API_KEY=replace-with-the-same-long-random-secret
 EXTERNAL_KNOWLEDGE_LIMIT=5
 EXTERNAL_KNOWLEDGE_MIN_RELEVANCE=0.60
 KNOWLEDGE_SOURCES=["local_pdf","external_knowledge"]
 ```
 
-直接运行 Agent 时使用 `EXTERNAL_KNOWLEDGE_BASE_URL`；Docker Compose 中的 API 和 Worker
-使用 `EXTERNAL_KNOWLEDGE_DOCKER_BASE_URL` 访问宿主机。Base URL 和最低相关度均为部署级配置，
-不能通过管理 API 修改。管理页可选择 `local_pdf`、`external_knowledge` 或两者；“外部知识库”
-参考来源按钮就是连接开关，选中并保存后创建外部知识客户端，取消并保存后停用连接。管理页还
-允许录入只写 API Key。运行时录入的 Key 会绑定当前 Base URL；部署变更 URL 后旧 Key不会发送，
-必须在管理页重新输入。
+Agent 的 API 和 Worker 都加入 `KNOWLEDGE_NETWORK_NAME` 指定的外部网络，并通过
+`http://knowledge:8000` 访问 KnowledgePack。Base URL 和最低相关度均为部署级配置，不能通过管理
+API 修改。管理页可选择 `local_pdf`、`external_knowledge` 或两者；“外部知识库”参考来源按钮就是
+连接开关，选中并保存后创建外部知识客户端，取消并保存后停用连接。管理页还允许录入只写 API
+Key。运行时录入的 Key 会绑定当前 Base URL；部署变更 URL 后旧 Key 不会发送，必须在管理页重新
+输入。
 
 本地 PDF 使用 `RUNBOOK_MATCH_MIN_SCORE` 和 `RUNBOOK_MATCH_MIN_CONFIDENCE` 拒绝低匹配候选；
 外部知识先把 KnowledgePack 的 cosine distance 转成 `clamp(1-distance, 0, 1)`，再按
@@ -267,8 +266,13 @@ npm run dev
 也可以使用 Docker Compose 启动 API、Kafka Worker 和前端：
 
 ```bash
+docker network inspect database-alert-knowledge >/dev/null 2>&1 \
+  || docker network create database-alert-knowledge
 docker compose up -d --build
 ```
+
+共享网络存在即可先启动 Agent；如果 KnowledgePack 尚未运行，本次外部检索会作为缺失知识依据
+降级处理。KnowledgePack 启动后，后续告警无需重启 Agent 即可恢复外部检索。
 
 Compose 中 API 和 Worker 默认设置 `RESET_RUNTIME_SETTINGS_ON_START=true`，并通过容器入口脚本在
 应用进程启动前检查 `RUNTIME_SETTINGS_PATH`（当前为 `/app/data/runtime-settings.json`）。如果文件

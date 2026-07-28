@@ -11,7 +11,7 @@ servers:
   - url: "{baseUrl}"
     variables:
       baseUrl:
-        default: http://localhost:8001
+        default: http://knowledge:8000
 security:
   - bearerAuth: []
   - {}
