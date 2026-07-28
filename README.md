@@ -42,6 +42,10 @@ START → fingerprint → knowledge → runbook → strategy
 - 动态工具选择循环（React 模式）
 - 验证、影子分析、AI 降级等配置
 
+调查图使用 `state.error` 传播不可恢复错误。知识匹配、手册检索、策略选择、工具执行、建议生成和
+验证等中间节点发现上游错误后会立即短路，不再继续发起后续调查或 AI 调用；`report` 节点统一将
+运行和告警分析落为 `FAILED` 并保存失败进度，避免失败链路继续产生无效结果。
+
 ## 数据流
 
 ```text
@@ -166,6 +170,10 @@ WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-m
 
 当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成严格受限的保守候选建议，继续走完 `VALIDATING → REPORTING → REVIEW_REQUIRED`，不会在建议阶段直接跳到 `FAILED`。该候选结果会降低置信度、标记必须人工复核，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
 
+如果 `AI_FALLBACK_ENABLED=false` 或没有可用的降级 Advisor，建议生成失败会写入 `state.error`，
+后续中间节点短路并由 `report` 统一结束失败链路。服务同时记录包含异常类型和脱敏错误摘要的
+`advise_failed_no_fallback` 告警日志，便于定位模型网关或响应格式问题。
+
 ## FlashDuty 只读接入
 
 项目仅通过 [FlashDuty Open API](https://docs.flashduty.com/zh/openapi) 轮询和查询告警。客户端采用显式只读白名单；虽然 FlashDuty 的查询与诊断接口多数使用 `POST`，项目不会调用创建、更新、删除、认领、恢复等写接口。
@@ -260,8 +268,18 @@ npm run dev
 也可以使用 Docker Compose 启动 API、Kafka Worker 和前端：
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
+
+Compose 中 API 和 Worker 默认设置 `RESET_RUNTIME_SETTINGS_ON_START=true`，并通过容器入口脚本在
+应用进程启动前检查 `RUNTIME_SETTINGS_PATH`（当前为 `/app/data/runtime-settings.json`）。如果文件
+存在，入口脚本会将其重置为 `{}`，再使用 `exec` 启动 API 或 Worker。因此每次相关容器启动时，
+管理页或 `PATCH /api/v1/admin/settings` 保存的运行时覆盖都会被清除，`.env` 会重新成为可在线编辑
+配置的启动基线。这也确保执行 `docker compose up -d --build` 重建服务后采用最新 `.env` 配置。
+
+如果部署需要让管理 API 保存的运行时覆盖跨容器启动保留，请在自有 Compose 覆盖文件中将 API
+和 Worker 的 `RESET_RUNTIME_SETTINGS_ON_START` 都设为 `false`；普通非容器运行默认不会自动重置。
+无论是否启用自动重置，`runtime-settings.json` 中已有的可编辑项在正常加载后仍优先于 `.env`。
 
 Compose 默认只把前端、API 和 Kafka 外部端口绑定到本机。内置 SQLite 与单节点 Kafka 适合本地
 联调；生产部署应使用外部 PostgreSQL/MySQL、耐久 Kafka 和带身份认证的网关。
