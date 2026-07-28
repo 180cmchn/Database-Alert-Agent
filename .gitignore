@@ -19,6 +19,7 @@ frontend/dist/
 dist/
 build/
 tmp/
+certs/
 runbooks/*
 !runbooks/README.md
 evaluation/datasets/
