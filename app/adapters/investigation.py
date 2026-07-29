@@ -15,6 +15,7 @@ from app.domain.models import (
     NormalizedAlert,
     RunbookExcerpt,
     ToolExecutionRequest,
+    ToolExecutionResult,
     ToolStatus,
 )
 from app.domain.ports import InvestigationTool
@@ -59,16 +60,27 @@ class ToolExecutor:
                 request,
                 context,
                 source_system="unregistered",
-                status=ToolStatus.FAILED,
-                summary=f"调查工具 {request.tool_name} 尚未接入。",
-                error="Tool is not registered",
+                status=ToolStatus.SKIPPED,
+                summary=f"未执行调查工具 {request.tool_name}：工具未注册或能力未启用。",
+                structured_data={"reason_code": "tool_not_registered"},
                 started_at=started_at,
                 started=started,
             )
 
         try:
             async with asyncio.timeout(request.timeout_seconds):
-                summary, structured_data = await tool.execute(request, context)
+                outcome = await tool.execute(request, context)
+            if isinstance(outcome, ToolExecutionResult):
+                status = outcome.status
+                summary = outcome.summary
+                structured_data = outcome.structured_data
+            else:
+                status = ToolStatus.SUCCESS
+                summary, structured_data = outcome
+            if status in {ToolStatus.FAILED, ToolStatus.TIMEOUT}:
+                raise ValueError(
+                    "Tools must raise an exception for FAILED/TIMEOUT outcomes"
+                )
             safe_data = sanitize(structured_data)
             serialized = json.dumps(safe_data, ensure_ascii=False, default=str)
             truncated = len(serialized) > self.max_result_chars
@@ -81,7 +93,7 @@ class ToolExecutor:
                 request,
                 context,
                 source_system=tool.source_system,
-                status=ToolStatus.SUCCESS,
+                status=status,
                 summary=str(sanitize(summary))[:2000],
                 structured_data=safe_data,
                 truncated=truncated,
@@ -100,16 +112,37 @@ class ToolExecutor:
                 started=started,
             )
         except Exception as exc:
+            failure_data = self._failure_data(exc)
             return self._record(
                 request,
                 context,
                 source_system=tool.source_system,
                 status=ToolStatus.FAILED,
                 summary=f"调查工具 {request.tool_name} 执行失败。",
+                structured_data=failure_data,
                 error=f"{type(exc).__name__}: {sanitize(str(exc))}",
                 started_at=started_at,
                 started=started,
             )
+
+    @staticmethod
+    def _failure_data(exc: Exception) -> dict[str, Any]:
+        status_code = getattr(exc, "status_code", None)
+        vendor_error_code = getattr(exc, "code", None)
+        reason_code = (
+            "permission_denied"
+            if status_code in {401, 403}
+            else str(vendor_error_code or type(exc).__name__)
+        )
+        result: dict[str, Any] = {"reason_code": reason_code}
+        if vendor_error_code:
+            result["vendor_error_code"] = str(sanitize(vendor_error_code))
+        if isinstance(status_code, int):
+            result["http_status"] = status_code
+        request_id = getattr(exc, "request_id", None)
+        if request_id:
+            result["request_id"] = str(sanitize(request_id))
+        return result
 
     @staticmethod
     def _record(
@@ -175,9 +208,11 @@ class UnavailableExternalTool:
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
-        raise RuntimeError(
-            f"{self.name} adapter is not configured; connect the real {self.source_system} API"
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            status=ToolStatus.SKIPPED,
+            summary=f"未执行调查工具 {self.name}：对应的 {self.source_system} 能力未配置。",
+            structured_data={"reason_code": "adapter_not_configured"},
         )
 
 
@@ -299,10 +334,9 @@ class DefaultInvestigationStrategyProvider:
             )
 
         for tool_name in (
-            "query_database_diagnostics",
             "query_metrics",
             "query_logs",
-            "query_changes",
+            "query_similar_incidents",
         ):
             if tool_name not in self.available_tools:
                 continue

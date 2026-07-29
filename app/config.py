@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     flashduty_poll_integration_ids: Annotated[list[int], NoDecode] = Field(
         default_factory=list
     )
+    # These capability gates stay off until a read-only deployment audit shows
+    # that the scoped collaboration spaces have corresponding upstream data.
+    flashduty_monitors_enabled: bool = False
+    flashduty_changes_enabled: bool = False
     flashduty_metrics_ds_name: str = ""
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
@@ -339,6 +343,15 @@ class Settings(BaseSettings):
         ):
             issues.append(
                 "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration space ID"
+            )
+        if (
+            self.flashduty_enabled
+            and self.flashduty_changes_enabled
+            and not self.flashduty_poll_channel_ids
+        ):
+            issues.append(
+                "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration "
+                "space ID when FlashDuty change queries are enabled"
             )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

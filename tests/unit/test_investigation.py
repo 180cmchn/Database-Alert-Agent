@@ -9,6 +9,7 @@ from app.domain.models import (
     InvestigationContext,
     InvestigationStrategy,
     ToolExecutionRequest,
+    ToolExecutionResult,
     ToolStatus,
 )
 
@@ -36,6 +37,32 @@ class FailingTool:
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         raise RuntimeError("backend unavailable")
+
+
+class NoDataTool:
+    name = "no_data"
+    source_system = "test_system"
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        return ToolExecutionResult(
+            status=ToolStatus.NO_DATA,
+            summary="query succeeded without records",
+            structured_data={"rows": []},
+        )
+
+
+class PermissionDeniedError(RuntimeError):
+    status_code = 403
+    code = "Forbidden"
+    request_id = "req-forbidden"
+
+
+class PermissionDeniedTool:
+    name = "permission_denied"
+    source_system = "test_system"
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        raise PermissionDeniedError("not allowed")
 
 
 def make_context() -> InvestigationContext:
@@ -96,4 +123,52 @@ async def test_tool_executor_returns_failed() -> None:
 
     assert record.status == ToolStatus.FAILED
     assert record.error == "RuntimeError: backend unavailable"
-    assert record.structured_data == {}
+    assert record.structured_data == {"reason_code": "RuntimeError"}
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_distinguishes_no_data_from_success() -> None:
+    executor = ToolExecutor(InvestigationToolRegistry([NoDataTool()]))
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name="no_data"),
+        make_context(),
+    )
+
+    assert record.status == ToolStatus.NO_DATA
+    assert record.summary == "query succeeded without records"
+    assert record.structured_data == {"rows": []}
+    assert record.error is None
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_skips_unregistered_tools_without_external_call() -> None:
+    executor = ToolExecutor(InvestigationToolRegistry())
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name="invented_tool"),
+        make_context(),
+    )
+
+    assert record.status == ToolStatus.SKIPPED
+    assert record.source_system == "unregistered"
+    assert record.structured_data == {"reason_code": "tool_not_registered"}
+    assert record.error is None
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_records_permission_failures_separately() -> None:
+    executor = ToolExecutor(InvestigationToolRegistry([PermissionDeniedTool()]))
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name="permission_denied"),
+        make_context(),
+    )
+
+    assert record.status == ToolStatus.FAILED
+    assert record.structured_data == {
+        "reason_code": "permission_denied",
+        "vendor_error_code": "Forbidden",
+        "http_status": 403,
+        "request_id": "req-forbidden",
+    }

@@ -70,18 +70,9 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
     )
 
     assert result.status == AlertStatus.COMPLETED
-    assert [name for name, _ in calls] == [
-        "query_database_diagnostics",
-        "query_metrics",
-    ]
+    assert [name for name, _ in calls] == ["query_metrics"]
     assert all(parameters["environment"] == "production" for _, parameters in calls)
     parameters_by_tool = dict(calls)
-    assert parameters_by_tool["query_database_diagnostics"]["target_locator"] == (
-        "orders-primary"
-    )
-    assert parameters_by_tool["query_database_diagnostics"]["diagnostics"] == [
-        "connection_sources"
-    ]
     assert parameters_by_tool["query_metrics"]["ds_name"] == "prod-prom"
     assert parameters_by_tool["query_metrics"]["expr"] == "mysql_threads_connected"
     assert all(item.status.value == "SUCCESS" for item in result.evidence_records)

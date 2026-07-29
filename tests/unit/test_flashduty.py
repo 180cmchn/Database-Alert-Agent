@@ -12,12 +12,15 @@ from app.adapters.flashduty import (
     FlashDutyAlertContextTool,
     FlashDutyAlertSourceAdapter,
     FlashDutyAPIError,
+    FlashDutyChangesTool,
     FlashDutyClient,
     FlashDutyDatabaseDiagnosticsTool,
     FlashDutyDataSourceTool,
     FlashDutyReadOnlyViolation,
     FlashDutyResponse,
+    FlashDutySimilarIncidentsTool,
 )
+from app.adapters.investigation import DefaultInvestigationStrategyProvider
 from app.application.factory import build_runtime
 from app.config import Settings
 from app.domain.models import (
@@ -25,6 +28,8 @@ from app.domain.models import (
     InvestigationStrategy,
     Severity,
     ToolExecutionRequest,
+    ToolExecutionResult,
+    ToolStatus,
 )
 
 ALERT_ID = "663a1b2c3d4e5f6789abcdef"
@@ -526,6 +531,27 @@ class NoRowsClient:
         raise AssertionError("write-shaped SQL must be rejected before the API call")
 
 
+class EmptyPlatformClient:
+    async def similar_incidents(self, _incident_id: str, *, limit: int) -> Any:
+        return FlashDutyResponse("req-similar-empty", {"items": []})
+
+    async def changes(self, _payload: dict[str, Any]) -> Any:
+        return FlashDutyResponse("req-changes-empty", {"items": [], "total": 0})
+
+
+class UnavailableMonitorClient:
+    async def targets(self, _payload: dict[str, Any]) -> Any:
+        return FlashDutyResponse("req-targets-empty", {"items": [], "total": 0})
+
+    async def tool_catalog(self, _payload: dict[str, Any]) -> Any:
+        raise FlashDutyAPIError(
+            "target is unavailable",
+            code="target_unavailable",
+            request_id="req-target-unavailable",
+            status_code=200,
+        )
+
+
 @pytest.mark.asyncio
 async def test_metrics_tool_uses_documented_diagnose_shape() -> None:
     client = RecordingMonitorClient()
@@ -611,6 +637,73 @@ async def test_database_tool_discovers_and_invokes_only_compatible_tools() -> No
             )
 
 
+@pytest.mark.asyncio
+async def test_empty_flashduty_results_are_not_success_evidence() -> None:
+    client = EmptyPlatformClient()
+
+    similar = await FlashDutySimilarIncidentsTool(client).execute(  # type: ignore[arg-type]
+        ToolExecutionRequest(tool_name="query_similar_incidents"),
+        make_context(),
+    )
+    changes = await FlashDutyChangesTool(  # type: ignore[arg-type]
+        client,
+        channel_ids=[7],
+    ).execute(
+        ToolExecutionRequest(tool_name="query_changes"),
+        make_context(),
+    )
+    unscoped_changes = await FlashDutyChangesTool(  # type: ignore[arg-type]
+        client
+    ).execute(
+        ToolExecutionRequest(tool_name="query_changes"),
+        make_context(),
+    )
+
+    assert isinstance(similar, ToolExecutionResult)
+    assert similar.status == ToolStatus.NO_DATA
+    assert similar.structured_data["items"] == []
+    assert isinstance(changes, ToolExecutionResult)
+    assert changes.status == ToolStatus.NO_DATA
+    assert changes.structured_data["items"] == []
+    assert changes.structured_data["query_window"]["channel_ids"] == [7]
+    assert isinstance(unscoped_changes, ToolExecutionResult)
+    assert unscoped_changes.status == ToolStatus.SKIPPED
+    assert unscoped_changes.structured_data["reason_code"] == "channel_scope_missing"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_monitor_target_is_skipped_as_missing_capability() -> None:
+    outcome = await FlashDutyDatabaseDiagnosticsTool(  # type: ignore[arg-type]
+        UnavailableMonitorClient()
+    ).execute(
+        ToolExecutionRequest(tool_name="query_database_diagnostics"),
+        make_context(),
+    )
+
+    assert isinstance(outcome, ToolExecutionResult)
+    assert outcome.status == ToolStatus.SKIPPED
+    assert outcome.structured_data == {
+        "reason_code": "monitor_target_unavailable",
+        "vendor_error_code": "target_unavailable",
+        "request_id": "req-target-unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_default_strategy_omits_unproductive_flashduty_probes() -> None:
+    strategy = await DefaultInvestigationStrategyProvider(
+        available_tools=[
+            "alert_context",
+            "query_similar_incidents",
+            "query_changes",
+            "query_database_diagnostics",
+        ]
+    ).select(make_context().alert)
+
+    tool_names = [item.tool_name for item in strategy.tool_plan]
+    assert tool_names == ["alert_context", "query_similar_incidents"]
+
+
 def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
@@ -621,6 +714,9 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         flashduty_enabled=True,
         flashduty_app_key="test-app-key",
+        flashduty_poll_channel_ids=[7],
+        flashduty_monitors_enabled=True,
+        flashduty_changes_enabled=True,
         flashduty_metrics_ds_name="prod-prom",
     )
 
@@ -629,7 +725,32 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     normalized = runtime.service.source_registry.normalize("flashduty", flashduty_alert_payload())
     assert normalized.source == "flashduty"
     assert isinstance(runtime.service.tool_registry.get("query_metrics"), FlashDutyDataSourceTool)
+    assert isinstance(runtime.service.tool_registry.get("query_changes"), FlashDutyChangesTool)
     assert runtime.service.strategy_provider.external_tool_timeout_seconds == 120  # type: ignore[attr-defined]
+
+
+def test_factory_disables_unaudited_flashduty_capabilities_by_default(
+    tmp_path: Path,
+) -> None:
+    runbooks = tmp_path / "runbooks-default-capabilities"
+    runbooks.mkdir()
+    runtime = build_runtime(
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            runbook_pdf_dir=runbooks,
+            database_url=f"sqlite+aiosqlite:///{tmp_path / 'default-capabilities.db'}",
+            flashduty_enabled=True,
+            flashduty_app_key="test-app-key",
+        )
+    )
+
+    available = runtime.service.tool_registry.available_names()
+    assert "alert_context" in available
+    assert "query_similar_incidents" in available
+    assert "query_changes" not in available
+    assert "query_database_diagnostics" not in available
+    assert "query_metrics" not in available
 
 
 def test_flashduty_settings_require_official_endpoint_and_key_when_enabled(

@@ -50,6 +50,7 @@ class RunStatus(StrEnum):
 
 class ToolStatus(StrEnum):
     SUCCESS = "SUCCESS"
+    NO_DATA = "NO_DATA"
     TIMEOUT = "TIMEOUT"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
@@ -336,6 +337,14 @@ class ToolExecutionRequest(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = Field(default=10, gt=0, le=120)
     required: bool = False
+
+
+class ToolExecutionResult(BaseModel):
+    """Explicit non-error outcome returned by an investigation tool."""
+
+    status: ToolStatus = ToolStatus.SUCCESS
+    summary: str
+    structured_data: dict[str, Any] = Field(default_factory=dict)
 
 
 class InvestigationStrategy(BaseModel):

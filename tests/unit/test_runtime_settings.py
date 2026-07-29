@@ -13,7 +13,7 @@ from app.application.admin import (
     RuntimeSettingsConflictError,
     RuntimeSettingsManager,
 )
-from app.config import Settings, get_settings
+from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings
 from tests.pdf_fixtures import create_tikv_runbook_pdf
 
 
@@ -252,6 +252,27 @@ def test_flashduty_polling_requires_a_collaboration_space_scope() -> None:
     assert (
         "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration space ID"
         in settings.readiness_issues()
+    )
+
+
+def test_flashduty_unaudited_capabilities_are_disabled_and_deployment_only() -> None:
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.flashduty_monitors_enabled is False
+    assert settings.flashduty_changes_enabled is False
+    assert "flashduty_monitors_enabled" not in RUNTIME_SETTINGS_KEYS
+    assert "flashduty_changes_enabled" not in RUNTIME_SETTINGS_KEYS
+
+    unscoped_changes = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_changes_enabled=True,
+    )
+    assert any(
+        "when FlashDuty change queries are enabled" in issue
+        for issue in unscoped_changes.readiness_issues()
     )
 
 

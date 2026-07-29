@@ -31,6 +31,7 @@ export const stageLabel: Record<InvestigationStage, string> = {
 
 export const toolStatusLabel = {
   SUCCESS: "采集成功",
+  NO_DATA: "无返回数据",
   TIMEOUT: "采集超时",
   FAILED: "采集失败",
   SKIPPED: "已跳过",

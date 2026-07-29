@@ -180,7 +180,7 @@ export interface ProgressRecord {
   created_at: string;
 }
 
-export type ToolStatus = "SUCCESS" | "TIMEOUT" | "FAILED" | "SKIPPED";
+export type ToolStatus = "SUCCESS" | "NO_DATA" | "TIMEOUT" | "FAILED" | "SKIPPED";
 
 export interface EvidenceRecord {
   id: string;

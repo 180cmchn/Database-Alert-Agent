@@ -20,6 +20,8 @@ from app.domain.models import (
     InvestigationContext,
     NormalizedAlert,
     ToolExecutionRequest,
+    ToolExecutionResult,
+    ToolStatus,
 )
 
 
@@ -661,7 +663,7 @@ class FlashDutyAlertContextTool:
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         alert = context.alert
         alert_id = _flashduty_identifier(alert, "flashduty_alert_id")
         if not alert_id:
@@ -740,7 +742,7 @@ class FlashDutySimilarIncidentsTool:
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         incident_id = request.parameters.get("incident_id") or _flashduty_identifier(
             context.alert, "flashduty_incident_id"
         )
@@ -752,22 +754,43 @@ class FlashDutySimilarIncidentsTool:
         limit = int(limit) if isinstance(limit, (int, str)) else 5
         response = await self.client.similar_incidents(incident_id, limit=limit)
         items = response.data.get("items", []) if isinstance(response.data, dict) else []
-        return (
-            f"FlashDuty 返回 {len(items)} 条历史相似故障；历史记录仅作为调查线索。",
-            {"request_id": response.request_id, "items": items},
+        summary = (
+            f"FlashDuty 返回 {len(items)} 条历史相似故障；历史记录仅作为调查线索。"
         )
+        structured_data = {"request_id": response.request_id, "items": items}
+        if not items:
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+        return summary, structured_data
 
 
 class FlashDutyChangesTool:
     name = "query_changes"
     source_system = "alert_platform"
 
-    def __init__(self, client: FlashDutyClient) -> None:
+    def __init__(
+        self,
+        client: FlashDutyClient,
+        *,
+        channel_ids: list[int] | None = None,
+    ) -> None:
         self.client = client
+        self.channel_ids = list(dict.fromkeys(channel_ids or []))
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
+        if not self.channel_ids:
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "未执行 FlashDuty 变更查询：没有配置协作空间范围。"
+                ),
+                structured_data={"reason_code": "channel_scope_missing"},
+            )
         parameters = request.parameters
         occurred = int(context.alert.occurred_at.timestamp())
         window = int(parameters.get("window_seconds", 1800))
@@ -779,16 +802,26 @@ class FlashDutyChangesTool:
             "orderby": "start_time",
             "asc": False,
             "include_events": False,
+            "channel_ids": self.channel_ids,
         }
         query = parameters.get("query") or context.alert.service_name
         if isinstance(query, str) and query and query != "unknown":
             payload["query"] = query
         response = await self.client.changes(payload)
         items = response.data.get("items", []) if isinstance(response.data, dict) else []
-        return (
-            f"FlashDuty 在告警时间窗内返回 {len(items)} 条变更记录。",
-            {"request_id": response.request_id, "query_window": payload, "items": items},
-        )
+        summary = f"FlashDuty 在告警时间窗内返回 {len(items)} 条变更记录。"
+        structured_data = {
+            "request_id": response.request_id,
+            "query_window": payload,
+            "items": items,
+        }
+        if not items:
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+        return summary, structured_data
 
 
 def _merged_query_config(
@@ -830,7 +863,7 @@ class FlashDutyDataSourceTool:
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         config = _merged_query_config(self.name, request, context.alert, self.defaults)
         if self.name in {"query_metrics", "query_logs"}:
             return await self._diagnose(config, context)
@@ -838,7 +871,7 @@ class FlashDutyDataSourceTool:
 
     async def _diagnose(
         self, config: Mapping[str, Any], context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         is_metrics = self.name == "query_metrics"
         ds_type = str(config.get("ds_type") or ("prometheus" if is_metrics else "loki"))
         ds_name = str(config.get("ds_name") or "").strip()
@@ -872,20 +905,30 @@ class FlashDutyDataSourceTool:
             if key in config:
                 payload[key] = config[key]
         response = await self.client.diagnose(payload)
-        return (
-            (
-                "FlashDuty Monitors 已返回只读指标趋势诊断。"
-                if is_metrics
-                else "FlashDuty Monitors 已返回只读日志模式诊断。"
-            ),
-            {
-                "request_id": response.request_id,
-                "operation": payload["operation"],
-                "data": response.data,
-            },
+        summary = (
+            "FlashDuty Monitors 已返回只读指标趋势诊断。"
+            if is_metrics
+            else "FlashDuty Monitors 已返回只读日志模式诊断。"
         )
+        structured_data = {
+            "request_id": response.request_id,
+            "operation": payload["operation"],
+            "data": response.data,
+        }
+        diagnostic_results = (
+            response.data.get("results") if isinstance(response.data, dict) else None
+        )
+        if isinstance(diagnostic_results, list) and not diagnostic_results:
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+        return summary, structured_data
 
-    async def _query_rows(self, config: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    async def _query_rows(
+        self, config: Mapping[str, Any]
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         ds_type = str(config.get("ds_type") or "").strip()
         ds_name = str(config.get("ds_name") or "").strip()
         expr = config.get("expr") or config.get("query_expr")
@@ -908,11 +951,24 @@ class FlashDutyDataSourceTool:
                 payload[key] = config[key]
         _validate_read_only_expression(ds_type, payload["expr"], payload.get("args"))
         response = await self.client.query_rows(payload)
-        row_count = len(response.data) if isinstance(response.data, list) else 0
-        return (
-            f"FlashDuty Monitors 已通过只读接口返回 {row_count} 行原始查询结果。",
-            {"request_id": response.request_id, "rows": response.data},
+        if not isinstance(response.data, list):
+            raise FlashDutyAPIError(
+                "Raw query response was not a row list",
+                code="InvalidResponse",
+                request_id=response.request_id,
+            )
+        row_count = len(response.data)
+        summary = (
+            f"FlashDuty Monitors 已通过只读接口返回 {row_count} 行原始查询结果。"
         )
+        structured_data = {"request_id": response.request_id, "rows": response.data}
+        if not response.data:
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+        return summary, structured_data
 
 
 _DIAGNOSTIC_TERMS: Final[Mapping[str, set[str]]] = {
@@ -1057,7 +1113,7 @@ class FlashDutyDatabaseDiagnosticsTool:
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult:
         parameters = request.parameters
         alert = context.alert
         raw_candidates = (
@@ -1077,26 +1133,72 @@ class FlashDutyDatabaseDiagnosticsTool:
             )
         )
         if not target_candidates:
-            raise FlashDutyConfigurationError(
-                "query_database_diagnostics requires target_locator or database instance"
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "未执行 FlashDuty 数据库诊断：告警中没有可解析的监控对象标识。"
+                ),
+                structured_data={"reason_code": "target_locator_missing"},
             )
         target_kind = parameters.get("target_kind") or alert.attributes.get("flashduty_target_kind")
         if not target_kind and alert.database and alert.database.engine:
             target_kind = _TARGET_KIND_BY_ENGINE.get(alert.database.engine.casefold())
 
-        (
-            catalog,
-            catalog_data,
-            target_locator,
-            target_kind,
-            target_request_ids,
-        ) = await self._resolve_catalog(target_candidates, target_kind)
+        try:
+            (
+                catalog,
+                catalog_data,
+                target_locator,
+                target_kind,
+                target_request_ids,
+            ) = await self._resolve_catalog(target_candidates, target_kind)
+        except FlashDutyAPIError as exc:
+            if exc.code not in {
+                "target_unavailable",
+                "ambiguous_target_kind",
+                "timeout",
+                "forward_failed",
+                "invalid_tool_result",
+            }:
+                raise
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "未执行 FlashDuty 数据库诊断：目标当前没有可用的 "
+                    "monit-agent 工具能力。"
+                ),
+                structured_data={
+                    "reason_code": "monitor_target_unavailable",
+                    "vendor_error_code": exc.code,
+                    "request_id": exc.request_id,
+                },
+            )
         tools = catalog_data["tools"]
+        if not tools:
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "未执行 FlashDuty 数据库诊断：监控对象没有暴露任何工具。"
+                ),
+                structured_data={
+                    "reason_code": "monitor_tool_catalog_empty",
+                    "catalog_request_id": catalog.request_id,
+                    "target_request_ids": target_request_ids,
+                },
+            )
 
         calls = self._select_calls(parameters, tools)
         if not calls:
-            raise FlashDutyConfigurationError(
-                "No compatible read-only monit-agent tool matched the requested diagnostics"
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "未执行 FlashDuty 数据库诊断：工具目录中没有匹配的只读工具。"
+                ),
+                structured_data={
+                    "reason_code": "no_compatible_read_only_tool",
+                    "catalog_request_id": catalog.request_id,
+                    "target_request_ids": target_request_ids,
+                },
             )
         invoke_payload: dict[str, Any] = {
             "target_locator": target_locator,
@@ -1140,18 +1242,25 @@ class FlashDutyDatabaseDiagnosticsTool:
         summaries = [
             str(item["summary"]) for item in successful if isinstance(item.get("summary"), str)
         ]
-        return (
+        summary = (
             "；".join(summaries)[:2000]
-            or f"FlashDuty Monitors 成功执行 {len(successful)} 个只读诊断工具。",
-            {
-                "catalog_request_id": catalog.request_id,
-                "target_request_ids": target_request_ids,
-                "invoke_request_id": invoked.request_id,
-                "target": invoked_data.get("target") or resolved_target,
-                "selected_tools": [item["tool"] for item in calls],
-                "results": results,
-            },
+            or f"FlashDuty Monitors 成功执行 {len(successful)} 个只读诊断工具。"
         )
+        structured_data = {
+            "catalog_request_id": catalog.request_id,
+            "target_request_ids": target_request_ids,
+            "invoke_request_id": invoked.request_id,
+            "target": invoked_data.get("target") or resolved_target,
+            "selected_tools": [item["tool"] for item in calls],
+            "results": results,
+        }
+        if not summaries and not any(bool(item.get("data")) for item in successful):
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+        return summary, structured_data
 
     async def _resolve_catalog(
         self, target_candidates: list[str], target_kind: Any
@@ -1332,22 +1441,43 @@ def build_flashduty_tools(
     metrics_ds_name: str = "",
     logs_ds_name: str = "",
     logs_ds_type: str = "loki",
+    monitors_enabled: bool = False,
+    changes_enabled: bool = False,
+    channel_ids: list[int] | None = None,
 ) -> list[Any]:
-    return [
+    tools: list[Any] = [
         FlashDutyAlertContextTool(client, item_limit=item_limit),
-        FlashDutyDataSourceTool(
-            "query_metrics",
-            client,
-            defaults={"ds_type": "prometheus", "ds_name": metrics_ds_name},
-        ),
-        FlashDutyDataSourceTool(
-            "query_logs",
-            client,
-            defaults={"ds_type": logs_ds_type, "ds_name": logs_ds_name},
-        ),
-        FlashDutyDataSourceTool("query_trace", client),
-        FlashDutyDataSourceTool("query_endpoint_errors", client),
-        FlashDutyDatabaseDiagnosticsTool(client),
-        FlashDutyChangesTool(client),
         FlashDutySimilarIncidentsTool(client),
     ]
+    if changes_enabled:
+        tools.append(
+            FlashDutyChangesTool(
+                client,
+                channel_ids=channel_ids,
+            )
+        )
+    if monitors_enabled:
+        tools.extend(
+            [
+                FlashDutyDataSourceTool(
+                    "query_metrics",
+                    client,
+                    defaults={
+                        "ds_type": "prometheus",
+                        "ds_name": metrics_ds_name,
+                    },
+                ),
+                FlashDutyDataSourceTool(
+                    "query_logs",
+                    client,
+                    defaults={
+                        "ds_type": logs_ds_type,
+                        "ds_name": logs_ds_name,
+                    },
+                ),
+                FlashDutyDataSourceTool("query_trace", client),
+                FlashDutyDataSourceTool("query_endpoint_errors", client),
+                FlashDutyDatabaseDiagnosticsTool(client),
+            ]
+        )
+    return tools

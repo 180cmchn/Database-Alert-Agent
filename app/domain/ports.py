@@ -24,6 +24,7 @@ from app.domain.models import (
     RunbookExcerpt,
     StoredAlert,
     ToolExecutionRequest,
+    ToolExecutionResult,
     ValidationRecord,
 )
 
@@ -80,7 +81,7 @@ class InvestigationTool(Protocol):
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
-    ) -> tuple[str, dict[str, Any]]: ...
+    ) -> tuple[str, dict[str, Any]] | ToolExecutionResult: ...
 
 
 class InvestigationStrategyProvider(Protocol):

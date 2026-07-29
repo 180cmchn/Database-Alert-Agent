@@ -135,6 +135,9 @@ def _build_tool_registry(
         metrics_ds_name=settings.flashduty_metrics_ds_name,
         logs_ds_name=settings.flashduty_logs_ds_name,
         logs_ds_type=settings.flashduty_logs_ds_type,
+        monitors_enabled=settings.flashduty_monitors_enabled,
+        changes_enabled=settings.flashduty_changes_enabled,
+        channel_ids=settings.flashduty_poll_channel_ids,
     ):
         registry.register(tool)
     return registry

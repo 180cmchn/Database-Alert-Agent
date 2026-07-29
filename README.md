@@ -194,8 +194,10 @@ FLASHDUTY_POLL_LOOKBACK_SECONDS=900
 # 必填：仅轮询这些协作空间
 FLASHDUTY_POLL_CHANNEL_IDS=[123456789]
 FLASHDUTY_POLL_INTEGRATION_IDS=[]
-FLASHDUTY_METRICS_DS_NAME=prod-prometheus
-FLASHDUTY_LOGS_DS_NAME=prod-loki
+FLASHDUTY_CHANGES_ENABLED=false
+FLASHDUTY_MONITORS_ENABLED=false
+FLASHDUTY_METRICS_DS_NAME=
+FLASHDUTY_LOGS_DS_NAME=
 FLASHDUTY_LOGS_DS_TYPE=loki
 ```
 
@@ -214,9 +216,10 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 启用后：
 
 - `alert_context` 读取告警详情、原始事件、告警动态，以及关联故障的详情、时间线和告警；
-- `query_changes` 与 `query_similar_incidents` 分别读取时间窗内变更和历史相似故障，这两类历史/平台上下文不会单独支撑“已验证根因”；
-- `query_metrics`、`query_logs` 使用 Monitors 诊断接口，`query_trace`、`query_endpoint_errors` 使用原始行查询接口；
-- `query_database_diagnostics` 先读取目标工具清单，再调用其中匹配的只读 monit-agent 工具，单次最多 8 个。
+- 有 `incident_id` 时，默认追加 `query_similar_incidents`；历史故障只作为调查线索，不会单独支撑“已验证根因”；
+- `query_changes` 不再作为基础探针；只有显式设置 `FLASHDUTY_CHANGES_ENABLED=true` 后才注册该适配器，且仍需由手册或受限动态规划明确选择；
+- 所有 `/monit/*` 工具默认关闭。只有只读能力审计确认存在数据源或监控对象工具后，才设置 `FLASHDUTY_MONITORS_ENABLED=true`；`query_database_diagnostics` 不再由基础工作流自动调用；
+- 外部调用成功但业务记录为空时保存为 `NO_DATA`，未注册、未配置或目标未暴露能力时保存为 `SKIPPED`，两者都不能作为 `SUCCESS` 实时证据。
 
 项目使用的上游接口均已按官方 OpenAPI 重新核对：
 
@@ -233,7 +236,9 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 核心告警详情成功、部分事件流或故障时间线失败时，`alert_context` 会保存已取得的数据及失败类型并继续分析，避免单个辅助接口暂时不可用导致整条 AI 流程失败。
 
-数据源查询需要 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由告警属性或动态调查参数显式提供 `expr`；数据库诊断需要可解析的 `target_locator`。系统会在没有命中手册时照常尝试参数完整的基础只读探针，并通过 `/monit/targets` 辅助解析数据库监控对象。缺少必要绑定时会跳过无法安全构造的探针并让结论进入人工复核，不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
+`FLASHDUTY_POLL_CHANNEL_IDS` 只约束告警和变更的协作空间范围；FlashDuty 的 Monitors 数据源、监控对象与工具目录是账户级能力，不能仅凭协作空间 ID 推定存在。启用 Monitors 前必须先确认 `/monit/datasource/list` 或 `/monit/targets` 有对象，并对目标调用 `/monit/tools/catalog` 验证实际工具目录；接口存在不等于目标 Agent 已暴露工具。
+
+数据源查询需要真实存在的 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由告警属性或动态调查参数显式提供 `expr`；数据库诊断需要可解析的 `target_locator` 和非空工具目录。缺少必要绑定时不会注册相应能力，也不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
 
 FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次 `SUCCESS` 证据，才能把候选原因提升为 `SUPPORTED`。
 
