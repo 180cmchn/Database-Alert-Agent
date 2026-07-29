@@ -232,6 +232,7 @@ def test_real_ai_clients_use_system_trust_http_client(
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="test-model",
+        max_tokens=16_384,
         timeout_seconds=19,
         max_retries=2,
         json_mode=True,
@@ -240,6 +241,7 @@ def test_real_ai_clients_use_system_trust_http_client(
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="test-model",
+        max_tokens=16_384,
         timeout_seconds=23,
         max_retries=2,
     )
@@ -274,6 +276,7 @@ async def test_real_ai_adapters_close_their_owned_clients(
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="test-model",
+        max_tokens=16_384,
         timeout_seconds=19,
         max_retries=2,
         json_mode=True,
@@ -282,6 +285,7 @@ async def test_real_ai_adapters_close_their_owned_clients(
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="test-model",
+        max_tokens=16_384,
         timeout_seconds=19,
         max_retries=2,
     )
@@ -296,9 +300,11 @@ async def test_real_ai_adapters_close_their_owned_clients(
 async def test_advisor_empty_content_error_contains_only_safe_response_metadata() -> None:
     prompt_secret = "prompt-secret-that-must-not-be-logged"
     reasoning_secret = "reasoning-secret-that-must-not-be-logged"
+    calls: list[dict[str, object]] = []
 
     class EmptyCompletions:
         async def create(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
             return SimpleNamespace(
                 id="empty-request-1",
                 choices=[
@@ -325,6 +331,7 @@ async def test_advisor_empty_content_error_contains_only_safe_response_metadata(
 
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._model = "shared-analysis-model"
+    advisor._max_tokens = 16_384
     advisor._json_mode = False
     advisor._client = SimpleNamespace(
         chat=SimpleNamespace(completions=EmptyCompletions())
@@ -338,12 +345,14 @@ async def test_advisor_empty_content_error_contains_only_safe_response_metadata(
         await advisor._complete(messages)
 
     error = str(caught.value)
+    assert calls[0]["max_tokens"] == 16_384
     assert "AI provider returned empty content" in error
     assert "request_id=empty-request-1" in error
     assert "finish_reason=length" in error
     assert f"input_chars={len('system') + len(prompt_secret)}" in error
     assert f"reasoning_chars={len(reasoning_secret)}" in error
     assert "extra_keys=['provider_trace', 'reasoning_content']" in error
+    assert "max_tokens=16384" in error
     assert "json_mode=False" in error
     assert "'prompt_tokens': 321" in error
     assert prompt_secret not in error
@@ -359,6 +368,7 @@ async def test_advisor_no_choices_error_contains_request_shape() -> None:
 
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._model = "shared-analysis-model"
+    advisor._max_tokens = 16_384
     advisor._json_mode = True
     advisor._client = SimpleNamespace(
         chat=SimpleNamespace(completions=NoChoiceCompletions())
@@ -369,7 +379,8 @@ async def test_advisor_no_choices_error_contains_request_shape() -> None:
 
     assert str(caught.value) == (
         "AI provider returned no choices "
-        "(request_id=no-choice-request-1, input_chars=5, json_mode=True)"
+        "(request_id=no-choice-request-1, input_chars=5, "
+        "max_tokens=16384, json_mode=True)"
     )
 
 
@@ -397,6 +408,7 @@ async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -
 
     validator = object.__new__(ai_module.OpenAICompatibleConclusionValidator)
     validator._model = "shared-analysis-model"
+    validator._max_tokens = 16_384
     validator._json_mode = True
     validator._client = SimpleNamespace(
         chat=SimpleNamespace(completions=CapturingCompletions())
@@ -415,6 +427,7 @@ async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -
     assert len(calls) == 1
     assert calls[0]["model"] == "shared-analysis-model"
     assert calls[0]["temperature"] == 0
+    assert calls[0]["max_tokens"] == 16_384
     response_format = calls[0]["response_format"]
     assert isinstance(response_format, dict)
     assert response_format["type"] == "json_schema"

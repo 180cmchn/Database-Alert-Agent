@@ -106,6 +106,23 @@ def test_fake_provider_is_rejected_in_production() -> None:
         )
 
 
+def test_ai_max_tokens_has_reasoning_safe_default_and_bounds() -> None:
+    settings = Settings(_env_file=None, ai_provider="fake")
+    assert settings.ai_max_tokens == 16_384
+
+    configured = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        ai_max_tokens=32_768,
+    )
+    assert configured.ai_max_tokens == 32_768
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ai_provider="fake", ai_max_tokens=1023)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ai_provider="fake", ai_max_tokens=131_073)
+
+
 def test_pdf_runbook_readiness_requires_directory_and_pdf(
     tmp_path: Path,
 ) -> None:

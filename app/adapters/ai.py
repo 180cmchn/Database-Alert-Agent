@@ -284,12 +284,14 @@ class OpenAICompatibleAdvisor:
         api_key: str,
         base_url: str,
         model: str,
+        max_tokens: int,
         timeout_seconds: float,
         max_retries: int,
         json_mode: bool,
     ) -> None:
         self._api_key = api_key
         self._model = model
+        self._max_tokens = max_tokens
         self._json_mode = json_mode
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
@@ -403,6 +405,7 @@ class OpenAICompatibleAdvisor:
             "model": self._model,
             "messages": messages,
             "temperature": 0,
+            "max_tokens": self._max_tokens,
         }
         if self._json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -416,7 +419,7 @@ class OpenAICompatibleAdvisor:
             raise AdvisorError(
                 "AI provider returned no choices "
                 f"(request_id={request_id}, input_chars={input_chars}, "
-                f"json_mode={self._json_mode})"
+                f"max_tokens={self._max_tokens}, json_mode={self._json_mode})"
             )
 
         choice = response.choices[0]
@@ -438,7 +441,8 @@ class OpenAICompatibleAdvisor:
                 f"(request_id={request_id}, "
                 f"finish_reason={getattr(choice, 'finish_reason', None)}, "
                 f"input_chars={input_chars}, reasoning_chars={reasoning_chars}, "
-                f"extra_keys={extra_keys}, json_mode={self._json_mode}, usage={usage})"
+                f"extra_keys={extra_keys}, max_tokens={self._max_tokens}, "
+                f"json_mode={self._json_mode}, usage={usage})"
             )
         return content, AdvisorMetadata(
             provider="openai_compatible",
@@ -710,11 +714,13 @@ class OpenAICompatibleConclusionValidator:
         api_key: str,
         base_url: str,
         model: str,
+        max_tokens: int,
         timeout_seconds: float,
         max_retries: int,
         json_mode: bool = True,
     ) -> None:
         self._model = model
+        self._max_tokens = max_tokens
         self._json_mode = json_mode
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
@@ -796,6 +802,7 @@ class OpenAICompatibleConclusionValidator:
             "model": self._model,
             "messages": messages,
             "temperature": 0,
+            "max_tokens": self._max_tokens,
         }
         if self._json_mode:
             kwargs["response_format"] = {

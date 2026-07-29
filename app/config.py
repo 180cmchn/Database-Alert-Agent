@@ -68,7 +68,11 @@ class Settings(BaseSettings):
     ai_base_url: str = "https://api.openai.com/v1"
     ai_api_key: str = ""
     ai_model: str = ""
-    ai_timeout_seconds: float = Field(default=60, gt=0)
+    # Reasoning models may consume several thousand completion tokens before
+    # emitting final content. Set an explicit ceiling so provider defaults such
+    # as 4096 do not end the response during the reasoning phase.
+    ai_max_tokens: int = Field(default=16_384, ge=1024, le=131_072)
+    ai_timeout_seconds: float = Field(default=300, gt=0)
     ai_max_retries: int = Field(default=2, ge=0)
     ai_json_mode: bool = True
     # Keep the investigation auditable when an OpenAI-compatible gateway is

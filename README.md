@@ -156,13 +156,18 @@ AI_PROVIDER=openai_compatible
 AI_BASE_URL=https://api.openai.com/v1
 AI_API_KEY=replace-me
 AI_MODEL=replace-me
-AI_TIMEOUT_SECONDS=60
+AI_MAX_TOKENS=16384
+AI_TIMEOUT_SECONDS=300
 AI_FALLBACK_ENABLED=true
 SHADOW_ENABLED=true
 PRODUCTION_GATE_APPROVED=false
 
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 ```
+
+`AI_MAX_TOKENS` 会显式传给主分析、动态规划和独立结论验收。对于默认启用 Thinking 的推理模型，
+建议至少使用 `16384`，并配合足够的 `AI_TIMEOUT_SECONDS`；否则企业网关常见的 `4096` 默认上限
+可能全部消耗在 `reasoning_content`，以 `finish_reason=length` 结束且没有最终 `content`。
 
 `AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
 

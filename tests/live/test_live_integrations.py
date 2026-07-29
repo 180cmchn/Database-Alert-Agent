@@ -141,6 +141,7 @@ async def test_live_ai_provider_returns_valid_schema_and_request_id(
         api_key=live_settings.ai_api_key,
         base_url=live_settings.ai_base_url,
         model=live_settings.ai_model,
+        max_tokens=live_settings.ai_max_tokens,
         timeout_seconds=live_settings.ai_timeout_seconds,
         max_retries=live_settings.ai_max_retries,
         json_mode=live_settings.ai_json_mode,
