@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
 
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import AliasChoices, Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_ENVIRONMENT_ALIASES = {
@@ -125,6 +125,21 @@ class Settings(BaseSettings):
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
 
+    # Archery MCP is a deployment-only live evidence source. The endpoint and
+    # bearer token intentionally stay outside RUNTIME_SETTINGS_KEYS so an admin
+    # API caller cannot redirect the token or diagnostic traffic.
+    archery_mcp_url: str = ""
+    archery_mcp_token: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "archery_mcp_token",
+            "ARCHERY_MCP_HTTP_API_KEY",
+            "ARCHERY_TOKEN",
+        ),
+    )
+    archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
+
     # External knowledge deployment coordinates are intentionally not runtime
     # editable. Production content is approved before it enters the index, so it
     # is a peer of the approved local PDFs rather than a lower-priority source.
@@ -232,6 +247,7 @@ class Settings(BaseSettings):
             ("wecom_webhook_url", False),
             ("flashduty_base_url", True),
             ("external_knowledge_base_url", False),
+            ("archery_mcp_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -267,6 +283,12 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "flashduty_base_url must be the official HTTPS FlashDuty API endpoint"
                 )
+            if field_name == "archery_mcp_url" and (
+                parsed.query or parsed.fragment or parsed.path in {"", "/"}
+            ):
+                raise ValueError(
+                    "archery_mcp_url must be the full MCP endpoint without query or fragment"
+                )
             if (
                 field_name != "external_knowledge_base_url"
                 and self.app_env.lower() in {"production", "prod"}
@@ -297,6 +319,13 @@ class Settings(BaseSettings):
         """Expose the selected source as a compatibility/read-model flag."""
 
         return "external_knowledge" in self.knowledge_sources
+
+    @computed_field
+    @property
+    def archery_mcp_enabled(self) -> bool:
+        """Enable the live evidence adapter only when both coordinates exist."""
+
+        return bool(self.archery_mcp_url.strip() and self.archery_mcp_token.strip())
 
     def external_knowledge_api_key_is_current(self) -> bool:
         """Return whether the secret is bound to the active deployment URL."""
@@ -352,6 +381,10 @@ class Settings(BaseSettings):
             issues.append(
                 "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration "
                 "space ID when FlashDuty change queries are enabled"
+            )
+        if bool(self.archery_mcp_url.strip()) != bool(self.archery_mcp_token.strip()):
+            issues.append(
+                "ARCHERY_MCP_URL and ARCHERY_MCP_TOKEN must be configured together"
             )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

@@ -10,6 +10,7 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
+from app.adapters.archery_mcp import ArcheryMCPClient, ArcherySlowLogEvidenceTool
 from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.flashduty import (
     FlashDutyAlertSourceAdapter,
@@ -123,23 +124,39 @@ def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeCli
     )
 
 
+def _build_archery_mcp_tool(
+    settings: Settings,
+) -> ArcherySlowLogEvidenceTool | None:
+    if not settings.archery_mcp_enabled:
+        return None
+    return ArcherySlowLogEvidenceTool(
+        ArcheryMCPClient(
+            settings.archery_mcp_url,
+            settings.archery_mcp_token,
+            timeout_seconds=settings.archery_mcp_timeout_seconds,
+        )
+    )
+
+
 def _build_tool_registry(
     settings: Settings, client: FlashDutyClient | None = None
 ) -> InvestigationToolRegistry:
     registry = build_default_tool_registry()
-    if client is None:
-        return registry
-    for tool in build_flashduty_tools(
-        client,
-        item_limit=settings.flashduty_context_item_limit,
-        metrics_ds_name=settings.flashduty_metrics_ds_name,
-        logs_ds_name=settings.flashduty_logs_ds_name,
-        logs_ds_type=settings.flashduty_logs_ds_type,
-        monitors_enabled=settings.flashduty_monitors_enabled,
-        changes_enabled=settings.flashduty_changes_enabled,
-        channel_ids=settings.flashduty_poll_channel_ids,
-    ):
-        registry.register(tool)
+    if client is not None:
+        for tool in build_flashduty_tools(
+            client,
+            item_limit=settings.flashduty_context_item_limit,
+            metrics_ds_name=settings.flashduty_metrics_ds_name,
+            logs_ds_name=settings.flashduty_logs_ds_name,
+            logs_ds_type=settings.flashduty_logs_ds_type,
+            monitors_enabled=settings.flashduty_monitors_enabled,
+            changes_enabled=settings.flashduty_changes_enabled,
+            channel_ids=settings.flashduty_poll_channel_ids,
+        ):
+            registry.register(tool)
+    archery_tool = _build_archery_mcp_tool(settings)
+    if archery_tool is not None:
+        registry.register(archery_tool)
     return registry
 
 

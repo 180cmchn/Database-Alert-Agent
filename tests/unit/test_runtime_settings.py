@@ -276,6 +276,48 @@ def test_flashduty_unaudited_capabilities_are_disabled_and_deployment_only() -> 
     )
 
 
+def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        archery_mcp_url="https://archery.example.test/mcp",
+    )
+    assert settings.archery_mcp_enabled is False
+    assert (
+        "ARCHERY_MCP_URL and ARCHERY_MCP_TOKEN must be configured together"
+        in settings.readiness_issues()
+    )
+
+    configured = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        archery_mcp_url="https://archery.example.test/mcp",
+        archery_mcp_token="test-token",
+    )
+    assert configured.archery_mcp_enabled is True
+    assert "archery_mcp_url" not in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
+
+    monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
+    alias_configured = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        archery_mcp_url="https://archery.example.test/mcp",
+    )
+    assert alias_configured.archery_mcp_enabled is True
+    assert alias_configured.archery_mcp_token == "existing-server-token"
+
+    with pytest.raises(ValidationError, match="full MCP endpoint"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            archery_mcp_url="https://archery.example.test",
+            archery_mcp_token="test-token",
+        )
+
+
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     create_tikv_runbook_pdf(runbooks)

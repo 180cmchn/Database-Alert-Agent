@@ -7,6 +7,11 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from app.adapters.archery_mcp import (
+    ARCHERY_SLOW_LOG_QUERY,
+    ARCHERY_SLOW_LOG_TOOL_NAME,
+    is_excessive_slow_query_alert,
+)
 from app.application.sanitization import sanitize
 from app.domain.models import (
     EvidenceRecord,
@@ -301,16 +306,25 @@ class DefaultInvestigationStrategyProvider:
             "connection_exhausted",
             "too_many_connections",
         }
+        slow_query_alert = is_excessive_slow_query_alert(alert.alert_type)
         return InvestigationStrategy(
             strategy_id=(
                 "database-connection-exhausted-v2"
                 if connection_alert
-                else "generic-alert-investigation-v2"
+                else (
+                    "database-excessive-slow-query-v1"
+                    if slow_query_alert
+                    else "generic-alert-investigation-v2"
+                )
             ),
             title=(
                 "数据库连接数耗尽调查策略"
                 if connection_alert
-                else "通用告警调查策略"
+                else (
+                    "慢查询过多实时取证策略"
+                    if slow_query_alert
+                    else "通用告警调查策略"
+                )
             ),
             description=(
                 "先采集告警上下文，再执行具备完整参数的基础只读探针；"
@@ -330,6 +344,16 @@ class DefaultInvestigationStrategyProvider:
                     tool_name="alert_context",
                     required=True,
                     timeout_seconds=self.alert_context_timeout_seconds,
+                )
+            )
+
+        if is_excessive_slow_query_alert(alert.alert_type):
+            requests.append(
+                ToolExecutionRequest(
+                    tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
+                    parameters={"sql": ARCHERY_SLOW_LOG_QUERY},
+                    required=True,
+                    timeout_seconds=self.external_tool_timeout_seconds,
                 )
             )
 
@@ -360,6 +384,11 @@ class DefaultInvestigationStrategyProvider:
     def _parameters_for_tool(
         self, tool_name: str, alert: NormalizedAlert, objective: str
     ) -> dict[str, Any] | None:
+        if tool_name == ARCHERY_SLOW_LOG_TOOL_NAME:
+            if not is_excessive_slow_query_alert(alert.alert_type):
+                return None
+            return {"sql": ARCHERY_SLOW_LOG_QUERY}
+
         if tool_name == "query_database_diagnostics":
             target_locator = (
                 alert.attributes.get("flashduty_target_locator")
@@ -508,6 +537,9 @@ def build_default_tool_registry() -> InvestigationToolRegistry:
             ),
             UnavailableExternalTool(
                 "query_database_diagnostics", "database_management_platform"
+            ),
+            UnavailableExternalTool(
+                ARCHERY_SLOW_LOG_TOOL_NAME, "archery_mcp"
             ),
             UnavailableExternalTool("query_changes", "alert_platform"),
             UnavailableExternalTool("query_similar_incidents", "alert_platform"),
