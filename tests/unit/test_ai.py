@@ -6,6 +6,7 @@ import pytest
 import app.adapters.ai as ai_module
 from app.adapters.ai import FakeAIAdvisor, _validate_manual_policy
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
+from app.domain.errors import AdvisorError
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
@@ -289,6 +290,87 @@ async def test_real_ai_adapters_close_their_owned_clients(
     await validator.aclose()
 
     assert closed == ["advisor", "validator"]
+
+
+@pytest.mark.asyncio
+async def test_advisor_empty_content_error_contains_only_safe_response_metadata() -> None:
+    prompt_secret = "prompt-secret-that-must-not-be-logged"
+    reasoning_secret = "reasoning-secret-that-must-not-be-logged"
+
+    class EmptyCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                id="empty-request-1",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content=reasoning_secret,
+                            model_extra={
+                                "reasoning_content": reasoning_secret,
+                                "provider_trace": "trace-secret-that-must-not-be-logged",
+                            },
+                        ),
+                    )
+                ],
+                usage=SimpleNamespace(
+                    model_dump=lambda: {
+                        "prompt_tokens": 321,
+                        "completion_tokens": 654,
+                        "total_tokens": 975,
+                    }
+                ),
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._model = "shared-analysis-model"
+    advisor._json_mode = False
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=EmptyCompletions())
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": prompt_secret},
+    ]
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._complete(messages)
+
+    error = str(caught.value)
+    assert "AI provider returned empty content" in error
+    assert "request_id=empty-request-1" in error
+    assert "finish_reason=length" in error
+    assert f"input_chars={len('system') + len(prompt_secret)}" in error
+    assert f"reasoning_chars={len(reasoning_secret)}" in error
+    assert "extra_keys=['provider_trace', 'reasoning_content']" in error
+    assert "json_mode=False" in error
+    assert "'prompt_tokens': 321" in error
+    assert prompt_secret not in error
+    assert reasoning_secret not in error
+    assert "trace-secret-that-must-not-be-logged" not in error
+
+
+@pytest.mark.asyncio
+async def test_advisor_no_choices_error_contains_request_shape() -> None:
+    class NoChoiceCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(id="no-choice-request-1", choices=[], usage=None)
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._model = "shared-analysis-model"
+    advisor._json_mode = True
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=NoChoiceCompletions())
+    )
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._complete([{"role": "user", "content": "hello"}])
+
+    assert str(caught.value) == (
+        "AI provider returned no choices "
+        "(request_id=no-choice-request-1, input_chars=5, json_mode=True)"
+    )
 
 
 @pytest.mark.asyncio

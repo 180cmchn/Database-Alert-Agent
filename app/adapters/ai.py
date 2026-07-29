@@ -394,6 +394,11 @@ class OpenAICompatibleAdvisor:
         return decision
 
     async def _complete(self, messages: list[dict[str, str]]) -> tuple[str, AdvisorMetadata]:
+        input_chars = sum(
+            len(message.get("content", ""))
+            for message in messages
+            if isinstance(message.get("content"), str)
+        )
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -405,15 +410,41 @@ class OpenAICompatibleAdvisor:
             response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             raise AdvisorError(f"AI provider request failed: {exc}") from exc
-        content = response.choices[0].message.content
-        if not content:
-            raise AdvisorError("AI provider returned empty content")
+
+        request_id = getattr(response, "id", None)
+        if not response.choices:
+            raise AdvisorError(
+                "AI provider returned no choices "
+                f"(request_id={request_id}, input_chars={input_chars}, "
+                f"json_mode={self._json_mode})"
+            )
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content
+        message_extra = getattr(message, "model_extra", None) or {}
+        reasoning = (
+            getattr(message, "reasoning_content", None)
+            or message_extra.get("reasoning_content")
+            or message_extra.get("reasoning")
+            or ""
+        )
         usage = response.usage.model_dump() if response.usage else {}
+        if not content:
+            reasoning_chars = len(reasoning) if isinstance(reasoning, str) else -1
+            extra_keys = sorted(str(key)[:100] for key in message_extra)[:20]
+            raise AdvisorError(
+                "AI provider returned empty content "
+                f"(request_id={request_id}, "
+                f"finish_reason={getattr(choice, 'finish_reason', None)}, "
+                f"input_chars={input_chars}, reasoning_chars={reasoning_chars}, "
+                f"extra_keys={extra_keys}, json_mode={self._json_mode}, usage={usage})"
+            )
         return content, AdvisorMetadata(
             provider="openai_compatible",
             model=self._model,
             prompt_version=PROMPT_VERSION,
-            request_id=response.id,
+            request_id=request_id,
             usage=usage,
         )
 
