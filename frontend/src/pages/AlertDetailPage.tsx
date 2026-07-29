@@ -616,16 +616,28 @@ export function AlertDetailPage() {
       )}
 
       <section className="detail-grid audit-grid">
-        <SectionCard eyebrow="VALIDATION" title="独立校验" description="规则与独立模型共同约束最终结论">
+        <SectionCard eyebrow="VALIDATION" title="独立校验" description="规则与 Agent 验收分别判断分析契约和实时证据是否充分">
           {record.validations.length ? (
             <div className="validation-list">
-              {record.validations.map((validation) => (
-                <article key={validation.id} className={validation.passed ? "passed" : "rejected"}>
-                  <span>{validation.passed ? <FileCheck2 size={18} /> : <XCircle size={18} />}</span>
-                  <div><strong>{validation.kind === "RULE" ? "确定性规则校验" : "独立 Agent 校验"}</strong><p>{validation.passed ? "未发现阻断问题" : validation.issues.join("；") || "校验未通过"}</p></div>
-                  <b>{validation.passed ? "PASS" : "REJECT"}</b>
-                </article>
-              ))}
+              {record.validations.map((validation) => {
+                const state = !validation.passed
+                  ? "rejected"
+                  : validation.evidence_sufficient
+                    ? "passed"
+                    : "needs-evidence";
+                const detail = !validation.passed
+                  ? validation.issues.join("；") || "分析契约未通过"
+                  : validation.evidence_sufficient
+                    ? "分析契约通过，实时证据充分"
+                    : "分析契约通过，但实时证据不足，结论进入人工复核";
+                return (
+                  <article key={validation.id} className={state}>
+                    <span>{state === "rejected" ? <XCircle size={18} /> : state === "needs-evidence" ? <CircleAlert size={18} /> : <FileCheck2 size={18} />}</span>
+                    <div><strong>{validation.kind === "RULE" ? "确定性规则校验" : "独立 Agent 校验"}</strong><p>{detail}</p></div>
+                    <b>{state === "rejected" ? "REJECT" : state === "needs-evidence" ? "PASS · REVIEW" : "PASS · EVIDENCE"}</b>
+                  </article>
+                );
+              })}
             </div>
           ) : <EmptyState title="暂无校验记录" description="建议生成后，校验结果会记录在审计链路中。" />}
         </SectionCard>

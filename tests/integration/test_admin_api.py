@@ -454,18 +454,18 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
         assert filtered["total"] == 1
         assert filtered["items"][0]["external_id"] == "list-warning"
 
-        completed = client.get(
-            "/api/v1/alerts", params={"status": "COMPLETED"}
+        review_required = client.get(
+            "/api/v1/alerts", params={"status": "REVIEW_REQUIRED"}
         ).json()
-        assert completed["total"] == 1
-        assert completed["items"][0]["external_id"] == "list-info"
+        assert review_required["total"] == 1
+        assert review_required["items"][0]["external_id"] == "list-info"
 
         dashboard = client.get("/api/v1/dashboard/summary").json()
         assert dashboard["total"] == 3
         assert dashboard["active"] == 2
         assert dashboard["critical_open"] == 1
         assert dashboard["by_status"]["QUEUED"] == 2
-        assert dashboard["by_status"]["COMPLETED"] == 1
+        assert dashboard["by_status"]["REVIEW_REQUIRED"] == 1
 
 
 def test_feedback_requires_admin_and_uses_authenticated_actor(tmp_path: Path) -> None:
@@ -519,7 +519,7 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
         detail = client.get(f"/api/v1/alerts/{alert_id}")
         assert detail.status_code == 200
         body = detail.json()
-        assert body["status"] == "COMPLETED"
+        assert body["status"] == "REVIEW_REQUIRED"
         assert body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
         assert body["recommendation"]["manual_matched"] is True
         assert body["recommendation"]["steps"][0]["source_ref"] == {
@@ -535,6 +535,6 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
             "ADVISING",
             "VALIDATING",
             "REPORTING",
-            "COMPLETED",
+            "REVIEW_REQUIRED",
             "REPORTING",
         ]

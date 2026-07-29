@@ -62,11 +62,11 @@ async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
     result = await runtime.service.get(str(stored.alert.id))
     await scheduler.stop()
 
-    assert result.status == AlertStatus.COMPLETED
+    assert result.status == AlertStatus.REVIEW_REQUIRED
     assert result.latest_run is not None
-    # The investigation pipeline records COMPLETED, then the notification step
+    # The investigation pipeline records REVIEW_REQUIRED, then the notification step
     # appends a REPORTING progress record for the WeCom delivery status.
-    assert any(record.stage.value == "COMPLETED" for record in result.progress)
+    assert any(record.stage.value == "REVIEW_REQUIRED" for record in result.progress)
     assert result.progress[-1].stage.value == "REPORTING"
     assert "通知" in result.progress[-1].message
     await runtime.repository.close()  # type: ignore[attr-defined]

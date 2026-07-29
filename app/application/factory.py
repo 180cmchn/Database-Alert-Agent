@@ -176,6 +176,10 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     strategy_provider = DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
+        available_tools=service.tool_registry.available_names(),
+        metrics_ds_name=settings.flashduty_metrics_ds_name,
+        logs_ds_name=settings.flashduty_logs_ds_name,
+        logs_ds_type=settings.flashduty_logs_ds_type,
     )
     external_knowledge_client = _build_external_knowledge_client(settings)
     agent = InvestigationAgent(
@@ -259,6 +263,10 @@ def build_runtime(
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
+        available_tools=tool_registry.available_names(),
+        metrics_ds_name=settings.flashduty_metrics_ds_name,
+        logs_ds_name=settings.flashduty_logs_ds_name,
+        logs_ds_type=settings.flashduty_logs_ds_type,
     )
     rule_validator = rule_validator or RuleConclusionValidator()
     tool_executor = ToolExecutor(tool_registry, settings.tool_max_result_chars)

@@ -14,6 +14,7 @@ from app.domain.models import (
     AdvisorMetadata,
     AnalysisBasis,
     AnalysisBasisSource,
+    ConclusionValidationDecision,
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     ExternalKnowledgeReference,
@@ -66,6 +67,8 @@ EXTERNAL_KNOWLEDGE 依据必须引用实际返回的 knowledge_id/title/source_u
 SUPPORTED 必须引用非 alert_platform 的 SUCCESS 实时 evidence id；
 反证成立使用 CONTRADICTED；证据不足使用 UNKNOWN 并给出 next_probe。
 只有 SUPPORTED 才允许 verified=true；UNKNOWN/CONTRADICTED 必须 verified=false。
+存在 UNKNOWN 或结论仍需人工判断时 requires_human 必须为 true；只有所有候选机制均已由
+实时证据支持或反驳，且至少存在一个 SUPPORTED 根因时，才允许 requires_human=false。
 若 cause_id 来自手册，必须使用实际候选 cause_id；AI 补充原因的 cause_id 必须为 null。
 手册 actions 中 execution_class=change 的动作只能作为需要审批的风险说明，
 不能放入可直接执行的 steps；steps 仅允许只读核查。
@@ -76,9 +79,22 @@ PLANNER_PROMPT = """你是一个受限的数据库告警调查规划器。根据
 只返回 JSON：action 为 tool 或 finish；tool 时填写 tool_name 和 parameters。"""
 
 VALIDATION_PROMPT = """你是独立的告警结论验收员，不负责重新生成建议。
-检查根因三态是否被成功的实时证据支持、知识引用是否可追溯、结论是否明确、建议是否安全可执行、是否把超时或失败工具结果写成事实。
-特别检查变更类动作是否被写成可直接执行步骤。
-只返回 JSON：{\"passed\": true|false, \"issues\": [\"...\"]}。证据不足时必须拒绝，不得宽容通过。"""
+分别判断两个维度：
+1. analysis_contract_passed：结论是否诚实、可追溯、安全且正确使用根因三态。
+2. evidence_sufficient：实时证据是否足以在无需人工复核的情况下完成根因分析。
+
+证据不足本身不是 analysis_contract_passed=false 的理由。若候选根因正确标记为
+UNKNOWN、verified=false、没有把猜测写成事实、提供了具体 next_probe，并要求人工复核，
+则分析契约可以通过，但 evidence_sufficient 必须为 false。
+
+SUPPORTED 必须引用非 alert_platform 的 SUCCESS 实时证据并设置 verified=true。
+CONTRADICTED 必须引用能反驳必要预测的非 alert_platform SUCCESS 实时证据。
+只要存在 UNKNOWN、没有 SUPPORTED 根因、工具失败/超时导致关键证据缺失，或仍有未排除的
+候选机制，evidence_sufficient 必须为 false。
+
+检查知识引用是否可追溯、摘要和 likely_causes 是否把未验证推测写成事实、建议是否只包含
+安全的只读核查、是否把失败或超时工具结果写成事实，特别检查变更动作是否被写成直接步骤。
+严格按给定 JSON Schema 返回一个 JSON 对象，不要输出 Markdown。"""
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -467,7 +483,7 @@ class FakeAIAdvisor:
                 ],
                 knowledge_match_summary=knowledge_match_summary,
                 risks=["在未确认影响范围前不要执行写操作或重启实例。"],
-                requires_human=True,
+                requires_human=not has_live_diagnostics,
                 confidence=0.85,
                 manual_matched=True,
                 runbook_references=[reference],
@@ -522,7 +538,7 @@ class FakeAIAdvisor:
                     )
                 ],
                 risks=["知识依据不能单独证明本次事故根因。"],
-                requires_human=True,
+                requires_human=not has_live_diagnostics,
                 confidence=0.75,
                 manual_matched=False,
                 external_knowledge_matches=external_knowledge,
@@ -568,7 +584,7 @@ class FakeAIAdvisor:
                     )
                 ],
                 risks=["缺少匹配的知识依据，建议必须由人工复核。"],
-                requires_human=True,
+                requires_human=not has_live_diagnostics,
                 confidence=0.35,
                 manual_matched=False,
                 root_causes=[
@@ -690,47 +706,76 @@ class OpenAICompatibleConclusionValidator:
         evidence: list[EvidenceRecord],
         runbooks: list[RunbookExcerpt],
     ) -> ValidationRecord:
+        schema = ConclusionValidationDecision.model_json_schema()
         payload = {
             "alert": alert.model_dump(mode="json", exclude={"raw_payload"}),
             "recommendation": recommendation.model_dump(mode="json"),
             "evidence": [item.model_dump(mode="json") for item in evidence],
             "runbook_ids": [f"{item.runbook_id}/{item.section}" for item in runbooks],
+            "output_schema": schema,
         }
         try:
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": VALIDATION_PROMPT},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-            }
-            if self._json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            response = await self._client.chat.completions.create(
-                **kwargs
-            )
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": VALIDATION_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+            response = await self._complete_validation(messages, schema)
             content = response.choices[0].message.content or ""
-            parsed = _extract_json(content)
-            passed = parsed.get("passed") is True
-            issues = parsed.get("issues") or []
-            if not isinstance(issues, list):
-                issues = [str(issues)]
+            try:
+                decision = ConclusionValidationDecision.model_validate(
+                    _extract_json(content)
+                )
+            except (ValidationError, AdvisorError) as first_error:
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "上一个验收输出不符合严格 Schema。只返回修复后的 JSON；"
+                            f"不得改变验收标准。错误：{first_error}"
+                        ),
+                    },
+                ]
+                response = await self._complete_validation(repair_messages, schema)
+                decision = ConclusionValidationDecision.model_validate(
+                    _extract_json(response.choices[0].message.content or "")
+                )
             return ValidationRecord(
                 run_id=run.id,
                 kind=ValidationKind.AGENT,
-                passed=passed,
-                issues=[str(item) for item in issues],
+                passed=decision.analysis_contract_passed,
+                evidence_sufficient=decision.evidence_sufficient,
+                issues=decision.issues,
                 metadata={
                     "provider": "openai_compatible",
                     "model": self._model,
                     "request_id": response.id,
-                    "prompt_version": f"{PROMPT_VERSION}-validation-v1",
+                    "prompt_version": f"{PROMPT_VERSION}-validation-v2",
                     "usage": response.usage.model_dump() if response.usage else {},
                 },
             )
         except Exception as exc:
             raise AdvisorError(f"Validation agent failed: {exc}") from exc
+
+    async def _complete_validation(
+        self, messages: list[dict[str, str]], schema: dict[str, Any]
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        if self._json_mode:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "database_alert_conclusion_validation",
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        return await self._client.chat.completions.create(**kwargs)
 
 
 class FakeConclusionValidator:
@@ -742,9 +787,32 @@ class FakeConclusionValidator:
         evidence: list[EvidenceRecord],
         runbooks: list[RunbookExcerpt],
     ) -> ValidationRecord:
+        has_supported = any(
+            item.status == RootCauseStatus.SUPPORTED and item.verified
+            for item in recommendation.root_causes
+        )
+        has_unknown = any(
+            item.status == RootCauseStatus.UNKNOWN
+            for item in recommendation.root_causes
+        )
+        live_success_ids = {
+            str(item.id)
+            for item in evidence
+            if item.status.value == "SUCCESS" and item.source_system != "alert_platform"
+        }
+        all_decisive_refs_are_live = all(
+            item.status == RootCauseStatus.UNKNOWN
+            or bool(set(item.evidence_refs).intersection(live_success_ids))
+            for item in recommendation.root_causes
+        )
         return ValidationRecord(
             run_id=run.id,
             kind=ValidationKind.AGENT,
             passed=True,
-            metadata={"provider": "fake", "prompt_version": "fake-validation-v1"},
+            evidence_sufficient=(
+                has_supported
+                and not has_unknown
+                and all_decisive_refs_are_live
+            ),
+            metadata={"provider": "fake", "prompt_version": "fake-validation-v2"},
         )

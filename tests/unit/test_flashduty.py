@@ -304,7 +304,41 @@ def test_flashduty_alert_adapter_normalizes_alert_info_envelope() -> None:
     assert alert.database.engine == "mysql"
     assert alert.database.instance == "db-prod-01"
     assert alert.attributes["flashduty_incident_id"] == INCIDENT_ID
+    assert alert.attributes["flashduty_target_locator"] == "db-prod-01"
+    assert alert.attributes["flashduty_target_kind"] == "mysql"
     assert alert.incident_fingerprint.startswith("incident-v1-")
+
+
+def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> None:
+    payload = flashduty_alert_payload()
+    payload["data"]["labels"] = {
+        "env": "prd",
+        "app_type": "PostgreSQL",
+        "alarm_host": "pg-prod-01",
+        "db_name": "orders",
+        "promql": "pg_stat_activity_count",
+        "logql": '{service="postgres"} |= "deadlock"',
+        "value": "95",
+        "threshold": "90",
+    }
+
+    alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(payload)
+
+    assert alert.database is not None
+    assert alert.database.engine == "postgresql"
+    assert alert.database.instance == "pg-prod-01"
+    assert alert.database.host == "pg-prod-01"
+    assert alert.database.database == "orders"
+    assert alert.attributes["flashduty_target_locator"] == "pg-prod-01"
+    assert alert.attributes["flashduty_target_kind"] == "postgres"
+    assert alert.attributes["flashduty_metrics"] == {
+        "expr": "pg_stat_activity_count"
+    }
+    assert alert.attributes["flashduty_logs"] == {
+        "expr": '{service="postgres"} |= "deadlock"'
+    }
+    assert alert.features["observed_value"] == "95"
+    assert alert.features["threshold"] == "90"
 
 
 def make_context() -> InvestigationContext:
@@ -415,13 +449,31 @@ async def test_alert_context_keeps_partial_data_when_auxiliary_feed_fails() -> N
 class RecordingMonitorClient:
     def __init__(self) -> None:
         self.diagnose_payload: dict[str, Any] | None = None
+        self.target_payload: dict[str, Any] | None = None
+        self.catalog_payload: dict[str, Any] | None = None
         self.invoke_payload: dict[str, Any] | None = None
 
     async def diagnose(self, payload: dict[str, Any]) -> Any:
         self.diagnose_payload = payload
         return FlashDutyResponse("req-diagnose", {"operation": "metric_trends"})
 
-    async def tool_catalog(self, _payload: dict[str, Any]) -> Any:
+    async def targets(self, payload: dict[str, Any]) -> Any:
+        self.target_payload = payload
+        return FlashDutyResponse(
+            "req-targets",
+            {
+                "items": [
+                    {
+                        "target_kind": "mysql",
+                        "target_locator": "db-prod-01",
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    async def tool_catalog(self, payload: dict[str, Any]) -> Any:
+        self.catalog_payload = payload
         return FlashDutyResponse(
             "req-catalog",
             {
@@ -530,9 +582,15 @@ async def test_database_tool_discovers_and_invokes_only_compatible_tools() -> No
     )
 
     assert summary == "95 active connections"
+    assert client.target_payload == {"keyword": "db-prod-01", "limit": 50}
+    assert client.catalog_payload == {
+        "target_locator": "db-prod-01",
+        "target_kind": "mysql",
+    }
     assert client.invoke_payload is not None
     assert client.invoke_payload["target_kind"] == "mysql"
     assert client.invoke_payload["tools"] == [{"tool": "mysql.connection_overview", "params": {}}]
+    assert data["target_request_ids"] == ["req-targets"]
     assert data["selected_tools"] == ["mysql.connection_overview"]
 
     for tool_name in ("mysql.kill_session", "mysql.killSession", "terminateConnection"):

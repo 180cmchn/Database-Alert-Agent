@@ -82,7 +82,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0008"
+DATABASE_SCHEMA_REVISION = "0009"
 
 
 class Base(DeclarativeBase):
@@ -197,6 +197,7 @@ class ValidationRow(Base):
     )
     kind: Mapped[str] = mapped_column(String(20), nullable=False)
     passed: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_sufficient: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     issues_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
@@ -778,6 +779,9 @@ class SQLAlchemyAlertRepository:
                     run_id=str(validation.run_id),
                     kind=validation.kind.value,
                     passed=1 if validation.passed else 0,
+                    evidence_sufficient=(
+                        1 if validation.evidence_sufficient else 0
+                    ),
                     issues_json=validation.issues,
                     metadata_json=validation.metadata,
                     created_at=validation.created_at,
@@ -1049,6 +1053,7 @@ class SQLAlchemyAlertRepository:
                     run_id=item.run_id,
                     kind=ValidationKind(item.kind),
                     passed=bool(item.passed),
+                    evidence_sufficient=bool(item.evidence_sufficient),
                     issues=item.issues_json,
                     metadata=item.metadata_json,
                     created_at=item.created_at,

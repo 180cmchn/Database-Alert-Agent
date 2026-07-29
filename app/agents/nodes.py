@@ -480,7 +480,7 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
                 strategy=strategy,
             ),
             evidence,
-            ctx.tool_registry.names(),
+            ctx.tool_registry.available_names(),
         )
     except Exception as exc:
         logger.warning("dynamic_tool_selection_failed error=%s", type(exc).__name__)
@@ -728,11 +728,14 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     if required_failures:
         rule_validation = rule_validation.model_copy(
             update={
-                "passed": False,
-                "issues": [
-                    *rule_validation.issues,
-                    f"必需调查工具未成功：{', '.join(required_failures)}",
-                ],
+                "evidence_sufficient": False,
+                "metadata": {
+                    **rule_validation.metadata,
+                    "required_tool_failures": required_failures,
+                    "evidence_gap": (
+                        f"必需调查工具未成功：{', '.join(required_failures)}"
+                    ),
+                },
             }
         )
     await ctx.repository.save_validation(alert_id, rule_validation)
@@ -761,13 +764,32 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 run_id=run.id,
                 kind=ValidationKind.AGENT,
                 passed=False,
+                evidence_sufficient=False,
                 issues=[f"独立验收不可用：{type(exc).__name__}: {sanitize(str(exc))}"],
+            )
+        if agent_validation.evidence_sufficient and not rule_validation.evidence_sufficient:
+            agent_validation = agent_validation.model_copy(
+                update={
+                    "evidence_sufficient": False,
+                    "metadata": {
+                        **agent_validation.metadata,
+                        "evidence_sufficiency_clamped_by_rules": True,
+                    },
+                }
             )
         await ctx.repository.save_validation(alert_id, agent_validation)
 
-    # Determine validation passed
+    # Contract validity and evidence sufficiency are independent. An honest
+    # UNKNOWN can pass validation while still requiring human review.
     validation_passed = rule_validation.passed and (
         not validation_enabled or (agent_validation is not None and agent_validation.passed)
+    )
+    evidence_sufficient = rule_validation.evidence_sufficient and (
+        not validation_enabled
+        or (
+            agent_validation is not None
+            and agent_validation.evidence_sufficient
+        )
     )
 
     return {
@@ -775,6 +797,7 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         "rule_validation": rule_validation,
         "agent_validation": agent_validation,
         "validation_passed": validation_passed,
+        "evidence_sufficient": evidence_sufficient,
         "progress": [
             ProgressRecord(
                 run_id=run.id,
@@ -794,6 +817,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     recommendation = state.recommendation
     advisor_metadata = state.advisor_metadata
     validation_passed = state.validation_passed
+    evidence_sufficient = state.evidence_sufficient
     advisor_degraded = state.advisor_degraded
     shadow_enabled = state.shadow_enabled
     error = state.error
@@ -829,7 +853,10 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     # Determine final status
     passed = (
-        validation_passed and not shadow_enabled and not advisor_degraded
+        validation_passed
+        and evidence_sufficient
+        and not shadow_enabled
+        and not advisor_degraded
     )
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
     run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
@@ -863,6 +890,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             message="调查完成。" if passed else "结论需要人工复核。",
             details={
                 "validation_passed": validation_passed,
+                "evidence_sufficient": evidence_sufficient,
                 "shadow_enabled": shadow_enabled,
                 "advisor_degraded": advisor_degraded,
             },
@@ -888,6 +916,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 message="调查完成。" if passed else "结论需要人工复核。",
                 details={
                     "validation_passed": validation_passed,
+                    "evidence_sufficient": evidence_sufficient,
                     "shadow_enabled": shadow_enabled,
                     "advisor_degraded": advisor_degraded,
                 },

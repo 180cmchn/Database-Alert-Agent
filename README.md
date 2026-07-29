@@ -228,7 +228,9 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 核心告警详情成功、部分事件流或故障时间线失败时，`alert_context` 会保存已取得的数据及失败类型并继续分析，避免单个辅助接口暂时不可用导致整条 AI 流程失败。
 
-数据源查询需要 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由手册探针/动态调查参数显式提供 `expr`；缺少必要绑定时工具会失败并让结论进入人工复核，不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
+数据源查询需要 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由告警属性或动态调查参数显式提供 `expr`；数据库诊断需要可解析的 `target_locator`。系统会在没有命中手册时照常尝试参数完整的基础只读探针，并通过 `/monit/targets` 辅助解析数据库监控对象。缺少必要绑定时会跳过无法安全构造的探针并让结论进入人工复核，不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
+
+FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次 `SUCCESS` 证据，才能把候选原因提升为 `SUPPORTED`。
 
 影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `REVIEW_REQUIRED`，建议
 标记为 `analysis_mode=shadow`。收集到足够专家反馈且生产门槛通过前，建议保持开启。
@@ -356,6 +358,12 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 只有 `SUPPORTED` 可以设置 `verified=true`。手册诊断图中的候选原因不是本次事故已经成立的
 事实，历史确认案例也只能作为线索。
 
+校验记录把两个维度分开保存：`passed` 只表示分析契约诚实、可追溯且安全，
+`evidence_sufficient` 表示实时证据是否足以完成根因判断。一个正确声明为 `UNKNOWN`、
+设置 `verified=false`、提供具体 `next_probe` 且要求人工复核的结论可以通过分析契约，
+但 `evidence_sufficient=false`，最终状态仍为 `REVIEW_REQUIRED`。只有规则校验和 Agent
+校验的契约均通过且证据充分时，才允许进入 `COMPLETED`。
+
 ## 人工反馈与训练闭环
 
 `POST /api/v1/alerts/{id}/feedback` 除最终根因和实际恢复动作外，还支持：
@@ -416,7 +424,7 @@ Remove-Item Env:FLASHDUTY_TEST_CHANNEL_IDS
 
 数据库升级使用 Alembic。服务会在启动和就绪检查中核对 Alembic 版本及关键列，不再用
 `create_all` 静默修补已有数据库。`0006_training_feedback` 增加手册匹配、证据引用和步骤采纳等
-训练反馈字段。
+训练反馈字段；`0009_validation_evidence_sufficiency` 为校验记录增加独立的证据充分度字段。
 
 早期版本可能留下“已有业务表但 `alembic_version` 为空”的 SQLite。不要直接或盲目 stamp：
 先停止进程并备份数据库，核对其表结构确实对应 `0002`，再执行

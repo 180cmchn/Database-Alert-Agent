@@ -12,6 +12,7 @@ from app.domain.models import (
     Recommendation,
     RecommendationStep,
     RootCauseAssessment,
+    RootCauseStatus,
     ToolStatus,
 )
 
@@ -28,7 +29,10 @@ def make_alert():  # type: ignore[no-untyped-def]
 
 
 def make_recommendation(
-    *, root_causes: list[RootCauseAssessment] | None = None, action: str = "只读核对指标"
+    *,
+    root_causes: list[RootCauseAssessment] | None = None,
+    action: str = "只读核对指标",
+    requires_human: bool = True,
 ) -> Recommendation:
     return Recommendation(
         summary="candidate conclusion",
@@ -39,7 +43,7 @@ def make_recommendation(
             )
         ],
         steps=[RecommendationStep(order=1, action=action)],
-        requires_human=True,
+        requires_human=requires_human,
         confidence=0.5,
         manual_matched=False,
         root_causes=root_causes or [],
@@ -77,6 +81,65 @@ async def test_rule_validator_rejects_missing_and_failed_evidence() -> None:
     assert any("不是 SUCCESS" in issue for issue in result.issues)
     assert any("不存在的证据" in issue for issue in result.issues)
     assert any("必须至少引用一条 SUCCESS 证据" in issue for issue in result.issues)
+    assert result.evidence_sufficient is False
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_accepts_honest_unknown_but_marks_evidence_insufficient() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="connection leak",
+                status=RootCauseStatus.UNKNOWN,
+                confidence=0.3,
+                verified=False,
+                next_probe="查询连接来源和长会话分布。",
+            )
+        ]
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [], []
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is False
+    assert result.issues == []
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_marks_supported_live_evidence_sufficient() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    live_evidence = EvidenceRecord(
+        run_id=run.id,
+        tool_name="query_database_diagnostics",
+        source_system="flashduty_monitors",
+        status=ToolStatus.SUCCESS,
+        summary="connection sources confirm one leaking client",
+    )
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="connection leak",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(live_evidence.id)],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+        requires_human=False,
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [live_evidence], []
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is True
+    assert result.issues == []
 
 
 @pytest.mark.asyncio

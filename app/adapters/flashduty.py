@@ -111,6 +111,55 @@ _SQL_MUTATION = re.compile(
     r"call|execute|copy|vacuum|set|reset)\b",
     re.IGNORECASE,
 )
+_DATABASE_ENGINE_ALIASES: Final[Mapping[str, str]] = {
+    "mysql": "mysql",
+    "mariadb": "mysql",
+    "oceanbase": "oceanbase",
+    "tidb": "tidb",
+    "tikv": "tidb",
+    "pd": "tidb",
+    "postgres": "postgresql",
+    "postgresql": "postgresql",
+    "mongodb": "mongodb",
+    "mongo": "mongodb",
+    "oracle": "oracle",
+    "clickhouse": "clickhouse",
+}
+_TARGET_KIND_BY_ENGINE: Final[Mapping[str, str]] = {
+    "mysql": "mysql",
+    "postgresql": "postgres",
+    "mongodb": "mongodb",
+}
+
+
+def _first_nonempty(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _database_engine_from_labels(
+    labels: Mapping[str, str], resource_type: str | None
+) -> str | None:
+    candidates = (
+        labels.get("database_engine"),
+        labels.get("db_type"),
+        labels.get("engine"),
+        labels.get("app_type"),
+        resource_type,
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = re.sub(r"[\s_-]+", "", candidate).casefold()
+        engine = _DATABASE_ENGINE_ALIASES.get(normalized)
+        if engine:
+            return engine
+    return None
 
 
 class FlashDutyClient:
@@ -446,13 +495,33 @@ class FlashDutyAlertSourceAdapter:
         if not isinstance(occurred_at, (int, float)):
             raise InvalidAlertPayloadError("FlashDuty start_time or event_time is required")
 
+        resource_type = _first_nonempty(
+            labels.get("resource_type"),
+            item.get("integration_type"),
+            item.get("data_source_type"),
+        )
+        database_engine = _database_engine_from_labels(labels, resource_type)
+        database_host = _first_nonempty(
+            labels.get("host"),
+            labels.get("alarm_host"),
+            labels.get("host_ip"),
+        )
+        database_instance = _first_nonempty(
+            labels.get("instance"),
+            labels.get("resource"),
+            database_host,
+            labels.get("resource_name"),
+        )
         database_values = {
-            "engine": labels.get("database_engine")
-            or labels.get("db_type")
-            or labels.get("engine"),
-            "instance": labels.get("instance") or labels.get("resource") or labels.get("host"),
-            "database": labels.get("database") or labels.get("db"),
-            "host": labels.get("host"),
+            "engine": database_engine,
+            "instance": database_instance,
+            "database": _first_nonempty(
+                labels.get("database"),
+                labels.get("db"),
+                labels.get("db_name"),
+                labels.get("schema"),
+            ),
+            "host": database_host,
         }
         database = (
             DatabaseTarget(**database_values)
@@ -477,6 +546,25 @@ class FlashDutyAlertSourceAdapter:
             "channel_id": item.get("channel_id"),
             "channel_name": item.get("channel_name"),
         }
+        if database_instance:
+            attributes["flashduty_target_locator"] = database_instance
+        target_kind = _TARGET_KIND_BY_ENGINE.get(database_engine or "")
+        if target_kind:
+            attributes["flashduty_target_kind"] = target_kind
+
+        metric_expression = _first_nonempty(
+            labels.get("expr"),
+            labels.get("promql"),
+            labels.get("query_expr"),
+        )
+        if metric_expression:
+            attributes["flashduty_metrics"] = {"expr": metric_expression}
+        log_expression = _first_nonempty(
+            labels.get("logql"),
+            labels.get("log_query"),
+        )
+        if log_expression:
+            attributes["flashduty_logs"] = {"expr": log_expression}
         for key in (
             "flashduty_metrics",
             "flashduty_logs",
@@ -499,9 +587,7 @@ class FlashDutyAlertSourceAdapter:
             "metric_name": labels.get("metric") or labels.get("metric_name"),
             "severity": severity,
             "alert_name": labels.get("alertname") or labels.get("alert_name") or reason,
-            "resource_type": labels.get("resource_type")
-            or item.get("integration_type")
-            or item.get("data_source_type"),
+            "resource_type": resource_type,
             "cluster": labels.get("cluster"),
             "alarm_type": labels.get("alarm_type"),
             "title": title,
@@ -514,6 +600,11 @@ class FlashDutyAlertSourceAdapter:
                 "event_count": item.get("event_cnt"),
                 "last_time": item.get("last_time"),
                 "end_time": item.get("end_time"),
+                "observed_value": labels.get("value"),
+                "threshold": labels.get("threshold"),
+                "alarm_content": labels.get("alarm_content"),
+                "alarm_host": labels.get("alarm_host"),
+                "host_ip": labels.get("host_ip"),
             },
             "labels": labels,
             "attributes": attributes,
@@ -832,6 +923,7 @@ _DIAGNOSTIC_TERMS: Final[Mapping[str, set[str]]] = {
     "overview": {"overview", "health", "status"},
 }
 _MONIT_TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+_TARGET_LOCATOR = re.compile(r"^(?!.*\|)[\x21-\x7e]{1,256}$")
 _CAMEL_CASE_BOUNDARY = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
 )
@@ -968,37 +1060,38 @@ class FlashDutyDatabaseDiagnosticsTool:
     ) -> tuple[str, dict[str, Any]]:
         parameters = request.parameters
         alert = context.alert
-        target_locator = (
-            parameters.get("target_locator")
-            or parameters.get("instance")
-            or alert.attributes.get("flashduty_target_locator")
-            or (alert.database.instance if alert.database else None)
-            or (alert.database.host if alert.database else None)
+        raw_candidates = (
+            parameters.get("target_locator"),
+            parameters.get("instance"),
+            alert.attributes.get("flashduty_target_locator"),
+            alert.database.instance if alert.database else None,
+            alert.database.host if alert.database else None,
         )
-        if not isinstance(target_locator, str) or not target_locator.strip():
+        target_candidates = list(
+            dict.fromkeys(
+                value.strip()
+                for value in raw_candidates
+                if isinstance(value, str)
+                and value.strip()
+                and _TARGET_LOCATOR.fullmatch(value.strip())
+            )
+        )
+        if not target_candidates:
             raise FlashDutyConfigurationError(
                 "query_database_diagnostics requires target_locator or database instance"
             )
         target_kind = parameters.get("target_kind") or alert.attributes.get("flashduty_target_kind")
         if not target_kind and alert.database and alert.database.engine:
-            if alert.database.engine.casefold() == "mysql":
-                target_kind = "mysql"
+            target_kind = _TARGET_KIND_BY_ENGINE.get(alert.database.engine.casefold())
 
-        catalog_payload: dict[str, Any] = {
-            "target_locator": target_locator,
-            "include_output_shape": False,
-        }
-        if isinstance(target_kind, str) and target_kind:
-            catalog_payload["target_kind"] = target_kind
-        catalog = await self.client.tool_catalog(catalog_payload)
-        catalog_data = catalog.data if isinstance(catalog.data, dict) else {}
-        tools = catalog_data.get("tools")
-        if not isinstance(tools, list):
-            raise FlashDutyAPIError(
-                "Tool catalog did not contain tools",
-                code="InvalidResponse",
-                request_id=catalog.request_id,
-            )
+        (
+            catalog,
+            catalog_data,
+            target_locator,
+            target_kind,
+            target_request_ids,
+        ) = await self._resolve_catalog(target_candidates, target_kind)
+        tools = catalog_data["tools"]
 
         calls = self._select_calls(parameters, tools)
         if not calls:
@@ -1052,11 +1145,127 @@ class FlashDutyDatabaseDiagnosticsTool:
             or f"FlashDuty Monitors 成功执行 {len(successful)} 个只读诊断工具。",
             {
                 "catalog_request_id": catalog.request_id,
+                "target_request_ids": target_request_ids,
                 "invoke_request_id": invoked.request_id,
                 "target": invoked_data.get("target") or resolved_target,
                 "selected_tools": [item["tool"] for item in calls],
                 "results": results,
             },
+        )
+
+    async def _resolve_catalog(
+        self, target_candidates: list[str], target_kind: Any
+    ) -> tuple[
+        FlashDutyResponse,
+        dict[str, Any],
+        str,
+        str | None,
+        list[str],
+    ]:
+        requested_kind = (
+            target_kind.strip()
+            if isinstance(target_kind, str) and target_kind.strip()
+            else None
+        )
+        target_request_ids: list[str] = []
+        last_error: FlashDutyError | None = None
+
+        for candidate in target_candidates:
+            resolved_locator = candidate
+            resolved_kind = requested_kind
+            try:
+                target_response = await self.client.targets(
+                    {"keyword": candidate, "limit": 50}
+                )
+                target_request_ids.append(target_response.request_id)
+                selected = self._select_target(
+                    target_response.data, candidate, requested_kind
+                )
+                if selected is not None:
+                    resolved_locator, selected_kind = selected
+                    resolved_kind = selected_kind or resolved_kind
+            except FlashDutyError as exc:
+                # The targets endpoint is a resolver aid, not a prerequisite.
+                # Fall back to the exact locator carried by the alert.
+                last_error = exc
+
+            catalog_payload: dict[str, Any] = {
+                "target_locator": resolved_locator,
+            }
+            if resolved_kind:
+                catalog_payload["target_kind"] = resolved_kind
+            try:
+                catalog = await self.client.tool_catalog(catalog_payload)
+            except FlashDutyAPIError as exc:
+                last_error = exc
+                if exc.code in {
+                    "target_unavailable",
+                    "ambiguous_target_kind",
+                    "timeout",
+                    "forward_failed",
+                }:
+                    continue
+                raise
+            catalog_data = catalog.data if isinstance(catalog.data, dict) else {}
+            tools = catalog_data.get("tools")
+            if isinstance(tools, list):
+                return (
+                    catalog,
+                    catalog_data,
+                    resolved_locator,
+                    resolved_kind,
+                    target_request_ids,
+                )
+            last_error = FlashDutyAPIError(
+                "Tool catalog did not contain tools",
+                code="InvalidResponse",
+                request_id=catalog.request_id,
+            )
+
+        if last_error is not None:
+            raise last_error
+        raise FlashDutyConfigurationError(
+            "No FlashDuty monitor target matched the alert target locators"
+        )
+
+    @staticmethod
+    def _select_target(
+        data: Any, locator: str, target_kind: str | None
+    ) -> tuple[str, str | None] | None:
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return None
+        candidates = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("target_locator"), str)
+            and (
+                not target_kind
+                or item.get("target_kind") == target_kind
+            )
+        ]
+        exact = [
+            item
+            for item in candidates
+            if item["target_locator"] == locator
+        ]
+        total = data.get("total")
+        selected = (
+            exact[0]
+            if len(exact) == 1
+            else (
+                candidates[0]
+                if len(candidates) == 1 and total == 1
+                else None
+            )
+        )
+        if selected is None:
+            return None
+        selected_kind = selected.get("target_kind")
+        return (
+            selected["target_locator"],
+            selected_kind if isinstance(selected_kind, str) else None,
         )
 
     @staticmethod

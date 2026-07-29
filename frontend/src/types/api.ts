@@ -203,6 +203,7 @@ export interface ValidationRecord {
   run_id: string;
   kind: "RULE" | "AGENT";
   passed: boolean;
+  evidence_sufficient: boolean;
   issues: string[];
   metadata: Record<string, unknown>;
   created_at: string;

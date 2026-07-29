@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 import pytest
 
 import app.adapters.ai as ai_module
@@ -8,6 +11,7 @@ from app.domain.models import (
     AnalysisBasisSource,
     ExternalKnowledgeExcerpt,
     ExternalKnowledgeReference,
+    InvestigationRun,
     Recommendation,
     RecommendationStep,
     RunbookExcerpt,
@@ -285,3 +289,61 @@ async def test_real_ai_adapters_close_their_owned_clients(
     await validator.aclose()
 
     assert closed == ["advisor", "validator"]
+
+
+@pytest.mark.asyncio
+async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -> None:
+    calls: list[dict[str, object]] = []
+
+    class CapturingCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            content = json.dumps(
+                {
+                    "analysis_contract_passed": True,
+                    "evidence_sufficient": False,
+                    "issues": [],
+                }
+            )
+            return SimpleNamespace(
+                id="validation-request-1",
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content=content))
+                ],
+                usage=None,
+            )
+
+    validator = object.__new__(ai_module.OpenAICompatibleConclusionValidator)
+    validator._model = "shared-analysis-model"
+    validator._json_mode = True
+    validator._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=CapturingCompletions())
+    )
+    alert = make_alert()
+    recommendation, _ = await FakeAIAdvisor().advise(alert, [])
+    run = InvestigationRun(alert_id=alert.id)
+
+    result = await validator.validate(run, alert, recommendation, [], [])
+
+    assert result.passed is True
+    assert result.evidence_sufficient is False
+    assert result.issues == []
+    assert result.metadata["model"] == "shared-analysis-model"
+    assert result.metadata["prompt_version"].endswith("validation-v2")
+    assert len(calls) == 1
+    assert calls[0]["model"] == "shared-analysis-model"
+    assert calls[0]["temperature"] == 0
+    response_format = calls[0]["response_format"]
+    assert isinstance(response_format, dict)
+    assert response_format["type"] == "json_schema"
+    json_schema = response_format["json_schema"]
+    assert isinstance(json_schema, dict)
+    assert json_schema["strict"] is True
+    schema = json_schema["schema"]
+    assert isinstance(schema, dict)
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {
+        "analysis_contract_passed",
+        "evidence_sufficient",
+        "issues",
+    }

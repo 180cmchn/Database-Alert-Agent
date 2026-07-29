@@ -60,9 +60,14 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         detail = client.get(body["detail_url"])
         assert detail.status_code == 200
         detail_body = detail.json()
-        assert detail_body["status"] == "COMPLETED"
+        assert detail_body["status"] == "REVIEW_REQUIRED"
         assert detail_body["alert"]["external_id"] == "api-1"
         assert detail_body["recommendation"]["manual_matched"] is False
+        assert all(item["passed"] for item in detail_body["validations"])
+        assert all(
+            not item["evidence_sufficient"]
+            for item in detail_body["validations"]
+        )
 
 
 def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:

@@ -52,10 +52,13 @@ class RuleConclusionValidator:
     ) -> ValidationRecord:
         issues: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
+        has_supported_cause = False
+        all_causes_decisive = bool(recommendation.root_causes)
+        if not recommendation.root_causes:
+            issues.append("根因判断必须至少包含一个 SUPPORTED、CONTRADICTED 或 UNKNOWN 候选")
 
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
-            successful_refs: set[str] = set()
             live_successful_refs: set[str] = set()
 
             for evidence_ref in dict.fromkeys(root_cause.evidence_refs):
@@ -71,7 +74,6 @@ class RuleConclusionValidator:
                         f"{evidence_ref}（{record.status.value}）"
                     )
                     continue
-                successful_refs.add(evidence_ref)
                 if record.source_system != "alert_platform":
                     live_successful_refs.add(evidence_ref)
 
@@ -84,10 +86,37 @@ class RuleConclusionValidator:
                 issues.append(
                     f"SUPPORTED 根因 #{index}（{cause_label}）缺少实时 SUCCESS 证据"
                 )
+                all_causes_decisive = False
+            if root_cause.status == RootCauseStatus.SUPPORTED:
+                has_supported_cause = True
+                if not root_cause.verified:
+                    issues.append(
+                        f"SUPPORTED 根因 #{index}（{cause_label}）必须标记 verified=true"
+                    )
+            elif root_cause.status == RootCauseStatus.CONTRADICTED:
+                if not live_successful_refs:
+                    issues.append(
+                        f"CONTRADICTED 根因 #{index}（{cause_label}）缺少实时 SUCCESS 反证"
+                    )
+                    all_causes_decisive = False
+            else:
+                all_causes_decisive = False
+                if not (root_cause.next_probe or "").strip():
+                    issues.append(
+                        f"UNKNOWN 根因 #{index}（{cause_label}）必须提供具体 next_probe"
+                    )
             if root_cause.status != RootCauseStatus.SUPPORTED and root_cause.verified:
                 issues.append(
                     f"根因 #{index}（{cause_label}）只有 SUPPORTED 状态才能标记已验证"
                 )
+
+        evidence_sufficient = (
+            has_supported_cause
+            and all_causes_decisive
+            and bool(recommendation.root_causes)
+        )
+        if not evidence_sufficient and not recommendation.requires_human:
+            issues.append("实时证据不足时 recommendation.requires_human 必须为 true")
 
         manual_matched = recommendation.manual_matched
         sources = [item.source for item in recommendation.analysis_bases]
@@ -211,6 +240,7 @@ class RuleConclusionValidator:
             run_id=run.id,
             kind=ValidationKind.RULE,
             passed=not issues,
+            evidence_sufficient=evidence_sufficient,
             issues=issues,
             metadata={
                 "validator": type(self).__name__,

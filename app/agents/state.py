@@ -95,6 +95,7 @@ class AgentState(BaseModel):
 
     # Validation flags
     validation_passed: bool = False
+    evidence_sufficient: bool = False
 
     # Configuration
     validation_enabled: bool = True

@@ -378,11 +378,37 @@ class ProgressRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ConclusionValidationDecision(BaseModel):
+    """Strict independent-validator output.
+
+    ``analysis_contract_passed`` answers whether the recommendation is honest,
+    traceable, and safe. ``evidence_sufficient`` separately answers whether the
+    live evidence is strong enough to complete the RCA without human review.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_contract_passed: bool
+    evidence_sufficient: bool
+    issues: list[str] = Field(max_length=50)
+
+    @model_validator(mode="after")
+    def validate_decision_consistency(self) -> ConclusionValidationDecision:
+        if self.analysis_contract_passed and self.issues:
+            raise ValueError("a passed validation decision must not contain blocking issues")
+        if not self.analysis_contract_passed and not self.issues:
+            raise ValueError("a rejected validation decision must explain at least one issue")
+        return self
+
+
 class ValidationRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     run_id: UUID
     kind: ValidationKind
+    # ``passed`` is retained for API/storage compatibility and now means only
+    # that the analysis contract is valid. Evidence sufficiency is independent.
     passed: bool
+    evidence_sufficient: bool = False
     issues: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)

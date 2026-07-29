@@ -199,7 +199,9 @@ async def test_every_severity_sends_one_final_ai_result(
     assert events == ["ADVISOR", f"RESULT:{severity}"]
     assert advisor.calls == 1
     assert first.alert.id == second.alert.id
-    assert first.status == AlertStatus.COMPLETED
+    assert first.status == AlertStatus.REVIEW_REQUIRED
+    assert all(item.passed for item in first.validations)
+    assert all(not item.evidence_sufficient for item in first.validations)
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -233,7 +235,7 @@ async def test_ai_failure_finishes_with_review_required_fallback(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_wecom_send_failure_does_not_change_completed_analysis(tmp_path: Path) -> None:
+async def test_wecom_send_failure_does_not_change_analysis_status(tmp_path: Path) -> None:
     events: list[str] = []
     runtime = build_runtime(
         settings_for(tmp_path), notifier=RecordingNotifier(events, fail=True)
@@ -250,7 +252,7 @@ async def test_wecom_send_failure_does_not_change_completed_analysis(tmp_path: P
         },
     )
 
-    assert result.status == AlertStatus.COMPLETED
+    assert result.status == AlertStatus.REVIEW_REQUIRED
     assert events == ["RESULT:WARNING"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
@@ -282,7 +284,7 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
 
     result = await runtime.service.analyze("canonical", payload, retry_failed=True)
 
-    assert result.status == AlertStatus.COMPLETED
+    assert result.status == AlertStatus.REVIEW_REQUIRED
     assert advisor.calls == 2
     assert events == ["RESULT:CRITICAL"]
     await runtime.repository.close()  # type: ignore[attr-defined]
@@ -349,8 +351,8 @@ async def test_dynamic_investigation_executes_selected_tool_and_preserves_strate
     assert dynamic_tool.calls == [{"query": "database timeout"}]
     assert advisor.decisions == 2
     assert advisor.strategy_ids == [
-        "generic-alert-investigation-v1",
-        "generic-alert-investigation-v1",
+        "generic-alert-investigation-v2",
+        "generic-alert-investigation-v2",
     ]
     assert [item.tool_name for item in result.evidence_records] == [
         "alert_context",
@@ -468,8 +470,11 @@ async def test_required_tool_failure_comes_from_selected_strategy(tmp_path: Path
     )
 
     assert result.status == AlertStatus.REVIEW_REQUIRED
-    assert result.validations[0].passed is False
-    assert "custom_required_probe" in result.validations[0].issues[-1]
+    assert result.validations[0].passed is True
+    assert result.validations[0].evidence_sufficient is False
+    assert result.validations[0].metadata["required_tool_failures"] == [
+        "custom_required_probe"
+    ]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -523,5 +528,5 @@ async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Pa
     assert runtime.service.agent.ctx.runbook_limit == 9
     assert runtime.service.max_dynamic_turns == 3
     assert provider.limits == [9]
-    assert result.status == AlertStatus.COMPLETED
+    assert result.status == AlertStatus.REVIEW_REQUIRED
     await runtime.repository.close()  # type: ignore[attr-defined]
