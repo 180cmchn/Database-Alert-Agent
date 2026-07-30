@@ -259,30 +259,31 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 
 当规范化后的 `alert_type` **精确等于** `慢查询过多` 时，调查策略会新增一个必需的
 `query_archery_slow_logs` 工具调用。该工具通过 Archery MCP 的 Streamable HTTP Endpoint
-完成初始化和工具发现，随后调用 `archery_query_readonly` 执行固定 SQL：
+完成初始化和工具发现，随后调用 `sql_query_gymJPA` 执行固定 SQL：
 
 ```sql
 select * from t_slowlog_info
 ```
 
-工具不会根据标题、描述或模型输出拼接 SQL，也不会接受其他 SQL。若 MCP 将查询转为需要确认的
-两阶段调用，客户端只会在 `normalizedSql` 仍是上述查询（允许 MCP 追加数字 `LIMIT`）时调用
-`archery_execute_query`。查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord`
-保存并传给 Agent；传输失败、鉴权失败、缺少查询范围、超时或 MCP 工具报错只会形成失败证据，
-不能被当作根因的反证或成功结果。
+工具不会根据标题、描述或模型输出拼接 SQL，也不会接受其他 SQL。调用 `sql_query_gymJPA` 即
+直接向后端提交查询，不存在"预览后再确认"的步骤。查询结果以
+`source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent；传输失败、鉴权失败、
+缺少查询范围、超时或 MCP 工具报错只会形成失败证据，不能被当作根因的反证或成功结果。
 
-在 `.env` 配置完整 MCP Endpoint 和 Bearer Token：
+在 `.env` 配置完整 MCP Endpoint 和 Token：
 
 ```dotenv
-ARCHERY_MCP_URL=https://archery-mcp.example.internal/mcp
-ARCHERY_MCP_TOKEN=replace-with-a-long-random-token
+ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
+ARCHERY_MCP_TOKEN=archery_replace-with-your-token
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
-URL 与 Token 是部署级配置，必须同时提供，不能通过管理 API 修改。Token 只通过每个 MCP HTTP
-请求的 `Authorization: Bearer ...` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP
-重定向。生产环境要求 HTTPS。为兼容现有 Archery MCP 部署，Token 也可从
-`ARCHERY_MCP_HTTP_API_KEY` 或 `ARCHERY_TOKEN` 读取；新配置建议使用 `ARCHERY_MCP_TOKEN`。
+URL 与 Token 是部署级配置，必须同时提供，不能通过管理 API 修改。当前认证方式是
+`X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的
+`X-Archery-Username` 和 `X-Archery-Password`。Token 只通过每个 MCP HTTP 请求的
+`X-Archery-Token` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP 重定向。生产
+环境要求 HTTPS。为兼容现有 Archery MCP 部署，Token 也可从 `ARCHERY_MCP_HTTP_API_KEY` 或
+`ARCHERY_TOKEN` 读取；新配置建议使用 `ARCHERY_MCP_TOKEN`。
 
 ## 本地运行
 

@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     flashduty_logs_ds_type: str = "loki"
 
     # Archery MCP is a deployment-only live evidence source. The endpoint and
-    # bearer token intentionally stay outside RUNTIME_SETTINGS_KEYS so an admin
+    # X-Archery-Token intentionally stay outside RUNTIME_SETTINGS_KEYS so an admin
     # API caller cannot redirect the token or diagnostic traffic.
     archery_mcp_url: str = ""
     archery_mcp_token: str = Field(
