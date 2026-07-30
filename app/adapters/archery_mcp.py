@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Mapping
 from typing import Any, Final
 from urllib.parse import urlsplit
@@ -14,9 +13,14 @@ from app.domain.models import InvestigationContext, ToolExecutionRequest
 
 ARCHERY_SLOW_LOG_QUERY: Final = "select * from t_slowlog_info"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
-ARCHERY_MCP_QUERY_TOOL_NAME: Final = "archery_query_readonly"
-ARCHERY_MCP_EXECUTE_TOOL_NAME: Final = "archery_execute_query"
-EXCESSIVE_SLOW_QUERY_ALERT_TYPE: Final = "慢查询过多"
+ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
+ARCHERY_SLOW_LOG_INSTANCE_REF: Final = "archery"
+ARCHERY_SLOW_LOG_DATABASE: Final = "archery"
+# Keep a complete set of slow-SQL text in one evidence record under the Agent's
+# default 12 KB evidence ceiling. This is intentionally fixed, not model input.
+ARCHERY_SLOW_LOG_LIMIT: Final = 20
+ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 8_000
+SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 
 _MCP_PROTOCOL_VERSION: Final = "2025-11-25"
 _SUPPORTED_PROTOCOL_VERSIONS: Final = {
@@ -26,20 +30,9 @@ _SUPPORTED_PROTOCOL_VERSIONS: Final = {
 }
 _MAX_MCP_RESPONSE_BYTES: Final = 2_000_000
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-_ALLOWED_NORMALIZED_QUERY: Final = re.compile(
-    r"^\s*select\s+\*\s+from\s+`?t_slowlog_info`?"
-    r"(?:\s+limit\s+\d+)?\s*;?\s*$",
-    re.IGNORECASE,
+_SLOW_QUERY_TITLE_IDENTIFIER: Final = re.compile(
+    rf"(?<![a-z0-9]){SLOW_QUERY_TITLE_IDENTIFIER}(?![a-z0-9])", re.IGNORECASE
 )
-_SEMANTIC_FAILURE_STATUSES: Final = {
-    "blocked",
-    "business_not_available",
-    "error",
-    "failed",
-    "missing_scope",
-    "needs_user_input",
-    "rejected",
-}
 
 
 class ArcheryMCPError(RuntimeError):
@@ -62,11 +55,10 @@ class ArcheryMCPReadOnlyViolation(ArcheryMCPError):
     """A caller attempted to replace the approved fixed SELECT statement."""
 
 
-def is_excessive_slow_query_alert(alert_type: str) -> bool:
-    """Match only the normalized alert type, never fuzzy title/reason text."""
+def is_slow_query_alert_title(title: str) -> bool:
+    """Match the controlled ``slow_query`` identifier in the alert title."""
 
-    normalized = unicodedata.normalize("NFKC", alert_type).strip().casefold()
-    return normalized == EXCESSIVE_SLOW_QUERY_ALERT_TYPE.casefold()
+    return bool(_SLOW_QUERY_TITLE_IDENTIFIER.search(title))
 
 
 def _is_approved_query(sql: str) -> bool:
@@ -125,7 +117,7 @@ class ArcheryMCPClient:
             follow_redirects=False,
             headers={
                 "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {self._token}",
+                "X-Archery-Token": self._token,
                 "Content-Type": "application/json",
             },
         ) as client:
@@ -176,29 +168,17 @@ class ArcheryMCPClient:
                     client,
                     request_id=10,
                     tool_name=self.query_tool_name,
-                    arguments={"sql": ARCHERY_SLOW_LOG_QUERY},
+                    arguments={
+                        "instance_ref": ARCHERY_SLOW_LOG_INSTANCE_REF,
+                        "db_name": ARCHERY_SLOW_LOG_DATABASE,
+                        "sql_content": ARCHERY_SLOW_LOG_QUERY,
+                        "limit_num": ARCHERY_SLOW_LOG_LIMIT,
+                        "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+                    },
                     session_id=session_id,
                     protocol_version=protocol_version,
                 )
                 payload = self._extract_tool_payload(query_result)
-
-                if self._requires_staged_execution(payload):
-                    self._validate_execute_tool(tools)
-                    payload = await self._execute_prepared_query(
-                        client,
-                        payload,
-                        session_id=session_id,
-                        protocol_version=protocol_version,
-                    )
-
-                self._validate_semantic_result(payload)
-                normalized_sql = payload.get("normalizedSql")
-                if isinstance(normalized_sql, str) and not _ALLOWED_NORMALIZED_QUERY.fullmatch(
-                    normalized_sql
-                ):
-                    raise ArcheryMCPReadOnlyViolation(
-                        "Archery MCP reported an unexpected normalized SQL statement"
-                    )
                 return payload
             finally:
                 if session_id:
@@ -251,64 +231,12 @@ class ArcheryMCPClient:
             )
         schema = tool.get("inputSchema")
         properties = schema.get("properties") if isinstance(schema, dict) else None
-        if not isinstance(properties, dict) or "sql" not in properties:
+        required_properties = {"instance_ref", "db_name", "sql_content"}
+        if not isinstance(properties, dict) or not required_properties.issubset(properties):
             raise ArcheryMCPConfigurationError(
-                f"Archery MCP tool {self.query_tool_name!r} does not accept a sql argument"
+                f"Archery MCP tool {self.query_tool_name!r} does not accept the required "
+                "instance_ref, db_name, and sql_content arguments"
             )
-
-    @staticmethod
-    def _validate_execute_tool(tools: Mapping[str, dict[str, Any]]) -> None:
-        tool = tools.get(ARCHERY_MCP_EXECUTE_TOOL_NAME)
-        if tool is None:
-            raise ArcheryMCPConfigurationError(
-                "Archery MCP requested staged execution but does not expose "
-                f"{ARCHERY_MCP_EXECUTE_TOOL_NAME!r}"
-            )
-        schema = tool.get("inputSchema")
-        properties = schema.get("properties") if isinstance(schema, dict) else None
-        if not isinstance(properties, dict) or not {
-            "prepareId",
-            "confirmationToken",
-        }.issubset(properties):
-            raise ArcheryMCPConfigurationError(
-                "Archery MCP execute tool is missing prepareId or confirmationToken"
-            )
-
-    async def _execute_prepared_query(
-        self,
-        client: httpx.AsyncClient,
-        prepared: dict[str, Any],
-        *,
-        session_id: str | None,
-        protocol_version: str,
-    ) -> dict[str, Any]:
-        prepare_id = prepared.get("prepareId")
-        confirmation_token = prepared.get("confirmationToken")
-        normalized_sql = prepared.get("normalizedSql")
-        if (
-            not isinstance(prepare_id, str)
-            or not prepare_id
-            or not isinstance(confirmation_token, str)
-            or not confirmation_token
-            or not isinstance(normalized_sql, str)
-            or not _ALLOWED_NORMALIZED_QUERY.fullmatch(normalized_sql)
-        ):
-            raise ArcheryMCPReadOnlyViolation(
-                "Archery MCP staged execution did not preserve the approved slow-log SELECT"
-            )
-
-        execute_result = await self._call_tool(
-            client,
-            request_id=20,
-            tool_name=ARCHERY_MCP_EXECUTE_TOOL_NAME,
-            arguments={
-                "prepareId": prepare_id,
-                "confirmationToken": confirmation_token,
-            },
-            session_id=session_id,
-            protocol_version=protocol_version,
-        )
-        return self._extract_tool_payload(execute_result)
 
     async def _call_tool(
         self,
@@ -375,32 +303,6 @@ class ArcheryMCPClient:
             if isinstance(item, dict) and item.get("type") == "text"
         ]
         return _safe_error_detail(" ".join(str(value) for value in values if value))
-
-    @staticmethod
-    def _requires_staged_execution(payload: dict[str, Any]) -> bool:
-        return payload.get("nextAction") == ARCHERY_MCP_EXECUTE_TOOL_NAME
-
-    @staticmethod
-    def _validate_semantic_result(payload: dict[str, Any]) -> None:
-        status = payload.get("status")
-        normalized_status = str(status).strip().casefold() if status is not None else ""
-        next_action = str(payload.get("nextAction") or "").strip()
-        if normalized_status in _SEMANTIC_FAILURE_STATUSES or (
-            next_action and next_action != ARCHERY_MCP_EXECUTE_TOOL_NAME
-        ):
-            detail = (
-                payload.get("message")
-                or (
-                    payload.get("scopeError", {}).get("message")
-                    if isinstance(payload.get("scopeError"), dict)
-                    else ""
-                )
-                or status
-                or next_action
-            )
-            raise ArcheryMCPToolError(
-                _safe_error_detail(detail) or "Archery MCP query did not execute"
-            )
 
     async def _send_request(
         self,
@@ -573,9 +475,10 @@ class ArcherySlowLogEvidenceTool:
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
     ) -> tuple[str, dict[str, Any]]:
-        if not is_excessive_slow_query_alert(context.alert.alert_type):
+        if not is_slow_query_alert_title(context.alert.title):
             raise ArcheryMCPReadOnlyViolation(
-                "Archery slow-log evidence is restricted to alert_type=慢查询过多"
+                "Archery slow-log evidence is restricted to titles containing "
+                "the slow_query identifier"
             )
         requested_sql = request.parameters.get("sql")
         if not isinstance(requested_sql, str) or not _is_approved_query(requested_sql):
