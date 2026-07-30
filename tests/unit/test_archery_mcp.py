@@ -10,11 +10,15 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_mcp import (
-    ARCHERY_MCP_EXECUTE_TOOL_NAME,
     ARCHERY_MCP_QUERY_TOOL_NAME,
+    ARCHERY_SLOW_LOG_DATABASE,
+    ARCHERY_SLOW_LOG_INSTANCE_REF,
+    ARCHERY_SLOW_LOG_LIMIT,
+    ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
     ARCHERY_SLOW_LOG_QUERY,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
+    ArcheryMCPConfigurationError,
     ArcheryMCPReadOnlyViolation,
     ArcherySlowLogEvidenceTool,
 )
@@ -59,7 +63,8 @@ async def test_archery_mcp_executes_fixed_query_and_parses_sse_result() -> None:
     calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == "Bearer test-archery-token"
+        assert request.headers["X-Archery-Token"] == "test-archery-token"
+        assert "Authorization" not in request.headers
         if request.method == "DELETE":
             assert request.headers["Mcp-Session-Id"] == "session-1"
             calls.append(("DELETE", {}, dict(request.headers)))
@@ -88,12 +93,29 @@ async def test_archery_mcp_executes_fixed_query_and_parses_sse_result() -> None:
             return _json_response(
                 request,
                 body["id"],
-                {"tools": [_tool_schema(ARCHERY_MCP_QUERY_TOOL_NAME, "sql")]},
+                {
+                    "tools": [
+                        _tool_schema(
+                            ARCHERY_MCP_QUERY_TOOL_NAME,
+                            "instance_ref",
+                            "db_name",
+                            "sql_content",
+                            "limit_num",
+                            "max_result_chars",
+                        )
+                    ]
+                },
             )
         if method == "tools/call":
             assert body["params"] == {
                 "name": ARCHERY_MCP_QUERY_TOOL_NAME,
-                "arguments": {"sql": ARCHERY_SLOW_LOG_QUERY},
+                "arguments": {
+                    "instance_ref": ARCHERY_SLOW_LOG_INSTANCE_REF,
+                    "db_name": ARCHERY_SLOW_LOG_DATABASE,
+                    "sql_content": ARCHERY_SLOW_LOG_QUERY,
+                    "limit_num": ARCHERY_SLOW_LOG_LIMIT,
+                    "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+                },
             }
             message = {
                 "jsonrpc": "2.0",
@@ -143,7 +165,7 @@ async def test_archery_mcp_executes_fixed_query_and_parses_sse_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_completes_approved_staged_query() -> None:
+async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> None:
     tool_calls: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -169,38 +191,13 @@ async def test_archery_mcp_completes_approved_staged_query() -> None:
                 body["id"],
                 {
                     "tools": [
-                        _tool_schema(ARCHERY_MCP_QUERY_TOOL_NAME, "sql"),
-                        _tool_schema(
-                            ARCHERY_MCP_EXECUTE_TOOL_NAME,
-                            "prepareId",
-                            "confirmationToken",
-                        ),
+                        _tool_schema(ARCHERY_MCP_QUERY_TOOL_NAME, "sql_content"),
                     ]
                 },
             )
         if body["method"] == "tools/call":
             tool_calls.append(body["params"])
-            if body["params"]["name"] == ARCHERY_MCP_QUERY_TOOL_NAME:
-                result = {
-                    "structuredContent": {
-                        "status": "ok",
-                        "nextAction": ARCHERY_MCP_EXECUTE_TOOL_NAME,
-                        "prepareId": "prepared-1",
-                        "confirmationToken": "CONFIRM:secret",
-                        "normalizedSql": (
-                            "SELECT * FROM t_slowlog_info LIMIT 100"
-                        ),
-                    }
-                }
-            else:
-                result = {
-                    "structuredContent": {
-                        "status": "ok",
-                        "rows": [],
-                        "rowCount": 0,
-                    }
-                }
-            return _json_response(request, body["id"], result)
+            raise AssertionError("tools/call must not run for an incompatible schema")
         raise AssertionError(body["method"])
 
     client = ArcheryMCPClient(
@@ -209,22 +206,10 @@ async def test_archery_mcp_completes_approved_staged_query() -> None:
         transport=httpx.MockTransport(handler),
     )
 
-    result = await client.execute_slow_log_query()
+    with pytest.raises(ArcheryMCPConfigurationError, match="instance_ref, db_name"):
+        await client.execute_slow_log_query()
 
-    assert result == {"status": "ok", "rows": [], "rowCount": 0}
-    assert tool_calls == [
-        {
-            "name": ARCHERY_MCP_QUERY_TOOL_NAME,
-            "arguments": {"sql": ARCHERY_SLOW_LOG_QUERY},
-        },
-        {
-            "name": ARCHERY_MCP_EXECUTE_TOOL_NAME,
-            "arguments": {
-                "prepareId": "prepared-1",
-                "confirmationToken": "CONFIRM:secret",
-            },
-        },
-    ]
+    assert tool_calls == []
 
 
 class RecordingArcheryClient:
@@ -260,7 +245,7 @@ def _context(alert_type: str, *, title: str = "Database alert") -> Investigation
 
 
 @pytest.mark.asyncio
-async def test_archery_evidence_tool_is_restricted_to_exact_alert_type_and_sql() -> None:
+async def test_archery_evidence_tool_is_restricted_to_slow_query_title_and_sql() -> None:
     client = RecordingArcheryClient()
     tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
 
@@ -269,7 +254,7 @@ async def test_archery_evidence_tool_is_restricted_to_exact_alert_type_and_sql()
             tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
             parameters={"sql": ARCHERY_SLOW_LOG_QUERY},
         ),
-        _context(" 慢查询过多 "),
+        _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306"),
     )
 
     assert client.calls == 1
@@ -283,7 +268,7 @@ async def test_archery_evidence_tool_is_restricted_to_exact_alert_type_and_sql()
                 tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
                 parameters={"sql": "select * from another_table"},
             ),
-            _context("慢查询过多"),
+            _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306"),
         )
     with pytest.raises(ArcheryMCPReadOnlyViolation):
         await tool.execute(
@@ -291,20 +276,22 @@ async def test_archery_evidence_tool_is_restricted_to_exact_alert_type_and_sql()
                 tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
                 parameters={"sql": ARCHERY_SLOW_LOG_QUERY},
             ),
-            _context("database_latency", title="慢查询过多"),
+            _context("慢查询过多", title="MySQL/mysql_slow_queryable_400/db-1:3306"),
         )
     assert client.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_strategy_requires_archery_evidence_only_for_exact_slow_query_type() -> None:
+async def test_strategy_requires_archery_evidence_only_for_slow_query_title_identifier() -> None:
     provider = DefaultInvestigationStrategyProvider(
         available_tools=["alert_context"]
     )
 
-    strategy = await provider.select(_context("慢查询过多").alert)
+    strategy = await provider.select(
+        _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306").alert
+    )
     other = await provider.select(
-        _context("database_latency", title="慢查询过多").alert
+        _context("慢查询过多", title="MySQL/mysql_slow_queryable_400/db-1:3306").alert
     )
 
     request = next(
@@ -362,9 +349,9 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
         {
             "external_id": "slow-query-live-evidence-1",
             "severity": "WARNING",
-            "title": "Slow query count exceeded",
-            "reason": "慢查询过多",
-            "alert_type": "慢查询过多",
+            "title": "MySQL/mysql_slow_query_400/db-1:3306",
+            "reason": "mysql_slow_query_400",
+            "alert_type": "mysql_slow_query_400",
         },
     )
 

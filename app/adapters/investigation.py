@@ -10,7 +10,7 @@ from typing import Any
 from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_QUERY,
     ARCHERY_SLOW_LOG_TOOL_NAME,
-    is_excessive_slow_query_alert,
+    is_slow_query_alert_title,
 )
 from app.application.sanitization import sanitize
 from app.domain.models import (
@@ -306,7 +306,7 @@ class DefaultInvestigationStrategyProvider:
             "connection_exhausted",
             "too_many_connections",
         }
-        slow_query_alert = is_excessive_slow_query_alert(alert.alert_type)
+        slow_query_alert = is_slow_query_alert_title(alert.title)
         return InvestigationStrategy(
             strategy_id=(
                 "database-connection-exhausted-v2"
@@ -347,7 +347,7 @@ class DefaultInvestigationStrategyProvider:
                 )
             )
 
-        if is_excessive_slow_query_alert(alert.alert_type):
+        if is_slow_query_alert_title(alert.title):
             requests.append(
                 ToolExecutionRequest(
                     tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
@@ -385,7 +385,7 @@ class DefaultInvestigationStrategyProvider:
         self, tool_name: str, alert: NormalizedAlert, objective: str
     ) -> dict[str, Any] | None:
         if tool_name == ARCHERY_SLOW_LOG_TOOL_NAME:
-            if not is_excessive_slow_query_alert(alert.alert_type):
+            if not is_slow_query_alert_title(alert.title):
                 return None
             return {"sql": ARCHERY_SLOW_LOG_QUERY}
 
