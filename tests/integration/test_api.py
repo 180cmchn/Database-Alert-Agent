@@ -112,30 +112,26 @@ def test_readiness_reports_configuration(tmp_path: Path) -> None:
         assert response.json() == {"status": "ready", "issues": []}
 
 
-def test_readiness_rejects_empty_external_knowledge_index(tmp_path: Path) -> None:
+def test_readiness_does_not_probe_external_knowledge_service(tmp_path: Path) -> None:
     client, runtime, _ = create_test_client(
         tmp_path,
-        external_knowledge_enabled=True,
         external_knowledge_base_url="http://knowledge.test",
         knowledge_sources=["external_knowledge"],
     )
 
-    class EmptyExternalKnowledgeClient:
+    class ExternalKnowledgeClientThatMustNotBeProbed:
         async def health(self) -> dict[str, int]:
-            return {"total_documents": 0}
+            raise AssertionError("API readiness must not probe external knowledge")
 
     runtime.service.external_knowledge_client = (  # type: ignore[assignment]
-        EmptyExternalKnowledgeClient()
+        ExternalKnowledgeClientThatMustNotBeProbed()
     )
 
     with client:
         response = client.get("/health/ready")
 
-    assert response.status_code == 503
-    assert response.json() == {
-        "status": "not_ready",
-        "issues": ["External knowledge index contains no documents"],
-    }
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "issues": []}
 
 
 def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -> None:
