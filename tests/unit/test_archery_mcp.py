@@ -18,7 +18,6 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
     ArcheryMCPConfigurationError,
-    ArcheryMCPProtocolError,
     ArcheryMCPReadOnlyViolation,
     ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
@@ -173,9 +172,6 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
                             "text": json.dumps(
                                 {
                                     "status": "ok",
-                                    "actual_sql": (
-                                        f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
-                                    ),
                                     "columns": ["id", "sql_text"],
                                     "rows": [[1, "select 1"]],
                                     "rowCount": 1,
@@ -201,7 +197,6 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert result.payload["rows"] == [[1, "select 1"]]
     assert result.payload["rowCount"] == 1
     assert result.requested_sql == TEST_SLOW_LOG_QUERY
-    assert result.actual_sql == f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
     assert result.window_start == TEST_WINDOW_START
     assert result.window_end == TEST_WINDOW_END
     assert [item[0] for item in calls] == [
@@ -332,7 +327,7 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
             query_result={
                 "structuredContent": {
                     "status": "ok",
-                    "actual_sql": f"{TEST_SLOW_LOG_QUERY} LIMIT 20",
+                    "rows": [],
                 },
                 "isError": False,
             },
@@ -376,100 +371,9 @@ async def test_archery_mcp_rejects_business_error_without_mcp_is_error() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("query_payload", "error_type", "error_match"),
-    [
-        (
-            {"status": "ok", "rows": []},
-            ArcheryMCPProtocolError,
-            "actual executed SQL",
-        ),
-        (
-            {
-                "status": "ok",
-                "actual_sql": TEST_SLOW_LOG_QUERY.replace(
-                    "t_slowlog_info", "another_table"
-                ),
-                "rows": [],
-            },
-            ArcheryMCPReadOnlyViolation,
-            "outside the approved",
-        ),
-        (
-            {
-                "status": "ok",
-                "actual_sql": f"{TEST_SLOW_LOG_QUERY} LIMIT 21",
-                "rows": [],
-            },
-            ArcheryMCPReadOnlyViolation,
-            "outside the approved",
-        ),
-        (
-            {
-                "status": "ok",
-                "actual_sql": TEST_SLOW_LOG_QUERY.replace(
-                    "from_unixtime(1784793300)", "from_unixtime(1784789700)"
-                ),
-                "rows": [],
-            },
-            ArcheryMCPReadOnlyViolation,
-            "outside the approved",
-        ),
-    ],
-)
-async def test_archery_mcp_requires_safe_actual_executed_sql(
-    query_payload: dict[str, Any],
-    error_type: type[Exception],
-    error_match: str,
-) -> None:
-    client = _client(
-        _archery_call_handler(
-            login_result={
-                "structuredContent": {"status": "ok"},
-                "isError": False,
-            },
-            query_result={
-                "structuredContent": query_payload,
-                "isError": False,
-            },
-            tool_calls=[],
-        )
-    )
-
-    with pytest.raises(error_type, match=error_match):
-        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
-
-
-def test_archery_mcp_extracts_actual_sql_from_documented_text_output() -> None:
-    payload = {
-        "content": [
-            "查询成功\n实际执行 SQL：\n"
-            f"```sql\n{TEST_SLOW_LOG_QUERY} LIMIT 20\n```"
-        ]
-    }
-
-    assert ArcheryMCPClient._extract_actual_sql(payload) == (
-        f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "text_output",
-    [
-        (
-            "**实际执行 SQL：**\n"
-            f"```sql\n{TEST_SLOW_LOG_QUERY} LIMIT 20\n```"
-        ),
-        json.dumps({"actual_sql": f"{TEST_SLOW_LOG_QUERY} LIMIT 20"}),
-    ],
-    ids=["markdown", "json"],
-)
-async def test_archery_mcp_reads_actual_sql_from_text_alongside_structured_content(
-    text_output: str,
-) -> None:
+async def test_archery_mcp_accepts_result_without_actual_executed_sql() -> None:
     tool_calls: list[str] = []
-    structured_payload = {
+    query_payload = {
         "status": "ok",
         "columns": ["f_id"],
         "rows": [[1]],
@@ -482,11 +386,11 @@ async def test_archery_mcp_reads_actual_sql_from_text_alongside_structured_conte
                 "isError": False,
             },
             query_result={
-                "structuredContent": structured_payload,
+                "structuredContent": query_payload,
                 "content": [
                     {
                         "type": "text",
-                        "text": text_output,
+                        "text": "查询成功",
                     }
                 ],
                 "isError": False,
@@ -497,12 +401,50 @@ async def test_archery_mcp_reads_actual_sql_from_text_alongside_structured_conte
 
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert result.payload == structured_payload
-    assert result.actual_sql == f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
+    assert result.payload == query_payload
+    assert result.requested_sql == TEST_SLOW_LOG_QUERY
     assert tool_calls == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_merges_text_result_with_structured_status() -> None:
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"status": "ok"},
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "columns": ["f_id"],
+                                "rows": [[1]],
+                                "rowCount": 1,
+                            }
+                        ),
+                    }
+                ],
+                "isError": False,
+            },
+            tool_calls=[],
+        )
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.payload == {
+        "status": "ok",
+        "columns": ["f_id"],
+        "rows": [[1]],
+        "rowCount": 1,
+    }
 
 
 class RecordingArcheryClient:
@@ -525,7 +467,6 @@ class RecordingArcheryClient:
         return ArcherySlowLogQueryResult(
             payload={"status": "ok", "rows": [{"id": 1}], "rowCount": 1},
             requested_sql=TEST_SLOW_LOG_QUERY,
-            actual_sql=f"{TEST_SLOW_LOG_QUERY} LIMIT 20",
             window_start=TEST_WINDOW_START,
             window_end=TEST_WINDOW_END,
         )
@@ -571,7 +512,7 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert data["sql"] == TEST_SLOW_LOG_QUERY
     assert data["login_confirmed"] is True
     assert data["login_tool"] == ARCHERY_MCP_LOGIN_TOOL_NAME
-    assert data["actual_sql"] == f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
+    assert data["actual_sql_verified"] is False
     assert data["target"] == {
         "instance_ref": TEST_INSTANCE_REF,
         "db_name": TEST_DB_NAME,
@@ -584,7 +525,7 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
         "duration_seconds": 300,
         "time_column": TEST_TIME_COLUMN,
     }
-    assert data["scope"] == "alert_time_window_global_slow_log_snapshot"
+    assert data["scope"] == "requested_alert_time_window_global_slow_log_snapshot"
     assert data["result_bounds"]["truncation_possible"] is True
     assert data["root_cause_eligible"] is False
     assert data["result"]["rows"] == [{"id": 1}]

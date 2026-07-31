@@ -36,35 +36,6 @@ _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SLOW_QUERY_TITLE_IDENTIFIER: Final = re.compile(
     rf"(?<![a-z0-9]){SLOW_QUERY_TITLE_IDENTIFIER}(?![a-z0-9])", re.IGNORECASE
 )
-_TRAILING_LIMIT: Final = re.compile(
-    r"\s+LIMIT\s+(?:(?P<offset>[0-9]+)\s*,\s*)?(?P<limit>[0-9]+)\s*;?\s*\Z",
-    re.IGNORECASE,
-)
-_ACTUAL_SQL_KEYS: Final = {
-    "actualsql",
-    "actualexecutedsql",
-    "executedsql",
-    "实际执行sql",
-    "实际执行的sql",
-}
-_ACTUAL_SQL_BLOCK: Final = re.compile(
-    r"""
-    (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
-    \s*(?:\*{1,2}|_{1,2})?\s*[:：]\s*(?:\*{1,2}|_{1,2})?\s*
-    ```(?:sql)?\s*
-    (?P<sql>.*?)
-    ```
-    """,
-    re.IGNORECASE | re.DOTALL | re.VERBOSE,
-)
-_ACTUAL_SQL_INLINE: Final = re.compile(
-    r"""
-    (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
-    \s*(?:\*{1,2}|_{1,2})?\s*[:：]\s*(?:\*{1,2}|_{1,2})?\s*
-    `?(?P<sql>[^\r\n`]+)`?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
 _BUSINESS_ERROR_TEXT: Final = re.compile(
     r"""
     实例不在白名单中，?已拒绝执行
@@ -83,6 +54,15 @@ _FAILURE_STATUSES: Final = {
     "forbidden",
     "not_logged_in",
     "login_expired",
+}
+_QUERY_RESULT_KEYS: Final = {
+    "columns",
+    "data",
+    "result",
+    "rowCount",
+    "row_count",
+    "rows",
+    "total",
 }
 _PAYLOAD_CONTAINER_KEYS: Final = {
     "data",
@@ -116,11 +96,10 @@ class ArcheryMCPReadOnlyViolation(ArcheryMCPError):
 
 @dataclass(frozen=True, slots=True)
 class ArcherySlowLogQueryResult:
-    """Validated result of the login-confirmed Archery slow-log query."""
+    """Result of the login-confirmed Archery slow-log query."""
 
     payload: dict[str, Any]
     requested_sql: str
-    actual_sql: str
     window_start: datetime
     window_end: datetime
 
@@ -129,35 +108,6 @@ def is_slow_query_alert_title(title: str) -> bool:
     """Match the controlled ``slow_query`` identifier in the alert title."""
 
     return bool(_SLOW_QUERY_TITLE_IDENTIFIER.search(title))
-
-
-def _canonical_sql(sql: str) -> str:
-    without_quotes = sql.replace("`", "")
-    return re.sub(
-        r"\s+", " ", without_quotes.strip().removesuffix(";").strip()
-    ).casefold()
-
-
-def _is_approved_executed_query(
-    sql: str, *, requested_sql: str, db_name: str
-) -> bool:
-    limit_match = _TRAILING_LIMIT.search(sql)
-    base_sql = sql
-    if limit_match is not None:
-        offset = limit_match.group("offset")
-        limit = int(limit_match.group("limit"))
-        if (offset is not None and int(offset) != 0) or limit > ARCHERY_SLOW_LOG_LIMIT:
-            return False
-        base_sql = sql[: limit_match.start()]
-
-    expected = _canonical_sql(requested_sql)
-    actual = _canonical_sql(base_sql)
-    qualified_expected = expected.replace(
-        f"from {ARCHERY_SLOW_LOG_TABLE}",
-        f"from {_canonical_sql(db_name)}.{ARCHERY_SLOW_LOG_TABLE}",
-        1,
-    )
-    return actual in {expected, qualified_expected}
 
 
 def _build_slow_log_query(
@@ -352,27 +302,9 @@ class ArcheryMCPClient:
                     tool_name=self.query_tool_name,
                     supplemental_text=query_text,
                 )
-                actual_sql = self._extract_actual_sql(
-                    payload,
-                    supplemental_text=query_text,
-                )
-                if actual_sql is None:
-                    raise ArcheryMCPProtocolError(
-                        "Archery MCP query result did not expose the actual executed SQL"
-                    )
-                if not _is_approved_executed_query(
-                    actual_sql,
-                    requested_sql=requested_sql,
-                    db_name=self.db_name,
-                ):
-                    raise ArcheryMCPReadOnlyViolation(
-                        "Archery MCP rewrote the SELECT outside the approved table, "
-                        "alert window, or row limit"
-                    )
                 return ArcherySlowLogQueryResult(
                     payload=payload,
                     requested_sql=requested_sql,
-                    actual_sql=actual_sql,
                     window_start=window_start,
                     window_end=window_end,
                 )
@@ -494,15 +426,21 @@ class ArcheryMCPClient:
                 or "Archery MCP tool reported an execution error"
             )
 
+        text_blocks = ArcheryMCPClient._tool_text_blocks(result)
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
+            for decoded in ArcheryMCPClient._decoded_text_payloads(text_blocks):
+                merged = dict(decoded)
+                merged.update(structured)
+                return merged
+            if text_blocks and not _QUERY_RESULT_KEYS.intersection(structured):
+                return {**structured, "content": list(text_blocks)}
             return structured
         if structured is not None:
             raise ArcheryMCPProtocolError(
                 "Archery MCP structuredContent was not an object"
             )
 
-        text_blocks = ArcheryMCPClient._tool_text_blocks(result)
         for text in text_blocks:
             try:
                 decoded = json.loads(text)
@@ -565,37 +503,6 @@ class ArcheryMCPClient:
                 raise ArcheryMCPToolError(
                     f"{tool_name} failed: {_safe_error_detail(match.group(0))}"
                 )
-
-    @staticmethod
-    def _extract_actual_sql(
-        payload: Mapping[str, Any],
-        *,
-        supplemental_text: tuple[str, ...] = (),
-    ) -> str | None:
-        for container in ArcheryMCPClient._metadata_containers(payload):
-            for key, value in container.items():
-                normalized_key = re.sub(r"[\s_:：-]+", "", str(key)).casefold()
-                if normalized_key in _ACTUAL_SQL_KEYS and isinstance(value, str):
-                    actual_sql = value.strip()
-                    if actual_sql:
-                        return actual_sql
-
-        for decoded in ArcheryMCPClient._decoded_text_payloads(supplemental_text):
-            actual_sql = ArcheryMCPClient._extract_actual_sql(decoded)
-            if actual_sql is not None:
-                return actual_sql
-
-        for text in [
-            *ArcheryMCPClient._metadata_text(payload),
-            *supplemental_text,
-        ]:
-            for pattern in (_ACTUAL_SQL_BLOCK, _ACTUAL_SQL_INLINE):
-                match = pattern.search(text)
-                if match is not None:
-                    actual_sql = match.group("sql").strip()
-                    if actual_sql:
-                        return actual_sql
-        return None
 
     @staticmethod
     def _tool_text_blocks(result: Mapping[str, Any]) -> tuple[str, ...]:
@@ -850,11 +757,12 @@ class ArcherySlowLogEvidenceTool:
         row_summary = f"，返回 {row_count} 行" if row_count is not None else ""
         return (
             f"Archery MCP 登录确认成功并执行慢查询记录只读查询{row_summary}；"
-            "结果已按告警时间窗过滤，但尚未按受影响数据库实例关联且可能被截断，"
-            "只能作为排查线索，不能单独证明本次告警根因。",
+            "查询请求已按告警时间窗生成，但未校验 Archery 实际执行 SQL，"
+            "且结果尚未按受影响数据库实例关联并可能被截断，只能作为排查线索，"
+            "不能单独证明本次告警根因。",
             {
                 "sql": result.requested_sql,
-                "actual_sql": result.actual_sql,
+                "actual_sql_verified": False,
                 "login_confirmed": True,
                 "login_tool": self.client.login_tool_name,
                 "mcp_tool": self.client.query_tool_name,
@@ -870,7 +778,7 @@ class ArcherySlowLogEvidenceTool:
                     "duration_seconds": self.client.window_seconds,
                     "time_column": self.client.slow_log_time_column,
                 },
-                "scope": "alert_time_window_global_slow_log_snapshot",
+                "scope": "requested_alert_time_window_global_slow_log_snapshot",
                 "result_bounds": {
                     "row_limit": ARCHERY_SLOW_LOG_LIMIT,
                     "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
@@ -878,7 +786,8 @@ class ArcherySlowLogEvidenceTool:
                 },
                 "root_cause_eligible": False,
                 "root_cause_ineligible_reason": (
-                    "结果尚未按受影响数据库实例关联，且可能被字符上限截断"
+                    "实际执行 SQL 未校验，结果尚未按受影响数据库实例关联，"
+                    "且可能被字符上限截断"
                 ),
                 "result": result.payload,
             },
