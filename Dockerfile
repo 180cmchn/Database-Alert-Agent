@@ -11,6 +11,7 @@ COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
 COPY runbooks ./runbooks
+COPY config ./config
 COPY entrypoint.sh ./
 
 RUN python -m venv /opt/venv \

@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     # Archery MCP is a deployment-only live evidence source. Its endpoint,
     # X-Archery-Token, target scope, and query window stay outside
     # RUNTIME_SETTINGS_KEYS so an admin caller cannot redirect diagnostic traffic.
+    mcp_settings_path: Path = Path("./config/mcp/settings.json")
     archery_mcp_url: str = ""
     archery_mcp_token: str = Field(
         default="",
@@ -419,6 +420,14 @@ class Settings(BaseSettings):
                 issues.append(
                     "Archery MCP configuration is incomplete; missing: "
                     + ", ".join(missing_archery_settings)
+                )
+            elif not self.mcp_settings_path.is_file():
+                issues.append(
+                    f"MCP settings file does not exist: {self.mcp_settings_path}"
+                )
+            elif self.ai_provider != "openai_compatible":
+                issues.append(
+                    "Archery MCP requires an openai_compatible model with tool calling"
                 )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

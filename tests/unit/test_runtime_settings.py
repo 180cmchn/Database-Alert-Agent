@@ -309,10 +309,14 @@ def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
         }
     )
     assert configured.archery_mcp_enabled is True
+    assert any(
+        "model with tool calling" in issue for issue in configured.readiness_issues()
+    )
     assert "archery_mcp_url" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_db_name" not in RUNTIME_SETTINGS_KEYS
+    assert "mcp_settings_path" not in RUNTIME_SETTINGS_KEYS
     assert configured.archery_slow_log_window_seconds == 300
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")

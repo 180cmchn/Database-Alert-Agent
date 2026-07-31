@@ -33,6 +33,7 @@ from app.domain.models import (
     ValidationKind,
     ValidationRecord,
 )
+from app.domain.tool_calling import MCPModelToolCall
 
 PROMPT_VERSION = "database-alert-advisor-v5"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
@@ -398,6 +399,102 @@ class OpenAICompatibleAdvisor:
         if decision.action == "tool" and decision.tool_name not in available_tools:
             raise AdvisorError(f"Planner selected unavailable tool: {decision.tool_name}")
         return decision
+
+    async def request_mcp_tool_call(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tool: dict[str, Any],
+    ) -> MCPModelToolCall:
+        """Ask the model for one forced function call used by the MCP host."""
+
+        if not self._api_key or not self._model:
+            raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
+        function = tool.get("function") if isinstance(tool, dict) else None
+        tool_name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(tool_name, str) or not tool_name:
+            raise AdvisorError("MCP model tool definition is missing a function name")
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                tools=[tool],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": tool_name},
+                },
+                temperature=0,
+                max_tokens=self._max_tokens,
+            )
+        except Exception as exc:
+            raise AdvisorError(
+                f"AI provider MCP tool request failed: {type(exc).__name__}"
+            ) from exc
+
+        request_id = getattr(response, "id", None)
+        if not response.choices:
+            raise AdvisorError(
+                f"AI provider returned no MCP tool choice (request_id={request_id})"
+            )
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if len(tool_calls) != 1:
+            raise AdvisorError(
+                "AI provider must return exactly one MCP tool call "
+                f"(request_id={request_id}, count={len(tool_calls)})"
+            )
+
+        raw_call = tool_calls[0]
+        call_id = (
+            raw_call.get("id")
+            if isinstance(raw_call, dict)
+            else getattr(raw_call, "id", None)
+        )
+        raw_function = (
+            raw_call.get("function")
+            if isinstance(raw_call, dict)
+            else getattr(raw_call, "function", None)
+        )
+        if isinstance(raw_function, dict):
+            selected_name = raw_function.get("name")
+            raw_arguments = raw_function.get("arguments")
+        else:
+            selected_name = getattr(raw_function, "name", None)
+            raw_arguments = getattr(raw_function, "arguments", None)
+        if not isinstance(call_id, str) or not call_id:
+            raise AdvisorError(
+                f"AI provider MCP tool call has no id (request_id={request_id})"
+            )
+        if not isinstance(selected_name, str) or not selected_name:
+            raise AdvisorError(
+                f"AI provider MCP tool call has no name (request_id={request_id})"
+            )
+        if isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
+                raise AdvisorError(
+                    "AI provider MCP tool arguments are not valid JSON "
+                    f"(request_id={request_id})"
+                ) from exc
+        elif isinstance(raw_arguments, dict):
+            arguments = raw_arguments
+        else:
+            raise AdvisorError(
+                "AI provider MCP tool arguments are missing "
+                f"(request_id={request_id})"
+            )
+        if not isinstance(arguments, dict):
+            raise AdvisorError(
+                "AI provider MCP tool arguments must be an object "
+                f"(request_id={request_id})"
+            )
+        return MCPModelToolCall(
+            call_id=call_id,
+            name=selected_name,
+            arguments=arguments,
+            request_id=request_id if isinstance(request_id, str) else None,
+        )
 
     async def _complete(self, messages: list[dict[str, str]]) -> tuple[str, AdvisorMetadata]:
         input_chars = sum(

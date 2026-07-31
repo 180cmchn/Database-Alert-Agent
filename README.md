@@ -260,12 +260,18 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 
 当规范化后的告警标题包含独立的 `slow_query` 标识符时（忽略大小写，但不匹配
 `slow_queryable` 等更长标识符），调查策略会新增一个必需的
-`query_archery_slow_logs` 工具调用。该工具通过 Archery MCP 的 Streamable HTTP Endpoint
-完成初始化和工具发现，先调用当前 MCP `tools/list` 实际暴露的
-`ensure_login_gymJPA()` 确认 Token 登录有效；只有确认成功后，才调用 `sql_query_gymJPA`。
-服务内部提示中的 `ensure_login()` 不是当前 MCP 暴露的工具名。查询结构固定，但时间边界由
-规范化告警的 `occurred_at` 和部署窗口计算。默认窗口与慢查询告警规则一致，为截至告警发生时
-的前 5 分钟：
+`query_archery_slow_logs` 取证任务。项目自身作为 MCP Host，加载
+[`config/mcp/settings.json`](config/mcp/settings.json) 中的 Archery 连接配置，在同一个
+Streamable HTTP 会话中完成初始化和工具发现，再把本次允许的 MCP 工具以 function tools
+交给当前 AI 模型。
+模型按专用提示词先调用 `ensure_login_gymJPA()`；登录成功后，下一轮再调用
+`sql_query_gymJPA`。服务内部提示中的 `ensure_login()` 不是当前 MCP 暴露的工具名。
+
+每轮模型只能看到当前步骤允许的一个工具，MCP 工具返回内容不会作为可执行指令继续传给模型。
+Host 还会在发送 Archery 请求前校验工具名、空登录参数、目标实例、数据库、SQL 和结果上限；
+提示词负责让模型完成工具调用，代码校验仍是只读安全边界。模型不能扩大时间范围、改写 SQL
+或选择其他 Archery 工具。查询结构固定，但时间边界由规范化告警的 `occurred_at` 和部署窗口
+计算。默认窗口与慢查询告警规则一致，为截至告警发生时的前 5 分钟：
 
 ```sql
 select * from t_slowlog_info
@@ -276,10 +282,11 @@ order by `f_insert_time` desc
 
 `f_insert_time` 是 `t_slowlog_info` 中不会因后续更新而变化的 `datetime` 插入时间。SQL 使用
 `FROM_UNIXTIME`，使 Unix 告警时间按照数据库会话时区转换，与该列的 `CURRENT_TIMESTAMP`
-语义保持一致。工具不接受调用者或模型提供的 SQL/窗口参数。调用 `sql_query_gymJPA` 即直接向
-后端提交查询，不存在"预览后再确认"的步骤。为兼容当前 Archery MCP 返回格式，客户端直接读取
-工具执行结果，不再要求响应回显“实际执行 SQL”。因此客户端无法验证 Archery 是否自动改写了
-表、字段、时间边界或行数；输入 SQL 仍由代码固定生成，但该结果必须作为未验证的排查线索使用。
+语义保持一致。模型必须把提示词给出的准确 SQL 作为 `sql_content`，Host 会与按告警时间计算的
+期望 SQL 做逐字段比对。调用 `sql_query_gymJPA` 即直接向后端提交查询，不存在“预览后再确认”
+的步骤。为兼容当前 Archery MCP 返回格式，Host 直接读取工具执行结果，不要求响应回显“实际
+执行 SQL”。因此客户端无法验证 Archery 是否自动改写了表、字段、时间边界或行数；输入 SQL
+虽已在调用前校验，该结果仍必须作为未验证的排查线索使用。
 当前表结构没有 `f_insert_time` 索引；数据量增长后可能出现扫描和排序开销，是否加索引属于
 数据库变更，应由 DBA 根据执行计划和实际数据量另行评审。
 
@@ -289,9 +296,25 @@ order by `f_insert_time` desc
 传输失败、登录确认失败、鉴权失败、缺少查询范围、超时、MCP 标准错误或 Archery 业务错误只会
 形成失败证据。
 
-在 `.env` 配置完整 MCP Endpoint 和 Token：
+项目级 MCP 配置只保存环境变量引用，不保存秘密：
+
+```json
+{
+  "mcpServers": {
+    "archery": {
+      "url": "${ARCHERY_MCP_URL}",
+      "headers": {
+        "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+在 `.env` 配置该文件路径、完整 MCP Endpoint、Token 和查询目标：
 
 ```dotenv
+MCP_SETTINGS_PATH=./config/mcp/settings.json
 ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
 ARCHERY_MCP_TOKEN=archery_replace-with-your-token
 ARCHERY_MCP_INSTANCE_REF=archery
@@ -301,12 +324,15 @@ ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
 URL、Token、`instance_ref`、`db_name` 和窗口都是部署级配置，不能通过管理 API 修改；启用
-Archery MCP 时前四项必须同时提供。当前认证方式是
+Archery MCP 时前四项必须同时提供，`MCP_SETTINGS_PATH` 指向的文件也必须存在。当前认证方式是
 `X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的
 `X-Archery-Username` 和 `X-Archery-Password`。Token 只通过每个 MCP HTTP 请求的
 `X-Archery-Token` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP 重定向。生产
 环境要求 HTTPS。为兼容现有 Archery MCP 部署，Token 也可从 `ARCHERY_MCP_HTTP_API_KEY` 或
-`ARCHERY_TOKEN` 读取；新配置建议使用 `ARCHERY_MCP_TOKEN`。
+`ARCHERY_TOKEN` 读取；新配置建议使用 `ARCHERY_MCP_TOKEN`。所配置的
+`openai_compatible` 模型和网关必须支持 Chat Completions function/tool calling；仅把
+`settings.json` 放进仓库不会让远端模型自动获得 MCP，实际加载配置和转发工具调用的是本服务的
+MCP Host。
 
 ## 本地运行
 

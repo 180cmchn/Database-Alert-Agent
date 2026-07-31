@@ -15,6 +15,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_SLOW_LOG_LIMIT,
     ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+    ARCHERY_SLOW_LOG_PROMPT_VERSION,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
     ArcheryMCPConfigurationError,
@@ -22,15 +23,18 @@ from app.adapters.archery_mcp import (
     ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
     ArcherySlowLogQueryResult,
+    MCPServerSettings,
+    load_mcp_server_settings,
 )
 from app.adapters.investigation import (
     AlertContextTool,
     DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
 )
-from app.application.factory import build_runtime
+from app.application.factory import apply_runtime_settings, build_runtime
 from app.config import Settings
 from app.domain.models import InvestigationContext, InvestigationStrategy, ToolExecutionRequest
+from app.domain.tool_calling import MCPModelToolCall
 
 TEST_INSTANCE_REF = "archery-metadata"
 TEST_DB_NAME = "archery_data"
@@ -72,19 +76,100 @@ def _json_response(
     )
 
 
-def _client(transport: httpx.AsyncBaseTransport) -> ArcheryMCPClient:
+class PromptFollowingMCPModel:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def request_mcp_tool_call(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tool: dict[str, Any],
+    ) -> MCPModelToolCall:
+        name = tool["function"]["name"]
+        task = json.loads(messages[1]["content"])
+        arguments = (
+            {}
+            if name == ARCHERY_MCP_LOGIN_TOOL_NAME
+            else {
+                "instance_ref": task["target"]["instance_ref"],
+                "db_name": task["target"]["db_name"],
+                "sql_content": task["required_sql"],
+                "limit_num": task["result_bounds"]["limit_num"],
+                "max_result_chars": task["result_bounds"]["max_result_chars"],
+            }
+        )
+        self.calls.append(
+            {
+                "name": name,
+                "messages": messages,
+                "tool": tool,
+                "arguments": arguments,
+            }
+        )
+        return MCPModelToolCall(
+            call_id=f"model-call-{len(self.calls)}",
+            name=name,
+            arguments=arguments,
+            request_id=f"model-request-{len(self.calls)}",
+        )
+
+
+def _client(
+    transport: httpx.AsyncBaseTransport,
+    *,
+    model: PromptFollowingMCPModel | None = None,
+) -> ArcheryMCPClient:
     return ArcheryMCPClient(
-        "https://archery.example.test/mcp",
-        "test-archery-token",
+        MCPServerSettings(
+            url="https://archery.example.test/mcp",
+            headers={"X-Archery-Token": "test-archery-token"},
+        ),
+        model or PromptFollowingMCPModel(),
         instance_ref=TEST_INSTANCE_REF,
         db_name=TEST_DB_NAME,
         transport=transport,
     )
 
 
+def test_project_mcp_settings_resolve_environment_without_persisting_token(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "archery": {
+                        "url": "${ARCHERY_MCP_URL}",
+                        "headers": {
+                            "X-Archery-Token": "${ARCHERY_MCP_TOKEN}",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    server = load_mcp_server_settings(
+        settings_path,
+        server_name="archery",
+        environment={
+            "ARCHERY_MCP_URL": "https://archery.example.test/mcp",
+            "ARCHERY_MCP_TOKEN": "runtime-only-token",
+        },
+    )
+
+    assert server.url == "https://archery.example.test/mcp"
+    assert server.headers == {"X-Archery-Token": "runtime-only-token"}
+    assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
+
+
 @pytest.mark.asyncio
 async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -> None:
     calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+    model = PromptFollowingMCPModel()
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Archery-Token"] == "test-archery-token"
@@ -190,7 +275,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
             )
         raise AssertionError(method)
 
-    client = _client(httpx.MockTransport(handler))
+    client = _client(httpx.MockTransport(handler), model=model)
 
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
@@ -199,6 +284,18 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert result.requested_sql == TEST_SLOW_LOG_QUERY
     assert result.window_start == TEST_WINDOW_START
     assert result.window_end == TEST_WINDOW_END
+    assert result.model_tool_calls == (
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+    assert result.model_request_ids == ("model-request-1", "model-request-2")
+    assert [item["name"] for item in model.calls] == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+    assert TEST_SLOW_LOG_QUERY in model.calls[0]["messages"][1]["content"]
+    assert model.calls[1]["messages"][-1]["role"] == "tool"
+    assert "登录确认工具已成功返回" in model.calls[1]["messages"][-1]["content"]
     assert [item[0] for item in calls] == [
         "initialize",
         "notifications/initialized",
@@ -346,6 +443,51 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_rejects_model_sql_changes_before_query_tool_call() -> None:
+    tool_calls: list[str] = []
+
+    class TamperingModel(PromptFollowingMCPModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tool: dict[str, Any],
+        ) -> MCPModelToolCall:
+            call = await super().request_mcp_tool_call(messages=messages, tool=tool)
+            if call.name != ARCHERY_MCP_QUERY_TOOL_NAME:
+                return call
+            return MCPModelToolCall(
+                call_id=call.call_id,
+                name=call.name,
+                arguments={
+                    **call.arguments,
+                    "sql_content": "select * from t_slowlog_info",
+                },
+                request_id=call.request_id,
+            )
+
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"status": "ok", "rows": []},
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+        ),
+        model=TamperingModel(),
+    )
+
+    with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
+        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_rejects_business_error_without_mcp_is_error() -> None:
     tool_calls: list[str] = []
     client = _client(
@@ -410,6 +552,14 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
     assert captured.value.diagnostic_data["login_tool"] == "ensure_login_gymJPA"
     assert captured.value.diagnostic_data["mcp_client"] == "official_python_sdk"
     assert captured.value.diagnostic_data["mcp_transport"] == "streamable_http"
+    assert captured.value.diagnostic_data["mcp_invocation"] == "model_tool_calling"
+    assert captured.value.diagnostic_data["prompt_version"] == (
+        ARCHERY_SLOW_LOG_PROMPT_VERSION
+    )
+    assert captured.value.diagnostic_data["model_tool_calls"] == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
     assert captured.value.diagnostic_data["username_field_present"] is True
     assert captured.value.diagnostic_data["mcp_session_id_present"] is True
 
@@ -556,6 +706,8 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert data["sql"] == TEST_SLOW_LOG_QUERY
     assert data["login_confirmed"] is True
     assert data["login_tool"] == ARCHERY_MCP_LOGIN_TOOL_NAME
+    assert data["mcp_invocation"] == "model_tool_calling"
+    assert data["prompt_version"] == ARCHERY_SLOW_LOG_PROMPT_VERSION
     assert data["actual_sql_verified"] is False
     assert data["target"] == {
         "instance_ref": TEST_INSTANCE_REF,
@@ -618,14 +770,34 @@ async def test_strategy_requires_archery_evidence_only_for_slow_query_title_iden
     )
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
+    mcp_settings_path = tmp_path / "mcp" / "settings.json"
+    mcp_settings_path.parent.mkdir()
+    mcp_settings_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "archery": {
+                        "url": "${ARCHERY_MCP_URL}",
+                        "headers": {
+                            "X-Archery-Token": "${ARCHERY_MCP_TOKEN}",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     return Settings(
         _env_file=None,
-        ai_provider="fake",
+        ai_provider="openai_compatible" if real_model else "fake",
+        ai_api_key="test-model-key" if real_model else "",
+        ai_model="test-tool-model" if real_model else "",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         runbook_pdf_dir=runbooks,
+        mcp_settings_path=mcp_settings_path,
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-archery-token",
         archery_mcp_instance_ref=TEST_INSTANCE_REF,
@@ -633,8 +805,10 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def test_factory_registers_configured_archery_tool(tmp_path: Path) -> None:
-    runtime = build_runtime(_settings(tmp_path))
+@pytest.mark.asyncio
+async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, real_model=True)
+    runtime = build_runtime(settings)
 
     tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
 
@@ -642,6 +816,20 @@ def test_factory_registers_configured_archery_tool(tmp_path: Path) -> None:
     assert tool.client.instance_ref == TEST_INSTANCE_REF
     assert tool.client.db_name == TEST_DB_NAME
     assert tool.client.window_seconds == 300
+
+    apply_runtime_settings(
+        runtime,
+        settings.model_copy(
+            update={
+                "ai_provider": "fake",
+                "ai_api_key": "",
+                "ai_model": "",
+            }
+        ),
+    )
+
+    assert runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME) is None
+    await runtime.service.close()
 
 
 @pytest.mark.asyncio

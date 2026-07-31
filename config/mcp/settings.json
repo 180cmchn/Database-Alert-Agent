@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "archery": {
+      "url": "${ARCHERY_MCP_URL}",
+      "headers": {
+        "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
+      }
+    }
+  }
+}

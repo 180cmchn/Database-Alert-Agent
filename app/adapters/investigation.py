@@ -34,6 +34,9 @@ class InvestigationToolRegistry:
     def register(self, tool: InvestigationTool) -> None:
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def get(self, name: str) -> InvestigationTool | None:
         return self._tools.get(name)
 

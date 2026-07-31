@@ -10,7 +10,11 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
-from app.adapters.archery_mcp import ArcheryMCPClient, ArcherySlowLogEvidenceTool
+from app.adapters.archery_mcp import (
+    ARCHERY_SLOW_LOG_TOOL_NAME,
+    ArcheryMCPClient,
+    ArcherySlowLogEvidenceTool,
+)
 from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.flashduty import (
     FlashDutyAlertSourceAdapter,
@@ -42,6 +46,7 @@ from app.domain.ports import (
     RunbookProvider,
     RunbookStore,
 )
+from app.domain.tool_calling import MCPToolCallingModel
 
 
 @dataclass
@@ -126,13 +131,18 @@ def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeCli
 
 def _build_archery_mcp_tool(
     settings: Settings,
+    model: AIAdvisor,
 ) -> ArcherySlowLogEvidenceTool | None:
-    if not settings.archery_mcp_enabled:
+    if not settings.archery_mcp_enabled or not isinstance(model, MCPToolCallingModel):
         return None
     return ArcherySlowLogEvidenceTool(
-        ArcheryMCPClient(
-            settings.archery_mcp_url,
-            settings.archery_mcp_token,
+        ArcheryMCPClient.from_settings(
+            settings.mcp_settings_path,
+            model,
+            environment={
+                "ARCHERY_MCP_URL": settings.archery_mcp_url,
+                "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
+            },
             instance_ref=settings.archery_mcp_instance_ref,
             db_name=settings.archery_mcp_db_name,
             window_seconds=settings.archery_slow_log_window_seconds,
@@ -142,7 +152,9 @@ def _build_archery_mcp_tool(
 
 
 def _build_tool_registry(
-    settings: Settings, client: FlashDutyClient | None = None
+    settings: Settings,
+    advisor: AIAdvisor,
+    client: FlashDutyClient | None = None,
 ) -> InvestigationToolRegistry:
     registry = build_default_tool_registry()
     if client is not None:
@@ -157,7 +169,7 @@ def _build_tool_registry(
             channel_ids=settings.flashduty_poll_channel_ids,
         ):
             registry.register(tool)
-    archery_tool = _build_archery_mcp_tool(settings)
+    archery_tool = _build_archery_mcp_tool(settings, advisor)
     if archery_tool is not None:
         registry.register(archery_tool)
     return registry
@@ -198,15 +210,24 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     advisor = _build_advisor(settings)
     conclusion_validator = _build_conclusion_validator(settings)
     notifier = _build_notifier(settings)
+    archery_tool = _build_archery_mcp_tool(settings, advisor)
+    available_tools = set(service.tool_registry.available_names())
+    if archery_tool is None:
+        available_tools.discard(ARCHERY_SLOW_LOG_TOOL_NAME)
+    else:
+        available_tools.add(ARCHERY_SLOW_LOG_TOOL_NAME)
     strategy_provider = DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
-        available_tools=service.tool_registry.available_names(),
+        available_tools=sorted(available_tools),
         metrics_ds_name=settings.flashduty_metrics_ds_name,
         logs_ds_name=settings.flashduty_logs_ds_name,
         logs_ds_type=settings.flashduty_logs_ds_type,
     )
     external_knowledge_client = _build_external_knowledge_client(settings)
+    service.tool_registry.unregister(ARCHERY_SLOW_LOG_TOOL_NAME)
+    if archery_tool is not None:
+        service.tool_registry.register(archery_tool)
     agent = InvestigationAgent(
         repository=service.repository,
         runbook_provider=service.runbook_provider,
@@ -284,7 +305,9 @@ def build_runtime(
 
     flashduty_client = _build_flashduty_client(settings)
     external_knowledge_client = _build_external_knowledge_client(settings)
-    tool_registry = tool_registry or _build_tool_registry(settings, flashduty_client)
+    tool_registry = tool_registry or _build_tool_registry(
+        settings, advisor, flashduty_client
+    )
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
