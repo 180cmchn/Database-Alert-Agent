@@ -126,6 +126,22 @@ async def test_tool_executor_returns_failed() -> None:
     assert record.structured_data == {"reason_code": "RuntimeError"}
 
 
+def test_tool_executor_sanitizes_exception_diagnostics() -> None:
+    exc = RuntimeError("backend unavailable")
+    exc.diagnostic_data = {  # type: ignore[attr-defined]
+        "stage": "login",
+        "token": "do-not-expose",
+    }
+
+    assert ToolExecutor._failure_data(exc) == {
+        "reason_code": "RuntimeError",
+        "diagnostics": {
+            "stage": "login",
+            "token": "***REDACTED***",
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_tool_executor_distinguishes_no_data_from_success() -> None:
     executor = ToolExecutor(InvestigationToolRegistry([NoDataTool()]))

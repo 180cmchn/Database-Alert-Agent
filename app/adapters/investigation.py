@@ -146,6 +146,9 @@ class ToolExecutor:
         request_id = getattr(exc, "request_id", None)
         if request_id:
             result["request_id"] = str(sanitize(request_id))
+        diagnostic_data = getattr(exc, "diagnostic_data", None)
+        if isinstance(diagnostic_data, dict) and diagnostic_data:
+            result["diagnostics"] = sanitize(diagnostic_data)
         return result
 
     @staticmethod

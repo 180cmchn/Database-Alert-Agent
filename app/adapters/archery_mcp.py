@@ -15,7 +15,7 @@ from app.domain.models import InvestigationContext, ToolExecutionRequest
 
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
-ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login"
+ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # Bound the global snapshot returned by Archery. The server can truncate at this
@@ -91,6 +91,15 @@ class ArcheryMCPProtocolError(ArcheryMCPError):
 
 class ArcheryMCPToolError(ArcheryMCPError):
     """The Archery MCP tool rejected or failed the read-only query."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic_data = diagnostic_data or {}
 
 
 class ArcheryMCPReadOnlyViolation(ArcheryMCPError):
@@ -300,11 +309,21 @@ class ArcheryMCPClient:
                 )
                 query_text = self._tool_text_blocks(query_result)
                 payload = self._extract_tool_payload(query_result)
-                self._validate_business_success(
-                    payload,
-                    tool_name=self.query_tool_name,
-                    supplemental_text=query_text,
-                )
+                try:
+                    self._validate_business_success(
+                        payload,
+                        tool_name=self.query_tool_name,
+                        supplemental_text=query_text,
+                    )
+                except ArcheryMCPToolError as exc:
+                    raise ArcheryMCPToolError(
+                        str(exc),
+                        diagnostic_data=self._login_diagnostic_data(
+                            login_payload,
+                            login_text,
+                            session_id=session_id,
+                        ),
+                    ) from exc
                 return ArcherySlowLogQueryResult(
                     payload=payload,
                     requested_sql=requested_sql,
@@ -533,6 +552,37 @@ class ArcheryMCPClient:
             if isinstance(decoded, Mapping):
                 payloads.append(decoded)
         return payloads
+
+    def _login_diagnostic_data(
+        self,
+        payload: Mapping[str, Any],
+        text_blocks: tuple[str, ...],
+        *,
+        session_id: str | None,
+    ) -> dict[str, Any]:
+        containers = self._metadata_containers(payload)
+        username_field_present = any(
+            re.sub(r"[\s_-]+", "", str(key)).casefold()
+            in {"user", "username", "currentuser", "当前用户", "用户名"}
+            and value not in (None, "", False)
+            for container in containers
+            for key, value in container.items()
+        )
+        diagnostic_data: dict[str, Any] = {
+            "login_tool": self.login_tool_name,
+            "mcp_session_id_present": bool(session_id),
+            "login_payload_keys": sorted(str(key) for key in payload)[:20],
+            "login_text_block_count": len(text_blocks),
+            "username_field_present": username_field_present,
+        }
+        status = payload.get("status")
+        if isinstance(status, (str, bool, int, float)):
+            diagnostic_data["login_status"] = _safe_error_detail(status)
+        preview_parts = [*self._metadata_text(payload), *text_blocks]
+        preview = _safe_error_detail(" ".join(preview_parts))
+        if preview:
+            diagnostic_data["login_response_preview"] = preview[:500]
+        return diagnostic_data
 
     @staticmethod
     def _metadata_containers(

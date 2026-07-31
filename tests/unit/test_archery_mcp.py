@@ -395,14 +395,17 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
         )
     )
 
-    with pytest.raises(ArcheryMCPToolError, match="需要先登录"):
+    with pytest.raises(ArcheryMCPToolError, match="需要先登录") as captured:
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert ARCHERY_MCP_LOGIN_TOOL_NAME == "ensure_login"
+    assert ARCHERY_MCP_LOGIN_TOOL_NAME == "ensure_login_gymJPA"
     assert tool_calls == [
-        "ensure_login",
+        "ensure_login_gymJPA",
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
+    assert captured.value.diagnostic_data["login_tool"] == "ensure_login_gymJPA"
+    assert captured.value.diagnostic_data["username_field_present"] is True
+    assert captured.value.diagnostic_data["mcp_session_id_present"] is True
 
 
 @pytest.mark.asyncio
