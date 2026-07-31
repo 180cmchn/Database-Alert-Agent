@@ -257,14 +257,10 @@ async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> No
 def _archery_call_handler(
     *,
     login_result: dict[str, Any],
-    query_result: dict[str, Any] | list[dict[str, Any]],
+    query_result: dict[str, Any],
     tool_calls: list[str],
 ) -> httpx.MockTransport:
-    query_results = query_result if isinstance(query_result, list) else [query_result]
-    query_call_index = 0
-
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal query_call_index
         if request.method == "DELETE":
             return httpx.Response(200, request=request)
         body = json.loads(request.content)
@@ -303,13 +299,11 @@ def _archery_call_handler(
         if method == "tools/call":
             tool_name = body["params"]["name"]
             tool_calls.append(tool_name)
-            if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME:
-                result = login_result
-            else:
-                result = query_results[
-                    min(query_call_index, len(query_results) - 1)
-                ]
-                query_call_index += 1
+            result = (
+                login_result
+                if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME
+                else query_result
+            )
             return _json_response(
                 request,
                 body["id"],
@@ -412,59 +406,12 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
     assert tool_calls == [
         "ensure_login_gymJPA",
         ARCHERY_MCP_QUERY_TOOL_NAME,
-        "ensure_login_gymJPA",
-        ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
     assert captured.value.diagnostic_data["login_tool"] == "ensure_login_gymJPA"
     assert captured.value.diagnostic_data["mcp_client"] == "official_python_sdk"
     assert captured.value.diagnostic_data["mcp_transport"] == "streamable_http"
-    assert captured.value.diagnostic_data["login_attempts"] == 2
-    assert captured.value.diagnostic_data["query_attempts"] == 2
     assert captured.value.diagnostic_data["username_field_present"] is True
     assert captured.value.diagnostic_data["mcp_session_id_present"] is True
-
-
-@pytest.mark.asyncio
-async def test_archery_mcp_reauthenticates_once_when_query_requests_login() -> None:
-    tool_calls: list[str] = []
-    client = _client(
-        _archery_call_handler(
-            login_result={
-                "structuredContent": {
-                    "status": "ok",
-                    "username": "test-user",
-                },
-                "isError": False,
-            },
-            query_result=[
-                {
-                    "structuredContent": {
-                        "result": "需要先登录 Archery（未获取到用户名）。"
-                    },
-                    "isError": False,
-                },
-                {
-                    "structuredContent": {
-                        "status": "ok",
-                        "rows": [[1]],
-                        "rowCount": 1,
-                    },
-                    "isError": False,
-                },
-            ],
-            tool_calls=tool_calls,
-        )
-    )
-
-    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
-
-    assert result.payload["rows"] == [[1]]
-    assert tool_calls == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
 
 
 @pytest.mark.asyncio

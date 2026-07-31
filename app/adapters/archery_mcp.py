@@ -32,14 +32,6 @@ _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SLOW_QUERY_TITLE_IDENTIFIER: Final = re.compile(
     rf"(?<![a-z0-9]){SLOW_QUERY_TITLE_IDENTIFIER}(?![a-z0-9])", re.IGNORECASE
 )
-_LOGIN_REQUIRED_TEXT: Final = re.compile(
-    r"""
-    需要先登录\s*Archery
-    |未获取到用户名
-    |请先调用\s*ensure_login(?:_gymJPA)?\s*\(\s*\)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
 _BUSINESS_ERROR_TEXT: Final = re.compile(
     r"""
     实例不在白名单中，?已拒绝执行
@@ -269,56 +261,49 @@ class ArcheryMCPClient:
                         tools = await self._list_tools(session)
                         self._validate_required_tools(tools)
 
-                        login_payload, login_text = await self._confirm_login(
-                            session
+                        login_result = await self._call_tool(
+                            session,
+                            tool_name=self.login_tool_name,
+                            arguments={},
                         )
-                        query_arguments = {
-                            "instance_ref": self.instance_ref,
-                            "db_name": self.db_name,
-                            "sql_content": requested_sql,
-                            "limit_num": ARCHERY_SLOW_LOG_LIMIT,
-                            "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                        }
-                        login_attempts = 1
-                        for query_attempt in (1, 2):
-                            try:
-                                query_result = await self._call_tool(
-                                    session,
-                                    tool_name=self.query_tool_name,
-                                    arguments=query_arguments,
-                                )
-                                query_text = self._tool_text_blocks(query_result)
-                                payload = self._extract_tool_payload(query_result)
-                                self._validate_business_success(
-                                    payload,
-                                    tool_name=self.query_tool_name,
-                                    supplemental_text=query_text,
-                                )
-                            except ArcheryMCPToolError as exc:
-                                if (
-                                    query_attempt == 1
-                                    and _LOGIN_REQUIRED_TEXT.search(str(exc))
-                                ):
-                                    login_payload, login_text = (
-                                        await self._confirm_login(session)
-                                    )
-                                    login_attempts += 1
-                                    continue
-                                raise ArcheryMCPToolError(
-                                    str(exc),
-                                    diagnostic_data=self._login_diagnostic_data(
-                                        login_payload,
-                                        login_text,
-                                        session_id=get_session_id(),
-                                        login_attempts=login_attempts,
-                                        query_attempts=query_attempt,
-                                    ),
-                                ) from exc
-                            break
-                        else:  # pragma: no cover - both loop exits raise or break
-                            raise ArcheryMCPProtocolError(
-                                "Archery MCP query retry loop ended unexpectedly"
+                        login_text = self._tool_text_blocks(login_result)
+                        login_payload = self._extract_tool_payload(login_result)
+                        self._validate_business_success(
+                            login_payload,
+                            tool_name=self.login_tool_name,
+                            supplemental_text=login_text,
+                        )
+
+                        query_result = await self._call_tool(
+                            session,
+                            tool_name=self.query_tool_name,
+                            arguments={
+                                "instance_ref": self.instance_ref,
+                                "db_name": self.db_name,
+                                "sql_content": requested_sql,
+                                "limit_num": ARCHERY_SLOW_LOG_LIMIT,
+                                "max_result_chars": (
+                                    ARCHERY_SLOW_LOG_MAX_RESULT_CHARS
+                                ),
+                            },
+                        )
+                        query_text = self._tool_text_blocks(query_result)
+                        payload = self._extract_tool_payload(query_result)
+                        try:
+                            self._validate_business_success(
+                                payload,
+                                tool_name=self.query_tool_name,
+                                supplemental_text=query_text,
                             )
+                        except ArcheryMCPToolError as exc:
+                            raise ArcheryMCPToolError(
+                                str(exc),
+                                diagnostic_data=self._login_diagnostic_data(
+                                    login_payload,
+                                    login_text,
+                                    session_id=get_session_id(),
+                                ),
+                            ) from exc
                         return ArcherySlowLogQueryResult(
                             payload=payload,
                             requested_sql=requested_sql,
@@ -427,24 +412,6 @@ class ArcheryMCPClient:
             mode="json",
             exclude_none=True,
         )
-
-    async def _confirm_login(
-        self,
-        session: ClientSession,
-    ) -> tuple[dict[str, Any], tuple[str, ...]]:
-        login_result = await self._call_tool(
-            session,
-            tool_name=self.login_tool_name,
-            arguments={},
-        )
-        login_text = self._tool_text_blocks(login_result)
-        login_payload = self._extract_tool_payload(login_result)
-        self._validate_business_success(
-            login_payload,
-            tool_name=self.login_tool_name,
-            supplemental_text=login_text,
-        )
-        return login_payload, login_text
 
     @staticmethod
     def _extract_tool_payload(result: dict[str, Any]) -> dict[str, Any]:
@@ -565,8 +532,6 @@ class ArcheryMCPClient:
         text_blocks: tuple[str, ...],
         *,
         session_id: str | None,
-        login_attempts: int = 1,
-        query_attempts: int = 1,
     ) -> dict[str, Any]:
         containers = self._metadata_containers(payload)
         username_field_present = any(
@@ -581,8 +546,6 @@ class ArcheryMCPClient:
             "mcp_client": "official_python_sdk",
             "mcp_transport": "streamable_http",
             "mcp_session_id_present": bool(session_id),
-            "login_attempts": login_attempts,
-            "query_attempts": query_attempts,
             "login_payload_keys": sorted(str(key) for key in payload)[:20],
             "login_text_block_count": len(text_blocks),
             "username_field_present": username_field_present,
