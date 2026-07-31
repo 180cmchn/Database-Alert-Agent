@@ -15,7 +15,7 @@ from app.domain.models import InvestigationContext, ToolExecutionRequest
 
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
-ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
+ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login"
 ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # Bound the global snapshot returned by Archery. The server can truncate at this
@@ -42,6 +42,9 @@ _BUSINESS_ERROR_TEXT: Final = re.compile(
     |您没有执行该\s*SQL\s*查询的权限
     |SQL\s*查询失败
     |登录已过期，?请重新登录后再试
+    |需要先登录\s*Archery
+    |未获取到用户名
+    |请先调用\s*ensure_login(?:_gymJPA)?\s*\(\s*\)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -553,7 +556,7 @@ class ArcheryMCPClient:
     def _metadata_text(payload: Mapping[str, Any]) -> list[str]:
         values: list[str] = []
         for container in ArcheryMCPClient._metadata_containers(payload):
-            for key in ("message", "detail", "content"):
+            for key in ("message", "detail", "content", "result"):
                 value = container.get(key)
                 if isinstance(value, str):
                     values.append(value)

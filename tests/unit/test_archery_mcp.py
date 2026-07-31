@@ -371,6 +371,41 @@ async def test_archery_mcp_rejects_business_error_without_mcp_is_error() -> None
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
+    tool_calls: list[str] = []
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {
+                    "status": "ok",
+                    "username": "test-user",
+                },
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {
+                    "result": (
+                        "需要先登录 Archery（未获取到用户名）。"
+                        "请先调用 ensure_login()。"
+                    )
+                },
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+        )
+    )
+
+    with pytest.raises(ArcheryMCPToolError, match="需要先登录"):
+        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert ARCHERY_MCP_LOGIN_TOOL_NAME == "ensure_login"
+    assert tool_calls == [
+        "ensure_login",
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_accepts_result_without_actual_executed_sql() -> None:
     tool_calls: list[str] = []
     query_payload = {

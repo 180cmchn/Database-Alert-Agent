@@ -261,7 +261,7 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 当规范化后的告警标题包含独立的 `slow_query` 标识符时（忽略大小写，但不匹配
 `slow_queryable` 等更长标识符），调查策略会新增一个必需的
 `query_archery_slow_logs` 工具调用。该工具通过 Archery MCP 的 Streamable HTTP Endpoint
-完成初始化和工具发现，先调用 `ensure_login_gymJPA()` 确认 Token 登录有效；只有确认成功后，
+完成初始化和工具发现，先调用当前部署实际暴露的 `ensure_login()` 确认 Token 登录有效；只有确认成功后，
 才调用 `sql_query_gymJPA`。查询结构固定，但时间边界由规范化告警的 `occurred_at` 和部署窗口
 计算。默认窗口与慢查询告警规则一致，为截至告警发生时的前 5 分钟：
 
