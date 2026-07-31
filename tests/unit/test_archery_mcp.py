@@ -453,6 +453,58 @@ def test_archery_mcp_extracts_actual_sql_from_documented_text_output() -> None:
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text_output",
+    [
+        (
+            "**实际执行 SQL：**\n"
+            f"```sql\n{TEST_SLOW_LOG_QUERY} LIMIT 20\n```"
+        ),
+        json.dumps({"actual_sql": f"{TEST_SLOW_LOG_QUERY} LIMIT 20"}),
+    ],
+    ids=["markdown", "json"],
+)
+async def test_archery_mcp_reads_actual_sql_from_text_alongside_structured_content(
+    text_output: str,
+) -> None:
+    tool_calls: list[str] = []
+    structured_payload = {
+        "status": "ok",
+        "columns": ["f_id"],
+        "rows": [[1]],
+        "rowCount": 1,
+    }
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": structured_payload,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text_output,
+                    }
+                ],
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+        )
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.payload == structured_payload
+    assert result.actual_sql == f"{TEST_SLOW_LOG_QUERY} LIMIT 20"
+    assert tool_calls == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+
+
 class RecordingArcheryClient:
     login_tool_name = ARCHERY_MCP_LOGIN_TOOL_NAME
     query_tool_name = ARCHERY_MCP_QUERY_TOOL_NAME

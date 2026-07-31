@@ -50,7 +50,7 @@ _ACTUAL_SQL_KEYS: Final = {
 _ACTUAL_SQL_BLOCK: Final = re.compile(
     r"""
     (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
-    \s*[:：]\s*
+    \s*(?:\*{1,2}|_{1,2})?\s*[:：]\s*(?:\*{1,2}|_{1,2})?\s*
     ```(?:sql)?\s*
     (?P<sql>.*?)
     ```
@@ -60,7 +60,7 @@ _ACTUAL_SQL_BLOCK: Final = re.compile(
 _ACTUAL_SQL_INLINE: Final = re.compile(
     r"""
     (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
-    \s*[:：]\s*
+    \s*(?:\*{1,2}|_{1,2})?\s*[:：]\s*(?:\*{1,2}|_{1,2})?\s*
     `?(?P<sql>[^\r\n`]+)`?
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -323,9 +323,12 @@ class ArcheryMCPClient:
                     session_id=session_id,
                     protocol_version=protocol_version,
                 )
+                login_text = self._tool_text_blocks(login_result)
                 login_payload = self._extract_tool_payload(login_result)
                 self._validate_business_success(
-                    login_payload, tool_name=self.login_tool_name
+                    login_payload,
+                    tool_name=self.login_tool_name,
+                    supplemental_text=login_text,
                 )
 
                 query_result = await self._call_tool(
@@ -342,11 +345,17 @@ class ArcheryMCPClient:
                     session_id=session_id,
                     protocol_version=protocol_version,
                 )
+                query_text = self._tool_text_blocks(query_result)
                 payload = self._extract_tool_payload(query_result)
                 self._validate_business_success(
-                    payload, tool_name=self.query_tool_name
+                    payload,
+                    tool_name=self.query_tool_name,
+                    supplemental_text=query_text,
                 )
-                actual_sql = self._extract_actual_sql(payload)
+                actual_sql = self._extract_actual_sql(
+                    payload,
+                    supplemental_text=query_text,
+                )
                 if actual_sql is None:
                     raise ArcheryMCPProtocolError(
                         "Archery MCP query result did not expose the actual executed SQL"
@@ -493,13 +502,7 @@ class ArcheryMCPClient:
                 "Archery MCP structuredContent was not an object"
             )
 
-        text_blocks = [
-            item["text"]
-            for item in result.get("content", [])
-            if isinstance(item, dict)
-            and item.get("type") == "text"
-            and isinstance(item.get("text"), str)
-        ]
+        text_blocks = ArcheryMCPClient._tool_text_blocks(result)
         for text in text_blocks:
             try:
                 decoded = json.loads(text)
@@ -509,12 +512,15 @@ class ArcheryMCPClient:
                 return decoded
             return {"result": decoded}
         if text_blocks:
-            return {"content": text_blocks}
+            return {"content": list(text_blocks)}
         raise ArcheryMCPProtocolError("Archery MCP tool returned no usable content")
 
     @staticmethod
     def _validate_business_success(
-        payload: Mapping[str, Any], *, tool_name: str
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str,
+        supplemental_text: tuple[str, ...] = (),
     ) -> None:
         status = payload.get("status")
         if isinstance(status, str) and status.strip().casefold() in _FAILURE_STATUSES:
@@ -544,7 +550,16 @@ class ArcheryMCPClient:
                 f"{tool_name} failed: {_safe_error_detail(explicit_error)}"
             )
 
-        for text in ArcheryMCPClient._metadata_text(payload):
+        for decoded in ArcheryMCPClient._decoded_text_payloads(supplemental_text):
+            ArcheryMCPClient._validate_business_success(
+                decoded,
+                tool_name=tool_name,
+            )
+
+        for text in [
+            *ArcheryMCPClient._metadata_text(payload),
+            *supplemental_text,
+        ]:
             match = _BUSINESS_ERROR_TEXT.search(text)
             if match is not None:
                 raise ArcheryMCPToolError(
@@ -552,7 +567,11 @@ class ArcheryMCPClient:
                 )
 
     @staticmethod
-    def _extract_actual_sql(payload: Mapping[str, Any]) -> str | None:
+    def _extract_actual_sql(
+        payload: Mapping[str, Any],
+        *,
+        supplemental_text: tuple[str, ...] = (),
+    ) -> str | None:
         for container in ArcheryMCPClient._metadata_containers(payload):
             for key, value in container.items():
                 normalized_key = re.sub(r"[\s_:：-]+", "", str(key)).casefold()
@@ -561,7 +580,15 @@ class ArcheryMCPClient:
                     if actual_sql:
                         return actual_sql
 
-        for text in ArcheryMCPClient._metadata_text(payload):
+        for decoded in ArcheryMCPClient._decoded_text_payloads(supplemental_text):
+            actual_sql = ArcheryMCPClient._extract_actual_sql(decoded)
+            if actual_sql is not None:
+                return actual_sql
+
+        for text in [
+            *ArcheryMCPClient._metadata_text(payload),
+            *supplemental_text,
+        ]:
             for pattern in (_ACTUAL_SQL_BLOCK, _ACTUAL_SQL_INLINE):
                 match = pattern.search(text)
                 if match is not None:
@@ -569,6 +596,33 @@ class ArcheryMCPClient:
                     if actual_sql:
                         return actual_sql
         return None
+
+    @staticmethod
+    def _tool_text_blocks(result: Mapping[str, Any]) -> tuple[str, ...]:
+        content = result.get("content")
+        if not isinstance(content, list):
+            return ()
+        return tuple(
+            item["text"]
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        )
+
+    @staticmethod
+    def _decoded_text_payloads(
+        text_blocks: tuple[str, ...],
+    ) -> list[Mapping[str, Any]]:
+        payloads: list[Mapping[str, Any]] = []
+        for text in text_blocks:
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, Mapping):
+                payloads.append(decoded)
+        return payloads
 
     @staticmethod
     def _metadata_containers(
