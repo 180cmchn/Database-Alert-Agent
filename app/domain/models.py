@@ -376,6 +376,15 @@ class EvidenceRecord(BaseModel):
     duration_ms: int = Field(default=0, ge=0)
     truncated: bool = False
 
+    def is_root_cause_support_eligible(self) -> bool:
+        """Return whether this successful live record may support a root cause."""
+
+        return (
+            self.status == ToolStatus.SUCCESS
+            and self.source_system != "alert_platform"
+            and self.structured_data.get("root_cause_eligible") is not False
+        )
+
 
 class ProgressRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)

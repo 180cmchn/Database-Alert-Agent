@@ -104,8 +104,9 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 
 KnowledgePack 作为独立项目和独立镜像部署。它与 Agent 的 Compose 项目加入同一个预创建的
 Docker 网络，并通过网络别名 `knowledge` 提供接口；不向宿主机发布端口。Agent 只调用
-`POST /search` 和 `GET /stats`。生产索引内容应在入库前完成审批，因此它与本地 PDF 同级作为
-知识依据；两者都不能代替本次事故的实时证据。
+`POST /search`。Agent 的启动和就绪检查不探测知识库；知识库应由自身服务检查健康状态，
+检索失败时 Agent 按可选知识来源缺失处理。生产索引内容应在入库前完成审批，因此它与本地 PDF
+同级作为知识依据；两者都不能代替本次事故的实时证据。
 
 在同一 Docker Engine 上只需创建一次共享网络，两个项目可随后独立启动、停止和升级：
 
@@ -257,28 +258,47 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 
 ## Archery 慢查询实时证据
 
-当规范化后的 `alert_type` **精确等于** `慢查询过多` 时，调查策略会新增一个必需的
+当规范化后的告警标题包含独立的 `slow_query` 标识符时（忽略大小写，但不匹配
+`slow_queryable` 等更长标识符），调查策略会新增一个必需的
 `query_archery_slow_logs` 工具调用。该工具通过 Archery MCP 的 Streamable HTTP Endpoint
-完成初始化和工具发现，随后调用 `sql_query_gymJPA` 执行固定 SQL：
+完成初始化和工具发现，先调用 `ensure_login_gymJPA()` 确认 Token 登录有效；只有确认成功后，
+才调用 `sql_query_gymJPA`。查询结构固定，但时间边界由规范化告警的 `occurred_at` 和部署窗口
+计算。默认窗口与慢查询告警规则一致，为截至告警发生时的前 5 分钟：
 
 ```sql
 select * from t_slowlog_info
+where `f_insert_time` >= from_unixtime(<occurred_at - 300>)
+  and `f_insert_time` <= from_unixtime(<occurred_at>)
+order by `f_insert_time` desc
 ```
 
-工具不会根据标题、描述或模型输出拼接 SQL，也不会接受其他 SQL。调用 `sql_query_gymJPA` 即
-直接向后端提交查询，不存在"预览后再确认"的步骤。查询结果以
-`source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent；传输失败、鉴权失败、
-缺少查询范围、超时或 MCP 工具报错只会形成失败证据，不能被当作根因的反证或成功结果。
+`f_insert_time` 是 `t_slowlog_info` 中不会因后续更新而变化的 `datetime` 插入时间。SQL 使用
+`FROM_UNIXTIME`，使 Unix 告警时间按照数据库会话时区转换，与该列的 `CURRENT_TIMESTAMP`
+语义保持一致。工具不接受调用者或模型提供的 SQL/窗口参数。调用 `sql_query_gymJPA` 即直接向
+后端提交查询，不存在"预览后再确认"的步骤。客户端会核对返回中的“实际执行 SQL”，只接受
+计算出的原查询以及 Archery 自动追加的不超过 20 行的 `LIMIT`；若未返回实际 SQL，或表、
+时间列、时间边界、其他语句或行数被改写，查询结果会失败关闭。
+当前表结构没有 `f_insert_time` 索引；数据量增长后可能出现扫描和排序开销，是否加索引属于
+数据库变更，应由 DBA 根据执行计划和实际数据量另行评审。
+
+查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。结果已按
+告警时间窗过滤，但当前表查询尚未按告警指向的受影响数据库实例过滤，并受 20 行和 8,000 字符
+上限约束，因此仍标记为可能截断的排查线索，不能单独支持或反驳本次告警根因。传输失败、登录
+确认失败、鉴权失败、缺少查询范围、超时、MCP 标准错误或 Archery 业务错误只会形成失败证据。
 
 在 `.env` 配置完整 MCP Endpoint 和 Token：
 
 ```dotenv
 ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
 ARCHERY_MCP_TOKEN=archery_replace-with-your-token
+ARCHERY_MCP_INSTANCE_REF=archery
+ARCHERY_MCP_DB_NAME=archery
+ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
-URL 与 Token 是部署级配置，必须同时提供，不能通过管理 API 修改。当前认证方式是
+URL、Token、`instance_ref`、`db_name` 和窗口都是部署级配置，不能通过管理 API 修改；启用
+Archery MCP 时前四项必须同时提供。当前认证方式是
 `X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的
 `X-Archery-Username` 和 `X-Archery-Password`。Token 只通过每个 MCP HTTP 请求的
 `X-Archery-Token` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP 重定向。生产

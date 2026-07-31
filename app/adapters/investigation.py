@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.adapters.archery_mcp import (
-    ARCHERY_SLOW_LOG_QUERY,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     is_slow_query_alert_title,
 )
@@ -351,7 +350,6 @@ class DefaultInvestigationStrategyProvider:
             requests.append(
                 ToolExecutionRequest(
                     tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
-                    parameters={"sql": ARCHERY_SLOW_LOG_QUERY},
                     required=True,
                     timeout_seconds=self.external_tool_timeout_seconds,
                 )
@@ -387,7 +385,7 @@ class DefaultInvestigationStrategyProvider:
         if tool_name == ARCHERY_SLOW_LOG_TOOL_NAME:
             if not is_slow_query_alert_title(alert.title):
                 return None
-            return {"sql": ARCHERY_SLOW_LOG_QUERY}
+            return {}
 
         if tool_name == "query_database_diagnostics":
             target_locator = (

@@ -285,22 +285,40 @@ def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
         archery_mcp_url="https://archery.example.test/mcp",
     )
     assert settings.archery_mcp_enabled is False
-    assert (
-        "ARCHERY_MCP_URL and ARCHERY_MCP_TOKEN must be configured together"
-        in settings.readiness_issues()
+    issue = next(
+        item
+        for item in settings.readiness_issues()
+        if "Archery MCP configuration is incomplete" in item
     )
+    assert "ARCHERY_MCP_TOKEN" in issue
+    assert "ARCHERY_MCP_INSTANCE_REF" in issue
+    assert "ARCHERY_MCP_DB_NAME" in issue
 
-    configured = Settings(
+    incomplete = Settings(
         _env_file=None,
         ai_provider="fake",
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-token",
     )
+    assert incomplete.archery_mcp_enabled is False
+
+    configured = incomplete.model_copy(
+        update={
+            "archery_mcp_instance_ref": "archery-metadata",
+            "archery_mcp_db_name": "archery_data",
+        }
+    )
     assert configured.archery_mcp_enabled is True
     assert "archery_mcp_url" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_db_name" not in RUNTIME_SETTINGS_KEYS
+    assert configured.archery_slow_log_window_seconds == 300
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
+    monkeypatch.setenv("ARCHERY_MCP_INSTANCE_REF", "archery-from-env")
+    monkeypatch.setenv("ARCHERY_MCP_DB_NAME", "archery_db_from_env")
+    monkeypatch.setenv("ARCHERY_SLOW_LOG_WINDOW_SECONDS", "600")
     alias_configured = Settings(
         _env_file=None,
         ai_provider="fake",
@@ -308,6 +326,9 @@ def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
     )
     assert alias_configured.archery_mcp_enabled is True
     assert alias_configured.archery_mcp_token == "existing-server-token"
+    assert alias_configured.archery_mcp_instance_ref == "archery-from-env"
+    assert alias_configured.archery_mcp_db_name == "archery_db_from_env"
+    assert alias_configured.archery_slow_log_window_seconds == 600
 
     with pytest.raises(ValidationError, match="full MCP endpoint"):
         Settings(

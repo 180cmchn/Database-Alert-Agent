@@ -143,6 +143,40 @@ async def test_rule_validator_marks_supported_live_evidence_sufficient() -> None
 
 
 @pytest.mark.asyncio
+async def test_rule_validator_rejects_live_evidence_marked_root_cause_ineligible() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    unscoped_evidence = EvidenceRecord(
+        run_id=run.id,
+        tool_name="query_archery_slow_logs",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="unscoped slow-log snapshot",
+        structured_data={"root_cause_eligible": False},
+    )
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="excessive slow queries on the alerted instance",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(unscoped_evidence.id)],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+        requires_human=False,
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [unscoped_evidence], []
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("明确标记为不能支持根因" in issue for issue in result.issues)
+
+
+@pytest.mark.asyncio
 async def test_rule_validator_rejects_dangerous_action() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)

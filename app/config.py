@@ -125,9 +125,9 @@ class Settings(BaseSettings):
     flashduty_logs_ds_name: str = ""
     flashduty_logs_ds_type: str = "loki"
 
-    # Archery MCP is a deployment-only live evidence source. The endpoint and
-    # X-Archery-Token intentionally stay outside RUNTIME_SETTINGS_KEYS so an admin
-    # API caller cannot redirect the token or diagnostic traffic.
+    # Archery MCP is a deployment-only live evidence source. Its endpoint,
+    # X-Archery-Token, target scope, and query window stay outside
+    # RUNTIME_SETTINGS_KEYS so an admin caller cannot redirect diagnostic traffic.
     archery_mcp_url: str = ""
     archery_mcp_token: str = Field(
         default="",
@@ -138,6 +138,9 @@ class Settings(BaseSettings):
             "ARCHERY_TOKEN",
         ),
     )
+    archery_mcp_instance_ref: str = ""
+    archery_mcp_db_name: str = ""
+    archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
 
     # External knowledge deployment coordinates are intentionally not runtime
@@ -183,6 +186,17 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_mode(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator(
+        "archery_mcp_instance_ref",
+        "archery_mcp_db_name",
+    )
+    @classmethod
+    def normalize_archery_scope(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) > 255 or any(ord(character) < 32 for character in value):
+            raise ValueError("Archery scope values must be printable and at most 255 chars")
+        return value
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
@@ -323,9 +337,16 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def archery_mcp_enabled(self) -> bool:
-        """Enable the live evidence adapter only when both coordinates exist."""
+        """Enable Archery evidence only when every deployment coordinate exists."""
 
-        return bool(self.archery_mcp_url.strip() and self.archery_mcp_token.strip())
+        return all(
+            (
+                self.archery_mcp_url.strip(),
+                self.archery_mcp_token.strip(),
+                self.archery_mcp_instance_ref.strip(),
+                self.archery_mcp_db_name.strip(),
+            )
+        )
 
     def external_knowledge_api_key_is_current(self) -> bool:
         """Return whether the secret is bound to the active deployment URL."""
@@ -382,10 +403,23 @@ class Settings(BaseSettings):
                 "FLASHDUTY_POLL_CHANNEL_IDS must contain at least one collaboration "
                 "space ID when FlashDuty change queries are enabled"
             )
-        if bool(self.archery_mcp_url.strip()) != bool(self.archery_mcp_token.strip()):
-            issues.append(
-                "ARCHERY_MCP_URL and ARCHERY_MCP_TOKEN must be configured together"
-            )
+        if self.archery_mcp_url.strip() or self.archery_mcp_token.strip():
+            required_archery_settings = {
+                "ARCHERY_MCP_URL": self.archery_mcp_url,
+                "ARCHERY_MCP_TOKEN": self.archery_mcp_token,
+                "ARCHERY_MCP_INSTANCE_REF": self.archery_mcp_instance_ref,
+                "ARCHERY_MCP_DB_NAME": self.archery_mcp_db_name,
+            }
+            missing_archery_settings = [
+                name
+                for name, value in required_archery_settings.items()
+                if not value.strip()
+            ]
+            if missing_archery_settings:
+                issues.append(
+                    "Archery MCP configuration is incomplete; missing: "
+                    + ", ".join(missing_archery_settings)
+                )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:

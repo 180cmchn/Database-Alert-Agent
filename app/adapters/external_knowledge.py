@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -26,8 +25,6 @@ import httpx
 
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.models import ExternalKnowledgeExcerpt, NormalizedAlert
-
-logger = logging.getLogger(__name__)
 
 
 class ExternalKnowledgeError(RuntimeError):
@@ -181,20 +178,6 @@ class ExternalKnowledgeClient:
         response = await self._request("POST", "/search", json=payload)
         return self._parse_search_response(response, query)
 
-    async def health(self) -> dict[str, Any]:
-        """Call ``GET /stats`` as a lightweight health / readiness probe.
-
-        Returns the raw stats dictionary. Returns an empty dict on failure so
-        callers can treat health checks as non-fatal.
-        """
-
-        try:
-            response = await self._request("GET", "/stats")
-            return response if isinstance(response, dict) else {}
-        except ExternalKnowledgeAPIError:
-            logger.debug("external_knowledge_health_check_failed", exc_info=True)
-            return {}
-
     async def search_alert(
         self, alert: NormalizedAlert, *, top_k: int = 5
     ) -> KnowledgeSearchResponse:
@@ -205,7 +188,7 @@ class ExternalKnowledgeClient:
 
     async def _request(
         self,
-        method: Literal["GET", "POST"],
+        method: Literal["POST"],
         path: str,
         *,
         json: Mapping[str, Any] | None = None,

@@ -74,8 +74,16 @@ class RuleConclusionValidator:
                         f"{evidence_ref}（{record.status.value}）"
                     )
                     continue
-                if record.source_system != "alert_platform":
+                if record.is_root_cause_support_eligible():
                     live_successful_refs.add(evidence_ref)
+                elif (
+                    root_cause.status != RootCauseStatus.UNKNOWN
+                    and record.structured_data.get("root_cause_eligible") is False
+                ):
+                    issues.append(
+                        f"根因 #{index}（{cause_label}）引用了明确标记为不能支持"
+                        f"根因的证据：{evidence_ref}"
+                    )
 
             if root_cause.verified and not live_successful_refs:
                 issues.append(

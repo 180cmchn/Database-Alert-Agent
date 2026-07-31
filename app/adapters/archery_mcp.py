@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from urllib.parse import urlsplit
 
@@ -11,15 +13,16 @@ import httpx
 from app.application.sanitization import sanitize_text
 from app.domain.models import InvestigationContext, ToolExecutionRequest
 
-ARCHERY_SLOW_LOG_QUERY: Final = "select * from t_slowlog_info"
+ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
+ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
-ARCHERY_SLOW_LOG_INSTANCE_REF: Final = "archery"
-ARCHERY_SLOW_LOG_DATABASE: Final = "archery"
-# Keep a complete set of slow-SQL text in one evidence record under the Agent's
-# default 12 KB evidence ceiling. This is intentionally fixed, not model input.
+ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
+# Bound the global snapshot returned by Archery. The server can truncate at this
+# character limit, so this is not a guarantee that the evidence is complete.
 ARCHERY_SLOW_LOG_LIMIT: Final = 20
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 8_000
+ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 
 _MCP_PROTOCOL_VERSION: Final = "2025-11-25"
@@ -33,6 +36,62 @@ _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SLOW_QUERY_TITLE_IDENTIFIER: Final = re.compile(
     rf"(?<![a-z0-9]){SLOW_QUERY_TITLE_IDENTIFIER}(?![a-z0-9])", re.IGNORECASE
 )
+_TRAILING_LIMIT: Final = re.compile(
+    r"\s+LIMIT\s+(?:(?P<offset>[0-9]+)\s*,\s*)?(?P<limit>[0-9]+)\s*;?\s*\Z",
+    re.IGNORECASE,
+)
+_ACTUAL_SQL_KEYS: Final = {
+    "actualsql",
+    "actualexecutedsql",
+    "executedsql",
+    "实际执行sql",
+    "实际执行的sql",
+}
+_ACTUAL_SQL_BLOCK: Final = re.compile(
+    r"""
+    (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
+    \s*[:：]\s*
+    ```(?:sql)?\s*
+    (?P<sql>.*?)
+    ```
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+_ACTUAL_SQL_INLINE: Final = re.compile(
+    r"""
+    (?:实际执行(?:的)?\s*SQL|actual(?:ly)?\s+executed\s+sql|executed\s+sql)
+    \s*[:：]\s*
+    `?(?P<sql>[^\r\n`]+)`?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_BUSINESS_ERROR_TEXT: Final = re.compile(
+    r"""
+    实例不在白名单中，?已拒绝执行
+    |您没有执行该\s*SQL\s*查询的权限
+    |SQL\s*查询失败
+    |登录已过期，?请重新登录后再试
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_FAILURE_STATUSES: Final = {
+    "error",
+    "failed",
+    "failure",
+    "rejected",
+    "unauthorized",
+    "forbidden",
+    "not_logged_in",
+    "login_expired",
+}
+_PAYLOAD_CONTAINER_KEYS: Final = {
+    "data",
+    "result",
+    "query",
+    "execution",
+    "meta",
+    "metadata",
+}
 
 
 class ArcheryMCPError(RuntimeError):
@@ -52,7 +111,18 @@ class ArcheryMCPToolError(ArcheryMCPError):
 
 
 class ArcheryMCPReadOnlyViolation(ArcheryMCPError):
-    """A caller attempted to replace the approved fixed SELECT statement."""
+    """A caller or server changed the controlled read-only query structure."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArcherySlowLogQueryResult:
+    """Validated result of the login-confirmed Archery slow-log query."""
+
+    payload: dict[str, Any]
+    requested_sql: str
+    actual_sql: str
+    window_start: datetime
+    window_end: datetime
 
 
 def is_slow_query_alert_title(title: str) -> bool:
@@ -61,9 +131,55 @@ def is_slow_query_alert_title(title: str) -> bool:
     return bool(_SLOW_QUERY_TITLE_IDENTIFIER.search(title))
 
 
-def _is_approved_query(sql: str) -> bool:
-    normalized = re.sub(r"\s+", " ", sql.strip().removesuffix(";").strip()).casefold()
-    return normalized == ARCHERY_SLOW_LOG_QUERY
+def _canonical_sql(sql: str) -> str:
+    without_quotes = sql.replace("`", "")
+    return re.sub(
+        r"\s+", " ", without_quotes.strip().removesuffix(";").strip()
+    ).casefold()
+
+
+def _is_approved_executed_query(
+    sql: str, *, requested_sql: str, db_name: str
+) -> bool:
+    limit_match = _TRAILING_LIMIT.search(sql)
+    base_sql = sql
+    if limit_match is not None:
+        offset = limit_match.group("offset")
+        limit = int(limit_match.group("limit"))
+        if (offset is not None and int(offset) != 0) or limit > ARCHERY_SLOW_LOG_LIMIT:
+            return False
+        base_sql = sql[: limit_match.start()]
+
+    expected = _canonical_sql(requested_sql)
+    actual = _canonical_sql(base_sql)
+    qualified_expected = expected.replace(
+        f"from {ARCHERY_SLOW_LOG_TABLE}",
+        f"from {_canonical_sql(db_name)}.{ARCHERY_SLOW_LOG_TABLE}",
+        1,
+    )
+    return actual in {expected, qualified_expected}
+
+
+def _build_slow_log_query(
+    occurred_at: datetime,
+    *,
+    window_seconds: int,
+) -> tuple[str, datetime, datetime]:
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise ArcheryMCPConfigurationError(
+            "Alert occurred_at must include a timezone for Archery window filtering"
+        )
+    window_end = occurred_at.astimezone(UTC)
+    window_start = window_end - timedelta(seconds=window_seconds)
+    start_timestamp = int(window_start.timestamp())
+    end_timestamp = int(window_end.timestamp())
+    sql = (
+        f"select * from {ARCHERY_SLOW_LOG_TABLE} "
+        f"where `{ARCHERY_SLOW_LOG_TIME_COLUMN}` >= from_unixtime({start_timestamp}) "
+        f"and `{ARCHERY_SLOW_LOG_TIME_COLUMN}` <= from_unixtime({end_timestamp}) "
+        f"order by `{ARCHERY_SLOW_LOG_TIME_COLUMN}` desc"
+    )
+    return sql, window_start, window_end
 
 
 def _safe_error_detail(value: Any) -> str:
@@ -78,6 +194,10 @@ class ArcheryMCPClient:
         mcp_url: str,
         token: str,
         *,
+        instance_ref: str,
+        db_name: str,
+        window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
+        login_tool_name: str = ARCHERY_MCP_LOGIN_TOOL_NAME,
         query_tool_name: str = ARCHERY_MCP_QUERY_TOOL_NAME,
         timeout_seconds: float = 60,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -97,20 +217,51 @@ class ArcheryMCPClient:
             )
         if not token.strip():
             raise ArcheryMCPConfigurationError("ARCHERY_MCP_TOKEN is not configured")
-        if not _TOOL_NAME.fullmatch(query_tool_name):
+        if not instance_ref.strip():
             raise ArcheryMCPConfigurationError(
-                "Archery MCP query tool name contains unsupported characters"
+                "ARCHERY_MCP_INSTANCE_REF is not configured"
+            )
+        if not db_name.strip():
+            raise ArcheryMCPConfigurationError("ARCHERY_MCP_DB_NAME is not configured")
+        if any(
+            len(value.strip()) > 255
+            or any(ord(character) < 32 for character in value.strip())
+            for value in (instance_ref, db_name)
+        ):
+            raise ArcheryMCPConfigurationError(
+                "Archery instance_ref and db_name must be printable and at most 255 chars"
+            )
+        if not 60 <= window_seconds <= 86_400:
+            raise ArcheryMCPConfigurationError(
+                "Archery slow-log window must be between 60 and 86400 seconds"
+            )
+        if not _TOOL_NAME.fullmatch(login_tool_name) or not _TOOL_NAME.fullmatch(
+            query_tool_name
+        ):
+            raise ArcheryMCPConfigurationError(
+                "Archery MCP tool name contains unsupported characters"
             )
 
         self.mcp_url = mcp_url.strip()
+        self.instance_ref = instance_ref.strip()
+        self.db_name = db_name.strip()
+        self.slow_log_time_column = ARCHERY_SLOW_LOG_TIME_COLUMN
+        self.window_seconds = window_seconds
+        self.login_tool_name = login_tool_name
         self.query_tool_name = query_tool_name
         self.timeout_seconds = timeout_seconds
         self._token = token.strip()
         self._transport = transport
 
-    async def execute_slow_log_query(self) -> dict[str, Any]:
-        """Execute the one approved slow-log SELECT and return its tool payload."""
+    async def execute_slow_log_query(
+        self, occurred_at: datetime
+    ) -> ArcherySlowLogQueryResult:
+        """Confirm login, then execute the alert-window slow-log SELECT."""
 
+        requested_sql, window_start, window_end = _build_slow_log_query(
+            occurred_at,
+            window_seconds=self.window_seconds,
+        )
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout_seconds),
             transport=self._transport,
@@ -162,16 +313,29 @@ class ArcheryMCPClient:
                     session_id=session_id,
                     protocol_version=protocol_version,
                 )
-                self._validate_query_tool(tools)
+                self._validate_required_tools(tools)
+
+                login_result = await self._call_tool(
+                    client,
+                    request_id=100,
+                    tool_name=self.login_tool_name,
+                    arguments={},
+                    session_id=session_id,
+                    protocol_version=protocol_version,
+                )
+                login_payload = self._extract_tool_payload(login_result)
+                self._validate_business_success(
+                    login_payload, tool_name=self.login_tool_name
+                )
 
                 query_result = await self._call_tool(
                     client,
-                    request_id=10,
+                    request_id=101,
                     tool_name=self.query_tool_name,
                     arguments={
-                        "instance_ref": ARCHERY_SLOW_LOG_INSTANCE_REF,
-                        "db_name": ARCHERY_SLOW_LOG_DATABASE,
-                        "sql_content": ARCHERY_SLOW_LOG_QUERY,
+                        "instance_ref": self.instance_ref,
+                        "db_name": self.db_name,
+                        "sql_content": requested_sql,
                         "limit_num": ARCHERY_SLOW_LOG_LIMIT,
                         "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
                     },
@@ -179,7 +343,30 @@ class ArcheryMCPClient:
                     protocol_version=protocol_version,
                 )
                 payload = self._extract_tool_payload(query_result)
-                return payload
+                self._validate_business_success(
+                    payload, tool_name=self.query_tool_name
+                )
+                actual_sql = self._extract_actual_sql(payload)
+                if actual_sql is None:
+                    raise ArcheryMCPProtocolError(
+                        "Archery MCP query result did not expose the actual executed SQL"
+                    )
+                if not _is_approved_executed_query(
+                    actual_sql,
+                    requested_sql=requested_sql,
+                    db_name=self.db_name,
+                ):
+                    raise ArcheryMCPReadOnlyViolation(
+                        "Archery MCP rewrote the SELECT outside the approved table, "
+                        "alert window, or row limit"
+                    )
+                return ArcherySlowLogQueryResult(
+                    payload=payload,
+                    requested_sql=requested_sql,
+                    actual_sql=actual_sql,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
             finally:
                 if session_id:
                     await self._close_session(
@@ -223,7 +410,30 @@ class ArcheryMCPClient:
             cursor = next_cursor
         raise ArcheryMCPProtocolError("Archery MCP tools/list pagination exceeded 10 pages")
 
-    def _validate_query_tool(self, tools: Mapping[str, dict[str, Any]]) -> None:
+    def _validate_required_tools(
+        self, tools: Mapping[str, dict[str, Any]]
+    ) -> None:
+        login_tool = tools.get(self.login_tool_name)
+        if login_tool is None:
+            raise ArcheryMCPConfigurationError(
+                f"Archery MCP does not expose the required tool {self.login_tool_name!r}"
+            )
+        login_schema = login_tool.get("inputSchema")
+        login_required = (
+            login_schema.get("required") if isinstance(login_schema, dict) else None
+        )
+        if not isinstance(login_schema, dict) or (
+            login_required is not None
+            and (
+                not isinstance(login_required, list)
+                or bool(login_required)
+            )
+        ):
+            raise ArcheryMCPConfigurationError(
+                f"Archery MCP tool {self.login_tool_name!r} cannot be called "
+                "without arguments"
+            )
+
         tool = tools.get(self.query_tool_name)
         if tool is None:
             raise ArcheryMCPConfigurationError(
@@ -231,11 +441,18 @@ class ArcheryMCPClient:
             )
         schema = tool.get("inputSchema")
         properties = schema.get("properties") if isinstance(schema, dict) else None
-        required_properties = {"instance_ref", "db_name", "sql_content"}
+        required_properties = {
+            "instance_ref",
+            "db_name",
+            "sql_content",
+            "limit_num",
+            "max_result_chars",
+        }
         if not isinstance(properties, dict) or not required_properties.issubset(properties):
             raise ArcheryMCPConfigurationError(
                 f"Archery MCP tool {self.query_tool_name!r} does not accept the required "
-                "instance_ref, db_name, and sql_content arguments"
+                "instance_ref, db_name, sql_content, limit_num, and "
+                "max_result_chars arguments"
             )
 
     async def _call_tool(
@@ -294,6 +511,94 @@ class ArcheryMCPClient:
         if text_blocks:
             return {"content": text_blocks}
         raise ArcheryMCPProtocolError("Archery MCP tool returned no usable content")
+
+    @staticmethod
+    def _validate_business_success(
+        payload: Mapping[str, Any], *, tool_name: str
+    ) -> None:
+        status = payload.get("status")
+        if isinstance(status, str) and status.strip().casefold() in _FAILURE_STATUSES:
+            detail = (
+                payload.get("message")
+                or payload.get("detail")
+                or payload.get("error")
+                or status
+            )
+            raise ArcheryMCPToolError(
+                f"{tool_name} failed: {_safe_error_detail(detail)}"
+            )
+        if payload.get("success") is False:
+            detail = (
+                payload.get("message")
+                or payload.get("detail")
+                or payload.get("error")
+                or "success=false"
+            )
+            raise ArcheryMCPToolError(
+                f"{tool_name} failed: {_safe_error_detail(detail)}"
+            )
+
+        explicit_error = payload.get("error")
+        if explicit_error not in (None, "", False, []):
+            raise ArcheryMCPToolError(
+                f"{tool_name} failed: {_safe_error_detail(explicit_error)}"
+            )
+
+        for text in ArcheryMCPClient._metadata_text(payload):
+            match = _BUSINESS_ERROR_TEXT.search(text)
+            if match is not None:
+                raise ArcheryMCPToolError(
+                    f"{tool_name} failed: {_safe_error_detail(match.group(0))}"
+                )
+
+    @staticmethod
+    def _extract_actual_sql(payload: Mapping[str, Any]) -> str | None:
+        for container in ArcheryMCPClient._metadata_containers(payload):
+            for key, value in container.items():
+                normalized_key = re.sub(r"[\s_:：-]+", "", str(key)).casefold()
+                if normalized_key in _ACTUAL_SQL_KEYS and isinstance(value, str):
+                    actual_sql = value.strip()
+                    if actual_sql:
+                        return actual_sql
+
+        for text in ArcheryMCPClient._metadata_text(payload):
+            for pattern in (_ACTUAL_SQL_BLOCK, _ACTUAL_SQL_INLINE):
+                match = pattern.search(text)
+                if match is not None:
+                    actual_sql = match.group("sql").strip()
+                    if actual_sql:
+                        return actual_sql
+        return None
+
+    @staticmethod
+    def _metadata_containers(
+        payload: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        containers: list[Mapping[str, Any]] = [payload]
+        index = 0
+        while index < len(containers) and len(containers) < 20:
+            container = containers[index]
+            index += 1
+            for key, value in container.items():
+                if (
+                    str(key).casefold() in _PAYLOAD_CONTAINER_KEYS
+                    and isinstance(value, Mapping)
+                    and value not in containers
+                ):
+                    containers.append(value)
+        return containers
+
+    @staticmethod
+    def _metadata_text(payload: Mapping[str, Any]) -> list[str]:
+        values: list[str] = []
+        for container in ArcheryMCPClient._metadata_containers(payload):
+            for key in ("message", "detail", "content"):
+                value = container.get(key)
+                if isinstance(value, str):
+                    values.append(value)
+                elif isinstance(value, list):
+                    values.extend(item for item in value if isinstance(item, str))
+        return values
 
     @staticmethod
     def _tool_content_summary(result: dict[str, Any]) -> str:
@@ -480,22 +785,48 @@ class ArcherySlowLogEvidenceTool:
                 "Archery slow-log evidence is restricted to titles containing "
                 "the slow_query identifier"
             )
-        requested_sql = request.parameters.get("sql")
-        if not isinstance(requested_sql, str) or not _is_approved_query(requested_sql):
+        if request.parameters:
             raise ArcheryMCPReadOnlyViolation(
-                "Archery slow-log evidence accepts only the approved fixed SELECT"
+                "Archery slow-log evidence parameters are derived only from deployment "
+                "configuration and alert occurred_at"
             )
 
-        result = await self.client.execute_slow_log_query()
-        row_count = self._row_count(result)
+        result = await self.client.execute_slow_log_query(context.alert.occurred_at)
+        row_count = self._row_count(result.payload)
         row_summary = f"，返回 {row_count} 行" if row_count is not None else ""
         return (
-            f"Archery MCP 已执行慢查询记录只读查询{row_summary}；"
-            "该结果作为本次告警的实时证据。",
+            f"Archery MCP 登录确认成功并执行慢查询记录只读查询{row_summary}；"
+            "结果已按告警时间窗过滤，但尚未按受影响数据库实例关联且可能被截断，"
+            "只能作为排查线索，不能单独证明本次告警根因。",
             {
-                "sql": ARCHERY_SLOW_LOG_QUERY,
+                "sql": result.requested_sql,
+                "actual_sql": result.actual_sql,
+                "login_confirmed": True,
+                "login_tool": self.client.login_tool_name,
                 "mcp_tool": self.client.query_tool_name,
-                "result": result,
+                "target": {
+                    "instance_ref": self.client.instance_ref,
+                    "db_name": self.client.db_name,
+                },
+                "query_window": {
+                    "basis": "alert.occurred_at",
+                    "alert_occurred_at": context.alert.occurred_at.isoformat(),
+                    "start": result.window_start.isoformat(),
+                    "end": result.window_end.isoformat(),
+                    "duration_seconds": self.client.window_seconds,
+                    "time_column": self.client.slow_log_time_column,
+                },
+                "scope": "alert_time_window_global_slow_log_snapshot",
+                "result_bounds": {
+                    "row_limit": ARCHERY_SLOW_LOG_LIMIT,
+                    "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+                    "truncation_possible": True,
+                },
+                "root_cause_eligible": False,
+                "root_cause_ineligible_reason": (
+                    "结果尚未按受影响数据库实例关联，且可能被字符上限截断"
+                ),
+                "result": result.payload,
             },
         )
 

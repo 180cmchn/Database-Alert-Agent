@@ -62,7 +62,8 @@ RUNBOOK 依据必须引用实际命中的 runbook_id/section；AI 依据不得�
 EXTERNAL_KNOWLEDGE 依据必须引用实际返回的 knowledge_id/title/source_uri。
 无论是否命中知识，都至少输出一条 AI 依据；命中某类知识时至少输出一条对应来源依据。
 命中知识时，每个 steps 项必须通过 source_ref 引用实际命中的本地 PDF 或外部知识条目。
-只有 status=SUCCESS 的实时工具证据才能支持已确认根因；失败、超时或历史案例只能作为线索。
+只有 status=SUCCESS、来自实时系统且未标记 root_cause_eligible=false 的工具证据才能支持
+已确认根因；失败、超时、历史案例或明确不具备根因支持资格的证据只能作为线索。
 手册中的 causes 是候选诊断图，不是本次事故已经成立的根因；必须逐条检查支持证据和反证。
 每个根因通过 root_causes 输出：status 只能是 SUPPORTED、CONTRADICTED 或 UNKNOWN。
 SUPPORTED 必须引用非 alert_platform 的 SUCCESS 实时 evidence id；
@@ -89,8 +90,8 @@ VALIDATION_PROMPT = """你是独立的告警结论验收员，不负责重新生
 UNKNOWN、verified=false、没有把猜测写成事实、提供了具体 next_probe，并要求人工复核，
 则分析契约可以通过，但 evidence_sufficient 必须为 false。
 
-SUPPORTED 必须引用非 alert_platform 的 SUCCESS 实时证据并设置 verified=true。
-CONTRADICTED 必须引用能反驳必要预测的非 alert_platform SUCCESS 实时证据。
+SUPPORTED 必须引用非 alert_platform、未标记 root_cause_eligible=false 的 SUCCESS 实时证据
+并设置 verified=true。CONTRADICTED 也必须引用具备根因支持资格、能反驳必要预测的实时证据。
 只要存在 UNKNOWN、没有 SUPPORTED 根因、工具失败/超时导致关键证据缺失，或仍有未排除的
 候选机制，evidence_sufficient 必须为 false。
 
@@ -473,10 +474,17 @@ class FakeAIAdvisor:
             item for item in evidence or [] if item.status.value == "SUCCESS"
         ]
         live_evidence = [
-            item for item in successful_evidence if item.source_system != "alert_platform"
+            item
+            for item in successful_evidence
+            if item.is_root_cause_support_eligible()
+        ]
+        referenceable_evidence = [
+            item
+            for item in successful_evidence
+            if item.structured_data.get("root_cause_eligible") is not False
         ]
         evidence_refs = [
-            str(item.id) for item in (live_evidence or successful_evidence)[:2]
+            str(item.id) for item in (live_evidence or referenceable_evidence)[:2]
         ]
         has_live_diagnostics = bool(live_evidence)
         external_knowledge = external_knowledge or []
@@ -839,7 +847,7 @@ class FakeConclusionValidator:
         live_success_ids = {
             str(item.id)
             for item in evidence
-            if item.status.value == "SUCCESS" and item.source_system != "alert_platform"
+            if item.is_root_cause_support_eligible()
         }
         all_decisive_refs_are_live = all(
             item.status == RootCauseStatus.UNKNOWN
