@@ -320,6 +320,9 @@ alembic upgrade head
 uvicorn app.api.main:app --reload
 ```
 
+拉取新代码后，如果 `pyproject.toml` 有依赖变更，需要在启动服务前重新执行
+`pip install -e '.[dev]'`，以同步当前虚拟环境和可编辑安装元数据。
+
 前端：
 
 ```bash
