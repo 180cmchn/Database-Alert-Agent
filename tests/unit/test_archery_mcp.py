@@ -304,7 +304,11 @@ def _archery_call_handler(
                 if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME
                 else query_result
             )
-            return _json_response(request, body["id"], result)
+            return _json_response(
+                request,
+                body["id"],
+                {"content": [], **result},
+            )
         raise AssertionError(method)
 
     return httpx.MockTransport(handler)
@@ -404,6 +408,8 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
     assert captured.value.diagnostic_data["login_tool"] == "ensure_login_gymJPA"
+    assert captured.value.diagnostic_data["mcp_client"] == "official_python_sdk"
+    assert captured.value.diagnostic_data["mcp_transport"] == "streamable_http"
     assert captured.value.diagnostic_data["username_field_present"] is True
     assert captured.value.diagnostic_data["mcp_session_id_present"] is True
 

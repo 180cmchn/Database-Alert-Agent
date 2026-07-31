@@ -9,6 +9,9 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 
 import httpx
+from mcp import ClientSession
+from mcp import types as mcp_types
+from mcp.client.streamable_http import streamable_http_client
 
 from app.application.sanitization import sanitize_text
 from app.domain.models import InvestigationContext, ToolExecutionRequest
@@ -25,13 +28,6 @@ ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 8_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 
-_MCP_PROTOCOL_VERSION: Final = "2025-11-25"
-_SUPPORTED_PROTOCOL_VERSIONS: Final = {
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-}
-_MAX_MCP_RESPONSE_BYTES: Final = 2_000_000
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SLOW_QUERY_TITLE_IDENTIFIER: Final = re.compile(
     rf"(?<![a-z0-9]){SLOW_QUERY_TITLE_IDENTIFIER}(?![a-z0-9])", re.IGNORECASE
@@ -148,8 +144,25 @@ def _safe_error_detail(value: Any) -> str:
     return sanitize_text(str(value or "")).strip()[:1000]
 
 
+def _nested_archery_error(error: BaseException) -> ArcheryMCPError | None:
+    if isinstance(error, ArcheryMCPError):
+        return error
+    if isinstance(error, BaseExceptionGroup):
+        for nested in error.exceptions:
+            matched = _nested_archery_error(nested)
+            if matched is not None:
+                return matched
+    return None
+
+
+def _first_exception_leaf(error: BaseException) -> BaseException:
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    return error
+
+
 class ArcheryMCPClient:
-    """Minimal stateful Streamable HTTP client for the Archery read-only tool."""
+    """Archery read-only client backed by the official MCP Python SDK."""
 
     def __init__(
         self,
@@ -224,153 +237,117 @@ class ArcheryMCPClient:
             occurred_at,
             window_seconds=self.window_seconds,
         )
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout_seconds),
-            transport=self._transport,
-            follow_redirects=False,
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "X-Archery-Token": self._token,
-                "Content-Type": "application/json",
-            },
-        ) as client:
-            session_id: str | None = None
-            protocol_version = _MCP_PROTOCOL_VERSION
-            try:
-                initialize, response = await self._send_request(
-                    client,
-                    request_id=1,
-                    method="initialize",
-                    params={
-                        "protocolVersion": _MCP_PROTOCOL_VERSION,
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "database-alert-agent",
-                            "version": "0.1.0",
-                        },
-                    },
-                )
-                if not isinstance(initialize, dict):
-                    raise ArcheryMCPProtocolError(
-                        "Archery MCP initialize result was not an object"
-                    )
-                negotiated = initialize.get("protocolVersion")
-                if not isinstance(negotiated, str) or (
-                    negotiated not in _SUPPORTED_PROTOCOL_VERSIONS
-                ):
-                    raise ArcheryMCPProtocolError(
-                        "Archery MCP returned an unsupported protocol version"
-                    )
-                protocol_version = negotiated
-                session_id = response.headers.get("Mcp-Session-Id")
-
-                await self._send_notification(
-                    client,
-                    method="notifications/initialized",
-                    session_id=session_id,
-                    protocol_version=protocol_version,
-                )
-                tools = await self._list_tools(
-                    client,
-                    session_id=session_id,
-                    protocol_version=protocol_version,
-                )
-                self._validate_required_tools(tools)
-
-                login_result = await self._call_tool(
-                    client,
-                    request_id=100,
-                    tool_name=self.login_tool_name,
-                    arguments={},
-                    session_id=session_id,
-                    protocol_version=protocol_version,
-                )
-                login_text = self._tool_text_blocks(login_result)
-                login_payload = self._extract_tool_payload(login_result)
-                self._validate_business_success(
-                    login_payload,
-                    tool_name=self.login_tool_name,
-                    supplemental_text=login_text,
-                )
-
-                query_result = await self._call_tool(
-                    client,
-                    request_id=101,
-                    tool_name=self.query_tool_name,
-                    arguments={
-                        "instance_ref": self.instance_ref,
-                        "db_name": self.db_name,
-                        "sql_content": requested_sql,
-                        "limit_num": ARCHERY_SLOW_LOG_LIMIT,
-                        "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                    },
-                    session_id=session_id,
-                    protocol_version=protocol_version,
-                )
-                query_text = self._tool_text_blocks(query_result)
-                payload = self._extract_tool_payload(query_result)
-                try:
-                    self._validate_business_success(
-                        payload,
-                        tool_name=self.query_tool_name,
-                        supplemental_text=query_text,
-                    )
-                except ArcheryMCPToolError as exc:
-                    raise ArcheryMCPToolError(
-                        str(exc),
-                        diagnostic_data=self._login_diagnostic_data(
-                            login_payload,
-                            login_text,
-                            session_id=session_id,
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_seconds),
+                transport=self._transport,
+                follow_redirects=False,
+                headers={"X-Archery-Token": self._token},
+            ) as http_client:
+                async with streamable_http_client(
+                    self.mcp_url,
+                    http_client=http_client,
+                ) as (read_stream, write_stream, get_session_id):
+                    async with ClientSession(
+                        read_stream,
+                        write_stream,
+                        read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                        client_info=mcp_types.Implementation(
+                            name="database-alert-agent",
+                            version="0.1.0",
                         ),
-                    ) from exc
-                return ArcherySlowLogQueryResult(
-                    payload=payload,
-                    requested_sql=requested_sql,
-                    window_start=window_start,
-                    window_end=window_end,
-                )
-            finally:
-                if session_id:
-                    await self._close_session(
-                        client,
-                        session_id=session_id,
-                        protocol_version=protocol_version,
-                    )
+                    ) as session:
+                        await session.initialize()
+                        tools = await self._list_tools(session)
+                        self._validate_required_tools(tools)
+
+                        login_result = await self._call_tool(
+                            session,
+                            tool_name=self.login_tool_name,
+                            arguments={},
+                        )
+                        login_text = self._tool_text_blocks(login_result)
+                        login_payload = self._extract_tool_payload(login_result)
+                        self._validate_business_success(
+                            login_payload,
+                            tool_name=self.login_tool_name,
+                            supplemental_text=login_text,
+                        )
+
+                        query_result = await self._call_tool(
+                            session,
+                            tool_name=self.query_tool_name,
+                            arguments={
+                                "instance_ref": self.instance_ref,
+                                "db_name": self.db_name,
+                                "sql_content": requested_sql,
+                                "limit_num": ARCHERY_SLOW_LOG_LIMIT,
+                                "max_result_chars": (
+                                    ARCHERY_SLOW_LOG_MAX_RESULT_CHARS
+                                ),
+                            },
+                        )
+                        query_text = self._tool_text_blocks(query_result)
+                        payload = self._extract_tool_payload(query_result)
+                        try:
+                            self._validate_business_success(
+                                payload,
+                                tool_name=self.query_tool_name,
+                                supplemental_text=query_text,
+                            )
+                        except ArcheryMCPToolError as exc:
+                            raise ArcheryMCPToolError(
+                                str(exc),
+                                diagnostic_data=self._login_diagnostic_data(
+                                    login_payload,
+                                    login_text,
+                                    session_id=get_session_id(),
+                                ),
+                            ) from exc
+                        return ArcherySlowLogQueryResult(
+                            payload=payload,
+                            requested_sql=requested_sql,
+                            window_start=window_start,
+                            window_end=window_end,
+                        )
+        except ArcheryMCPError:
+            raise
+        except ExceptionGroup as exc:
+            nested = _nested_archery_error(exc)
+            if nested is not None:
+                raise nested from exc
+            leaf = _first_exception_leaf(exc)
+            detail = _safe_error_detail(leaf)
+            suffix = f": {detail}" if detail else ""
+            raise ArcheryMCPProtocolError(
+                f"Archery MCP SDK client failed ({type(leaf).__name__}){suffix}"
+            ) from exc
+        except Exception as exc:
+            detail = _safe_error_detail(exc)
+            suffix = f": {detail}" if detail else ""
+            raise ArcheryMCPProtocolError(
+                f"Archery MCP SDK client failed ({type(exc).__name__}){suffix}"
+            ) from exc
 
     async def _list_tools(
         self,
-        client: httpx.AsyncClient,
-        *,
-        session_id: str | None,
-        protocol_version: str,
+        session: ClientSession,
     ) -> dict[str, dict[str, Any]]:
         tools: dict[str, dict[str, Any]] = {}
         cursor: str | None = None
-        for page in range(10):
-            params = {"cursor": cursor} if cursor else {}
-            result, _ = await self._send_request(
-                client,
-                request_id=2 + page,
-                method="tools/list",
-                params=params,
-                session_id=session_id,
-                protocol_version=protocol_version,
+        for _page in range(10):
+            result = await session.list_tools(
+                params=(mcp_types.PaginatedRequestParams(cursor=cursor) if cursor else None)
             )
-            if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
-                raise ArcheryMCPProtocolError(
-                    "Archery MCP tools/list result did not contain a tools array"
+            for item in result.tools:
+                tools[item.name] = item.model_dump(
+                    by_alias=True,
+                    mode="json",
+                    exclude_none=True,
                 )
-            for item in result["tools"]:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if isinstance(name, str):
-                    tools[name] = item
-            next_cursor = result.get("nextCursor")
-            if not isinstance(next_cursor, str) or not next_cursor:
+            if not result.nextCursor:
                 return tools
-            cursor = next_cursor
+            cursor = result.nextCursor
         raise ArcheryMCPProtocolError("Archery MCP tools/list pagination exceeded 10 pages")
 
     def _validate_required_tools(
@@ -420,25 +397,21 @@ class ArcheryMCPClient:
 
     async def _call_tool(
         self,
-        client: httpx.AsyncClient,
+        session: ClientSession,
         *,
-        request_id: int,
         tool_name: str,
         arguments: dict[str, Any],
-        session_id: str | None,
-        protocol_version: str,
     ) -> dict[str, Any]:
-        result, _ = await self._send_request(
-            client,
-            request_id=request_id,
-            method="tools/call",
-            params={"name": tool_name, "arguments": arguments},
-            session_id=session_id,
-            protocol_version=protocol_version,
+        result = await session.call_tool(
+            tool_name,
+            arguments,
+            read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
         )
-        if not isinstance(result, dict):
-            raise ArcheryMCPProtocolError("Archery MCP tools/call result was not an object")
-        return result
+        return result.model_dump(
+            by_alias=True,
+            mode="json",
+            exclude_none=True,
+        )
 
     @staticmethod
     def _extract_tool_payload(result: dict[str, Any]) -> dict[str, Any]:
@@ -570,6 +543,8 @@ class ArcheryMCPClient:
         )
         diagnostic_data: dict[str, Any] = {
             "login_tool": self.login_tool_name,
+            "mcp_client": "official_python_sdk",
+            "mcp_transport": "streamable_http",
             "mcp_session_id_present": bool(session_id),
             "login_payload_keys": sorted(str(key) for key in payload)[:20],
             "login_text_block_count": len(text_blocks),
@@ -622,164 +597,6 @@ class ArcheryMCPClient:
             if isinstance(item, dict) and item.get("type") == "text"
         ]
         return _safe_error_detail(" ".join(str(value) for value in values if value))
-
-    async def _send_request(
-        self,
-        client: httpx.AsyncClient,
-        *,
-        request_id: int,
-        method: str,
-        params: dict[str, Any],
-        session_id: str | None = None,
-        protocol_version: str | None = None,
-    ) -> tuple[Any, httpx.Response]:
-        headers = self._session_headers(session_id, protocol_version)
-        try:
-            response = await client.post(
-                self.mcp_url,
-                headers=headers,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                },
-            )
-        except httpx.TransportError as exc:
-            raise ArcheryMCPProtocolError(
-                f"Archery MCP network error: {type(exc).__name__}"
-            ) from exc
-        message = self._decode_response(response, expected_id=request_id)
-        if "error" in message:
-            error = message["error"]
-            detail = error.get("message") if isinstance(error, dict) else error
-            raise ArcheryMCPProtocolError(
-                _safe_error_detail(detail) or "Archery MCP returned a JSON-RPC error"
-            )
-        if "result" not in message:
-            raise ArcheryMCPProtocolError("Archery MCP response did not contain a result")
-        return message["result"], response
-
-    async def _send_notification(
-        self,
-        client: httpx.AsyncClient,
-        *,
-        method: str,
-        session_id: str | None,
-        protocol_version: str,
-    ) -> None:
-        try:
-            response = await client.post(
-                self.mcp_url,
-                headers=self._session_headers(session_id, protocol_version),
-                json={"jsonrpc": "2.0", "method": method},
-            )
-        except httpx.TransportError as exc:
-            raise ArcheryMCPProtocolError(
-                f"Archery MCP network error: {type(exc).__name__}"
-            ) from exc
-        if response.status_code != 202:
-            self._raise_http_error(response)
-
-    async def _close_session(
-        self,
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        protocol_version: str,
-    ) -> None:
-        try:
-            await client.delete(
-                self.mcp_url,
-                headers=self._session_headers(session_id, protocol_version),
-            )
-        except httpx.HTTPError:
-            # Session cleanup is best-effort and must not replace collected evidence.
-            return
-
-    @staticmethod
-    def _session_headers(
-        session_id: str | None, protocol_version: str | None
-    ) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        if protocol_version:
-            headers["MCP-Protocol-Version"] = protocol_version
-        return headers
-
-    @staticmethod
-    def _decode_response(
-        response: httpx.Response, *, expected_id: int
-    ) -> dict[str, Any]:
-        if response.is_error:
-            ArcheryMCPClient._raise_http_error(response)
-        if len(response.content) > _MAX_MCP_RESPONSE_BYTES:
-            raise ArcheryMCPProtocolError("Archery MCP response exceeded 2000000 bytes")
-
-        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
-        messages: list[Any] = []
-        if content_type == "application/json":
-            try:
-                messages = [response.json()]
-            except ValueError as exc:
-                raise ArcheryMCPProtocolError(
-                    "Archery MCP returned invalid JSON"
-                ) from exc
-        elif content_type == "text/event-stream":
-            messages = ArcheryMCPClient._decode_sse(response.text)
-        else:
-            raise ArcheryMCPProtocolError(
-                "Archery MCP returned an unsupported Content-Type"
-            )
-
-        for message in messages:
-            if isinstance(message, dict) and message.get("id") == expected_id:
-                if message.get("jsonrpc") != "2.0":
-                    raise ArcheryMCPProtocolError(
-                        "Archery MCP response had an invalid jsonrpc version"
-                    )
-                return message
-        raise ArcheryMCPProtocolError(
-            "Archery MCP response did not contain the matching JSON-RPC id"
-        )
-
-    @staticmethod
-    def _decode_sse(value: str) -> list[Any]:
-        messages: list[Any] = []
-        data_lines: list[str] = []
-        for line in [*value.splitlines(), ""]:
-            if not line:
-                if not data_lines:
-                    continue
-                raw = "\n".join(data_lines)
-                data_lines = []
-                try:
-                    messages.append(json.loads(raw))
-                except json.JSONDecodeError as exc:
-                    raise ArcheryMCPProtocolError(
-                        "Archery MCP returned invalid SSE JSON"
-                    ) from exc
-                continue
-            if line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-        return messages
-
-    @staticmethod
-    def _raise_http_error(response: httpx.Response) -> None:
-        detail = ""
-        try:
-            body = response.json()
-            if isinstance(body, dict):
-                detail = _safe_error_detail(
-                    body.get("detail") or body.get("message") or ""
-                )
-        except ValueError:
-            pass
-        suffix = f": {detail}" if detail else ""
-        raise ArcheryMCPProtocolError(
-            f"Archery MCP HTTP {response.status_code}{suffix}"
-        )
 
 
 class ArcherySlowLogEvidenceTool:
