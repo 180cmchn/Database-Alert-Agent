@@ -179,7 +179,6 @@ class PromptFollowingMCPModel:
             ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: {"page": 1, "size": 200},
             ARCHERY_MCP_INSTANCES_TOOL_NAME: {
                 "resource_group_id": TEST_RESOURCE_GROUP_ID,
-                "instance_ref": task["target"]["instance_ref"],
                 "page": 1,
                 "size": 200,
             },
@@ -275,6 +274,40 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
     assert server.url == "https://archery.example.test/mcp"
     assert server.headers == {"X-Archery-Token": "runtime-only-token"}
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
+
+
+def test_archery_instance_discovery_filter_is_optional_but_stays_scoped() -> None:
+    client = _client(
+        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
+    )
+    for arguments in (
+        {},
+        {"resource_group_id": TEST_RESOURCE_GROUP_ID},
+        {"instance_ref": ""},
+        {"instance_ref": TEST_INSTANCE_REF},
+    ):
+        client._validate_model_tool_call(
+            MCPModelToolCall(
+                call_id="discovery-call",
+                name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                arguments=arguments,
+            ),
+            requested_sql=TEST_SLOW_LOG_QUERY,
+            login_confirmed=True,
+            discovered_instance_ids=set(),
+        )
+
+    with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
+        client._validate_model_tool_call(
+            MCPModelToolCall(
+                call_id="other-target-call",
+                name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                arguments={"instance_ref": "another-instance"},
+            ),
+            requested_sql=TEST_SLOW_LOG_QUERY,
+            login_confirmed=True,
+            discovered_instance_ids=set(),
+        )
 
 
 @pytest.mark.asyncio

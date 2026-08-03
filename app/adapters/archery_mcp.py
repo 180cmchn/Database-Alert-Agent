@@ -663,9 +663,11 @@ class ArcheryMCPClient:
                 call.name,
                 arguments,
                 {"resource_group_id", "instance_ref", "page", "size"},
-                required={"instance_ref"},
             )
-            if arguments.get("instance_ref") != self.instance_ref:
+            # instance_ref is an optional discovery filter in Archery. A model may
+            # first enumerate a confirmed resource group and resolve the concrete
+            # instance ID from that result instead of filtering by deployment alias.
+            if arguments.get("instance_ref") not in (None, "", self.instance_ref):
                 self._raise_argument_violation(call.name)
             self._validate_nonnegative_integer(call.name, arguments, "resource_group_id")
             self._validate_pagination(call.name, arguments)
