@@ -306,14 +306,17 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_db_name" not in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_max_agent_steps" not in RUNTIME_SETTINGS_KEYS
     assert "mcp_settings_path" not in RUNTIME_SETTINGS_KEYS
     assert configured.archery_slow_log_window_seconds == 300
+    assert configured.archery_mcp_max_agent_steps == 10
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
     # Legacy target variables remain loadable but no longer gate or scope MCP.
     monkeypatch.setenv("ARCHERY_MCP_INSTANCE_REF", "archery-from-env")
     monkeypatch.setenv("ARCHERY_MCP_DB_NAME", "archery_db_from_env")
     monkeypatch.setenv("ARCHERY_SLOW_LOG_WINDOW_SECONDS", "600")
+    monkeypatch.setenv("ARCHERY_MCP_MAX_AGENT_STEPS", "18")
     alias_configured = Settings(
         _env_file=None,
         ai_provider="fake",
@@ -324,6 +327,7 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     assert alias_configured.archery_mcp_instance_ref == "archery-from-env"
     assert alias_configured.archery_mcp_db_name == "archery_db_from_env"
     assert alias_configured.archery_slow_log_window_seconds == 600
+    assert alias_configured.archery_mcp_max_agent_steps == 18
 
     with pytest.raises(ValidationError, match="full MCP endpoint"):
         Settings(

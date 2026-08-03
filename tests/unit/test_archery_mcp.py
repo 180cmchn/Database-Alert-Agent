@@ -1313,7 +1313,9 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
 
 @pytest.mark.asyncio
 async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, real_model=True)
+    settings = _settings(tmp_path, real_model=True).model_copy(
+        update={"archery_mcp_max_agent_steps": 18}
+    )
     runtime = build_runtime(settings)
 
     tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
@@ -1322,6 +1324,7 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
     assert tool.client.instance_ref == ""
     assert tool.client.db_name == ""
     assert tool.client.window_seconds == 300
+    assert tool.client.max_agent_steps == 18
 
     apply_runtime_settings(
         runtime,

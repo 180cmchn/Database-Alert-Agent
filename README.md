@@ -278,7 +278,8 @@ Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名�
 告警时间窗、慢日志表和最多返回行数。部署配置不再固定查询实例和数据库。模型根据告警上下文、
 工具实时 Schema 与资源发现结果自主确定目标，并决定是否查询资源组、实例、数据库、表和字段。
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法等可重试错误也会原样回传，
-模型可据此调整只读查询继续执行。模型最多执行 10 个只读步骤。`apply_query_permission_gymJPA`
+模型可据此调整只读查询继续执行。模型最多执行 `ARCHERY_MCP_MAX_AGENT_STEPS` 个只读步骤，
+默认值为 10。`apply_query_permission_gymJPA`
 等会产生外部状态变更的工具不会传给模型。
 
 Host 不再重复实现各资源发现工具的参数规则；登录、资源组、实例、数据库、表和字段调用直接使用
@@ -319,10 +320,12 @@ MCP_SETTINGS_PATH=./config/mcp/settings.json
 ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
 ARCHERY_MCP_TOKEN=archery_replace-with-your-token
 ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
+ARCHERY_MCP_MAX_AGENT_STEPS=10
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
-URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；启用 Archery MCP 时必须提供 URL
+URL、Token、窗口和 Agent 最大步骤数都是部署级配置，不能通过管理 API 修改；启用 Archery MCP
+时必须提供 URL
 和 Token，`MCP_SETTINGS_PATH` 指向的文件也必须存在。实例和数据库目标从每条规范化告警中提取，
 再由模型调用 MCP 资源发现工具解析，不读取固定目标配置。当前认证方式是
 `X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的

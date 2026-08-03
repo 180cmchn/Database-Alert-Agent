@@ -144,6 +144,7 @@ class Settings(BaseSettings):
     archery_mcp_instance_ref: str = ""
     archery_mcp_db_name: str = ""
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
+    archery_mcp_max_agent_steps: int = Field(default=10, ge=1, le=100)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
 
     # External knowledge deployment coordinates are intentionally not runtime

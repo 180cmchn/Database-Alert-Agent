@@ -33,6 +33,7 @@ ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 ARCHERY_SLOW_LOG_LIMIT: Final = 20
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
+# Backward-compatible constant: this is the default; deployments may override it.
 ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
@@ -279,6 +280,7 @@ class ArcheryMCPClient:
         instance_ref: str = "",
         db_name: str = "",
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
+        max_agent_steps: int = ARCHERY_MCP_MAX_AGENT_STEPS,
         login_tool_name: str = ARCHERY_MCP_LOGIN_TOOL_NAME,
         query_tool_name: str = ARCHERY_MCP_QUERY_TOOL_NAME,
         timeout_seconds: float = 60,
@@ -318,6 +320,14 @@ class ArcheryMCPClient:
             raise ArcheryMCPConfigurationError(
                 "Archery slow-log window must be between 60 and 86400 seconds"
             )
+        if (
+            isinstance(max_agent_steps, bool)
+            or not isinstance(max_agent_steps, int)
+            or not 1 <= max_agent_steps <= 100
+        ):
+            raise ArcheryMCPConfigurationError(
+                "Archery MCP max agent steps must be between 1 and 100"
+            )
         if not _TOOL_NAME.fullmatch(login_tool_name) or not _TOOL_NAME.fullmatch(
             query_tool_name
         ):
@@ -330,6 +340,7 @@ class ArcheryMCPClient:
         self.db_name = db_name.strip()
         self.slow_log_time_column = ARCHERY_SLOW_LOG_TIME_COLUMN
         self.window_seconds = window_seconds
+        self.max_agent_steps = max_agent_steps
         self.login_tool_name = login_tool_name
         self.query_tool_name = query_tool_name
         self.timeout_seconds = timeout_seconds
@@ -347,6 +358,7 @@ class ArcheryMCPClient:
         instance_ref: str = "",
         db_name: str = "",
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
+        max_agent_steps: int = ARCHERY_MCP_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> ArcheryMCPClient:
@@ -361,6 +373,7 @@ class ArcheryMCPClient:
             instance_ref=instance_ref,
             db_name=db_name,
             window_seconds=window_seconds,
+            max_agent_steps=max_agent_steps,
             timeout_seconds=timeout_seconds,
             transport=transport,
         )
@@ -413,7 +426,7 @@ class ArcheryMCPClient:
                         model_calls: list[MCPModelToolCall] = []
                         last_query_error: ArcheryMCPToolError | None = None
 
-                        for _step in range(ARCHERY_MCP_MAX_AGENT_STEPS):
+                        for _step in range(self.max_agent_steps):
                             call = await self._request_model_tool_call(
                                 messages=messages,
                                 tools=model_tools,
@@ -516,7 +529,7 @@ class ArcheryMCPClient:
                         )
                         raise ArcheryMCPModelError(
                             "Model did not complete the Archery slow-log query within "
-                            f"{ARCHERY_MCP_MAX_AGENT_STEPS} read-only tool calls"
+                            f"{self.max_agent_steps} read-only tool calls"
                             f"{error_suffix}"
                         )
         except ArcheryMCPError:

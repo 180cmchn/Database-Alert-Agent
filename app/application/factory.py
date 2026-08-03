@@ -144,6 +144,7 @@ def _build_archery_mcp_tool(
                 "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
             },
             window_seconds=settings.archery_slow_log_window_seconds,
+            max_agent_steps=settings.archery_mcp_max_agent_steps,
             timeout_seconds=settings.archery_mcp_timeout_seconds,
         )
     )
