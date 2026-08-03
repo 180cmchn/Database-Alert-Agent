@@ -360,6 +360,53 @@ def test_archery_query_requires_discovered_integer_id_not_configured_ref() -> No
             )
 
 
+def test_archery_normalizes_discovered_instance_identity_for_downstream_tools() -> None:
+    client = _client(
+        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
+    )
+    for arguments in (
+        {"instance_id": str(TEST_INSTANCE_ID), "page": 1},
+        {"instance_ref": str(TEST_INSTANCE_ID), "page": 1},
+        {"instance_ref": TEST_INSTANCE_REF, "page": 1},
+        {
+            "instance_id": TEST_INSTANCE_ID,
+            "instance_ref": TEST_INSTANCE_REF,
+            "page": 1,
+        },
+    ):
+        normalized = client._normalize_instance_identity(
+            MCPModelToolCall(
+                call_id="database-discovery",
+                name=ARCHERY_MCP_DATABASES_TOOL_NAME,
+                arguments=arguments,
+            ),
+            discovered_instance_ids={TEST_INSTANCE_ID},
+        )
+
+        assert normalized.arguments == {
+            "instance_id": TEST_INSTANCE_ID,
+            "page": 1,
+        }
+        client._validate_model_tool_call(
+            normalized,
+            requested_sql=TEST_SLOW_LOG_QUERY,
+            login_confirmed=True,
+            discovered_instance_ids={TEST_INSTANCE_ID},
+        )
+
+
+def test_archery_extracts_integer_and_numeric_string_instance_ids() -> None:
+    assert ArcheryMCPClient._extract_positive_instance_ids(
+        {
+            "results": [
+                {"id": TEST_INSTANCE_ID},
+                {"instance_id": str(TEST_INSTANCE_ID + 1)},
+                {"instanceId": "not-an-id"},
+            ]
+        }
+    ) == {TEST_INSTANCE_ID, TEST_INSTANCE_ID + 1}
+
+
 @pytest.mark.asyncio
 async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -> None:
     calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []

@@ -424,6 +424,10 @@ class ArcheryMCPClient:
                                 messages=messages,
                                 tools=model_tools,
                             )
+                            call = self._normalize_instance_identity(
+                                call,
+                                discovered_instance_ids=discovered_instance_ids,
+                            )
                             self._validate_model_tool_call(
                                 call,
                                 requested_sql=requested_sql,
@@ -643,6 +647,50 @@ class ArcheryMCPClient:
             )
         return call
 
+    def _normalize_instance_identity(
+        self,
+        call: MCPModelToolCall,
+        *,
+        discovered_instance_ids: set[int],
+    ) -> MCPModelToolCall:
+        if call.name not in {
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+            ARCHERY_MCP_COLUMNS_TOOL_NAME,
+            self.query_tool_name,
+        }:
+            return call
+
+        arguments = dict(call.arguments)
+        instance_id = self._coerce_positive_instance_id(arguments.get("instance_id"))
+        instance_ref = arguments.get("instance_ref")
+        if instance_id is None:
+            referenced_id = self._coerce_positive_instance_id(instance_ref)
+            if referenced_id in discovered_instance_ids:
+                instance_id = referenced_id
+            elif (
+                instance_ref == self.instance_ref
+                and len(discovered_instance_ids) == 1
+            ):
+                instance_id = next(iter(discovered_instance_ids))
+
+        if instance_id not in discovered_instance_ids:
+            return call
+
+        arguments["instance_id"] = instance_id
+        # All downstream tools accept the concrete instance ID. Remove a reference
+        # copied from the discovery request so it cannot conflict with that ID or
+        # violate a narrower MCP input schema.
+        arguments.pop("instance_ref", None)
+        if arguments == call.arguments:
+            return call
+        return MCPModelToolCall(
+            call_id=call.call_id,
+            name=call.name,
+            arguments=arguments,
+            request_id=call.request_id,
+        )
+
     def _validate_model_tool_call(
         self,
         call: MCPModelToolCall,
@@ -841,14 +889,43 @@ class ArcheryMCPClient:
         value: Any,
         discovered_instance_ids: set[int],
     ) -> None:
-        if type(value) is not int or value not in discovered_instance_ids:
-            ArcheryMCPClient._raise_argument_violation(tool_name)
+        if not discovered_instance_ids:
+            ArcheryMCPClient._raise_argument_violation(
+                tool_name,
+                "no instance_id was captured from list_instances_gymJPA",
+            )
+        if type(value) is not int:
+            ArcheryMCPClient._raise_argument_violation(
+                tool_name,
+                "instance_id must be an integer returned by list_instances_gymJPA",
+            )
+        if value not in discovered_instance_ids:
+            ArcheryMCPClient._raise_argument_violation(
+                tool_name,
+                "instance_id was not returned by list_instances_gymJPA",
+            )
 
     @staticmethod
-    def _raise_argument_violation(tool_name: str) -> None:
+    def _raise_argument_violation(tool_name: str, reason: str | None = None) -> None:
+        suffix = f": {reason}" if reason else ""
         raise ArcheryMCPReadOnlyViolation(
             f"Model produced arguments outside the approved {tool_name!r} request"
+            f"{suffix}"
         )
+
+    @staticmethod
+    def _coerce_positive_instance_id(value: Any) -> int | None:
+        if type(value) is int:
+            return value if 0 < value <= 9_223_372_036_854_775_807 else None
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not candidate or len(candidate) > 19 or not candidate.isascii():
+            return None
+        if not candidate.isdecimal():
+            return None
+        parsed = int(candidate)
+        return parsed if 0 < parsed <= 9_223_372_036_854_775_807 else None
 
     @staticmethod
     def _extract_positive_instance_ids(payload: Mapping[str, Any]) -> set[int]:
@@ -858,12 +935,12 @@ class ArcheryMCPClient:
             if isinstance(value, Mapping):
                 for key, item in value.items():
                     normalized_key = re.sub(r"[\s_-]+", "", str(key)).casefold()
-                    if (
-                        normalized_key in {"id", "instanceid"}
-                        and type(item) is int
-                        and item > 0
-                    ):
-                        instance_ids.add(item)
+                    if normalized_key in {"id", "instanceid"}:
+                        instance_id = ArcheryMCPClient._coerce_positive_instance_id(
+                            item
+                        )
+                        if instance_id is not None:
+                            instance_ids.add(instance_id)
                     visit(item)
             elif isinstance(value, list):
                 for item in value:
