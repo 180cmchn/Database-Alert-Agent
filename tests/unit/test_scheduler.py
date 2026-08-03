@@ -109,6 +109,58 @@ async def test_in_memory_scheduler_retries_job_while_old_lease_is_active() -> No
 
 
 @pytest.mark.asyncio
+async def test_in_memory_scheduler_applies_runtime_worker_concurrency() -> None:
+    first_started = asyncio.Event()
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class EmptyRepository:
+        async def list_by_status(self, statuses):  # type: ignore[no-untyped-def]
+            return []
+
+    class BlockingService:
+        repository = EmptyRepository()
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.started = 0
+
+        async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
+            self.active += 1
+            self.started += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.started == 1:
+                first_started.set()
+            if self.started == 2:
+                two_started.set()
+            try:
+                await release.wait()
+                return SimpleNamespace(status=AlertStatus.COMPLETED)
+            finally:
+                self.active -= 1
+
+    service = BlockingService()
+    scheduler = InMemoryAnalysisScheduler(service, workers=1)  # type: ignore[arg-type]
+    await scheduler.start()
+    try:
+        await scheduler.enqueue("alert-1")
+        await scheduler.enqueue("alert-2")
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        assert service.started == 1
+
+        await scheduler.sync_workers(2)
+        await asyncio.wait_for(two_started.wait(), timeout=1)
+        assert service.max_active == 2
+
+        release.set()
+        await scheduler.join()
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     tmp_path: Path,
 ) -> None:

@@ -136,6 +136,7 @@ class RuntimeSettingsPatch(BaseModel):
     validation_enabled: bool | None = None
     shadow_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
+    scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     wecom_page_base_url: str | None = Field(default=None, max_length=2048)
     wecom_feedback_form_url: str | None = Field(default=None, max_length=2048)
@@ -170,6 +171,7 @@ class RuntimeSettingsResponse(BaseModel):
     shadow_enabled: bool
     production_gate_approved: bool
     runbook_limit: int
+    scheduler_workers: int
     runbook_match_min_confidence: float
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
@@ -191,7 +193,7 @@ class RuntimeSettingsResponse(BaseModel):
     knowledge_sources: list[str]
     revision: str
     apply_status: Literal["applied"] = "applied"
-    worker_refresh_mode: Literal["before_each_job"] = "before_each_job"
+    worker_refresh_mode: Literal["before_each_batch"] = "before_each_batch"
     changed_fields: list[str] = Field(default_factory=list)
 
     @classmethod
@@ -222,6 +224,7 @@ class RuntimeSettingsResponse(BaseModel):
             shadow_enabled=settings.shadow_enabled,
             production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
+            scheduler_workers=settings.scheduler_workers,
             runbook_match_min_confidence=settings.runbook_match_min_confidence,
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),

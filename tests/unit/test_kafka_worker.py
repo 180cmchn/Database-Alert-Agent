@@ -1,10 +1,17 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
+from app.config import Settings
 from app.domain.errors import InvestigationLeaseUnavailableError
 from app.domain.models import AlertStatus
-from app.workers.kafka import parse_envelope, process_envelope, process_with_retries
+from app.workers.kafka import (
+    KafkaAlertWorker,
+    parse_envelope,
+    process_envelope,
+    process_with_retries,
+)
 
 
 class StubService:
@@ -117,3 +124,89 @@ async def test_process_envelope_accepts_terminal_duplicate() -> None:
         {"job_type": "investigate", "alert_id": "alert-1"},
     )
     assert result.status == AlertStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_kafka_worker_processes_configured_batch_concurrently() -> None:
+    both_started = asyncio.Event()
+
+    class ConcurrentService:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.started = 0
+
+        async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
+            self.active += 1
+            self.started += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.started == 2:
+                both_started.set()
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=1)
+                return SimpleNamespace(
+                    status=AlertStatus.COMPLETED,
+                    alert=SimpleNamespace(id=alert_id),
+                )
+            finally:
+                self.active -= 1
+
+    class FakeConsumer:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.commits = 0
+            self.max_records: list[int] = []
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        async def getmany(self, *, timeout_ms, max_records):  # type: ignore[no-untyped-def]
+            self.max_records.append(max_records)
+            if self.calls:
+                raise asyncio.CancelledError
+            self.calls += 1
+            return {
+                "partition-0": [
+                    SimpleNamespace(
+                        value={"job_type": "investigate", "alert_id": "alert-1"}
+                    ),
+                    SimpleNamespace(
+                        value={"job_type": "investigate", "alert_id": "alert-2"}
+                    ),
+                ]
+            }
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    class FakeProducer:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        scheduler_workers=2,
+    )
+    service = ConcurrentService()
+    consumer = FakeConsumer()
+    worker = KafkaAlertWorker.__new__(KafkaAlertWorker)
+    worker.settings = settings
+    worker.service = service  # type: ignore[assignment]
+    worker.runtime = None
+    worker.runtime_settings = None
+    worker.consumer = consumer  # type: ignore[assignment]
+    worker.producer = FakeProducer()  # type: ignore[assignment]
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run()
+
+    assert service.max_active == 2
+    assert consumer.commits == 1
+    assert consumer.max_records == [2, 2]

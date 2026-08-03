@@ -389,6 +389,7 @@ def create_app(
         updated, changed, revision = await runtime_settings.reload_if_changed(runtime.settings)
         if changed:
             apply_runtime_settings(runtime, updated)
+            await scheduler.sync_workers(updated.scheduler_workers)
             await flashduty_poller.sync_settings(updated)
         return RuntimeSettingsResponse.from_settings(runtime.settings, revision=revision)
 
@@ -428,6 +429,7 @@ def create_app(
                 },
             ) from exc
         apply_runtime_settings(runtime, updated)
+        await scheduler.sync_workers(updated.scheduler_workers)
         await flashduty_poller.sync_settings(updated)
         await audit_logger.record(
             action="update",
@@ -472,6 +474,7 @@ def create_app(
                 },
             ) from exc
         apply_runtime_settings(runtime, updated)
+        await scheduler.sync_workers(updated.scheduler_workers)
         await flashduty_poller.sync_settings(updated)
         await audit_logger.record(
             action="reset",

@@ -57,6 +57,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: "true"
       HTTP_SCHEDULER: kafka
+      SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-1}
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
       MCP_SETTINGS_PATH: /app/config/mcp/settings.json
       RESET_RUNTIME_SETTINGS_ON_START: "true"
@@ -99,6 +100,7 @@ services:
       RUNBOOK_PDF_DIR: /app/runbooks/pdfs
       KAFKA_ENABLED: "true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-1}
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
       MCP_SETTINGS_PATH: /app/config/mcp/settings.json
       RESET_RUNTIME_SETTINGS_ON_START: "true"

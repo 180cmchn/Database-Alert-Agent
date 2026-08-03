@@ -112,6 +112,7 @@ export function SettingsPage() {
         validation_enabled: form.get("validation_enabled") === "on",
         shadow_enabled: form.get("shadow_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
+        scheduler_workers: numberField(form, "scheduler_workers"),
         knowledge_sources: knowledgeSources,
         flashduty_polling_enabled: form.get("flashduty_polling_enabled") === "on",
         flashduty_poll_interval_seconds: numberField(
@@ -171,7 +172,7 @@ export function SettingsPage() {
 
       <div className="settings-status-strip">
         <div><span className={settings.ready ? "applied-dot" : "applied-dot not-ready"}>{settings.ready ? <Check size={14} /> : <CircleAlert size={14} />}</span><div><strong>{settings.ready ? "配置已应用且可用" : "配置尚未就绪"}</strong><small>{settings.app_env} · 修订版本 {settings.revision}</small></div></div>
-        <div><RefreshCw size={17} /><div><strong>Worker 刷新策略</strong><small>每个任务开始前读取最新配置</small></div></div>
+        <div><RefreshCw size={17} /><div><strong>Worker 刷新策略</strong><small>每批任务开始前读取最新配置</small></div></div>
         <div><ShieldCheck size={17} /><div><strong>秘密值保护</strong><small>仅显示是否已配置</small></div></div>
       </div>
 
@@ -231,6 +232,7 @@ export function SettingsPage() {
             <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并强制进入人工复核，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
+            <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>
             <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" required defaultValue={settings.react_max_dynamic_turns} /></label>
             <label className="field"><span>Archery MCP 最大调用步数</span><input name="archery_mcp_max_agent_steps" type="number" min="1" max="100" required defaultValue={settings.archery_mcp_max_agent_steps} /></label>
             <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>

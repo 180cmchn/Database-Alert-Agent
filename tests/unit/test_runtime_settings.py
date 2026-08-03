@@ -54,6 +54,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
             {
                 "ai_model": "persisted-model",
                 "runbook_limit": 9,
+                "scheduler_workers": 4,
                 "archery_mcp_max_agent_steps": 18,
                 "database_url": "sqlite+aiosqlite:///must-not-be-used.db",
             }
@@ -73,6 +74,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
 
     assert settings.ai_model == "persisted-model"
     assert settings.runbook_limit == 9
+    assert settings.scheduler_workers == 4
     assert settings.archery_mcp_max_agent_steps == 18
     assert settings.database_url == "sqlite+aiosqlite:///bootstrap.db"
 
@@ -407,12 +409,19 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
     payload = RuntimeSettingsPatch(
         expected_revision="0123456789abcdef",
         runbook_limit=7,
+        scheduler_workers=4,
         archery_mcp_max_agent_steps=18,
     )
     assert payload.updates() == {
         "runbook_limit": 7,
+        "scheduler_workers": 4,
         "archery_mcp_max_agent_steps": 18,
     }
+    with pytest.raises(ValidationError):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            scheduler_workers=17,
+        )
 
 
 @pytest.mark.asyncio
@@ -540,9 +549,11 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["wecom_page_base_url"] == ""
     assert body["wecom_feedback_form_url"] == ""
     assert body["ai_fallback_enabled"] is True
+    assert body["scheduler_workers"] == 1
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["archery_mcp_max_agent_steps"] == 10
+    assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
     assert "wecom_feedback_form_url" in RUNTIME_SETTINGS_KEYS
     assert "ai_api_key" not in body

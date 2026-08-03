@@ -7,7 +7,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from aiokafka.structs import TopicPartition
 
 from app.application.admin import RuntimeSettingsManager
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
@@ -136,39 +135,74 @@ class KafkaAlertWorker:
         await self.consumer.start()
         await self.producer.start()
         logger.info(
-            "Kafka worker started topic=%s group=%s",
+            "Kafka worker started topic=%s group=%s concurrency=%s",
             self.settings.kafka_alert_topic,
             self.settings.kafka_consumer_group,
+            self.settings.scheduler_workers,
         )
         try:
-            async for record in self.consumer:
-                try:
-                    await self._refresh_runtime_settings()
-                    envelope = parse_envelope(record.value)
-                    await process_with_retries(
-                        self.service,
-                        envelope,
-                        max_retries=self.settings.kafka_max_retries,
-                        dlq_sender=self._send_dlq,
-                    )
-                except InvestigationLeaseUnavailableError as exc:
-                    logger.info("Deferring leased investigation: %s", exc)
-                    self.consumer.seek(
-                        TopicPartition(record.topic, record.partition), record.offset
-                    )
+            while True:
+                await self._refresh_runtime_settings()
+                batches = await self.consumer.getmany(
+                    timeout_ms=1000,
+                    max_records=self.settings.scheduler_workers,
+                )
+                records = [record for batch in batches.values() for record in batch]
+                if not records:
+                    continue
+
+                outcomes = await asyncio.gather(
+                    *(self._process_record(record) for record in records),
+                    return_exceptions=True,
+                )
+                failures = [
+                    outcome for outcome in outcomes if isinstance(outcome, BaseException)
+                ]
+                if failures:
+                    for failure in failures:
+                        if isinstance(failure, InvestigationLeaseUnavailableError):
+                            logger.info("Deferring leased investigation: %s", failure)
+                        else:
+                            logger.error(
+                                "Kafka record batch failed error_type=%s",
+                                type(failure).__name__,
+                            )
+                    # Do not commit a partially successful batch. Rewind every
+                    # involved partition; terminal duplicates are idempotent and
+                    # this preserves at-least-once processing for the failed item.
+                    for partition, batch in batches.items():
+                        if batch:
+                            self.consumer.seek(partition, batch[0].offset)
                     await asyncio.sleep(1)
                     continue
-                except InvalidAlertPayloadError as exc:
-                    await self._send_dlq(
-                        {
-                            "original": sanitize(record.value.decode(errors="replace")),
-                            "error": str(exc),
-                        }
-                    )
                 await self.consumer.commit()
         finally:
             await self.consumer.stop()
             await self.producer.stop()
+
+    async def _process_record(self, record: Any) -> None:
+        try:
+            envelope = parse_envelope(record.value)
+            await process_with_retries(
+                self.service,
+                envelope,
+                max_retries=self.settings.kafka_max_retries,
+                dlq_sender=self._send_dlq,
+            )
+        except InvestigationLeaseUnavailableError:
+            raise
+        except InvalidAlertPayloadError as exc:
+            raw_value = (
+                record.value.decode(errors="replace")
+                if isinstance(record.value, bytes)
+                else record.value
+            )
+            await self._send_dlq(
+                {
+                    "original": sanitize(raw_value),
+                    "error": str(exc),
+                }
+            )
 
     async def _send_dlq(self, payload: dict[str, Any]) -> None:
         await self.producer.send_and_wait(self.settings.kafka_dlq_topic, payload)

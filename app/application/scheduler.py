@@ -22,6 +22,28 @@ def _remaining_poll_delay(
     return max(0.0, interval_seconds - (finished_at - started_at))
 
 
+class _ResizableConcurrencyLimiter:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+        self._condition = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+
+    async def release(self) -> None:
+        async with self._condition:
+            self.active -= 1
+            self._condition.notify_all()
+
+    async def resize(self, limit: int) -> None:
+        async with self._condition:
+            self.limit = limit
+            self._condition.notify_all()
+
+
 @dataclass(frozen=True)
 class FlashDutyPollItemResult:
     stored: StoredAlert
@@ -295,20 +317,27 @@ class InMemoryAnalysisScheduler:
         self,
         service: AlertAnalysisService,
         workers: int = 1,
+        max_workers: int = 16,
         lease_retry_delay_seconds: float = 1.0,
     ) -> None:
+        if not 1 <= workers <= max_workers:
+            raise ValueError("workers must be between 1 and max_workers")
         self.service = service
         self.workers = workers
+        self.max_workers = max_workers
         self.lease_retry_delay_seconds = lease_retry_delay_seconds
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
         self._tasks: list[asyncio.Task[None]] = []
         self._retry_tasks: set[asyncio.Task[None]] = set()
+        self._limiter = _ResizableConcurrencyLimiter(workers)
 
     async def start(self) -> None:
+        if self._tasks:
+            return
         self._tasks = [
             asyncio.create_task(self._worker(), name=f"alert-investigator-{index}")
-            for index in range(self.workers)
+            for index in range(self.max_workers)
         ]
         pending = await self.service.repository.list_by_status(
             {AlertStatus.RECEIVED, AlertStatus.QUEUED, AlertStatus.ANALYZING}
@@ -326,6 +355,12 @@ class InMemoryAnalysisScheduler:
         self._tasks.clear()
         self._retry_tasks.clear()
 
+    async def sync_workers(self, workers: int) -> None:
+        if not 1 <= workers <= self.max_workers:
+            raise ValueError("workers must be between 1 and max_workers")
+        self.workers = workers
+        await self._limiter.resize(workers)
+
     async def enqueue(self, alert_id: str) -> None:
         if alert_id in self._queued:
             return
@@ -339,9 +374,13 @@ class InMemoryAnalysisScheduler:
         while True:
             alert_id = await self.queue.get()
             try:
-                result = await self.service.analyze_by_id(alert_id)
-                if result.status in {AlertStatus.QUEUED, AlertStatus.ANALYZING}:
-                    self._schedule_lease_retry(alert_id)
+                await self._limiter.acquire()
+                try:
+                    result = await self.service.analyze_by_id(alert_id)
+                    if result.status in {AlertStatus.QUEUED, AlertStatus.ANALYZING}:
+                        self._schedule_lease_retry(alert_id)
+                finally:
+                    await self._limiter.release()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -386,6 +425,11 @@ class KafkaAnalysisScheduler:
             await self.producer.stop()
             self.producer = None
 
+    async def sync_workers(self, workers: int) -> None:
+        # Analysis concurrency is applied by the Kafka consumer process when it
+        # reloads the shared runtime settings before the next record batch.
+        return None
+
     async def enqueue(self, alert_id: str) -> None:
         if self.producer is None:
             raise RuntimeError("Kafka analysis scheduler is not started")
@@ -409,6 +453,9 @@ class ManualAnalysisScheduler:
         return None
 
     async def stop(self) -> None:
+        return None
+
+    async def sync_workers(self, workers: int) -> None:
         return None
 
     async def enqueue(self, alert_id: str) -> None:

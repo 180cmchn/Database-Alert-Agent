@@ -161,6 +161,7 @@ AI_MODEL=replace-me
 AI_MAX_TOKENS=16384
 AI_TIMEOUT_SECONDS=300
 AI_FALLBACK_ENABLED=true
+SCHEDULER_WORKERS=1
 SHADOW_ENABLED=true
 PRODUCTION_GATE_APPROVED=false
 
@@ -174,6 +175,10 @@ WECOM_FEEDBACK_FORM_URL=
 `AI_MAX_TOKENS` 会显式传给主分析、动态规划和独立结论验收。对于默认启用 Thinking 的推理模型，
 建议至少使用 `16384`，并配合足够的 `AI_TIMEOUT_SECONDS`；否则企业网关常见的 `4096` 默认上限
 可能全部消耗在 `reasoning_content`，以 `finish_reason=length` 结束且没有最终 `content`。
+
+`SCHEDULER_WORKERS` 控制每个进程同时分析的告警数，范围为 1–16，默认 1。该值属于运行时白名单，
+可通过 Agent 设置页或 `PATCH /api/v1/admin/settings` 调整；In-Memory 调度器立即调整并行上限，
+Kafka Worker 在下一批消息开始前读取并应用新值。
 
 `AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。
 启用企微通知时还必须配置 `WECOM_PAGE_BASE_URL`，它应是企微客户端可访问的前端 HTTPS 地址；

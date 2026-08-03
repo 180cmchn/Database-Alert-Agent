@@ -398,6 +398,7 @@ export interface AdminSettings {
   ai_json_mode: boolean;
   ai_fallback_enabled: boolean;
   runbook_limit: number;
+  scheduler_workers: number;
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
@@ -425,7 +426,7 @@ export interface AdminSettings {
   knowledge_sources: string[];
   revision: string;
   apply_status: "applied";
-  worker_refresh_mode: "before_each_job";
+  worker_refresh_mode: "before_each_batch";
   changed_fields: string[];
 }
 
@@ -439,6 +440,7 @@ export interface AdminSettingsPatch {
   ai_json_mode?: boolean;
   ai_fallback_enabled?: boolean;
   runbook_limit?: number;
+  scheduler_workers?: number;
   wecom_webhook_url?: string;
   wecom_page_base_url?: string;
   wecom_feedback_form_url?: string;

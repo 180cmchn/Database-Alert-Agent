@@ -110,7 +110,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert body["runbook_limit"] == 7
         assert body["archery_mcp_max_agent_steps"] == 18
         assert body["apply_status"] == "applied"
-        assert body["worker_refresh_mode"] == "before_each_job"
+        assert body["worker_refresh_mode"] == "before_each_batch"
         assert secret not in response.text
         assert "ai_api_key" not in body
 
@@ -255,6 +255,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
                 "flashduty_polling_enabled": True,
                 "flashduty_poll_interval_seconds": 600,
                 "flashduty_poll_lookback_seconds": 1200,
+                "scheduler_workers": 4,
                 "external_knowledge_api_key": "test-knowledge-key",
                 "knowledge_sources": ["local_pdf", "external_knowledge"],
             },
@@ -265,6 +266,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert body["flashduty_polling_enabled"] is True
     assert body["flashduty_poll_interval_seconds"] == 600
     assert body["flashduty_poll_lookback_seconds"] == 1200
+    assert body["scheduler_workers"] == 4
     assert body["external_knowledge_enabled"] is True
     assert body["external_knowledge_base_url"] == "http://127.0.0.1:8001"
     assert body["external_knowledge_api_key_configured"] is True
@@ -276,8 +278,10 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
         "flashduty_poll_lookback_seconds",
         "flashduty_polling_enabled",
         "knowledge_sources",
+        "scheduler_workers",
     }
     assert runtime.settings.flashduty_polling_enabled is True
+    assert runtime.settings.scheduler_workers == 4
     assert runtime.settings.external_knowledge_enabled is True
     assert runtime.service.external_knowledge_client is not None
 
@@ -285,6 +289,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert persisted["flashduty_polling_enabled"] is True
     assert persisted["flashduty_poll_interval_seconds"] == 600
     assert persisted["flashduty_poll_lookback_seconds"] == 1200
+    assert persisted["scheduler_workers"] == 4
     assert "external_knowledge_enabled" not in persisted
     assert "external_knowledge_base_url" not in persisted
     assert persisted["external_knowledge_api_key"] == "test-knowledge-key"

@@ -17,8 +17,8 @@ DEFAULT_ENVIRONMENT_ALIASES = {
 }
 
 # Only these settings may be changed through the administrative API. Bootstrap
-# controls such as the database URL, scheduler and admin credential intentionally
-# remain environment/file-deployment concerns.
+# controls such as the database URL, scheduler backend and admin credential
+# intentionally remain environment/file-deployment concerns.
 RUNTIME_SETTINGS_KEYS = frozenset(
     {
         "ai_provider",
@@ -39,6 +39,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "validation_enabled",
         "shadow_enabled",
         "knowledge_sources",
+        "scheduler_workers",
         "flashduty_polling_enabled",
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
@@ -182,6 +183,8 @@ class Settings(BaseSettings):
     kafka_max_retries: int = Field(default=3, ge=1, le=20)
 
     http_scheduler: str = "in_memory"
+    # Per-process alert-analysis concurrency. Runtime edits are applied by both
+    # the in-memory scheduler and the Kafka consumer before future work starts.
     scheduler_workers: int = Field(default=1, ge=1, le=16)
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
     tool_max_result_chars: int = Field(default=12000, ge=1000, le=100000)
