@@ -406,7 +406,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     )
     assert TEST_SLOW_LOG_QUERY in model.calls[0]["messages"][1]["content"]
     assert model.calls[1]["messages"][-1]["role"] == "tool"
-    assert "不可信数据" in model.calls[1]["messages"][-1]["content"]
+    assert "实时证据" in model.calls[1]["messages"][-1]["content"]
     assert {
         item["function"]["name"] for item in model.calls[0]["tools"]
     } == set(DEFAULT_MODEL_TOOL_SEQUENCE)
