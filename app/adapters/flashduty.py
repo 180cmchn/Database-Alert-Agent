@@ -334,7 +334,11 @@ class FlashDutyClient:
             "start_time": start_time,
             "end_time": end_time,
             "limit": min(max(limit, 1), 100),
-            "orderby": "updated_at",
+            # Keep cursor pagination ordered by the same immutable lifecycle axis
+            # as the requested window.  When by_updated_at is false FlashDuty
+            # filters on start_time; ordering that result by updated_at lets active
+            # alerts move between pages while a poll is in progress.
+            "orderby": "updated_at" if by_updated_at else "created_at",
             "asc": True,
             "by_updated_at": by_updated_at,
         }

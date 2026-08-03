@@ -141,6 +141,7 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
         flashduty_enabled=True,
         flashduty_app_key="test-app-key",
         flashduty_polling_enabled=False,
+        flashduty_poll_lookback_seconds=1200,
         flashduty_poll_channel_ids=[7],
     )
     requests: list[dict] = []
@@ -151,25 +152,25 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
             return FlashDutyResponse(
                 "list-request",
                 {
-                    "items": [{"alert_id": "663a1b2c3d4e5f6789abcdef"}],
+                    "items": [
+                        {
+                            "alert_id": "663a1b2c3d4e5f6789abcdef",
+                            "title": "Database latency",
+                            "description": "Latency is above threshold",
+                            "alert_severity": "Warning",
+                            "alert_status": "Warning",
+                            "alert_key": "database-latency",
+                            "start_time": 900,
+                            "labels": {"env": "test", "service": "orders-db"},
+                        }
+                    ],
+                    "total": 1,
                     "has_next_page": False,
                 },
             )
 
         async def alert_info(self, alert_id: str) -> FlashDutyResponse:
-            return FlashDutyResponse(
-                "detail-request",
-                {
-                    "alert_id": alert_id,
-                    "title": "Database latency",
-                    "description": "Latency is above threshold",
-                    "alert_severity": "Warning",
-                    "alert_status": "Warning",
-                    "alert_key": "database-latency",
-                    "start_time": 900,
-                    "labels": {"env": "test", "service": "orders-db"},
-                },
-            )
+            raise AssertionError(f"polling must not call /alert/info for {alert_id}")
 
     runtime.flashduty_client = RecordingFlashDutyClient()  # type: ignore[assignment]
     with client:
@@ -180,5 +181,7 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
 
     assert response.status_code == 200
     assert response.json()["new_count"] == 1
+    assert response.json()["time_range_seconds"] == 1200
+    assert response.json()["end_time"] - response.json()["start_time"] == 1200
     assert len(scheduler.jobs) == 1
     assert requests[0]["by_updated_at"] is False

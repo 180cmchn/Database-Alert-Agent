@@ -15,9 +15,7 @@ sequenceDiagram
 
     loop 每个 FLASHDUTY_POLL_INTERVAL_SECONDS
         API->>FD: POST /alert/list（指定 channel_ids）
-        FD-->>API: 创建时间窗内的告警列表
-        API->>FD: POST /alert/info（每条告警）
-        FD-->>API: 完整告警详情
+        FD-->>API: start_time 时间窗内的完整分页 AlertItem
         API->>DB: 按 source + alert_id 幂等入库
         API->>Q: 首次告警才异步入队
     end
@@ -70,8 +68,8 @@ FLASHDUTY_POLL_INTEGRATION_IDS=[]
 | 配置 | 作用 | 约束与建议 |
 | --- | --- | --- |
 | `FLASHDUTY_POLL_CHANNEL_IDS` | 指定协作空间范围，传给 `/alert/list` 的 `channel_ids` | **启用轮询时必填**；空值会导致 `/health/ready` 返回 503 且轮询器不启动 |
-| `FLASHDUTY_POLL_INTERVAL_SECONDS` | 每轮拉取的间隔 | 单位秒，最小 300；由 `.env` 控制，修改后重启 API 生效 |
-| `FLASHDUTY_POLL_LOOKBACK_SECONDS` | 每轮回看的重叠窗口 | 建议不小于轮询间隔；默认 900 秒，用于覆盖网络波动、API 重试和进程重启 |
+| `FLASHDUTY_POLL_INTERVAL_SECONDS` | 相邻两轮开始拉取的目标间隔 | 单位秒，最小 300；默认 300 秒 |
+| `FLASHDUTY_POLL_LOOKBACK_SECONDS` | 每轮回看的重叠窗口 | 启用轮询时必须不小于轮询间隔；默认 900 秒，用于覆盖网络波动、API 重试和进程重启 |
 | `FLASHDUTY_POLL_INTEGRATION_IDS` | 集成过滤范围 | 可选；空数组表示不额外按集成过滤，但始终按协作空间过滤 |
 
 ## 三、启动服务
@@ -123,22 +121,24 @@ source = "flashduty"
 external_id = FlashDuty alert_id
 ```
 
-轮询器对每个 `/alert/list` 项优先调用 `/alert/info`，再交给统一入站服务保存。首次见到某个 `alert_id` 时创建本地告警并入队分析；后续重叠窗口、下一轮扫描或 API 重试再次返回同一 `alert_id` 时，数据库返回已有记录，**不会创建第二条告警或重复入队**。
+FlashDuty 将 `/alert/list` 的 `AlertItem` 定义为完整告警对象。轮询器直接把已捕获的列表项交给统一入站服务保存；进入分析阶段后，`alert_context` 再按需调用 `/alert/info` 补充上下文。首次见到某个 `alert_id` 时创建本地告警并入队分析；后续重叠窗口、下一轮扫描或 API 重试再次返回同一 `alert_id` 时，数据库返回已有记录，**不会创建第二条告警或重复入队**。
 
 当前策略以“避免重复分析”为优先：同一 `alert_id` 后续字段更新不会自动启动新的完整分析。如果需要在 `Warning → Critical` 或关键标签变化时重跑，应额外设计生命周期事件表与明确的重分析规则。
 
 ### 水位和故障恢复
 
-1. 每轮均从“本轮当前时间减去 `FLASHDUTY_POLL_LOOKBACK_SECONDS`”开始拉取；查询窗口不会因上一轮延迟、失败或服务停顿而扩大；
-2. `/alert/list` 使用创建时间窗（`by_updated_at=false`）并按游标分页，单轮最多 100 页；由于同一 `alert_id` 的后续更新本来不会触发重分析，按创建时间轮询可避免高告警量空间的更新时间索引超时；
-3. 单条 `/alert/info` 暂时失败时，使用 `/alert/list` 中的完整 `AlertItem` 继续入库，避免单条详情请求造成漏告警。
+1. 每轮开始时固定 `end_time = 当前时间`，并以 `start_time = end_time - FLASHDUTY_POLL_LOOKBACK_SECONDS` 查询；默认形成严格的 `[当前时间 - 900s, 当前时间]` 回看窗口；
+2. `/alert/list` 设置 `by_updated_at=false`，因此 API 时间过滤作用于告警首次发生时间 `start_time`；结果按稳定的 `created_at` 升序游标分页，避免活跃告警的 `updated_at` 变化导致跨页移动；
+3. 轮询器先穷尽全部游标页并按 `alert_id` 去重，再开始入库，不会因为逐条详情查询拖慢后续分页，也不再以固定页数静默截断；
+4. 如果响应声明的 `total` 大于实际收集数量、下一页游标缺失/重复，或任一告警入库失败，本轮会明确失败；分页异常记录 `flashduty_poll_failed`，入库不完整记录 `flashduty_poll_incomplete`，下一轮重新扫描重叠窗口；
+5. 轮询耗时会从下一次等待中扣除，使相邻轮询的开始时间尽量保持 `FLASHDUTY_POLL_INTERVAL_SECONDS` 的配置节奏。
 
 ## 五、运行与排障
 
 ### 预期日志
 
 ```text
-flashduty_poll_completed start_time=... end_time=... created=...
+flashduty_poll_completed start_time=... end_time=... pages=... fetched=... created=... deduplicated=...
 ```
 
 常见日志与处理：
@@ -147,7 +147,7 @@ flashduty_poll_completed start_time=... end_time=... created=...
 | --- | --- | --- |
 | `flashduty_poll_completed` | 本轮拉取成功 | 检查 `created` 和本地告警列表 |
 | `flashduty_poll_failed` | `/alert/list`、分页或配置出现异常 | 检查 APP Key、网络、协作空间 ID 与 FlashDuty API 状态；下轮会自动重试重叠窗口 |
-| `flashduty_poll_alert_info_failed_using_list_item` | 单条详情查询失败 | 检查网络/API；当前告警仍会由列表项继续入库 |
+| `flashduty_poll_incomplete` | API 分页不完整或存在未能入库的列表项 | 根据日志中的 `fetched`、`processed`、`failed` 排查；本轮不会被误报为成功 |
 | 服务 ready 为 503 | 缺少 APP Key、协作空间 ID 或其他运行配置 | 根据 `issues` 字段补齐 `.env` 后重启 |
 | 告警未出现 | 不在指定协作空间、未处于 API 查询范围，或 API 权限不足 | 确认 `FLASHDUTY_POLL_CHANNEL_IDS`、APP Key 权限和 FlashDuty 告警状态 |
 

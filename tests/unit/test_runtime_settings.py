@@ -232,6 +232,15 @@ def test_flashduty_polling_interval_and_scope_configuration(
             flashduty_poll_interval_seconds=299,
         )
 
+    with pytest.raises(ValidationError, match="must be greater than or equal"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            flashduty_polling_enabled=True,
+            flashduty_poll_interval_seconds=600,
+            flashduty_poll_lookback_seconds=300,
+        )
+
     monkeypatch.setenv("FLASHDUTY_POLL_CHANNEL_IDS", "7,8")
     monkeypatch.setenv("FLASHDUTY_POLL_INTEGRATION_IDS", "[42,43]")
     settings = Settings(_env_file=None, ai_provider="fake")

@@ -11,6 +11,7 @@ from app.application.scheduler import (
     InMemoryAnalysisScheduler,
     KafkaAnalysisScheduler,
     ManualAnalysisScheduler,
+    _remaining_poll_delay,
 )
 from app.config import Settings
 from app.domain.models import AlertStatus
@@ -136,27 +137,24 @@ async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
                 "req-list",
                 {
                     "items": [
-                        {"alert_id": "663a1b2c3d4e5f6789abcdef"}
+                        {
+                            "alert_id": "663a1b2c3d4e5f6789abcdef",
+                            "title": "Database latency",
+                            "description": "Latency is above threshold",
+                            "alert_severity": "Warning",
+                            "alert_status": "Warning",
+                            "alert_key": "database-latency",
+                            "start_time": 900,
+                            "labels": {"env": "prod", "service": "orders-db"},
+                        }
                     ],
+                    "total": 1,
                     "has_next_page": False,
                 },
             )
 
         async def alert_info(self, alert_id: str) -> FlashDutyResponse:
-            assert alert_id == "663a1b2c3d4e5f6789abcdef"
-            return FlashDutyResponse(
-                "req-info",
-                {
-                    "alert_id": alert_id,
-                    "title": "Database latency",
-                    "description": "Latency is above threshold",
-                    "alert_severity": "Warning",
-                    "alert_status": "Warning",
-                    "alert_key": "database-latency",
-                    "start_time": 900,
-                    "labels": {"env": "prod", "service": "orders-db"},
-                },
-            )
+            raise AssertionError(f"polling must not call /alert/info for {alert_id}")
 
     scheduler = ManualAnalysisScheduler()
     poller = FlashDutyAlertPoller(
@@ -174,3 +172,108 @@ async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     assert list_payloads[0]["channel_ids"] == [7]
     assert list_payloads[0]["by_updated_at"] is False
     await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_flashduty_poller_fetches_more_than_100_pages_without_truncation() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=True,
+        flashduty_poll_interval_seconds=300,
+        flashduty_poll_lookback_seconds=900,
+        flashduty_poll_channel_ids=[7],
+    )
+    list_payloads: list[dict[str, object]] = []
+
+    class ManyPageClient:
+        async def list_alerts(self, **payload):  # type: ignore[no-untyped-def]
+            list_payloads.append(payload)
+            cursor = payload.get("search_after_ctx")
+            page = 0 if cursor is None else int(str(cursor).removeprefix("cursor-"))
+            has_next = page < 100
+            return FlashDutyResponse(
+                f"req-list-{page}",
+                {
+                    "items": [{"alert_id": f"{page:024x}"}],
+                    "total": 101,
+                    "has_next_page": has_next,
+                    "search_after_ctx": f"cursor-{page + 1}" if has_next else "",
+                },
+            )
+
+    class RecordingService:
+        def __init__(self) -> None:
+            self.alert_ids: list[str] = []
+
+        async def ingest(self, source, payload):  # type: ignore[no-untyped-def]
+            assert source == "flashduty"
+            alert_id = payload["data"]["alert_id"]
+            self.alert_ids.append(alert_id)
+            return (
+                SimpleNamespace(
+                    status=AlertStatus.QUEUED,
+                    alert=SimpleNamespace(id=alert_id),
+                ),
+                True,
+            )
+
+    service = RecordingService()
+    scheduler = ManualAnalysisScheduler()
+    poller = FlashDutyAlertPoller(
+        settings,
+        service,  # type: ignore[arg-type]
+        scheduler,
+        ManyPageClient(),  # type: ignore[arg-type]
+    )
+
+    assert await poller.run_once(now=1000) == 101
+    assert len(list_payloads) == 101
+    assert len(service.alert_ids) == 101
+    assert len(scheduler.jobs) == 101
+    assert all(payload["start_time"] == 100 for payload in list_payloads)
+    assert all(payload["end_time"] == 1000 for payload in list_payloads)
+
+
+@pytest.mark.asyncio
+async def test_flashduty_poller_rejects_silently_incomplete_pagination() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=True,
+        flashduty_poll_channel_ids=[7],
+    )
+
+    class IncompleteClient:
+        async def list_alerts(self, **_payload):  # type: ignore[no-untyped-def]
+            return FlashDutyResponse(
+                "req-list",
+                {
+                    "items": [{"alert_id": "663a1b2c3d4e5f6789abcdef"}],
+                    "total": 2,
+                    "has_next_page": False,
+                },
+            )
+
+    class ServiceThatMustNotRun:
+        async def ingest(self, source, payload):  # type: ignore[no-untyped-def]
+            raise AssertionError(f"unexpected ingest: {source} {payload}")
+
+    poller = FlashDutyAlertPoller(
+        settings,
+        ServiceThatMustNotRun(),  # type: ignore[arg-type]
+        ManualAnalysisScheduler(),
+        IncompleteClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="pagination was incomplete"):
+        await poller.run_once(now=1000)
+
+
+def test_flashduty_poller_keeps_start_to_start_interval() -> None:
+    assert _remaining_poll_delay(300, started_at=100.0, finished_at=125.0) == 275.0
+    assert _remaining_poll_delay(300, started_at=100.0, finished_at=450.0) == 0.0

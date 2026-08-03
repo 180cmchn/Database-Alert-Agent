@@ -242,6 +242,37 @@ async def test_client_alert_list_uses_documented_updated_at_cursor_shape() -> No
 
 
 @pytest.mark.asyncio
+async def test_client_alert_list_uses_stable_created_at_order_for_start_time_window() -> None:
+    request_body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "request_id": "req-list",
+                "data": {"items": [], "has_next_page": False},
+            },
+        )
+
+    client = FlashDutyClient(
+        "test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep
+    )
+    await client.list_alerts(
+        start_time=1712650000,
+        end_time=1712650300,
+        channel_ids=[7],
+        is_active=None,
+        by_updated_at=False,
+    )
+
+    assert request_body["orderby"] == "created_at"
+    assert request_body["asc"] is True
+    assert request_body["by_updated_at"] is False
+    assert "is_active" not in request_body
+
+
+@pytest.mark.asyncio
 async def test_client_treats_http_200_monitor_business_error_as_failure() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(

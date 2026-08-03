@@ -321,6 +321,15 @@ class Settings(BaseSettings):
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
         if self.flashduty_logs_ds_type not in {"loki", "victorialogs"}:
             raise ValueError("FLASHDUTY_LOGS_DS_TYPE must be loki or victorialogs")
+        if (
+            self.flashduty_polling_enabled
+            and self.flashduty_poll_lookback_seconds
+            < self.flashduty_poll_interval_seconds
+        ):
+            raise ValueError(
+                "FLASHDUTY_POLL_LOOKBACK_SECONDS must be greater than or equal to "
+                "FLASHDUTY_POLL_INTERVAL_SECONDS when polling is enabled"
+            )
         valid_sources = {"local_pdf", "external_knowledge"}
         invalid_sources = set(self.knowledge_sources) - valid_sources
         if invalid_sources:
