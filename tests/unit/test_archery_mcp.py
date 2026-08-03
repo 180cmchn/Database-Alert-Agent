@@ -276,7 +276,7 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
 
 
-def test_archery_instance_discovery_accepts_optional_reference_filter() -> None:
+def test_archery_discovery_arguments_are_delegated_to_mcp_schema() -> None:
     client = _client(
         httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     )
@@ -286,6 +286,7 @@ def test_archery_instance_discovery_accepts_optional_reference_filter() -> None:
         {"instance_ref": ""},
         {"instance_ref": TEST_INSTANCE_REF},
         {"instance_ref": "another-instance"},
+        {"instance_ref": {"server_specific": True}},
     ):
         client._validate_model_tool_call(
             MCPModelToolCall(
@@ -295,92 +296,55 @@ def test_archery_instance_discovery_accepts_optional_reference_filter() -> None:
             ),
             requested_sql=TEST_SLOW_LOG_QUERY,
             login_confirmed=True,
-            discovered_instance_ids=set(),
         )
 
-    for invalid_ref in (TEST_INSTANCE_ID, {"name": TEST_INSTANCE_REF}, "bad\nref"):
-        with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
-            client._validate_model_tool_call(
-                MCPModelToolCall(
-                    call_id="invalid-discovery-call",
-                    name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
-                    arguments={"instance_ref": invalid_ref},
-                ),
-                requested_sql=TEST_SLOW_LOG_QUERY,
-                login_confirmed=True,
-                discovered_instance_ids=set(),
-            )
 
-
-def test_archery_query_requires_discovered_integer_id_not_configured_ref() -> None:
+def test_archery_query_accepts_instance_id_or_configured_reference() -> None:
     client = _client(
         httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     )
-    approved_arguments = {
-        "instance_id": TEST_INSTANCE_ID,
-        "db_name": TEST_DB_NAME,
-        "sql_content": TEST_SLOW_LOG_QUERY,
-        "limit_num": 20,
-        "max_result_chars": 8_000,
-    }
-    client._validate_model_tool_call(
-        MCPModelToolCall(
-            call_id="query-by-id",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments=approved_arguments,
-        ),
-        requested_sql=TEST_SLOW_LOG_QUERY,
-        login_confirmed=True,
-        discovered_instance_ids={TEST_INSTANCE_ID},
-    )
-
-    for invalid_arguments in (
-        {
-            key: value
-            for key, value in approved_arguments.items()
-            if key != "instance_id"
-        }
-        | {"instance_ref": TEST_INSTANCE_REF},
-        {
-            **approved_arguments,
-            "instance_id": TEST_INSTANCE_ID,
-            "instance_ref": TEST_INSTANCE_REF,
-        },
+    for identity in (
+        {"instance_id": str(TEST_INSTANCE_ID)},
+        {"instance_ref": TEST_INSTANCE_REF},
     ):
-        with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
-            client._validate_model_tool_call(
-                MCPModelToolCall(
-                    call_id="query-by-ref",
-                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                    arguments=invalid_arguments,
-                ),
-                requested_sql=TEST_SLOW_LOG_QUERY,
-                login_confirmed=True,
-                discovered_instance_ids={TEST_INSTANCE_ID},
+        call = client._normalize_model_tool_call(
+            MCPModelToolCall(
+                call_id="query-call",
+                name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                arguments={
+                    **identity,
+                    "db_name": TEST_DB_NAME,
+                    "sql_content": TEST_SLOW_LOG_QUERY,
+                },
             )
+        )
+        assert call.arguments["limit_num"] == 20
+        assert call.arguments["max_result_chars"] == 8_000
+        client._validate_model_tool_call(
+            call,
+            requested_sql=TEST_SLOW_LOG_QUERY,
+            login_confirmed=True,
+        )
 
 
-def test_archery_normalizes_discovered_instance_identity_for_downstream_tools() -> None:
+def test_archery_normalizes_numeric_instance_id_without_tracking_discovery() -> None:
     client = _client(
         httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     )
     for arguments in (
         {"instance_id": str(TEST_INSTANCE_ID), "page": 1},
-        {"instance_ref": str(TEST_INSTANCE_ID), "page": 1},
-        {"instance_ref": TEST_INSTANCE_REF, "page": 1},
         {
             "instance_id": TEST_INSTANCE_ID,
             "instance_ref": TEST_INSTANCE_REF,
             "page": 1,
         },
     ):
-        normalized = client._normalize_instance_identity(
+        normalized = client._normalize_model_tool_call(
             MCPModelToolCall(
                 call_id="database-discovery",
                 name=ARCHERY_MCP_DATABASES_TOOL_NAME,
                 arguments=arguments,
-            ),
-            discovered_instance_ids={TEST_INSTANCE_ID},
+            )
         )
 
         assert normalized.arguments == {
@@ -391,20 +355,7 @@ def test_archery_normalizes_discovered_instance_identity_for_downstream_tools() 
             normalized,
             requested_sql=TEST_SLOW_LOG_QUERY,
             login_confirmed=True,
-            discovered_instance_ids={TEST_INSTANCE_ID},
         )
-
-
-def test_archery_extracts_integer_and_numeric_string_instance_ids() -> None:
-    assert ArcheryMCPClient._extract_positive_instance_ids(
-        {
-            "results": [
-                {"id": TEST_INSTANCE_ID},
-                {"instance_id": str(TEST_INSTANCE_ID + 1)},
-                {"instanceId": "not-an-id"},
-            ]
-        }
-    ) == {TEST_INSTANCE_ID, TEST_INSTANCE_ID + 1}
 
 
 @pytest.mark.asyncio
@@ -600,7 +551,10 @@ async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> No
 
     client = _client(httpx.MockTransport(handler))
 
-    with pytest.raises(ArcheryMCPConfigurationError, match="db_name, instance_id"):
+    with pytest.raises(
+        ArcheryMCPConfigurationError,
+        match="instance_id or instance_ref",
+    ):
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert tool_calls == []
@@ -717,7 +671,7 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_does_not_execute_query_before_instance_discovery() -> None:
+async def test_archery_mcp_allows_query_after_login_without_host_discovery_tracking() -> None:
     tool_calls: list[str] = []
     model = PromptFollowingMCPModel(
         sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME)
@@ -737,14 +691,17 @@ async def test_archery_mcp_does_not_execute_query_before_instance_discovery() ->
         model=model,
     )
 
-    with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
-        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
+    assert result.payload == {"status": "ok", "rows": []}
     assert [item["name"] for item in model.calls] == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
-    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+    assert tool_calls == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
 
 
 @pytest.mark.asyncio
