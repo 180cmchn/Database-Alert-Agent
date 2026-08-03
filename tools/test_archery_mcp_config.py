@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Run a live, read-only Archery MCP connection and target smoke test.
+r"""Run a live, read-only Archery MCP connection and fixed-target smoke test.
 
 Run from the project root so the result is printed in the VS Code terminal::
 
-    .venv/bin/python -m tools.test_archery_mcp_config \
-        --instance-ref db-prod-01:3306 --db-name orders
+    .\.venv\Scripts\python.exe -m tools.test_archery_mcp_config
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import re
@@ -37,7 +35,9 @@ from app.config import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULT_CHARACTER_LIMIT = 24_000
-LATEST_SLOW_LOG_SQL = """SELECT
+INSTANCE_REF = "archery"
+DB_NAME = "archery"
+OLDEST_SLOW_LOG_SQL = """SELECT
     f_id,
     f_instances_id,
     f_start_time,
@@ -52,7 +52,7 @@ LATEST_SLOW_LOG_SQL = """SELECT
     f_insert_time,
     f_update_time
 FROM t_slowlog_info
-ORDER BY f_insert_time DESC, f_id DESC
+ORDER BY f_insert_time ASC, f_id ASC
 LIMIT 5"""
 
 
@@ -184,14 +184,14 @@ async def _call_read_only_tool(
     return payload
 
 
-async def run(*, instance_ref: str, db_name: str) -> None:
+async def run() -> None:
     settings, server = _load_connection()
     timeout_seconds = settings.archery_mcp_timeout_seconds
     print("=== Archery MCP 配置冒烟测试 ===")
     print(f"MCP Endpoint: {server.url}")
-    print(f"模拟告警实例: {instance_ref}")
-    print(f"模拟告警数据库: {db_name}")
-    print("查询目标: t_slowlog_info 最新 5 条\n")
+    print(f"固定实例: {INSTANCE_REF}")
+    print(f"固定数据库: {DB_NAME}")
+    print("查询目标: t_slowlog_info 最老 5 条\n")
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds),
@@ -234,24 +234,24 @@ async def run(*, instance_ref: str, db_name: str) -> None:
                 )
                 print("      登录确认成功")
 
-                print(f"[2/3] 按模拟告警实例查询 instance_id: {instance_ref}")
+                print(f"[2/3] 按固定实例查询 instance_id: {INSTANCE_REF}")
                 instances_payload = await _call_read_only_tool(
                     session,
                     name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
-                    arguments={"instance_ref": instance_ref, "page": 1, "size": 200},
+                    arguments={"instance_ref": INSTANCE_REF, "page": 1, "size": 200},
                     timeout_seconds=timeout_seconds,
                 )
-                instance_id = _instance_id_from_payload(instances_payload, instance_ref)
+                instance_id = _instance_id_from_payload(instances_payload, INSTANCE_REF)
                 print(f"      instance_id={instance_id}")
 
-                print(f"[3/3] 查询 {db_name}.t_slowlog_info 最新 5 条")
+                print(f"[3/3] 查询 {DB_NAME}.t_slowlog_info 最老 5 条")
                 query_payload = await _call_read_only_tool(
                     session,
                     name=ARCHERY_MCP_QUERY_TOOL_NAME,
                     arguments={
                         "instance_id": instance_id,
-                        "db_name": db_name,
-                        "sql_content": LATEST_SLOW_LOG_SQL,
+                        "db_name": DB_NAME,
+                        "sql_content": OLDEST_SLOW_LOG_SQL,
                         "limit_num": 5,
                         "max_result_chars": RESULT_CHARACTER_LIMIT,
                     },
@@ -261,7 +261,7 @@ async def run(*, instance_ref: str, db_name: str) -> None:
     normalized, executed_sql, actual_sql_verified = (
         ArcheryMCPClient._normalize_query_payload(
             query_payload,
-            requested_sql=LATEST_SLOW_LOG_SQL,
+            requested_sql=OLDEST_SLOW_LOG_SQL,
         )
     )
     row_count = ArcherySlowLogEvidenceTool._row_count(normalized)
@@ -275,27 +275,8 @@ async def run(*, instance_ref: str, db_name: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="使用显式告警目标测试 Archery MCP 只读查询链路"
-    )
-    parser.add_argument(
-        "--instance-ref",
-        required=True,
-        help="模拟告警中的数据库实例名、主机或 host:port",
-    )
-    parser.add_argument(
-        "--db-name",
-        required=True,
-        help="模拟告警中的数据库名",
-    )
-    args = parser.parse_args()
     try:
-        asyncio.run(
-            run(
-                instance_ref=args.instance_ref.strip(),
-                db_name=args.db_name.strip(),
-            )
-        )
+        asyncio.run(run())
     except KeyboardInterrupt:
         print("\n测试已取消。", file=sys.stderr)
         return 130
