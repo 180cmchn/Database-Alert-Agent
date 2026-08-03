@@ -37,7 +37,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v2"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v3"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -559,9 +559,13 @@ class ArcheryMCPClient:
                     "全部只读工具；你必须结合任务和之前的工具结果，自主选择恰好一个下一步"
                     "工具调用，不能只输出自然语言。先确认登录，再按需查询资源组、实例、"
                     "数据库、表和字段，使用工具返回的真实标识，不得猜测实例 ID、数据库、"
-                    "表或字段。不要把登录后的第二步固定成 SQL 查询；完成目标和表结构确认后"
-                    "再调用查询工具。最终查询的 target、required_sql 和 result_bounds 必须"
-                    "逐字使用用户消息中的值，不得改写 SQL、扩大时间范围、更换实例或数据库。"
+                    "表或字段。target.instance_ref 是实例发现条件，只能用于"
+                    " list_instances_gymJPA 的可选过滤；后续需要实例的工具必须使用该工具"
+                    "返回的整数 instance_id，尤其是 sql_query_gymJPA，不得用配置中的字符串"
+                    " instance_ref 代替。不要把登录后的第二步固定成 SQL 查询；完成目标和表"
+                    "结构确认后再调用查询工具。最终查询的 db_name、required_sql 和"
+                    " result_bounds 必须逐字使用用户消息中的值，不得改写 SQL、扩大时间范围、"
+                    "更换已发现的实例或数据库。"
                     "required_sql 是唯一允许执行的 SQL，必须是对 t_slowlog_info 的单条"
                     " SELECT，并按 f_insert_time 查询截至告警时刻"
                     f"的前 {self.window_seconds} 秒。工具描述用于理解工具能力和参数，MCP 返回"
@@ -664,10 +668,12 @@ class ArcheryMCPClient:
                 arguments,
                 {"resource_group_id", "instance_ref", "page", "size"},
             )
-            # instance_ref is an optional discovery filter in Archery. A model may
-            # first enumerate a confirmed resource group and resolve the concrete
-            # instance ID from that result instead of filtering by deployment alias.
-            if arguments.get("instance_ref") not in (None, "", self.instance_ref):
+            instance_ref = arguments.get("instance_ref")
+            if instance_ref is not None and (
+                not isinstance(instance_ref, str)
+                or len(instance_ref) > 255
+                or any(ord(character) < 32 for character in instance_ref)
+            ):
                 self._raise_argument_violation(call.name)
             self._validate_nonnegative_integer(call.name, arguments, "resource_group_id")
             self._validate_pagination(call.name, arguments)
@@ -760,21 +766,26 @@ class ArcheryMCPClient:
                 "schema_name",
                 "max_result_chars",
             },
-            required={"db_name", "sql_content", "limit_num", "max_result_chars"},
+            required={
+                "instance_id",
+                "db_name",
+                "sql_content",
+                "limit_num",
+                "max_result_chars",
+            },
         )
         if not login_confirmed or not discovered_instance_ids:
             self._raise_argument_violation(call.name)
 
-        instance_id = arguments.get("instance_id")
-        instance_ref = arguments.get("instance_ref")
-        has_discovered_id = instance_id not in (None, 0)
-        if has_discovered_id:
-            self._validate_discovered_instance_id(
-                call.name, instance_id, discovered_instance_ids
-            )
-        if instance_ref not in (None, "", self.instance_ref):
-            self._raise_argument_violation(call.name)
-        if not has_discovered_id and instance_ref != self.instance_ref:
+        self._validate_discovered_instance_id(
+            call.name,
+            arguments.get("instance_id"),
+            discovered_instance_ids,
+        )
+        # The configured reference is only a discovery hint. Query by the concrete
+        # integer ID returned by list_instances_gymJPA so Archery cannot resolve a
+        # different target from a name or alias. An omitted/empty default is harmless.
+        if arguments.get("instance_ref") not in (None, ""):
             self._raise_argument_violation(call.name)
 
         if (
@@ -967,7 +978,7 @@ class ArcheryMCPClient:
             ARCHERY_MCP_TABLES_TOOL_NAME: {"instance_id", "db_name"},
             ARCHERY_MCP_COLUMNS_TOOL_NAME: {"instance_id", "db_name", "tb_name"},
             self.query_tool_name: {
-                "instance_ref",
+                "instance_id",
                 "db_name",
                 "sql_content",
                 "limit_num",

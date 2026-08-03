@@ -179,6 +179,7 @@ class PromptFollowingMCPModel:
             ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: {"page": 1, "size": 200},
             ARCHERY_MCP_INSTANCES_TOOL_NAME: {
                 "resource_group_id": TEST_RESOURCE_GROUP_ID,
+                "instance_ref": task["target"]["instance_ref"],
                 "page": 1,
                 "size": 200,
             },
@@ -201,7 +202,6 @@ class PromptFollowingMCPModel:
             },
             ARCHERY_MCP_QUERY_TOOL_NAME: {
                 "instance_id": TEST_INSTANCE_ID,
-                "instance_ref": task["target"]["instance_ref"],
                 "db_name": task["target"]["db_name"],
                 "sql_content": task["required_sql"],
                 "limit_num": task["result_bounds"]["limit_num"],
@@ -276,7 +276,7 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
 
 
-def test_archery_instance_discovery_filter_is_optional_but_stays_scoped() -> None:
+def test_archery_instance_discovery_accepts_optional_reference_filter() -> None:
     client = _client(
         httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     )
@@ -285,6 +285,7 @@ def test_archery_instance_discovery_filter_is_optional_but_stays_scoped() -> Non
         {"resource_group_id": TEST_RESOURCE_GROUP_ID},
         {"instance_ref": ""},
         {"instance_ref": TEST_INSTANCE_REF},
+        {"instance_ref": "another-instance"},
     ):
         client._validate_model_tool_call(
             MCPModelToolCall(
@@ -297,17 +298,66 @@ def test_archery_instance_discovery_filter_is_optional_but_stays_scoped() -> Non
             discovered_instance_ids=set(),
         )
 
-    with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
-        client._validate_model_tool_call(
-            MCPModelToolCall(
-                call_id="other-target-call",
-                name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
-                arguments={"instance_ref": "another-instance"},
-            ),
-            requested_sql=TEST_SLOW_LOG_QUERY,
-            login_confirmed=True,
-            discovered_instance_ids=set(),
-        )
+    for invalid_ref in (TEST_INSTANCE_ID, {"name": TEST_INSTANCE_REF}, "bad\nref"):
+        with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
+            client._validate_model_tool_call(
+                MCPModelToolCall(
+                    call_id="invalid-discovery-call",
+                    name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                    arguments={"instance_ref": invalid_ref},
+                ),
+                requested_sql=TEST_SLOW_LOG_QUERY,
+                login_confirmed=True,
+                discovered_instance_ids=set(),
+            )
+
+
+def test_archery_query_requires_discovered_integer_id_not_configured_ref() -> None:
+    client = _client(
+        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
+    )
+    approved_arguments = {
+        "instance_id": TEST_INSTANCE_ID,
+        "db_name": TEST_DB_NAME,
+        "sql_content": TEST_SLOW_LOG_QUERY,
+        "limit_num": 20,
+        "max_result_chars": 8_000,
+    }
+    client._validate_model_tool_call(
+        MCPModelToolCall(
+            call_id="query-by-id",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments=approved_arguments,
+        ),
+        requested_sql=TEST_SLOW_LOG_QUERY,
+        login_confirmed=True,
+        discovered_instance_ids={TEST_INSTANCE_ID},
+    )
+
+    for invalid_arguments in (
+        {
+            key: value
+            for key, value in approved_arguments.items()
+            if key != "instance_id"
+        }
+        | {"instance_ref": TEST_INSTANCE_REF},
+        {
+            **approved_arguments,
+            "instance_id": TEST_INSTANCE_ID,
+            "instance_ref": TEST_INSTANCE_REF,
+        },
+    ):
+        with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
+            client._validate_model_tool_call(
+                MCPModelToolCall(
+                    call_id="query-by-ref",
+                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                    arguments=invalid_arguments,
+                ),
+                requested_sql=TEST_SLOW_LOG_QUERY,
+                login_confirmed=True,
+                discovered_instance_ids={TEST_INSTANCE_ID},
+            )
 
 
 @pytest.mark.asyncio
@@ -447,6 +497,9 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
         item["function"]["name"] != "apply_query_permission_gymJPA"
         for item in model.calls[0]["tools"]
     )
+    query_arguments = model.calls[-1]["arguments"]
+    assert query_arguments["instance_id"] == TEST_INSTANCE_ID
+    assert "instance_ref" not in query_arguments
     assert [item[0] for item in calls] == [
         "initialize",
         "notifications/initialized",
@@ -500,7 +553,7 @@ async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> No
 
     client = _client(httpx.MockTransport(handler))
 
-    with pytest.raises(ArcheryMCPConfigurationError, match="db_name, instance_ref"):
+    with pytest.raises(ArcheryMCPConfigurationError, match="db_name, instance_id"):
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert tool_calls == []
