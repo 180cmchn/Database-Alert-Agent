@@ -37,7 +37,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v6"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v7"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -550,6 +550,8 @@ class ArcheryMCPClient:
             if self.window_seconds % 60 == 0
             else f"{self.window_seconds}秒"
         )
+        window_start_epoch = int(window_start.timestamp())
+        window_end_epoch = int(window_end.timestamp())
         task = (
             f"查询{self.mcp_url}中实例：{self.instance_ref}，数据库id：{self.db_name}，"
             f"告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
@@ -559,9 +561,11 @@ class ArcheryMCPClient:
             "格式未确认的varchar(2000)，f_insert_time是由数据库CURRENT_TIMESTAMP"
             "写入的无时区DATETIME插入时间。分钟级时间窗口请使用f_insert_time筛选和排序，不要用"
             "f_start_time或f_time_point与完整时间戳比较。上述ISO 8601时间是带时区的"
-            "绝对时间；请先把窗口边界换算为Unix秒，再在SQL中使用"
-            "FROM_UNIXTIME(Unix秒)生成数据库会话时区下的DATETIME，不要直接去掉"
-            "ISO时间的时区偏移后作为SQL字面值。"
+            f"绝对时间；Host已精确计算窗口起始Unix秒为{window_start_epoch}、结束Unix秒为"
+            f"{window_end_epoch}。时间条件请直接写为f_insert_time >= "
+            f"FROM_UNIXTIME({window_start_epoch}) AND f_insert_time < "
+            f"FROM_UNIXTIME({window_end_epoch})，不要自行换算或修改这两个Unix秒，也不要"
+            "直接去掉ISO时间的时区偏移后作为SQL字面值。"
             "请使用MCP返回的真实实例ID和字段生成只读SELECT；如果SQL执行失败，"
             "根据MCP返回的错误调整后重试。"
         )

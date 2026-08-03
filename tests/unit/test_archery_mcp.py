@@ -505,7 +505,12 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "f_start_time是只含YYYY-MM-DD的varchar(10)" in task_prompt
     assert "分钟级时间窗口请使用f_insert_time筛选和排序" in task_prompt
     assert "不要用f_start_time或f_time_point与完整时间戳比较" in task_prompt
-    assert "FROM_UNIXTIME(Unix秒)" in task_prompt
+    assert "窗口起始Unix秒为1784793300、结束Unix秒为1784793600" in task_prompt
+    assert (
+        "f_insert_time >= FROM_UNIXTIME(1784793300) AND "
+        "f_insert_time < FROM_UNIXTIME(1784793600)"
+    ) in task_prompt
+    assert "不要自行换算或修改这两个Unix秒" in task_prompt
     assert "不要直接去掉ISO时间的时区偏移" in task_prompt
     assert model.calls[1]["messages"][-1]["role"] == "tool"
     assert "实时证据" in model.calls[1]["messages"][-1]["content"]
