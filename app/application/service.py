@@ -699,6 +699,7 @@ class AlertAnalysisService:
             recommendation=recommendation,
             status=status,
             message=message,
+            run_id=run_id,
         )
         try:
             await self.notifier.send(event)

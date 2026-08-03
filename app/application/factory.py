@@ -96,8 +96,16 @@ def _build_conclusion_validator(settings: Settings) -> ConclusionValidator:
 
 
 def _build_notifier(settings: Settings) -> ManagementNotifier:
-    if settings.wecom_enabled and settings.wecom_webhook_url:
-        return WeComManagementNotifier(settings.wecom_webhook_url)
+    if (
+        settings.wecom_enabled
+        and settings.wecom_webhook_url
+        and settings.wecom_page_base_url
+    ):
+        return WeComManagementNotifier(
+            settings.wecom_webhook_url,
+            settings.wecom_page_base_url,
+            settings.wecom_feedback_form_url,
+        )
     return LogManagementNotifier()
 
 

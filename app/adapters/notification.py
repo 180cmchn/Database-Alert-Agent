@@ -1,36 +1,161 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import re
 from collections import deque
 from typing import Any
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
 
 from app.application.sanitization import sanitize_text
 from app.domain.errors import NotificationError
-from app.domain.models import (
-    AnalysisBasisSource,
-    AnalysisResultEvent,
-    ExternalKnowledgeReference,
-    RunbookReference,
-)
+from app.domain.models import AnalysisResultEvent
 
 logger = logging.getLogger(__name__)
 
-WECOM_MARKDOWN_MAX_BYTES = 3800
 WECOM_RATE_LIMIT_PER_MINUTE = 20
 WECOM_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _WHITESPACE = re.compile(r"\s+")
 
 
-def _safe_line(value: Any, *, limit: int = 500) -> str:
-    cleaned = _WHITESPACE.sub(" ", sanitize_text(str(value))).strip()
-    escaped = html.escape(cleaned, quote=False)
-    return escaped[:limit]
+def _safe_text(value: Any, *, limit: int, fallback: str = "未提供") -> str:
+    raw = "" if value is None else str(value)
+    cleaned = _WHITESPACE.sub(" ", sanitize_text(raw)).strip()
+    return cleaned[:limit] or fallback
+
+
+def _append_query_parameters(url: str, **parameters: str) -> str:
+    """Append authoritative correlation fields while preserving form options."""
+
+    parsed = urlsplit(url)
+    reserved_names = set(parameters)
+    query = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if name not in reserved_names
+    ]
+    query.extend(
+        (name, value)
+        for name, value in parameters.items()
+        if value
+    )
+    return urlunsplit(parsed._replace(query=urlencode(query)))
+
+
+def _action_urls(
+    event: AnalysisResultEvent,
+    *,
+    page_base_url: str,
+    feedback_form_url: str = "",
+) -> dict[str, str]:
+    alert_id = quote(str(event.alert.id), safe="")
+    wecom_url = f"{page_base_url.rstrip('/')}/wecom/alerts/{alert_id}"
+    if feedback_form_url:
+        feedback_url = _append_query_parameters(
+            feedback_form_url,
+            alert_id=str(event.alert.id),
+            run_id=str(event.run_id) if event.run_id else "",
+            source="wecom",
+        )
+    else:
+        feedback_url = f"{page_base_url.rstrip('/')}/alerts/{alert_id}#feedback"
+    return {
+        "overview": wecom_url,
+        "root_cause": f"{wecom_url}/root-cause",
+        "recovery_advice": f"{wecom_url}/recovery-advice",
+        "feedback": feedback_url,
+    }
+
+
+def build_wecom_template_card(
+    event: AnalysisResultEvent,
+    *,
+    page_base_url: str,
+    feedback_form_url: str = "",
+) -> dict[str, Any]:
+    """Build a bounded WeCom text-notice card with three bottom actions."""
+
+    if not page_base_url:
+        raise NotificationError("WeCom page base URL is not configured")
+
+    alert = event.alert
+    database = alert.database
+    urls = _action_urls(
+        event,
+        page_base_url=page_base_url,
+        feedback_form_url=feedback_form_url,
+    )
+    severity_labels = {
+        "CRITICAL": "严重",
+        "WARNING": "警告",
+        "INFO": "提示",
+    }
+    status_labels = {
+        "COMPLETED": "分析完成",
+        "REVIEW_REQUIRED": "待人工复核",
+        "FAILED": "分析失败",
+    }
+    severity = alert.severity.value
+    host = (database.host or database.instance) if database else None
+    database_name = None
+    if database:
+        database_name = " / ".join(
+            value for value in (database.engine, database.database) if value
+        )
+
+    return {
+        "card_type": "text_notice",
+        "source": {
+            "desc": "数据库告警 Agent",
+            "desc_color": 2 if severity == "CRITICAL" else 0,
+        },
+        "main_title": {
+            "title": _safe_text(alert.title, limit=26),
+            "desc": _safe_text(alert.occurred_at.isoformat(), limit=30),
+        },
+        "emphasis_content": {
+            "title": _safe_text(severity, limit=10),
+            "desc": _safe_text(
+                status_labels.get(event.status.value, event.status.value),
+                limit=15,
+            ),
+        },
+        "sub_title_text": _safe_text(
+            f"告警原因：{alert.reason}",
+            limit=112,
+        ),
+        "horizontal_content_list": [
+            {
+                "keyname": "告警级别",
+                "value": _safe_text(
+                    f"{severity_labels.get(severity, severity)} / {severity}",
+                    limit=26,
+                ),
+            },
+            {"keyname": "告警主机", "value": _safe_text(host, limit=26)},
+            {"keyname": "数据库", "value": _safe_text(database_name, limit=26)},
+            {"keyname": "环境", "value": _safe_text(alert.environment, limit=26)},
+            {"keyname": "服务", "value": _safe_text(alert.service_name, limit=26)},
+            {"keyname": "外部ID", "value": _safe_text(alert.external_id, limit=26)},
+        ],
+        "jump_list": [
+            {
+                "type": 1,
+                "title": "告警根因分析",
+                "url": urls["root_cause"],
+            },
+            {
+                "type": 1,
+                "title": "告警恢复建议",
+                "url": urls["recovery_advice"],
+            },
+            {"type": 1, "title": "人工反馈", "url": urls["feedback"]},
+        ],
+        "card_action": {"type": 1, "url": urls["overview"]},
+    }
 
 
 class _WeComRateLimiter:
@@ -68,99 +193,6 @@ class _WeComRateLimiter:
                     await asyncio.sleep(wait)
 
 
-def _truncate_utf8(value: str, max_bytes: int) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return value
-    suffix = "\n> 内容已截断，请按告警 ID 在管理台查看完整详情。"
-    suffix_bytes = suffix.encode("utf-8")
-    available = max(0, max_bytes - len(suffix_bytes))
-    prefix = encoded[:available].decode("utf-8", errors="ignore").rstrip()
-    return f"{prefix}{suffix}"
-
-
-def format_wecom_markdown(event: AnalysisResultEvent) -> str:
-    """Render a bounded, sanitized WeCom message without raw alert payloads."""
-
-    alert = event.alert
-    severity_color = (
-        "warning" if alert.severity.value in {"CRITICAL", "WARNING"} else "info"
-    )
-    lines = [
-        "### 数据库告警 · AI 分析结果",
-        (
-            "> 等级："
-            f'<font color="{severity_color}">{_safe_line(alert.severity.value)}</font>'
-        ),
-        f"> 标题：{_safe_line(alert.title)}",
-        f"> 原因：{_safe_line(alert.reason)}",
-        f"> 来源：{_safe_line(alert.source)}",
-        f"> 外部 ID：{_safe_line(alert.external_id)}",
-        f"> 环境：{_safe_line(alert.environment)}",
-        f"> 服务：{_safe_line(alert.service_name)}",
-    ]
-    if alert.database and alert.database.instance:
-        lines.append(f"> 实例：{_safe_line(alert.database.instance)}")
-    lines.extend(
-        [
-            f"> 发生时间：{_safe_line(alert.occurred_at.isoformat())}",
-            f"> 告警 ID：{_safe_line(alert.id)}",
-            "",
-            f"**状态说明**  {_safe_line(event.message, limit=1000)}",
-        ]
-    )
-    recommendation = event.recommendation
-    lines.extend(
-        [
-            "",
-            "**AI 分析摘要**",
-            _safe_line(recommendation.summary, limit=1200),
-            "",
-            (
-                f"> 分析状态：{_safe_line(event.status.value)}　"
-                f"置信度：{recommendation.confidence:.0%}"
-            ),
-        ]
-    )
-    if recommendation.likely_causes:
-        lines.extend(["", "**可能原因**"])
-        for index, cause in enumerate(recommendation.likely_causes[:5], start=1):
-            lines.append(f"{index}. {_safe_line(cause, limit=700)}")
-    if recommendation.analysis_bases:
-        lines.extend(["", "**判断依据（本地 PDF、外部知识、AI）**"])
-        for index, basis in enumerate(recommendation.analysis_bases[:8], start=1):
-            label = {
-                AnalysisBasisSource.RUNBOOK: "本地 PDF",
-                AnalysisBasisSource.EXTERNAL_KNOWLEDGE: "外部知识",
-                AnalysisBasisSource.AI: "AI",
-            }[basis.source]
-            reference = ""
-            if isinstance(basis.source_ref, RunbookReference):
-                reference = (
-                    f"（{_safe_line(basis.source_ref.runbook_id)}/"
-                    f"{_safe_line(basis.source_ref.section)}）"
-                )
-            elif isinstance(basis.source_ref, ExternalKnowledgeReference):
-                reference = f"（{_safe_line(basis.source_ref.title)}）"
-            lines.append(
-                f"{index}. [{label}]{reference} {_safe_line(basis.statement, limit=700)}"
-            )
-    if recommendation.knowledge_match_summary:
-        lines.extend(
-            [
-                "",
-                "**知识匹配说明**",
-                _safe_line(recommendation.knowledge_match_summary, limit=1000),
-            ]
-        )
-    if recommendation.steps:
-        lines.extend(["", "**建议核查步骤（前 3 条）**"])
-        for index, step in enumerate(recommendation.steps[:3], start=1):
-            lines.append(f"{index}. {_safe_line(step.action, limit=700)}")
-
-    return _truncate_utf8("\n".join(lines), WECOM_MARKDOWN_MAX_BYTES)
-
-
 class LogManagementNotifier:
     async def send(self, event: AnalysisResultEvent) -> str:
         delivery_id = f"log-{uuid4()}"
@@ -180,6 +212,8 @@ class WeComManagementNotifier:
     def __init__(
         self,
         url: str,
+        page_base_url: str,
+        feedback_form_url: str = "",
         timeout_seconds: float = 10,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -188,6 +222,8 @@ class WeComManagementNotifier:
         rate_limit_per_minute: int = WECOM_RATE_LIMIT_PER_MINUTE,
     ) -> None:
         self._url = url
+        self._page_base_url = page_base_url
+        self._feedback_form_url = feedback_form_url
         self._timeout = timeout_seconds
         self._transport = transport
         self._max_retries = max_retries
@@ -204,8 +240,12 @@ class WeComManagementNotifier:
             "Idempotency-Key": f"{event.alert.id}:analysis-result",
         }
         payload = {
-            "msgtype": "markdown",
-            "markdown": {"content": format_wecom_markdown(event)},
+            "msgtype": "template_card",
+            "template_card": build_wecom_template_card(
+                event,
+                page_base_url=self._page_base_url,
+                feedback_form_url=self._feedback_form_url,
+            ),
         }
 
         response: httpx.Response | None = None
@@ -250,8 +290,8 @@ class WeComManagementNotifier:
         if not isinstance(result, dict) or "errcode" not in result:
             raise NotificationError("WeCom webhook response is missing errcode")
         if result["errcode"] != 0:
-            error_code = _safe_line(result["errcode"], limit=40)
-            errmsg = _safe_line(result.get("errmsg", ""), limit=200)
+            error_code = _safe_text(result["errcode"], limit=40)
+            errmsg = _safe_text(result.get("errmsg", ""), limit=200, fallback="")
             raise NotificationError(
                 f"WeCom webhook rejected message: errcode={error_code} errmsg={errmsg}"
             )

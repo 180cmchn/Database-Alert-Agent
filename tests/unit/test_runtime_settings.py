@@ -222,6 +222,36 @@ def test_settings_validation_error_hides_invalid_wecom_url_secret() -> None:
     assert secret not in str(caught.value)
 
 
+def test_wecom_page_and_feedback_urls_are_validated() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        wecom_page_base_url="http://alerts.intra.example.com",
+        wecom_feedback_form_url="https://survey.example.com/form?campaign=dba#questions",
+    )
+    assert settings.wecom_page_base_url == "http://alerts.intra.example.com"
+
+    with pytest.raises(ValidationError, match="must not contain a query or fragment"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            wecom_page_base_url="https://alerts.intra.example.com?tenant=dba",
+        )
+
+    enabled_without_page = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        wecom_enabled=True,
+        wecom_webhook_url=(
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
+        ),
+    )
+    assert any(
+        "WECOM_PAGE_BASE_URL" in issue
+        for issue in enabled_without_page.readiness_issues()
+    )
+
+
 def test_flashduty_polling_interval_and_scope_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -470,6 +500,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         admin_api_token="configured-admin-token",
         production_gate_approved=True,
         wecom_enabled=True,
+        wecom_page_base_url="https://alerts.example.test",
         runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
@@ -506,10 +537,14 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["ready"] is True
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
+    assert body["wecom_page_base_url"] == ""
+    assert body["wecom_feedback_form_url"] == ""
     assert body["ai_fallback_enabled"] is True
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["archery_mcp_max_agent_steps"] == 10
+    assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
+    assert "wecom_feedback_form_url" in RUNTIME_SETTINGS_KEYS
     assert "ai_api_key" not in body
     assert "wecom_webhook_url" not in body
 

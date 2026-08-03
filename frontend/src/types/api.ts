@@ -406,6 +406,8 @@ export interface AdminSettings {
   ai_api_key_configured: boolean;
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
+  wecom_page_base_url: string;
+  wecom_feedback_form_url: string;
   flashduty_enabled: boolean;
   flashduty_base_url: string;
   flashduty_app_key_configured: boolean;
@@ -438,6 +440,8 @@ export interface AdminSettingsPatch {
   ai_fallback_enabled?: boolean;
   runbook_limit?: number;
   wecom_webhook_url?: string;
+  wecom_page_base_url?: string;
+  wecom_feedback_form_url?: string;
   wecom_enabled?: boolean;
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;

@@ -214,12 +214,16 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
                 "expected_revision": initial["revision"],
                 "wecom_enabled": True,
                 "wecom_webhook_url": wecom_url,
+                "wecom_page_base_url": "https://alerts.intra.example.com",
+                "wecom_feedback_form_url": "https://survey.example.com/db-alert",
             },
         )
         assert response.status_code == 200
         body = response.json()
         assert body["wecom_enabled"] is True
         assert body["wecom_webhook_url_configured"] is True
+        assert body["wecom_page_base_url"] == "https://alerts.intra.example.com"
+        assert body["wecom_feedback_form_url"] == "https://survey.example.com/db-alert"
         assert "wecom_webhook_url" not in body
         assert wecom_url not in response.text
         assert isinstance(runtime.service.notifier, WeComManagementNotifier)
@@ -231,6 +235,8 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
 
     persisted = (tmp_path / "runtime-settings.json").read_text(encoding="utf-8")
     assert wecom_url in persisted
+    assert "https://alerts.intra.example.com" in persisted
+    assert "https://survey.example.com/db-alert" in persisted
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert wecom_url not in audit
 

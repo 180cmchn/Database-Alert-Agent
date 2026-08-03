@@ -7,10 +7,14 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { RunbooksPage } from "./pages/RunbooksPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { WeComAlertViewPage } from "./pages/WeComAlertViewPage";
 
 export default function App() {
   return (
     <Routes>
+      <Route path="wecom/alerts/:alertId" element={<WeComAlertViewPage view="overview" />} />
+      <Route path="wecom/alerts/:alertId/root-cause" element={<WeComAlertViewPage view="root-cause" />} />
+      <Route path="wecom/alerts/:alertId/recovery-advice" element={<WeComAlertViewPage view="recovery-advice" />} />
       <Route element={<AppShell />}>
         <Route index element={<DashboardPage />} />
         <Route path="alerts" element={<AlertsPage />} />

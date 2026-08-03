@@ -67,6 +67,7 @@ export function SectionCard({
   action,
   children,
   className = "",
+  id,
 }: {
   title?: string;
   eyebrow?: string;
@@ -74,9 +75,10 @@ export function SectionCard({
   action?: ReactNode;
   children: ReactNode;
   className?: string;
+  id?: string;
 }) {
   return (
-    <section className={`section-card ${className}`}>
+    <section id={id} className={`section-card ${className}`}>
       {(title || eyebrow || description || action) && (
         <div className="section-heading">
           <div>

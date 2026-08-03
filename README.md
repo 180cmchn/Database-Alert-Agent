@@ -148,7 +148,8 @@ chmod 600 .env
 
 旧配置名 `RUNBOOK_DIR`、`MANAGEMENT_WEBHOOK_URL`、`NOTIFIER_MODE` 和通知重试/升级相关变量已不再
 生效；升级部署时应以 `.env.example` 为准，分别改用 `RUNBOOK_PDF_DIR` 和官方
-`WECOM_WEBHOOK_URL`。FlashDuty 轮询还必须显式配置 APP Key 与协作空间 ID。
+`WECOM_WEBHOOK_URL`，并为卡片操作配置 `WECOM_PAGE_BASE_URL`。FlashDuty 轮询还必须显式配置
+APP Key 与协作空间 ID。
 
 关键配置：
 
@@ -163,14 +164,20 @@ AI_FALLBACK_ENABLED=true
 SHADOW_ENABLED=true
 PRODUCTION_GATE_APPROVED=false
 
+WECOM_ENABLED=true
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+WECOM_PAGE_BASE_URL=https://alerts.intra.example.com
+# Optional; leave empty to use /alerts/{alert_id}#feedback in this frontend.
+WECOM_FEEDBACK_FORM_URL=
 ```
 
 `AI_MAX_TOKENS` 会显式传给主分析、动态规划和独立结论验收。对于默认启用 Thinking 的推理模型，
 建议至少使用 `16384`，并配合足够的 `AI_TIMEOUT_SECONDS`；否则企业网关常见的 `4096` 默认上限
 可能全部消耗在 `reasoning_content`，以 `finish_reason=length` 结束且没有最终 `content`。
 
-`AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。生产环境必须配置企微机器人地址；开发环境未配置时仅写本地日志，便于测试。
+`AI_API_KEY` 和 `WECOM_WEBHOOK_URL` 都是秘密值。管理 API 只返回“是否已配置”，不会返回原值。
+启用企微通知时还必须配置 `WECOM_PAGE_BASE_URL`，它应是企微客户端可访问的前端 HTTPS 地址；
+开发环境未启用企微时仅写本地日志，便于测试。
 
 当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成严格受限的保守候选建议，继续走完 `VALIDATING → REPORTING → REVIEW_REQUIRED`，不会在建议阶段直接跳到 `FAILED`。该候选结果会降低置信度、标记必须人工复核，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
 
@@ -248,13 +255,18 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 生产环境只有在部署侧显式设置 `PRODUCTION_GATE_APPROVED=true` 后才允许关闭影子模式；该开关
 不属于管理 API 可在线修改的配置。
 
-企微消息包含：
+企微消息使用 `template_card`，主体展示告警标题、级别、主机、数据库、环境、服务和外部 ID，
+底部固定三项操作：
 
-- 告警基本信息与三等级状态；
-- AI 分析摘要和可能原因；
-- 有序判断依据，每条明确标记为“本地 PDF”“外部知识”或“AI”；
-- 知识匹配或拒绝匹配说明、命中的手册 ID/章节及外部知识来源；
-- 前三条只读核查建议。
+- “告警根因分析”：在企微客户端内打开 `/wecom/alerts/{id}/root-cause` 轻量页面，只展示已封装的
+  摘要、根因三态、证据引用和置信度；`next_probe` 保留在结构化结果中，不在该页重复展示；
+- “告警恢复建议”：在企微客户端内打开 `/wecom/alerts/{id}/recovery-advice` 轻量页面，只展示已
+  封装的建议步骤、预期结果、注意事项和风险；
+- “人工反馈”：默认打开本系统详情页的反馈表；配置 `WECOM_FEEDBACK_FORM_URL` 后改为外部问卷，
+  并自动附加 `alert_id`、`run_id`、`source=wecom` 查询参数。
+
+群机器人 Webhook 只负责出站通知，不具备按钮事件回调和原卡片更新能力。若需要完全原生的卡片
+内联交互，需切换到企业自建应用消息并增加回调验签与卡片更新接口。
 
 ## Archery 慢查询实时证据
 
@@ -475,6 +487,18 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 - Agent 的错误声明和被采纳步骤。
 
 确认或纠正且恢复成功的反馈会成为同问题指纹的候选历史案例，但新事件仍必须重新采集实时证据。
+
+内置反馈页会直接调用该接口。使用外部问卷时，应由问卷平台的服务端 Webhook 或受控内网中转服务
+读取卡片链接携带的 `alert_id`/`run_id`，把字段映射为上述请求结构后提交：
+
+```http
+POST /api/v1/alerts/{alert_id}/feedback
+Authorization: Bearer ${ADMIN_API_TOKEN}
+Content-Type: application/json
+```
+
+不要把 `ADMIN_API_TOKEN` 放入问卷链接或浏览器端脚本。接口会校验反馈所引用的 run、成功证据和
+建议步骤，并以 `idempotency_key` 防止问卷平台重试造成重复记录。
 
 ## 离线评测与生产准入
 

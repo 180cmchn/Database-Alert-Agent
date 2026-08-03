@@ -269,13 +269,13 @@ class RuntimeSettingsManager:
                 blocking.append("AI API key is required for openai_compatible provider")
             if not settings.ai_model.strip():
                 blocking.append("AI model is required for openai_compatible provider")
-        if (
-            settings.app_env.lower() in {"production", "prod"}
-            and settings.wecom_enabled
-            and not settings.wecom_webhook_url.strip()
-        ):
+        if settings.wecom_enabled and not settings.wecom_webhook_url.strip():
             blocking.append(
-                "WeCom webhook URL is required when WeCom notifications are enabled in production"
+                "WeCom webhook URL is required when WeCom notifications are enabled"
+            )
+        if settings.wecom_enabled and not settings.wecom_page_base_url.strip():
+            blocking.append(
+                "WeCom page base URL is required when WeCom notifications are enabled"
             )
         if (
             settings.app_env.lower() in {"production", "prod"}

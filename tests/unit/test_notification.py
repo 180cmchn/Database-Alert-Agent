@@ -7,10 +7,9 @@ import httpx
 import pytest
 
 from app.adapters.notification import (
-    WECOM_MARKDOWN_MAX_BYTES,
     LogManagementNotifier,
     WeComManagementNotifier,
-    format_wecom_markdown,
+    build_wecom_template_card,
 )
 from app.domain.errors import NotificationError
 from app.domain.models import (
@@ -44,7 +43,11 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             title=title,
             reason="connection_exhausted",
             description="password=must-not-appear",
-            database=DatabaseTarget(engine="postgresql", instance="orders-primary"),
+            database=DatabaseTarget(
+                engine="postgresql",
+                instance="orders-primary",
+                host="db-orders.internal",
+            ),
             raw_payload={"authorization": "Bearer must-not-appear"},
         ),
         recommendation=Recommendation(
@@ -76,34 +79,80 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
         ),
         status=AlertStatus.COMPLETED,
         message="分析完成；token=must-not-appear",
+        run_id=uuid4(),
     )
 
 
-def test_wecom_markdown_contains_causes_and_traceable_bases() -> None:
-    content = format_wecom_markdown(analysis_result_event())
-
-    assert "AI 分析结果" in content
-    assert "可能原因" in content
-    assert "连接池回收异常" in content
-    assert "判断依据（本地 PDF、外部知识、AI）" in content
-    assert content.index("[本地 PDF]") < content.index("[AI]")
-    assert "connection-limit/initial-triage" in content
-    assert "must-not-appear" not in content
-    assert "***REDACTED***" in content
-    assert "raw_payload" not in content
-    assert len(content.encode("utf-8")) <= WECOM_MARKDOWN_MAX_BYTES
-
-
-def test_wecom_markdown_truncates_long_chinese_text_on_utf8_boundary() -> None:
+def test_wecom_card_contains_alert_facts_and_exactly_three_actions() -> None:
     event = analysis_result_event()
-    event.recommendation = event.recommendation.model_copy(
-        update={"summary": "连接异常" * 3_000}
+    card = build_wecom_template_card(
+        event,
+        page_base_url="https://alerts.intra.example.com",
     )
-    content = format_wecom_markdown(event)
 
-    assert len(content.encode("utf-8")) <= WECOM_MARKDOWN_MAX_BYTES
-    assert "内容已截断" in content
-    content.encode("utf-8").decode("utf-8")
+    assert card["card_type"] == "text_notice"
+    assert card["main_title"]["title"] == "数据库连接数接近上限"
+    facts = {
+        item["keyname"]: item["value"]
+        for item in card["horizontal_content_list"]
+    }
+    assert facts["告警级别"] == "严重 / CRITICAL"
+    assert facts["告警主机"] == "db-orders.internal"
+    assert facts["数据库"] == "postgresql"
+
+    actions = card["jump_list"]
+    assert [item["title"] for item in actions] == [
+        "告警根因分析",
+        "告警恢复建议",
+        "人工反馈",
+    ]
+    assert actions[0]["url"] == (
+        f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/root-cause"
+    )
+    assert actions[1]["url"] == (
+        f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/recovery-advice"
+    )
+    assert actions[2]["url"] == (
+        f"https://alerts.intra.example.com/alerts/{event.alert.id}#feedback"
+    )
+    assert card["card_action"]["url"].endswith(f"/wecom/alerts/{event.alert.id}")
+
+
+def test_wecom_card_sanitizes_and_bounds_text_fields() -> None:
+    event = analysis_result_event(title=f"token=must-not-appear {'连接异常' * 20}")
+    card = build_wecom_template_card(
+        event,
+        page_base_url="https://alerts.intra.example.com",
+    )
+
+    serialized = str(card)
+    assert "must-not-appear" not in serialized
+    assert "***REDACTED***" in serialized
+    assert len(card["main_title"]["title"]) <= 26
+    assert len(card["sub_title_text"]) <= 112
+    assert all(
+        len(item["value"]) <= 26 for item in card["horizontal_content_list"]
+    )
+
+
+def test_wecom_card_external_feedback_url_gets_correlation_parameters() -> None:
+    event = analysis_result_event()
+    card = build_wecom_template_card(
+        event,
+        page_base_url="https://alerts.intra.example.com/base",
+        feedback_form_url=(
+            "https://survey.example.com/form?campaign=dba&alert_id=stale#questions"
+        ),
+    )
+
+    feedback_url = card["jump_list"][2]["url"]
+    assert feedback_url.startswith("https://survey.example.com/form?")
+    assert "campaign=dba" in feedback_url
+    assert "alert_id=stale" not in feedback_url
+    assert f"alert_id={event.alert.id}" in feedback_url
+    assert f"run_id={event.run_id}" in feedback_url
+    assert "source=wecom" in feedback_url
+    assert feedback_url.endswith("#questions")
 
 
 @pytest.mark.asyncio
@@ -124,7 +173,7 @@ async def test_log_notifier_records_only_delivery_metadata(
 
 
 @pytest.mark.asyncio
-async def test_wecom_notifier_sends_one_markdown_result() -> None:
+async def test_wecom_notifier_sends_one_template_card() -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -137,6 +186,7 @@ async def test_wecom_notifier_sends_one_markdown_result() -> None:
     event = analysis_result_event()
     notifier = WeComManagementNotifier(
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
+        "https://alerts.intra.example.com",
         transport=httpx.MockTransport(handler),
     )
 
@@ -148,7 +198,9 @@ async def test_wecom_notifier_sends_one_markdown_result() -> None:
     assert request.headers["x-alert-id"] == str(event.alert.id)
     assert request.headers["x-analysis-status"] == "COMPLETED"
     assert request.headers["idempotency-key"] == f"{event.alert.id}:analysis-result"
-    assert b'"msgtype":"markdown"' in request.content
+    assert b'"msgtype":"template_card"' in request.content
+    assert b'"card_type":"text_notice"' in request.content
+    assert request.content.count(b'"title":"') >= 4
 
 
 @pytest.mark.asyncio
@@ -169,6 +221,7 @@ async def test_wecom_notifier_reports_safe_errors_without_webhook_key(
 
     notifier = WeComManagementNotifier(
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=must-not-leak",
+        "https://alerts.intra.example.com",
         transport=httpx.MockTransport(handler),
     )
 
@@ -194,6 +247,7 @@ async def test_wecom_webhook_key_is_not_written_to_http_transport_logs(
         caplog.set_level(logging.DEBUG)
         notifier = WeComManagementNotifier(
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=log-secret-key",
+            "https://alerts.intra.example.com",
             transport=httpx.MockTransport(handler),
         )
         await notifier.send(analysis_result_event())

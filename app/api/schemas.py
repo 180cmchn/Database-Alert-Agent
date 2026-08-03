@@ -137,6 +137,8 @@ class RuntimeSettingsPatch(BaseModel):
     shadow_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
+    wecom_page_base_url: str | None = Field(default=None, max_length=2048)
+    wecom_feedback_form_url: str | None = Field(default=None, max_length=2048)
     wecom_enabled: bool | None = None
     knowledge_sources: list[str] | None = None
     flashduty_polling_enabled: bool | None = None
@@ -171,6 +173,8 @@ class RuntimeSettingsResponse(BaseModel):
     runbook_match_min_confidence: float
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
+    wecom_page_base_url: str
+    wecom_feedback_form_url: str
     flashduty_enabled: bool
     flashduty_base_url: str
     flashduty_app_key_configured: bool
@@ -221,6 +225,8 @@ class RuntimeSettingsResponse(BaseModel):
             runbook_match_min_confidence=settings.runbook_match_min_confidence,
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
+            wecom_page_base_url=settings.wecom_page_base_url,
+            wecom_feedback_form_url=settings.wecom_feedback_form_url,
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,
             flashduty_app_key_configured=bool(settings.flashduty_app_key),

@@ -146,6 +146,13 @@ export function AlertDetailPage() {
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
+    if (!record || !window.location.hash) return;
+    const targetId = decodeURIComponent(window.location.hash.slice(1));
+    window.requestAnimationFrame(() => {
+      document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [record]);
+  useEffect(() => {
     setFeedbackVerdict("CONFIRMED");
     setRunbookFeedbackVerdict("UNKNOWN");
     setFeedbackKey(newFeedbackKey());
@@ -645,6 +652,7 @@ export function AlertDetailPage() {
       </section>
 
       <SectionCard
+        id="feedback"
         eyebrow="EXPERT REVIEW"
         title="人工反馈与训练记录"
         description="反馈由管理员提交并写入审计链路；确认或修正且已恢复的记录可形成同类历史案例。"

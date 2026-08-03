@@ -531,6 +531,7 @@ class AnalysisResultEvent(BaseModel):
     recommendation: Recommendation
     status: AlertStatus
     message: str
+    run_id: UUID | None = None
 
 
 class StoredAlert(BaseModel):

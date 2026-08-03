@@ -31,6 +31,8 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_fallback_enabled",
         "runbook_limit",
         "wecom_webhook_url",
+        "wecom_page_base_url",
+        "wecom_feedback_form_url",
         "wecom_enabled",
         "react_enabled",
         "react_max_dynamic_turns",
@@ -95,9 +97,15 @@ class Settings(BaseSettings):
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
     wecom_webhook_url: str = Field(default="", repr=False)
+    # Public/intranet frontend origin used by WeCom's in-app browser. Root-cause
+    # and recovery actions open dedicated lightweight pages under this origin.
+    wecom_page_base_url: str = ""
+    # Optional external questionnaire. When empty, the card opens the built-in
+    # alert feedback form; correlation parameters are appended when configured.
+    wecom_feedback_form_url: str = ""
     # Master switch for WeCom group robot notifications. When false, no messages
     # are sent even if a webhook URL is configured; when true, a valid URL is
-    # required (in production) before notifications can be delivered.
+    # required before notifications can be delivered.
     wecom_enabled: bool = False
 
     # FlashDuty credentials and data-source bindings are deployment settings.
@@ -264,6 +272,8 @@ class Settings(BaseSettings):
         for field_name, required in (
             ("ai_base_url", True),
             ("wecom_webhook_url", False),
+            ("wecom_page_base_url", False),
+            ("wecom_feedback_form_url", False),
             ("flashduty_base_url", True),
             ("external_knowledge_base_url", False),
             ("archery_mcp_url", False),
@@ -291,6 +301,12 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "wecom_webhook_url must be an official HTTPS WeCom group robot URL"
                     )
+            if field_name == "wecom_page_base_url" and (
+                parsed.query or parsed.fragment
+            ):
+                raise ValueError(
+                    "wecom_page_base_url must not contain a query or fragment"
+                )
             if field_name == "flashduty_base_url" and (
                 parsed.scheme != "https"
                 or parsed.hostname != "api.flashcat.cloud"
@@ -386,13 +402,13 @@ class Settings(BaseSettings):
         elif self.ai_provider != "fake":
             issues.append(f"Unsupported AI_PROVIDER: {self.ai_provider}")
 
-        if (
-            self.app_env.lower() in {"production", "prod"}
-            and self.wecom_enabled
-            and not self.wecom_webhook_url
-        ):
+        if self.wecom_enabled and not self.wecom_webhook_url:
             issues.append(
-                "WECOM_WEBHOOK_URL is required when WeCom notifications are enabled in production"
+                "WECOM_WEBHOOK_URL is required when WeCom notifications are enabled"
+            )
+        if self.wecom_enabled and not self.wecom_page_base_url:
+            issues.append(
+                "WECOM_PAGE_BASE_URL is required when WeCom notifications are enabled"
             )
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
