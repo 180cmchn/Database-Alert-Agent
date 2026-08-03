@@ -38,7 +38,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v9"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v10"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -483,6 +483,14 @@ class ArcheryMCPClient:
 
                             if call.name == self.query_tool_name:
                                 requested_sql = str(call.arguments["sql_content"])
+                                if not self._is_slow_log_select(requested_sql):
+                                    messages.extend(
+                                        self._completed_tool_messages(
+                                            call,
+                                            self._model_tool_result(payload),
+                                        )
+                                    )
+                                    continue
                                 (
                                     normalized_payload,
                                     executed_sql,
@@ -590,8 +598,9 @@ class ArcheryMCPClient:
             f"FROM_UNIXTIME({window_start_epoch}) AND f_insert_time < "
             f"FROM_UNIXTIME({window_end_epoch})，不要自行换算或修改这两个Unix秒，也不要"
             "直接去掉ISO时间的时区偏移后作为SQL字面值。"
-            "请使用MCP返回的真实实例ID和字段生成只读SELECT；如果SQL执行失败，"
-            "根据MCP返回的错误调整后重试。"
+            "可按需使用sql_query执行辅助只读查询；辅助查询完成后必须继续，直到成功查询"
+            f"{ARCHERY_SLOW_LOG_TABLE}。请使用MCP返回的真实实例ID和字段生成最终只读SELECT；"
+            "如果SQL执行失败，根据MCP返回的错误调整后重试。"
         )
         return [
             {
@@ -599,7 +608,8 @@ class ArcheryMCPClient:
                 "content": (
                     "你是 Archery MCP 慢查询只读 Agent。按当前 MCP 工具 Schema 和返回结果"
                     "自主调用工具，每轮调用一个，直到查询成功；工具报错时可调整参数或只读"
-                    "SELECT 后重试。不要调用当前未提供的工具。"
+                    "SQL 后重试。辅助只读 SQL 的结果仅用于继续调查，查询到"
+                    f"{ARCHERY_SLOW_LOG_TABLE}才算完成。不要调用当前未提供的工具。"
                 ),
             },
             {
@@ -692,15 +702,16 @@ class ArcheryMCPClient:
             arguments["instance_id"] = instance_id
             arguments.pop("instance_ref", None)
         if call.name == self.query_tool_name:
+            sql_content = arguments.get("sql_content")
+            if isinstance(sql_content, str):
+                arguments["sql_content"] = self._unwrap_sql_code_fence(sql_content)
             normalized = self._coerce_positive_integer(
                 arguments.get("max_result_chars")
             )
-            if normalized is not None:
-                arguments["max_result_chars"] = normalized
-            else:
-                arguments.setdefault(
-                    "max_result_chars", ARCHERY_SLOW_LOG_MAX_RESULT_CHARS
-                )
+            arguments["max_result_chars"] = min(
+                normalized or ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+                ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+            )
         if arguments == call.arguments:
             return call
         return MCPModelToolCall(
@@ -758,15 +769,15 @@ class ArcheryMCPClient:
                 "db_name discovered from Archery MCP is required",
             )
         sql_content = arguments.get("sql_content")
-        if not isinstance(sql_content, str) or not self._is_read_only_slow_log_select(
-            sql_content
-        ):
+        if not isinstance(sql_content, str) or not self._is_read_only_query(sql_content):
             self._raise_argument_violation(
                 call.name,
-                f"sql_content must be one SELECT on {ARCHERY_SLOW_LOG_TABLE}",
+                "sql_content must be one read-only SQL statement",
             )
-        sql_limit = self._sql_row_limit(sql_content)
-        if sql_limit is None or sql_limit > ARCHERY_SLOW_LOG_LIMIT:
+        if self._is_slow_log_select(sql_content) and (
+            (sql_limit := self._sql_row_limit(sql_content)) is None
+            or sql_limit > ARCHERY_SLOW_LOG_LIMIT
+        ):
             self._raise_argument_violation(
                 call.name,
                 f"sql_content must end with LIMIT no greater than {ARCHERY_SLOW_LOG_LIMIT}",
@@ -781,23 +792,62 @@ class ArcheryMCPClient:
                 "max_result_chars exceeds the result bound",
             )
 
-    @staticmethod
-    def _is_read_only_slow_log_select(sql: str) -> bool:
+    @classmethod
+    def _is_read_only_query(cls, sql: str) -> bool:
         statement = sql.strip()
         if not statement or len(statement) > 50_000:
             return False
         if statement.endswith(";"):
             statement = statement[:-1].rstrip()
-        if ";" in statement or re.match(r"(?is)^select\b", statement) is None:
+        statement = cls._without_leading_sql_comments(statement)
+        if not statement or ";" in statement:
             return False
-        return (
-            re.search(
-                rf"(?i)(?<![A-Za-z0-9_]){re.escape(ARCHERY_SLOW_LOG_TABLE)}"
-                r"(?![A-Za-z0-9_])",
+        keyword_match = re.match(r"(?is)^(select|with|show|describe|desc|explain)\b", statement)
+        if keyword_match is None:
+            return False
+        keyword = keyword_match.group(1).casefold()
+        if keyword in {"select", "with", "explain"} and re.search(
+            r"(?is)\b(?:insert|update|delete|replace|alter|drop|truncate|create|"
+            r"rename|grant|revoke|call|load|lock|unlock|kill|optimize|repair)\b|"
+            r"\binto\s+(?:out|dump)file\b|\bfor\s+update\b|"
+            r"\block\s+in\s+share\s+mode\b",
+            statement,
+        ):
+            return False
+        return True
+
+    @classmethod
+    def _is_slow_log_select(cls, sql: str) -> bool:
+        statement = cls._without_leading_sql_comments(sql.strip())
+        if re.match(r"(?is)^(?:select|with)\b", statement) is None:
+            return False
+        return re.search(
+            rf"(?i)(?<![A-Za-z0-9_]){re.escape(ARCHERY_SLOW_LOG_TABLE)}"
+            r"(?![A-Za-z0-9_])",
+            statement,
+        ) is not None
+
+    @staticmethod
+    def _without_leading_sql_comments(sql: str) -> str:
+        statement = sql.lstrip()
+        while True:
+            comment = re.match(
+                r"(?is)^(?:--[^\r\n]*(?:\r?\n|$)|\#[^\r\n]*(?:\r?\n|$)|"
+                r"/\*.*?\*/)\s*",
                 statement,
             )
-            is not None
+            if comment is None:
+                return statement
+            statement = statement[comment.end() :]
+
+    @staticmethod
+    def _unwrap_sql_code_fence(sql: str) -> str:
+        candidate = sql.strip()
+        fenced = re.fullmatch(
+            r"(?is)```(?:sql|mysql)?\s*(?P<sql>.*?)\s*```",
+            candidate,
         )
+        return fenced.group("sql").strip() if fenced is not None else candidate
 
     @staticmethod
     def _sql_row_limit(sql: str) -> int | None:

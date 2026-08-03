@@ -336,13 +336,16 @@ def test_archery_query_requires_discovered_instance_id_and_accepts_dynamic_datab
                 "instance_id": TEST_INSTANCE_ID,
                 "db_name": TEST_DB_NAME,
                 "sql_content": (
-                    "SELECT * FROM t_slowlog_info ORDER BY f_insert_time DESC LIMIT 100"
+                    "WITH recent AS (SELECT * FROM t_slowlog_info) "
+                    "SELECT * FROM recent ORDER BY f_insert_time DESC LIMIT 100"
                 ),
                 "limit_num": 500,
+                "max_result_chars": 99_999,
             },
         )
     )
     assert model_limit_num_is_delegated.arguments["limit_num"] == 500
+    assert model_limit_num_is_delegated.arguments["max_result_chars"] == 24_000
     client._validate_model_tool_call(
         model_limit_num_is_delegated,
         login_confirmed=True,
@@ -363,6 +366,20 @@ def test_archery_query_requires_discovered_instance_id_and_accepts_dynamic_datab
     )
     with pytest.raises(ArcheryMCPReadOnlyViolation, match="LIMIT no greater than 100"):
         client._validate_model_tool_call(excessive_sql_limit, login_confirmed=True)
+
+    diagnostic_query = client._normalize_model_tool_call(
+        MCPModelToolCall(
+            call_id="diagnostic-query",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments={
+                "instance_id": TEST_INSTANCE_ID,
+                "db_name": TEST_DB_NAME,
+                "sql_content": "```sql\nSELECT NOW() AS server_time\n```",
+            },
+        )
+    )
+    assert diagnostic_query.arguments["sql_content"] == "SELECT NOW() AS server_time"
+    client._validate_model_tool_call(diagnostic_query, login_confirmed=True)
 
     reference_only = client._normalize_model_tool_call(
         MCPModelToolCall(
@@ -790,6 +807,51 @@ async def test_archery_mcp_allows_query_after_login_without_host_discovery_track
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_returns_auxiliary_read_only_sql_to_model() -> None:
+    tool_calls: list[str] = []
+    sequence = (
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+    model = PromptFollowingMCPModel(
+        sequence=sequence,
+        query_sqls=("SELECT NOW() AS server_time", TEST_SLOW_LOG_QUERY),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result=[
+                {
+                    "structuredContent": {
+                        "rows": [["2026-08-03 14:00:00"]],
+                        "column_list": ["server_time"],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {"status": "ok", "rows": [[1]]},
+                    "isError": False,
+                },
+            ],
+            tool_calls=tool_calls,
+        ),
+        model=model,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.requested_sql == TEST_SLOW_LOG_QUERY
+    assert result.payload["rows"] == [[1]]
+    assert result.model_tool_calls == sequence
+    assert "server_time" in model.calls[-1]["messages"][-1]["content"]
+    assert tool_calls == list(sequence)
 
 
 @pytest.mark.asyncio
