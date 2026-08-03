@@ -21,10 +21,12 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
     ARCHERY_SLOW_LOG_PROMPT_VERSION,
     ARCHERY_SLOW_LOG_TABLE,
+    ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
     ArcheryMCPConfigurationError,
     ArcheryMCPReadOnlyViolation,
+    ArcheryMCPSlowLogTableNotFound,
     ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
     ArcherySlowLogQueryResult,
@@ -167,10 +169,12 @@ class PromptFollowingMCPModel:
         sequence: tuple[str, ...] = DEFAULT_MODEL_TOOL_SEQUENCE,
         *,
         query_sqls: tuple[str, ...] = (TEST_SLOW_LOG_QUERY,),
+        slow_log_table: str = ARCHERY_SLOW_LOG_TABLE,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.sequence = sequence
         self.query_sqls = query_sqls
+        self.slow_log_table = slow_log_table
 
     async def request_mcp_tool_call(
         self,
@@ -202,13 +206,13 @@ class PromptFollowingMCPModel:
             ARCHERY_MCP_TABLES_TOOL_NAME: {
                 "instance_id": TEST_INSTANCE_ID,
                 "db_name": TEST_DB_NAME,
-                "keyword": ARCHERY_SLOW_LOG_TABLE,
+                "keyword": ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
                 "size": 200,
             },
             ARCHERY_MCP_COLUMNS_TOOL_NAME: {
                 "instance_id": TEST_INSTANCE_ID,
                 "db_name": TEST_DB_NAME,
-                "tb_name": ARCHERY_SLOW_LOG_TABLE,
+                "tb_name": self.slow_log_table,
                 "size": 200,
             },
             ARCHERY_MCP_QUERY_TOOL_NAME: {
@@ -570,19 +574,19 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert TEST_DB_NAME in task_prompt
     assert "部署配置不提供固定的查询实例或数据库" in task_prompt
     assert "list_instances和list_instance_databases" in task_prompt
-    assert ARCHERY_SLOW_LOG_TABLE in task_prompt
+    assert "不要预设固定表名" in task_prompt
+    assert "keyword=slow" in task_prompt
+    assert "slowlog或slowquerylog" in task_prompt
+    assert "list_table_columns读取真实字段" in task_prompt
+    assert ARCHERY_SLOW_LOG_TABLE not in task_prompt
     assert "之前5分钟" in task_prompt
     assert "LIMIT数值不得超过100" in task_prompt
     assert TEST_WINDOW_START.isoformat() in task_prompt
     assert TEST_WINDOW_END.isoformat() in task_prompt
-    assert "f_start_time是只含YYYY-MM-DD的varchar(10)" in task_prompt
-    assert "分钟级时间窗口请使用f_insert_time筛选和排序" in task_prompt
-    assert "不要用f_start_time或f_time_point与完整时间戳比较" in task_prompt
+    assert "依据list_table_columns返回的真实字段名和类型" in task_prompt
+    assert "对于DATETIME或TIMESTAMP字段" in task_prompt
+    assert "分钟级窗口优先使用f_insert_time" in task_prompt
     assert "窗口起始Unix秒为1784793300、结束Unix秒为1784793600" in task_prompt
-    assert (
-        "f_insert_time >= FROM_UNIXTIME(1784793300) AND "
-        "f_insert_time < FROM_UNIXTIME(1784793600)"
-    ) in task_prompt
     assert "不要自行换算或修改这两个Unix秒" in task_prompt
     assert "不要直接去掉ISO时间的时区偏移" in task_prompt
     assert model.calls[1]["messages"][-1]["role"] == "tool"
@@ -598,6 +602,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert query_arguments["instance_id"] == TEST_INSTANCE_ID
     assert "instance_ref" not in query_arguments
     assert result.db_name == TEST_DB_NAME
+    assert result.table_name == ARCHERY_SLOW_LOG_TABLE
     assert [item[0] for item in calls] == [
         "initialize",
         "notifications/initialized",
@@ -665,6 +670,7 @@ def _archery_call_handler(
     login_result: dict[str, Any],
     query_result: dict[str, Any] | list[dict[str, Any]],
     tool_calls: list[str],
+    tables_payload: dict[str, Any] | None = None,
 ) -> httpx.MockTransport:
     query_results = query_result if isinstance(query_result, list) else [query_result]
     query_index = 0
@@ -712,10 +718,14 @@ def _archery_call_handler(
                     "status": "ok",
                     "results": [{"name": TEST_DB_NAME}],
                 },
-                ARCHERY_MCP_TABLES_TOOL_NAME: {
-                    "status": "ok",
-                    "results": [{"name": ARCHERY_SLOW_LOG_TABLE}],
-                },
+                ARCHERY_MCP_TABLES_TOOL_NAME: (
+                    tables_payload
+                    if tables_payload is not None
+                    else {
+                        "status": "ok",
+                        "results": [{"name": ARCHERY_SLOW_LOG_TABLE}],
+                    }
+                ),
                 ARCHERY_MCP_COLUMNS_TOOL_NAME: {
                     "status": "ok",
                     "results": [
@@ -776,11 +786,15 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_allows_query_after_login_without_host_discovery_tracking() -> None:
+async def test_archery_mcp_requires_table_discovery_before_slow_log_query() -> None:
     tool_calls: list[str] = []
-    model = PromptFollowingMCPModel(
-        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME)
+    sequence = (
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
     )
+    model = PromptFollowingMCPModel(sequence=sequence)
     client = _client(
         _archery_call_handler(
             login_result={
@@ -799,14 +813,88 @@ async def test_archery_mcp_allows_query_after_login_without_host_discovery_track
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert result.payload == {"status": "ok", "rows": []}
-    assert [item["name"] for item in model.calls] == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert [item["name"] for item in model.calls] == list(sequence)
+    assert "list_db_tables_gymJPA" in model.calls[2]["messages"][-1]["content"]
     assert tool_calls == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_queries_discovered_dynamic_slow_log_table() -> None:
+    tool_calls: list[str] = []
+    table_name = "mysql_slow_log"
+    query_sql = (
+        f"SELECT * FROM {table_name} ORDER BY start_time DESC LIMIT 100"
+    )
+    model = PromptFollowingMCPModel(
+        query_sqls=(query_sql,),
+        slow_log_table=table_name,
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"status": "ok", "rows": [[1]]},
+                "isError": False,
+            },
+            tables_payload={
+                "status": "ok",
+                "results": [{"table_name": table_name}],
+            },
+            tool_calls=tool_calls,
+        ),
+        model=model,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.requested_sql == query_sql
+    assert result.table_name == table_name
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_reports_missing_slow_log_table_after_search() -> None:
+    tool_calls: list[str] = []
+    sequence = (
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        ARCHERY_MCP_DATABASES_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
+    )
+    model = PromptFollowingMCPModel(sequence=sequence)
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"status": "ok", "rows": []},
+                "isError": False,
+            },
+            tables_payload={"status": "ok", "results": []},
+            tool_calls=tool_calls,
+        ),
+        model=model,
+    )
+
+    with pytest.raises(
+        ArcheryMCPSlowLogTableNotFound,
+        match="No slowlog-related table was found",
+    ) as captured:
+        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert captured.value.diagnostic_data["instance_id"] == TEST_INSTANCE_ID
+    assert captured.value.diagnostic_data["db_name"] == TEST_DB_NAME
+    assert captured.value.diagnostic_data["table_search_keyword"] == "slow"
+    assert tool_calls == list(sequence)
 
 
 @pytest.mark.asyncio
@@ -815,6 +903,7 @@ async def test_archery_mcp_returns_auxiliary_read_only_sql_to_model() -> None:
     sequence = (
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     )
     model = PromptFollowingMCPModel(
@@ -850,7 +939,10 @@ async def test_archery_mcp_returns_auxiliary_read_only_sql_to_model() -> None:
     assert result.requested_sql == TEST_SLOW_LOG_QUERY
     assert result.payload["rows"] == [[1]]
     assert result.model_tool_calls == sequence
-    assert "server_time" in model.calls[-1]["messages"][-1]["content"]
+    assert any(
+        "server_time" in (message.get("content") or "")
+        for message in model.calls[-1]["messages"]
+    )
     assert tool_calls == list(sequence)
 
 
@@ -864,6 +956,7 @@ async def test_archery_mcp_returns_sql_error_to_model_and_allows_retry() -> None
     sequence = (
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
         ARCHERY_MCP_COLUMNS_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -1084,7 +1177,11 @@ async def test_archery_mcp_preserves_native_success_payload_without_status_flag(
         "affected_rows": 1,
     }
     model = PromptFollowingMCPModel(
-        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        sequence=(
+            ARCHERY_MCP_LOGIN_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+            ARCHERY_MCP_QUERY_TOOL_NAME,
+        ),
         query_sqls=(TEST_ALTERNATE_SLOW_LOG_QUERY,),
     )
     client = _client(
@@ -1108,6 +1205,7 @@ async def test_archery_mcp_preserves_native_success_payload_without_status_flag(
     assert result.requested_sql == TEST_ALTERNATE_SLOW_LOG_QUERY
     assert tool_calls == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
 
@@ -1140,7 +1238,11 @@ async def test_archery_mcp_normalizes_text_wrapped_success_result() -> None:
         f"{json.dumps(query_payload, ensure_ascii=False, indent=2)}"
     )
     model = PromptFollowingMCPModel(
-        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        sequence=(
+            ARCHERY_MCP_LOGIN_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+            ARCHERY_MCP_QUERY_TOOL_NAME,
+        ),
         query_sqls=(query_sql,),
     )
     client = _client(
@@ -1168,6 +1270,7 @@ async def test_archery_mcp_normalizes_text_wrapped_success_result() -> None:
     assert result.query_time_column == "f_time_point"
     assert tool_calls == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
 
@@ -1239,6 +1342,7 @@ class RecordingArcheryClient:
             actual_sql_verified=True,
             instance_id=TEST_INSTANCE_ID,
             db_name=TEST_DB_NAME,
+            table_name=ARCHERY_SLOW_LOG_TABLE,
             query_time_column=TEST_TIME_COLUMN,
         )
 
@@ -1302,6 +1406,7 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert client.alert_context["database_candidates"] == [TEST_DB_NAME]
     assert "返回 0 行" in summary
     assert f"实例 ID {TEST_INSTANCE_ID}" in summary
+    assert f"慢日志表 {ARCHERY_SLOW_LOG_TABLE}" in summary
     assert "实际执行 SQL 已由 Archery 回显并与模型提交一致" in summary
     assert "可能被截断" not in summary
     assert data["sql"] == TEST_SLOW_LOG_QUERY
@@ -1315,6 +1420,7 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
         "selection_basis": "alert_context_and_mcp_discovery",
         "instance_id": TEST_INSTANCE_ID,
         "db_name": TEST_DB_NAME,
+        "table_name": ARCHERY_SLOW_LOG_TABLE,
         "alert_context": client.alert_context,
     }
     assert data["query_window"] == {

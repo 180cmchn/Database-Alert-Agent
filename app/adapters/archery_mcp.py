@@ -18,7 +18,11 @@ from app.application.sanitization import sanitize, sanitize_text
 from app.domain.models import InvestigationContext, NormalizedAlert, ToolExecutionRequest
 from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 
+# Retained for compatibility with existing callers and fixtures. Runtime
+# discovery accepts any target-database table whose normalized name contains
+# ``slowlog`` or ``slowquerylog``.
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
+ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD: Final = "slow"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
 ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
 ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: Final = "list_resource_groups_gymJPA"
@@ -27,6 +31,7 @@ ARCHERY_MCP_DATABASES_TOOL_NAME: Final = "list_instance_databases_gymJPA"
 ARCHERY_MCP_TABLES_TOOL_NAME: Final = "list_db_tables_gymJPA"
 ARCHERY_MCP_COLUMNS_TOOL_NAME: Final = "list_table_columns_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
+# Compatibility hint only; dynamic probes use the discovered table's real columns.
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # Bound the generated SELECT and the evidence text returned by Archery. The
 # character limit can still truncate non-empty evidence.
@@ -38,7 +43,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v10"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v11"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -84,6 +89,22 @@ _PAYLOAD_CONTAINER_KEYS: Final = {
     "meta",
     "metadata",
 }
+_TABLE_NAME_KEYS: Final = {"name", "table", "tablename", "tbname"}
+_NO_MATCHING_TABLE_TEXT: Final = re.compile(
+    r"未找到|没有.*表|无匹配|不存在|(?:返回|共)\s*0\s*(?:个)?\s*表|"
+    r"not\s+found|no\s+(?:matching\s+)?tables?|\b0\s+tables?\b",
+    re.IGNORECASE,
+)
+_SLOW_LOG_TABLE_TEXT: Final = re.compile(
+    r"(?i)(?<![A-Za-z0-9_$])"
+    r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?[_$-]*log[A-Za-z0-9_$-]*)"
+    r"(?![A-Za-z0-9_$])"
+)
+_SQL_IDENTIFIER_PART: Final = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
+_SQL_TABLE_REFERENCE: Final = re.compile(
+    rf"(?is)\b(?:from|join)\s+"
+    rf"(?P<table>{_SQL_IDENTIFIER_PART}(?:\s*\.\s*{_SQL_IDENTIFIER_PART})?)"
+)
 
 
 class ArcheryMCPError(RuntimeError):
@@ -109,6 +130,10 @@ class ArcheryMCPToolError(ArcheryMCPError):
     ) -> None:
         super().__init__(message)
         self.diagnostic_data = diagnostic_data or {}
+
+
+class ArcheryMCPSlowLogTableNotFound(ArcheryMCPToolError):
+    """The resolved Archery target database has no slowlog-related table."""
 
 
 class ArcheryMCPModelError(ArcheryMCPError):
@@ -141,6 +166,7 @@ class ArcherySlowLogQueryResult:
     actual_sql_verified: bool = False
     instance_id: int | None = None
     db_name: str | None = None
+    table_name: str | None = None
     query_time_column: str | None = None
 
 
@@ -425,6 +451,7 @@ class ArcheryMCPClient:
                         login_confirmed = False
                         model_calls: list[MCPModelToolCall] = []
                         last_query_error: ArcheryMCPToolError | None = None
+                        slow_log_tables: dict[tuple[int, str], set[str]] = {}
 
                         for _step in range(self.max_agent_steps):
                             call = await self._request_model_tool_call(
@@ -436,6 +463,24 @@ class ArcheryMCPClient:
                                 call,
                                 login_confirmed=login_confirmed,
                             )
+                            selected_table: str | None = None
+                            if call.name == self.query_tool_name:
+                                requested_sql = str(call.arguments["sql_content"])
+                                if self._is_slow_log_select(requested_sql):
+                                    target = self._target_key(call.arguments)
+                                    selected_table = self._matching_discovered_table(
+                                        requested_sql,
+                                        slow_log_tables.get(target, set()),
+                                    )
+                                    if selected_table is None:
+                                        model_calls.append(call)
+                                        messages.extend(
+                                            self._completed_tool_messages(
+                                                call,
+                                                self._model_table_discovery_required_result(),
+                                            )
+                                        )
+                                        continue
                             result = await self._call_tool(
                                 session,
                                 tool_name=call.name,
@@ -481,6 +526,24 @@ class ArcheryMCPClient:
                                 login_text = result_text
                                 login_confirmed = True
 
+                            if call.name == ARCHERY_MCP_TABLES_TOOL_NAME:
+                                target = self._target_key(call.arguments)
+                                if target is not None:
+                                    discovered = self._slow_log_tables_from_discovery(
+                                        payload
+                                    )
+                                    if discovered:
+                                        slow_log_tables.setdefault(target, set()).update(
+                                            discovered
+                                        )
+                                    elif self._is_confirmed_slow_log_table_search(
+                                        call.arguments
+                                    ):
+                                        raise self._slow_log_table_not_found_error(
+                                            target,
+                                            model_calls=tuple(model_calls),
+                                        )
+
                             if call.name == self.query_tool_name:
                                 requested_sql = str(call.arguments["sql_content"])
                                 if not self._is_slow_log_select(requested_sql):
@@ -518,6 +581,7 @@ class ArcheryMCPClient:
                                         call.arguments.get("instance_id")
                                     ),
                                     db_name=str(call.arguments["db_name"]).strip(),
+                                    table_name=selected_table,
                                     query_time_column=self._query_time_column(
                                         executed_sql or requested_sql
                                     ),
@@ -585,21 +649,26 @@ class ArcheryMCPClient:
             "部署配置不提供固定的查询实例或数据库；请以告警中的实例名、主机、端口、"
             "数据库名等线索，结合list_instances和list_instance_databases等MCP实时返回，"
             "自主确定唯一目标。最终查询必须使用MCP返回的真实整数instance_id和数据库名。"
-            f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
-            f"{ARCHERY_SLOW_LOG_TABLE}。最终只读SELECT必须显式包含LIMIT，"
+            "确定目标后，必须对该instance_id和db_name调用list_db_tables，使用keyword=slow、"
+            "size=200搜索真实表名。不要预设固定表名；将表名转为小写并忽略下划线、连字符等"
+            "分隔符后，选择名称含slowlog或slowquerylog的表。如果搜索结果没有此类表，"
+            "Host会返回未找到慢日志表的错误，不要猜测表名并调用SQL。找到表后必须调用"
+            "list_table_columns读取真实字段，再生成查询。"
+            f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询。"
+            "最终只读SELECT必须使用发现到的慢日志相关表并显式包含LIMIT，"
             f"LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
-            "该表中f_start_time是只含YYYY-MM-DD的varchar(10)，f_time_point是"
-            "格式未确认的varchar(2000)，f_insert_time是由数据库CURRENT_TIMESTAMP"
-            "写入的无时区DATETIME插入时间。分钟级时间窗口请使用f_insert_time筛选和排序，不要用"
-            "f_start_time或f_time_point与完整时间戳比较。上述ISO 8601时间是带时区的"
+            "必须依据list_table_columns返回的真实字段名和类型选择慢查询时间字段，不要猜测。"
+            "对于DATETIME或TIMESTAMP字段，可直接使用Host给出的Unix秒配合FROM_UNIXTIME；"
+            "若真实字段中同时存在f_insert_time、f_start_time和f_time_point，分钟级窗口优先使用"
+            "f_insert_time，不要把只有日期或格式未知的varchar字段与完整时间戳比较。"
+            "对于其他类型，按真实字段格式生成等价时间条件。上述ISO 8601时间是带时区的"
             f"绝对时间；Host已精确计算窗口起始Unix秒为{window_start_epoch}、结束Unix秒为"
-            f"{window_end_epoch}。时间条件请直接写为f_insert_time >= "
-            f"FROM_UNIXTIME({window_start_epoch}) AND f_insert_time < "
-            f"FROM_UNIXTIME({window_end_epoch})，不要自行换算或修改这两个Unix秒，也不要"
-            "直接去掉ISO时间的时区偏移后作为SQL字面值。"
+            f"{window_end_epoch}。不要自行换算或修改这两个Unix秒，也不要直接去掉ISO时间的"
+            "时区偏移后作为SQL字面值。"
             "可按需使用sql_query执行辅助只读查询；辅助查询完成后必须继续，直到成功查询"
-            f"{ARCHERY_SLOW_LOG_TABLE}。请使用MCP返回的真实实例ID和字段生成最终只读SELECT；"
+            "已发现的慢日志相关表。请使用MCP返回的真实实例ID、数据库、表名和字段生成最终"
+            "只读SELECT；"
             "如果SQL执行失败，根据MCP返回的错误调整后重试。"
         )
         return [
@@ -609,7 +678,8 @@ class ArcheryMCPClient:
                     "你是 Archery MCP 慢查询只读 Agent。按当前 MCP 工具 Schema 和返回结果"
                     "自主调用工具，每轮调用一个，直到查询成功；工具报错时可调整参数或只读"
                     "SQL 后重试。辅助只读 SQL 的结果仅用于继续调查，查询到"
-                    f"{ARCHERY_SLOW_LOG_TABLE}才算完成。不要调用当前未提供的工具。"
+                    "目标实例和目标数据库中通过list_db_tables发现的slowlog相关表才算完成。"
+                    "不要调用当前未提供的工具。"
                 ),
             },
             {
@@ -821,11 +891,130 @@ class ArcheryMCPClient:
         statement = cls._without_leading_sql_comments(sql.strip())
         if re.match(r"(?is)^(?:select|with)\b", statement) is None:
             return False
-        return re.search(
-            rf"(?i)(?<![A-Za-z0-9_]){re.escape(ARCHERY_SLOW_LOG_TABLE)}"
-            r"(?![A-Za-z0-9_])",
-            statement,
-        ) is not None
+        return any(
+            cls._is_slow_log_table_name(name)
+            for name in cls._sql_table_references(statement)
+        )
+
+    @staticmethod
+    def _clean_table_name(value: str) -> str:
+        part = re.split(r"\s*\.\s*", value.strip())[-1]
+        return part.strip().strip("`\"'[]")
+
+    @classmethod
+    def _is_slow_log_table_name(cls, value: str) -> bool:
+        normalized = re.sub(
+            r"[^a-z0-9]+", "", cls._clean_table_name(value).casefold()
+        )
+        return re.search(r"slow(?:query)?log", normalized) is not None
+
+    @classmethod
+    def _sql_table_references(cls, sql: str) -> set[str]:
+        return {
+            cls._clean_table_name(match.group("table"))
+            for match in _SQL_TABLE_REFERENCE.finditer(sql)
+        }
+
+    @classmethod
+    def _matching_discovered_table(
+        cls,
+        sql: str,
+        discovered_tables: set[str],
+    ) -> str | None:
+        referenced = {
+            cls._clean_table_name(name).casefold()
+            for name in cls._sql_table_references(sql)
+        }
+        return next(
+            (
+                table
+                for table in sorted(discovered_tables)
+                if cls._clean_table_name(table).casefold() in referenced
+            ),
+            None,
+        )
+
+    @classmethod
+    def _slow_log_tables_from_discovery(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> set[str]:
+        discovered: set[str] = set()
+        pending: list[Any] = [payload]
+        visited = 0
+        while pending and visited < 500:
+            current = pending.pop()
+            visited += 1
+            if isinstance(current, Mapping):
+                for key, value in current.items():
+                    normalized_key = re.sub(
+                        r"[^a-z0-9]+", "", str(key).casefold()
+                    )
+                    if (
+                        normalized_key in _TABLE_NAME_KEYS
+                        and isinstance(value, str)
+                        and cls._is_slow_log_table_name(value)
+                    ):
+                        discovered.add(cls._clean_table_name(value))
+                    pending.append(value)
+                continue
+            if isinstance(current, list):
+                pending.extend(current)
+                continue
+            if not isinstance(current, str) or _NO_MATCHING_TABLE_TEXT.search(current):
+                continue
+            for match in _SLOW_LOG_TABLE_TEXT.finditer(current):
+                candidate = cls._clean_table_name(match.group("name"))
+                if cls._is_slow_log_table_name(candidate):
+                    discovered.add(candidate)
+        return discovered
+
+    @classmethod
+    def _target_key(cls, arguments: Mapping[str, Any]) -> tuple[int, str] | None:
+        instance_id = cls._coerce_positive_integer(arguments.get("instance_id"))
+        db_name = arguments.get("db_name")
+        if instance_id is None or not isinstance(db_name, str) or not db_name.strip():
+            return None
+        return instance_id, db_name.strip().casefold()
+
+    @staticmethod
+    def _is_confirmed_slow_log_table_search(arguments: Mapping[str, Any]) -> bool:
+        keyword = arguments.get("keyword")
+        return (
+            isinstance(keyword, str)
+            and keyword.strip().casefold() == ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD
+        )
+
+    @staticmethod
+    def _model_table_discovery_required_result() -> str:
+        return (
+            "尚未在本次查询的目标实例和数据库中发现SQL所引用的slowlog相关表。"
+            "请先调用list_db_tables_gymJPA，使用同一instance_id和db_name、"
+            f"keyword={ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD!r}、size=200搜索真实表名，"
+            "再调用list_table_columns并生成最终只读SQL。"
+        )
+
+    @staticmethod
+    def _slow_log_table_not_found_error(
+        target: tuple[int, str],
+        *,
+        model_calls: tuple[MCPModelToolCall, ...],
+    ) -> ArcheryMCPSlowLogTableNotFound:
+        instance_id, db_name = target
+        return ArcheryMCPSlowLogTableNotFound(
+            "No slowlog-related table was found in the resolved Archery target "
+            f"instance {instance_id}, database {db_name!r}",
+            diagnostic_data={
+                "instance_id": instance_id,
+                "db_name": db_name,
+                "table_search_keyword": ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
+                "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
+                "model_tool_calls": [call.name for call in model_calls],
+                "model_request_ids": [
+                    call.request_id for call in model_calls if call.request_id
+                ],
+            },
+        )
 
     @staticmethod
     def _without_leading_sql_comments(sql: str) -> str:
@@ -1370,6 +1559,7 @@ class ArcherySlowLogEvidenceTool:
             else "实例 ID 未解析"
         )
         database_summary = result.db_name or "数据库名未解析"
+        table_summary = result.table_name or "慢日志表名未解析"
         sql_summary = (
             "实际执行 SQL 已由 Archery 回显并与模型提交一致"
             if result.actual_sql_verified
@@ -1379,14 +1569,14 @@ class ArcherySlowLogEvidenceTool:
         limitations: list[str] = []
         if not result.actual_sql_verified:
             limitations.append("实际执行 SQL 未核对")
-        if result.instance_id is None or not result.db_name:
+        if result.instance_id is None or not result.db_name or not result.table_name:
             limitations.append("未获得完整的 MCP 目标标识")
         if truncation_possible:
             limitations.append("结果受字符上限约束并可能截断")
         limitations.append("慢查询记录不能单独证明告警根因")
         return (
             f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "
-            f"{database_summary}，{row_summary}；{sql_summary}。"
+            f"{database_summary}，慢日志表 {table_summary}，{row_summary}；{sql_summary}。"
             "查询目标由告警上下文和 MCP 实时资源发现确定；该结果可作为当前告警的"
             "排查证据，但不能单独证明本次告警根因。",
             {
@@ -1404,6 +1594,7 @@ class ArcherySlowLogEvidenceTool:
                     "selection_basis": "alert_context_and_mcp_discovery",
                     "instance_id": result.instance_id,
                     "db_name": result.db_name,
+                    "table_name": result.table_name,
                     "alert_context": alert_target_context,
                 },
                 "query_window": {

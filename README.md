@@ -286,8 +286,11 @@ Host 不再重复实现各资源发现工具的参数规则；登录、资源组
 MCP 实时输入 Schema，由模型结合前序结果自主规划，并由 MCP 服务端校验。Host 仅保留只读工具
 白名单以及查询的登录状态、MCP 发现得到的正整数实例 ID、非空数据库名、单条只读 SQL 和
 最多 24,000 字符校验。模型可先执行 `SELECT`、`WITH`、`SHOW`、`DESCRIBE` 或 `EXPLAIN` 等
-辅助只读 SQL，Host 会将结果回传模型并继续调查；只有查询 `t_slowlog_info` 且 SQL 的 `LIMIT`
-不超过 100 时才视为最终慢日志结果。`limit_num` 参数
+辅助只读 SQL，Host 会将结果回传模型并继续调查。模型必须先在告警定位出的实例和数据库中调用
+`list_db_tables_gymJPA(keyword="slow")`，并从真实返回中选择表名忽略大小写和分隔符后包含
+`slowlog` 或 `slowquerylog` 的表，再读取其真实字段；不再固定为 `t_slowlog_info`。搜索确认没有
+候选表时返回 `ArcheryMCPSlowLogTableNotFound`。只有查询已发现的候选表且 SQL 的 `LIMIT` 不超过
+100 时才视为最终慢日志结果。`limit_num` 参数
 交由 MCP 服务自身处理；Host 不再逐字比对预生成 SQL，也不解析模型
 选择的字段和时间表达式。提示词中的目标时间窗由规范化告警的 `occurred_at` 和部署窗口计算，
 默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在预览确认步骤。
