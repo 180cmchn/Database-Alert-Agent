@@ -502,6 +502,11 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "最多20条" in task_prompt
     assert TEST_WINDOW_START.isoformat() in task_prompt
     assert TEST_WINDOW_END.isoformat() in task_prompt
+    assert "f_start_time是只含YYYY-MM-DD的varchar(10)" in task_prompt
+    assert "分钟级时间窗口请使用f_insert_time筛选和排序" in task_prompt
+    assert "不要用f_start_time或f_time_point与完整时间戳比较" in task_prompt
+    assert "FROM_UNIXTIME(Unix秒)" in task_prompt
+    assert "不要直接去掉ISO时间的时区偏移" in task_prompt
     assert model.calls[1]["messages"][-1]["role"] == "tool"
     assert "实时证据" in model.calls[1]["messages"][-1]["content"]
     assert {
