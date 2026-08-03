@@ -22,12 +22,12 @@ services:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-      interval: 10s
+      interval: 3s
       timeout: 5s
       retries: 10
 
   migrate:
-    build: .
+    image: database-alert-agent-backend:local
     restart: "no"
     env_file:
       - path: .env
@@ -43,7 +43,10 @@ services:
     command: ["alembic", "upgrade", "head"]
 
   api:
-    build: .
+    # Build once; migrate and worker reuse this local backend image.
+    image: database-alert-agent-backend:local
+    build:
+      context: .
     restart: unless-stopped
     env_file:
       - path: .env
@@ -80,12 +83,12 @@ services:
         - python
         - -c
         - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"
-      interval: 10s
+      interval: 3s
       timeout: 3s
       retries: 10
 
   worker:
-    build: .
+    image: database-alert-agent-backend:local
     restart: unless-stopped
     command: ["python", "-m", "app.workers.kafka"]
     env_file:

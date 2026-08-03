@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
@@ -6,7 +8,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Keep the dependency layer independent of application source files.  This is
+# reused for ordinary code/config changes made before `docker compose up --build`.
 COPY pyproject.toml README.md ./
+# Hatchling validates the declared `app` package while installing this project.
+# Copying only its package marker preserves the dependency-layer cache.
+COPY app/__init__.py ./app/__init__.py
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv \
+    && /opt/venv/bin/pip install '.[postgres,mysql]'
+
 COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
@@ -14,8 +25,10 @@ COPY runbooks ./runbooks
 COPY config ./config
 COPY entrypoint.sh ./
 
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir '.[postgres,mysql]'
+# Install the project after copying its source without resolving dependencies
+# again: they were installed by the cacheable layer above.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/venv/bin/pip install --no-deps .
 
 FROM python:3.12-slim
 
