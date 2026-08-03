@@ -274,15 +274,16 @@ Streamable HTTP 会话中完成初始化和工具发现，再把本次允许的 
 - `list_table_columns_gymJPA`；
 - `sql_query_gymJPA`。
 
-Host 给模型的用户提示只描述 MCP 地址、实例、数据库、告警时间窗、慢日志表和最多返回行数。
-模型根据工具实时 Schema 自主决定是否查询资源组、实例、数据库、表和字段，不固定调用顺序。
+Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名、主机、端口、数据库名等目标线索、
+告警时间窗、慢日志表和最多返回行数。部署配置不再固定查询实例和数据库。模型根据告警上下文、
+工具实时 Schema 与资源发现结果自主确定目标，并决定是否查询资源组、实例、数据库、表和字段。
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法等可重试错误也会原样回传，
 模型可据此调整只读查询继续执行。模型最多执行 10 个只读步骤。`apply_query_permission_gymJPA`
 等会产生外部状态变更的工具不会传给模型。
 
 Host 不再重复实现各资源发现工具的参数规则；登录、资源组、实例、数据库、表和字段调用直接使用
 MCP 实时输入 Schema，由模型结合前序结果自主规划，并由 MCP 服务端校验。Host 仅保留只读工具
-白名单以及最终查询的登录状态、实例 ID 或配置别名、目标数据库、单条 `SELECT`、
+白名单以及最终查询的登录状态、MCP 发现得到的正整数实例 ID、非空数据库名、单条 `SELECT`、
 `t_slowlog_info` 表、最多 20 行和最多 24,000 字符校验；不再逐字比对预生成 SQL，也不解析模型
 选择的字段和时间表达式。提示词中的目标时间窗由规范化告警的 `occurred_at` 和部署窗口计算，
 默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在预览确认步骤。
@@ -290,8 +291,9 @@ MCP 实时输入 Schema，由模型结合前序结果自主规划，并由 MCP �
 查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。若 Archery
 以“SQL 查询已执行 / 执行的SQL / 结果”文本包裹返回数据，Host 会拆出其中的实际 SQL 和结果
 JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使用的实例 ID、时间字段和返回行数。
-空结果会明确显示为 0 行且不会误报为可能截断。当前表查询尚未按告警指向的受影响数据库实例
-过滤，因此即使查询成功也不可单独用于根因判定；非空结果仍受 20 行和 24,000 字符上限约束。
+空结果会明确显示为 0 行且不会误报为可能截断。证据会记录由告警上下文与 MCP 资源发现共同
+确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
+非空结果仍受 20 行和 24,000 字符上限约束。
 传输失败、登录确认失败、鉴权失败、缺少查询范围、超时、MCP 标准错误或 Archery 业务错误只会
 形成失败证据。
 
@@ -310,20 +312,19 @@ JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使�
 }
 ```
 
-在 `.env` 配置该文件路径、完整 MCP Endpoint、Token 和查询目标：
+在 `.env` 配置该文件路径、完整 MCP Endpoint、Token 和查询窗口：
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json
 ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
 ARCHERY_MCP_TOKEN=archery_replace-with-your-token
-ARCHERY_MCP_INSTANCE_REF=archery
-ARCHERY_MCP_DB_NAME=archery
 ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
-URL、Token、`instance_ref`、`db_name` 和窗口都是部署级配置，不能通过管理 API 修改；启用
-Archery MCP 时前四项必须同时提供，`MCP_SETTINGS_PATH` 指向的文件也必须存在。当前认证方式是
+URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；启用 Archery MCP 时必须提供 URL
+和 Token，`MCP_SETTINGS_PATH` 指向的文件也必须存在。实例和数据库目标从每条规范化告警中提取，
+再由模型调用 MCP 资源发现工具解析，不读取固定目标配置。当前认证方式是
 `X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的
 `X-Archery-Username` 和 `X-Archery-Password`。Token 只通过每个 MCP HTTP 请求的
 `X-Archery-Token` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP 重定向。生产

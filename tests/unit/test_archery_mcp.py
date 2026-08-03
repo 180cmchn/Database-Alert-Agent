@@ -309,29 +309,39 @@ def test_archery_discovery_arguments_are_delegated_to_mcp_schema() -> None:
         )
 
 
-def test_archery_query_accepts_instance_id_or_configured_reference() -> None:
+def test_archery_query_requires_discovered_instance_id_and_accepts_dynamic_database() -> None:
     client = _client(
         httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     )
-    for identity in (
-        {"instance_id": str(TEST_INSTANCE_ID)},
-        {"instance_ref": TEST_INSTANCE_REF},
-    ):
-        call = client._normalize_model_tool_call(
-            MCPModelToolCall(
-                call_id="query-call",
-                name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                arguments={
-                    **identity,
-                    "db_name": TEST_DB_NAME,
-                    "sql_content": TEST_ALTERNATE_SLOW_LOG_QUERY,
-                },
-            )
+    call = client._normalize_model_tool_call(
+        MCPModelToolCall(
+            call_id="query-call",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments={
+                "instance_id": str(TEST_INSTANCE_ID),
+                "db_name": "database-from-alert",
+                "sql_content": TEST_ALTERNATE_SLOW_LOG_QUERY,
+            },
         )
-        assert call.arguments["limit_num"] == 20
-        assert call.arguments["max_result_chars"] == 24_000
+    )
+    assert call.arguments["limit_num"] == 20
+    assert call.arguments["max_result_chars"] == 24_000
+    client._validate_model_tool_call(call, login_confirmed=True)
+
+    reference_only = client._normalize_model_tool_call(
+        MCPModelToolCall(
+            call_id="query-with-reference",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments={
+                "instance_ref": TEST_INSTANCE_REF,
+                "db_name": TEST_DB_NAME,
+                "sql_content": TEST_ALTERNATE_SLOW_LOG_QUERY,
+            },
+        )
+    )
+    with pytest.raises(ArcheryMCPReadOnlyViolation, match="positive instance_id"):
         client._validate_model_tool_call(
-            call,
+            reference_only,
             login_confirmed=True,
         )
 
@@ -478,7 +488,15 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
 
     client = _client(httpx.MockTransport(handler), model=model)
 
-    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+    alert_context = {
+        "title": "MySQL/mysql_slow_query_400/db-prod-01:3306",
+        "instance_candidates": ["db-prod-01:3306"],
+        "database_candidates": [TEST_DB_NAME],
+    }
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context=alert_context,
+    )
 
     assert result.payload["rows"] == [[1, "select 1"]]
     assert result.payload["rowCount"] == 1
@@ -495,8 +513,10 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     )
     task_prompt = model.calls[0]["messages"][1]["content"]
     assert "https://archery.example.test/mcp" in task_prompt
-    assert f"实例：{TEST_INSTANCE_REF}" in task_prompt
-    assert f"数据库id：{TEST_DB_NAME}" in task_prompt
+    assert "db-prod-01:3306" in task_prompt
+    assert TEST_DB_NAME in task_prompt
+    assert "部署配置不提供固定的查询实例或数据库" in task_prompt
+    assert "list_instances和list_instance_databases" in task_prompt
     assert ARCHERY_SLOW_LOG_TABLE in task_prompt
     assert "之前5分钟" in task_prompt
     assert "最多20条" in task_prompt
@@ -524,6 +544,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     query_arguments = model.calls[-1]["arguments"]
     assert query_arguments["instance_id"] == TEST_INSTANCE_ID
     assert "instance_ref" not in query_arguments
+    assert result.db_name == TEST_DB_NAME
     assert [item[0] for item in calls] == [
         "initialize",
         "notifications/initialized",
@@ -1094,20 +1115,23 @@ async def test_archery_mcp_merges_text_result_with_structured_status() -> None:
 class RecordingArcheryClient:
     login_tool_name = ARCHERY_MCP_LOGIN_TOOL_NAME
     query_tool_name = ARCHERY_MCP_QUERY_TOOL_NAME
-    instance_ref = TEST_INSTANCE_REF
-    db_name = TEST_DB_NAME
     slow_log_time_column = TEST_TIME_COLUMN
     window_seconds = 300
 
     def __init__(self) -> None:
         self.calls = 0
         self.occurred_at: datetime | None = None
+        self.alert_context: dict[str, Any] | None = None
 
     async def execute_slow_log_query(
-        self, occurred_at: datetime
+        self,
+        occurred_at: datetime,
+        *,
+        alert_context: dict[str, Any] | None = None,
     ) -> ArcherySlowLogQueryResult:
         self.calls += 1
         self.occurred_at = occurred_at
+        self.alert_context = alert_context
         return ArcherySlowLogQueryResult(
             payload={"status": "ok", "rows": [], "affected_rows": 0},
             requested_sql=TEST_SLOW_LOG_QUERY,
@@ -1116,11 +1140,18 @@ class RecordingArcheryClient:
             executed_sql=TEST_SLOW_LOG_QUERY,
             actual_sql_verified=True,
             instance_id=TEST_INSTANCE_ID,
+            db_name=TEST_DB_NAME,
             query_time_column=TEST_TIME_COLUMN,
         )
 
 
-def _context(alert_type: str, *, title: str = "Database alert") -> InvestigationContext:
+def _context(
+    alert_type: str,
+    *,
+    title: str = "Database alert",
+    database: dict[str, str] | None = None,
+    labels: dict[str, str] | None = None,
+) -> InvestigationContext:
     alert = CanonicalAlertSourceAdapter().normalize(
         {
             "external_id": f"archery-{alert_type}",
@@ -1129,6 +1160,8 @@ def _context(alert_type: str, *, title: str = "Database alert") -> Investigation
             "reason": alert_type,
             "alert_type": alert_type,
             "occurred_at": TEST_ALERT_OCCURRED_AT.isoformat(),
+            "database": database,
+            "labels": labels or {},
         }
     )
     return InvestigationContext(
@@ -1151,11 +1184,24 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
         ToolExecutionRequest(
             tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
         ),
-        _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306"),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-1:3306",
+            database={
+                "engine": "mysql",
+                "instance": "db-1:3306",
+                "database": TEST_DB_NAME,
+                "host": "db-1",
+            },
+            labels={"instance": "db-1:3306", "db_name": TEST_DB_NAME},
+        ),
     )
 
     assert client.calls == 1
     assert client.occurred_at == TEST_ALERT_OCCURRED_AT
+    assert client.alert_context is not None
+    assert client.alert_context["instance_candidates"] == ["db-1:3306", "db-1"]
+    assert client.alert_context["database_candidates"] == [TEST_DB_NAME]
     assert "返回 0 行" in summary
     assert f"实例 ID {TEST_INSTANCE_ID}" in summary
     assert "实际执行 SQL 已由 Archery 回显并与模型提交一致" in summary
@@ -1168,9 +1214,10 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert data["prompt_version"] == ARCHERY_SLOW_LOG_PROMPT_VERSION
     assert data["actual_sql_verified"] is True
     assert data["target"] == {
-        "instance_ref": TEST_INSTANCE_REF,
+        "selection_basis": "alert_context_and_mcp_discovery",
         "instance_id": TEST_INSTANCE_ID,
         "db_name": TEST_DB_NAME,
+        "alert_context": client.alert_context,
     }
     assert data["query_window"] == {
         "basis": "alert.occurred_at",
@@ -1180,7 +1227,7 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
         "duration_seconds": 300,
         "time_column": TEST_TIME_COLUMN,
     }
-    assert data["scope"] == "requested_alert_time_window_global_slow_log_snapshot"
+    assert data["scope"] == "alert_target_slow_log_snapshot"
     assert data["result_bounds"]["truncation_possible"] is False
     assert data["root_cause_eligible"] is False
     assert "实际执行 SQL 未核对" not in data["root_cause_ineligible_reason"]
@@ -1261,8 +1308,6 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
         mcp_settings_path=mcp_settings_path,
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-archery-token",
-        archery_mcp_instance_ref=TEST_INSTANCE_REF,
-        archery_mcp_db_name=TEST_DB_NAME,
     )
 
 
@@ -1274,8 +1319,8 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
     tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
 
     assert isinstance(tool, ArcherySlowLogEvidenceTool)
-    assert tool.client.instance_ref == TEST_INSTANCE_REF
-    assert tool.client.db_name == TEST_DB_NAME
+    assert tool.client.instance_ref == ""
+    assert tool.client.db_name == ""
     assert tool.client.window_seconds == 300
 
     apply_runtime_settings(
@@ -1318,6 +1363,12 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
             "reason": "mysql_slow_query_400",
             "alert_type": "mysql_slow_query_400",
             "occurred_at": TEST_ALERT_OCCURRED_AT.isoformat(),
+            "database": {
+                "engine": "mysql",
+                "instance": "db-1:3306",
+                "database": TEST_DB_NAME,
+                "host": "db-1",
+            },
         },
     )
 

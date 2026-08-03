@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Run a live, read-only Archery MCP configuration smoke test.
+"""Run a live, read-only Archery MCP connection and target smoke test.
 
 Run from the project root so the result is printed in the VS Code terminal::
 
-    .venv/bin/python -m tools.test_archery_mcp_config
+    .venv/bin/python -m tools.test_archery_mcp_config \
+        --instance-ref db-prod-01:3306 --db-name orders
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import re
@@ -121,13 +123,11 @@ def _instance_id_from_payload(payload: Mapping[str, Any], instance_ref: str) -> 
     )
 
 
-def _load_target() -> tuple[Settings, MCPServerSettings, str, str]:
+def _load_connection() -> tuple[Settings, MCPServerSettings]:
     settings = Settings(_env_file=PROJECT_ROOT / ".env")
     required = {
         "ARCHERY_MCP_URL": settings.archery_mcp_url,
         "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
-        "ARCHERY_MCP_INSTANCE_REF": settings.archery_mcp_instance_ref,
-        "ARCHERY_MCP_DB_NAME": settings.archery_mcp_db_name,
     }
     missing = [name for name, value in required.items() if not value.strip()]
     if missing:
@@ -144,12 +144,7 @@ def _load_target() -> tuple[Settings, MCPServerSettings, str, str]:
             "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
         },
     )
-    return (
-        settings,
-        server,
-        settings.archery_mcp_instance_ref,
-        settings.archery_mcp_db_name,
-    )
+    return settings, server
 
 
 async def _available_tool_names(session: ClientSession) -> set[str]:
@@ -189,13 +184,13 @@ async def _call_read_only_tool(
     return payload
 
 
-async def run() -> None:
-    settings, server, instance_ref, db_name = _load_target()
+async def run(*, instance_ref: str, db_name: str) -> None:
+    settings, server = _load_connection()
     timeout_seconds = settings.archery_mcp_timeout_seconds
     print("=== Archery MCP 配置冒烟测试 ===")
     print(f"MCP Endpoint: {server.url}")
-    print(f"配置实例名: {instance_ref}")
-    print(f"配置数据库名: {db_name}")
+    print(f"模拟告警实例: {instance_ref}")
+    print(f"模拟告警数据库: {db_name}")
     print("查询目标: t_slowlog_info 最新 5 条\n")
 
     async with httpx.AsyncClient(
@@ -239,7 +234,7 @@ async def run() -> None:
                 )
                 print("      登录确认成功")
 
-                print(f"[2/3] 按配置实例名查询 instance_id: {instance_ref}")
+                print(f"[2/3] 按模拟告警实例查询 instance_id: {instance_ref}")
                 instances_payload = await _call_read_only_tool(
                     session,
                     name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
@@ -280,8 +275,27 @@ async def run() -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="使用显式告警目标测试 Archery MCP 只读查询链路"
+    )
+    parser.add_argument(
+        "--instance-ref",
+        required=True,
+        help="模拟告警中的数据库实例名、主机或 host:port",
+    )
+    parser.add_argument(
+        "--db-name",
+        required=True,
+        help="模拟告警中的数据库名",
+    )
+    args = parser.parse_args()
     try:
-        asyncio.run(run())
+        asyncio.run(
+            run(
+                instance_ref=args.instance_ref.strip(),
+                db_name=args.db_name.strip(),
+            )
+        )
     except KeyboardInterrupt:
         print("\n测试已取消。", file=sys.stderr)
         return 130

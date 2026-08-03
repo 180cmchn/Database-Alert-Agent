@@ -15,7 +15,7 @@ from mcp import types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
 
 from app.application.sanitization import sanitize, sanitize_text
-from app.domain.models import InvestigationContext, ToolExecutionRequest
+from app.domain.models import InvestigationContext, NormalizedAlert, ToolExecutionRequest
 from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
@@ -37,7 +37,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v7"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v8"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -139,6 +139,7 @@ class ArcherySlowLogQueryResult:
     executed_sql: str | None = None
     actual_sql_verified: bool = False
     instance_id: int | None = None
+    db_name: str | None = None
     query_time_column: str | None = None
 
 
@@ -275,8 +276,8 @@ class ArcheryMCPClient:
         server: MCPServerSettings,
         model: MCPToolCallingModel,
         *,
-        instance_ref: str,
-        db_name: str,
+        instance_ref: str = "",
+        db_name: str = "",
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         login_tool_name: str = ARCHERY_MCP_LOGIN_TOOL_NAME,
         query_tool_name: str = ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -305,19 +306,13 @@ class ArcheryMCPClient:
             raise ArcheryMCPConfigurationError(
                 "Archery MCP must use X-Archery-Token, not Authorization"
             )
-        if not instance_ref.strip():
-            raise ArcheryMCPConfigurationError(
-                "ARCHERY_MCP_INSTANCE_REF is not configured"
-            )
-        if not db_name.strip():
-            raise ArcheryMCPConfigurationError("ARCHERY_MCP_DB_NAME is not configured")
         if any(
             len(value.strip()) > 255
             or any(ord(character) < 32 for character in value.strip())
             for value in (instance_ref, db_name)
         ):
             raise ArcheryMCPConfigurationError(
-                "Archery instance_ref and db_name must be printable and at most 255 chars"
+                "Legacy Archery target hints must be printable and at most 255 chars"
             )
         if not 60 <= window_seconds <= 86_400:
             raise ArcheryMCPConfigurationError(
@@ -349,8 +344,8 @@ class ArcheryMCPClient:
         model: MCPToolCallingModel,
         *,
         environment: Mapping[str, str],
-        instance_ref: str,
-        db_name: str,
+        instance_ref: str = "",
+        db_name: str = "",
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         timeout_seconds: float = 60,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -371,7 +366,10 @@ class ArcheryMCPClient:
         )
 
     async def execute_slow_log_query(
-        self, occurred_at: datetime
+        self,
+        occurred_at: datetime,
+        *,
+        alert_context: Mapping[str, Any] | None = None,
     ) -> ArcherySlowLogQueryResult:
         """Let the model navigate the read-only Archery tools and run one bounded SELECT."""
 
@@ -383,6 +381,7 @@ class ArcheryMCPClient:
             occurred_at=occurred_at,
             window_start=window_start,
             window_end=window_end,
+            alert_context=alert_context or {},
         )
         try:
             async with httpx.AsyncClient(
@@ -497,6 +496,7 @@ class ArcheryMCPClient:
                                     instance_id=self._coerce_positive_integer(
                                         call.arguments.get("instance_id")
                                     ),
+                                    db_name=str(call.arguments["db_name"]).strip(),
                                     query_time_column=self._query_time_column(
                                         executed_sql or requested_sql
                                     ),
@@ -544,6 +544,7 @@ class ArcheryMCPClient:
         occurred_at: datetime,
         window_start: datetime,
         window_end: datetime,
+        alert_context: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         duration = (
             f"{self.window_seconds // 60}分钟"
@@ -552,9 +553,18 @@ class ArcheryMCPClient:
         )
         window_start_epoch = int(window_start.timestamp())
         window_end_epoch = int(window_end.timestamp())
+        serialized_alert_context = json.dumps(
+            sanitize(dict(alert_context)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         task = (
-            f"查询{self.mcp_url}中实例：{self.instance_ref}，数据库id：{self.db_name}，"
-            f"告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
+            f"查询{self.mcp_url}中与当前告警对应的数据库实例和数据库。"
+            f"告警上下文为：{serialized_alert_context}。"
+            "部署配置不提供固定的查询实例或数据库；请以告警中的实例名、主机、端口、"
+            "数据库名等线索，结合list_instances和list_instance_databases等MCP实时返回，"
+            "自主确定唯一目标。最终查询必须使用MCP返回的真实整数instance_id和数据库名。"
+            f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
             f"{ARCHERY_SLOW_LOG_TABLE}，最多{ARCHERY_SLOW_LOG_LIMIT}条。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
             "该表中f_start_time是只含YYYY-MM-DD的varchar(10)，f_time_point是"
@@ -717,13 +727,22 @@ class ArcheryMCPClient:
             self._raise_argument_violation(call.name, "login is not confirmed")
 
         instance_id = self._coerce_positive_integer(arguments.get("instance_id"))
-        if instance_id is None and arguments.get("instance_ref") != self.instance_ref:
+        if instance_id is None:
             self._raise_argument_violation(
                 call.name,
-                "instance_id or the configured instance_ref is required",
+                "a positive instance_id discovered from Archery MCP is required",
             )
-        if arguments.get("db_name") != self.db_name:
-            self._raise_argument_violation(call.name, "db_name changed")
+        db_name = arguments.get("db_name")
+        if (
+            not isinstance(db_name, str)
+            or not db_name.strip()
+            or len(db_name.strip()) > 255
+            or any(ord(character) < 32 for character in db_name.strip())
+        ):
+            self._raise_argument_violation(
+                call.name,
+                "db_name discovered from Archery MCP is required",
+            )
         sql_content = arguments.get("sql_content")
         if not isinstance(sql_content, str) or not self._is_read_only_slow_log_select(
             sql_content
@@ -1253,11 +1272,15 @@ class ArcherySlowLogEvidenceTool:
             )
         if request.parameters:
             raise ArcheryMCPReadOnlyViolation(
-                "Archery slow-log evidence parameters are derived only from deployment "
-                "configuration and alert occurred_at"
+                "Archery slow-log evidence parameters are derived only from the alert "
+                "context and occurred_at"
             )
 
-        result = await self.client.execute_slow_log_query(context.alert.occurred_at)
+        alert_target_context = self._alert_target_context(context.alert)
+        result = await self.client.execute_slow_log_query(
+            context.alert.occurred_at,
+            alert_context=alert_target_context,
+        )
         row_count = self._row_count(result.payload)
         row_summary = (
             f"返回 {row_count} 行"
@@ -1267,8 +1290,9 @@ class ArcherySlowLogEvidenceTool:
         instance_summary = (
             f"实例 ID {result.instance_id}"
             if result.instance_id is not None
-            else f"实例 {self.client.instance_ref}"
+            else "实例 ID 未解析"
         )
+        database_summary = result.db_name or "数据库名未解析"
         sql_summary = (
             "实际执行 SQL 已由 Archery 回显并与模型提交一致"
             if result.actual_sql_verified
@@ -1278,14 +1302,16 @@ class ArcherySlowLogEvidenceTool:
         limitations: list[str] = []
         if not result.actual_sql_verified:
             limitations.append("实际执行 SQL 未核对")
-        limitations.append("结果尚未按告警指向的受影响数据库实例关联")
+        if result.instance_id is None or not result.db_name:
+            limitations.append("未获得完整的 MCP 目标标识")
         if truncation_possible:
             limitations.append("结果受字符上限约束并可能截断")
+        limitations.append("慢查询记录不能单独证明告警根因")
         return (
             f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "
-            f"{self.client.db_name}，{row_summary}；{sql_summary}。"
-            "该结果尚未与告警指向的受影响数据库实例建立关联，"
-            "不能单独证明本次告警根因。",
+            f"{database_summary}，{row_summary}；{sql_summary}。"
+            "查询目标由告警上下文和 MCP 实时资源发现确定；该结果可作为当前告警的"
+            "排查证据，但不能单独证明本次告警根因。",
             {
                 "sql": result.requested_sql,
                 "executed_sql": result.executed_sql,
@@ -1298,9 +1324,10 @@ class ArcherySlowLogEvidenceTool:
                 "model_tool_calls": list(result.model_tool_calls),
                 "model_request_ids": list(result.model_request_ids),
                 "target": {
-                    "instance_ref": self.client.instance_ref,
+                    "selection_basis": "alert_context_and_mcp_discovery",
                     "instance_id": result.instance_id,
-                    "db_name": self.client.db_name,
+                    "db_name": result.db_name,
+                    "alert_context": alert_target_context,
                 },
                 "query_window": {
                     "basis": "alert.occurred_at",
@@ -1310,7 +1337,7 @@ class ArcherySlowLogEvidenceTool:
                     "duration_seconds": self.client.window_seconds,
                     "time_column": result.query_time_column,
                 },
-                "scope": "requested_alert_time_window_global_slow_log_snapshot",
+                "scope": "alert_target_slow_log_snapshot",
                 "result_bounds": {
                     "row_limit": ARCHERY_SLOW_LOG_LIMIT,
                     "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
@@ -1321,6 +1348,79 @@ class ArcherySlowLogEvidenceTool:
                 "result": result.payload,
             },
         )
+
+    @staticmethod
+    def _alert_target_context(alert: NormalizedAlert) -> dict[str, Any]:
+        database = (
+            alert.database.model_dump(mode="json", exclude_none=True)
+            if alert.database is not None
+            else {}
+        )
+        target_label_names = (
+            "instance",
+            "resource",
+            "resource_name",
+            "host",
+            "host_ip",
+            "alarm_host",
+            "database",
+            "db",
+            "db_name",
+            "schema",
+            "cluster",
+            "service",
+            "app",
+            "application",
+        )
+        target_labels = {
+            key: alert.labels[key]
+            for key in target_label_names
+            if isinstance(alert.labels.get(key), str) and alert.labels[key].strip()
+        }
+
+        def candidates(*values: Any) -> list[str]:
+            unique: list[str] = []
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                normalized = value.strip()
+                if not normalized or normalized.casefold() == "unknown":
+                    continue
+                if normalized not in unique:
+                    unique.append(normalized)
+            return unique
+
+        return {
+            "title": alert.title,
+            "reason": alert.reason,
+            "alert_type": alert.alert_type,
+            "environment": alert.environment,
+            "service_name": alert.service_name,
+            "cluster": alert.cluster,
+            "resource_type": alert.resource_type,
+            "database": database,
+            "target_labels": target_labels,
+            "instance_candidates": candidates(
+                database.get("instance"),
+                database.get("host"),
+                alert.attributes.get("flashduty_target_locator"),
+                target_labels.get("instance"),
+                target_labels.get("resource"),
+                target_labels.get("resource_name"),
+                target_labels.get("host"),
+                target_labels.get("host_ip"),
+                target_labels.get("alarm_host"),
+                alert.cluster,
+                alert.service_name,
+            ),
+            "database_candidates": candidates(
+                database.get("database"),
+                target_labels.get("database"),
+                target_labels.get("db"),
+                target_labels.get("db_name"),
+                target_labels.get("schema"),
+            ),
+        }
 
     @staticmethod
     def _row_count(result: Mapping[str, Any]) -> int | None:

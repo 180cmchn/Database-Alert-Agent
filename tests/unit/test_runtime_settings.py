@@ -276,7 +276,7 @@ def test_flashduty_unaudited_capabilities_are_disabled_and_deployment_only() -> 
     )
 
 
-def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
+def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(
@@ -291,22 +291,12 @@ def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
         if "Archery MCP configuration is incomplete" in item
     )
     assert "ARCHERY_MCP_TOKEN" in issue
-    assert "ARCHERY_MCP_INSTANCE_REF" in issue
-    assert "ARCHERY_MCP_DB_NAME" in issue
 
-    incomplete = Settings(
+    configured = Settings(
         _env_file=None,
         ai_provider="fake",
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-token",
-    )
-    assert incomplete.archery_mcp_enabled is False
-
-    configured = incomplete.model_copy(
-        update={
-            "archery_mcp_instance_ref": "archery-metadata",
-            "archery_mcp_db_name": "archery_data",
-        }
     )
     assert configured.archery_mcp_enabled is True
     assert any(
@@ -320,6 +310,7 @@ def test_archery_mcp_coordinates_are_deployment_only_and_configured_together(
     assert configured.archery_slow_log_window_seconds == 300
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
+    # Legacy target variables remain loadable but no longer gate or scope MCP.
     monkeypatch.setenv("ARCHERY_MCP_INSTANCE_REF", "archery-from-env")
     monkeypatch.setenv("ARCHERY_MCP_DB_NAME", "archery_db_from_env")
     monkeypatch.setenv("ARCHERY_SLOW_LOG_WINDOW_SECONDS", "600")

@@ -126,8 +126,8 @@ class Settings(BaseSettings):
     flashduty_logs_ds_type: str = "loki"
 
     # Archery MCP is a deployment-only live evidence source. Its endpoint,
-    # X-Archery-Token, target scope, and query window stay outside
-    # RUNTIME_SETTINGS_KEYS so an admin caller cannot redirect diagnostic traffic.
+    # X-Archery-Token, and query window stay outside RUNTIME_SETTINGS_KEYS so an
+    # admin caller cannot redirect traffic. Each query target comes from its alert.
     mcp_settings_path: Path = Path("./config/mcp/settings.json")
     archery_mcp_url: str = ""
     archery_mcp_token: str = Field(
@@ -139,6 +139,8 @@ class Settings(BaseSettings):
             "ARCHERY_TOKEN",
         ),
     )
+    # Retained only so older deployment files remain loadable. Query targets are
+    # resolved from each alert through MCP discovery and these values are ignored.
     archery_mcp_instance_ref: str = ""
     archery_mcp_db_name: str = ""
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
@@ -338,14 +340,12 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def archery_mcp_enabled(self) -> bool:
-        """Enable Archery evidence only when every deployment coordinate exists."""
+        """Enable Archery evidence when the MCP connection itself is configured."""
 
         return all(
             (
                 self.archery_mcp_url.strip(),
                 self.archery_mcp_token.strip(),
-                self.archery_mcp_instance_ref.strip(),
-                self.archery_mcp_db_name.strip(),
             )
         )
 
@@ -408,8 +408,6 @@ class Settings(BaseSettings):
             required_archery_settings = {
                 "ARCHERY_MCP_URL": self.archery_mcp_url,
                 "ARCHERY_MCP_TOKEN": self.archery_mcp_token,
-                "ARCHERY_MCP_INSTANCE_REF": self.archery_mcp_instance_ref,
-                "ARCHERY_MCP_DB_NAME": self.archery_mcp_db_name,
             }
             missing_archery_settings = [
                 name

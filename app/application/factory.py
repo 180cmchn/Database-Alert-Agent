@@ -143,8 +143,6 @@ def _build_archery_mcp_tool(
                 "ARCHERY_MCP_URL": settings.archery_mcp_url,
                 "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
             },
-            instance_ref=settings.archery_mcp_instance_ref,
-            db_name=settings.archery_mcp_db_name,
             window_seconds=settings.archery_slow_log_window_seconds,
             timeout_seconds=settings.archery_mcp_timeout_seconds,
         )
