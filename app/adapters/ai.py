@@ -404,25 +404,29 @@ class OpenAICompatibleAdvisor:
         self,
         *,
         messages: list[dict[str, Any]],
-        tool: dict[str, Any],
+        tools: list[dict[str, Any]],
     ) -> MCPModelToolCall:
-        """Ask the model for one forced function call used by the MCP host."""
+        """Ask the model to select one function call from an MCP-safe tool set."""
 
         if not self._api_key or not self._model:
             raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
-        function = tool.get("function") if isinstance(tool, dict) else None
-        tool_name = function.get("name") if isinstance(function, dict) else None
-        if not isinstance(tool_name, str) or not tool_name:
-            raise AdvisorError("MCP model tool definition is missing a function name")
+        if not tools:
+            raise AdvisorError("MCP model tool definitions cannot be empty")
+        tool_names: set[str] = set()
+        for tool in tools:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            tool_name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(tool_name, str) or not tool_name:
+                raise AdvisorError("MCP model tool definition is missing a function name")
+            if tool_name in tool_names:
+                raise AdvisorError(f"Duplicate MCP model tool definition: {tool_name}")
+            tool_names.add(tool_name)
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                tools=[tool],
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": tool_name},
-                },
+                tools=tools,
+                tool_choice="required",
                 temperature=0,
                 max_tokens=self._max_tokens,
             )
@@ -468,6 +472,11 @@ class OpenAICompatibleAdvisor:
         if not isinstance(selected_name, str) or not selected_name:
             raise AdvisorError(
                 f"AI provider MCP tool call has no name (request_id={request_id})"
+            )
+        if selected_name not in tool_names:
+            raise AdvisorError(
+                "AI provider selected an unavailable MCP tool "
+                f"{selected_name!r} (request_id={request_id})"
             )
         if isinstance(raw_arguments, str):
             try:

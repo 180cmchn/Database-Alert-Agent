@@ -22,5 +22,5 @@ class MCPToolCallingModel(Protocol):
         self,
         *,
         messages: list[dict[str, Any]],
-        tool: dict[str, Any],
+        tools: list[dict[str, Any]],
     ) -> MCPModelToolCall: ...

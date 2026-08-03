@@ -361,7 +361,7 @@ async def test_advisor_empty_content_error_contains_only_safe_response_metadata(
 
 
 @pytest.mark.asyncio
-async def test_advisor_requests_one_forced_mcp_tool_call() -> None:
+async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
     calls: list[dict[str, object]] = []
 
     class ToolCompletions:
@@ -403,21 +403,29 @@ async def test_advisor_requests_one_forced_mcp_tool_call() -> None:
             },
         },
     }
+    discovery_tool = {
+        "type": "function",
+        "function": {
+            "name": "list_instances_gymJPA",
+            "parameters": {
+                "type": "object",
+                "properties": {"instance_ref": {"type": "string"}},
+            },
+        },
+    }
+    tools = [tool, discovery_tool]
 
     result = await advisor.request_mcp_tool_call(
         messages=[{"role": "user", "content": "confirm login"}],
-        tool=tool,
+        tools=tools,
     )
 
     assert result.name == "ensure_login_gymJPA"
     assert result.arguments == {}
     assert result.call_id == "tool-call-1"
     assert result.request_id == "model-tool-request-1"
-    assert calls[0]["tools"] == [tool]
-    assert calls[0]["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "ensure_login_gymJPA"},
-    }
+    assert calls[0]["tools"] == tools
+    assert calls[0]["tool_choice"] == "required"
     assert "response_format" not in calls[0]
 
 

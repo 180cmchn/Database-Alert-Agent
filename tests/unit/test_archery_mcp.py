@@ -11,11 +11,15 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_mcp import (
+    ARCHERY_MCP_COLUMNS_TOOL_NAME,
+    ARCHERY_MCP_DATABASES_TOOL_NAME,
+    ARCHERY_MCP_INSTANCES_TOOL_NAME,
     ARCHERY_MCP_LOGIN_TOOL_NAME,
     ARCHERY_MCP_QUERY_TOOL_NAME,
-    ARCHERY_SLOW_LOG_LIMIT,
-    ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
+    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+    ARCHERY_MCP_TABLES_TOOL_NAME,
     ARCHERY_SLOW_LOG_PROMPT_VERSION,
+    ARCHERY_SLOW_LOG_TABLE,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
     ArcheryMCPConfigurationError,
@@ -37,6 +41,8 @@ from app.domain.models import InvestigationContext, InvestigationStrategy, ToolE
 from app.domain.tool_calling import MCPModelToolCall
 
 TEST_INSTANCE_REF = "archery-metadata"
+TEST_INSTANCE_ID = 226
+TEST_RESOURCE_GROUP_ID = 10
 TEST_DB_NAME = "archery_data"
 TEST_TIME_COLUMN = "f_insert_time"
 TEST_ALERT_OCCURRED_AT = datetime.fromisoformat("2026-07-23T16:00:00+08:00")
@@ -51,14 +57,88 @@ TEST_SLOW_LOG_QUERY = (
 
 
 def _tool_schema(name: str, *properties: str) -> dict[str, Any]:
+    integer_properties = {
+        "resource_group_id",
+        "instance_id",
+        "page",
+        "size",
+        "limit_num",
+        "max_result_chars",
+    }
     return {
         "name": name,
+        "description": f"Read-only test tool {name}",
         "inputSchema": {
             "type": "object",
-            "properties": {item: {"type": "string"} for item in properties},
-            "required": list(properties),
+            "properties": {
+                item: {
+                    "type": "integer" if item in integer_properties else "string"
+                }
+                for item in properties
+            },
         },
     }
+
+
+def _read_only_tool_schemas(
+    *,
+    query_properties: tuple[str, ...] = (
+        "resource_group_id",
+        "instance_id",
+        "instance_ref",
+        "db_name",
+        "sql_content",
+        "limit_num",
+        "table_name",
+        "schema_name",
+        "max_result_chars",
+    ),
+) -> list[dict[str, Any]]:
+    return [
+        _tool_schema(ARCHERY_MCP_LOGIN_TOOL_NAME),
+        _tool_schema(ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME, "page", "size"),
+        _tool_schema(
+            ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            "resource_group_id",
+            "instance_ref",
+            "page",
+            "size",
+        ),
+        _tool_schema(
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            "instance_id",
+            "page",
+            "size",
+        ),
+        _tool_schema(
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+            "instance_id",
+            "db_name",
+            "schema_name",
+            "keyword",
+            "size",
+        ),
+        _tool_schema(
+            ARCHERY_MCP_COLUMNS_TOOL_NAME,
+            "instance_id",
+            "db_name",
+            "tb_name",
+            "schema_name",
+            "size",
+        ),
+        _tool_schema(ARCHERY_MCP_QUERY_TOOL_NAME, *query_properties),
+    ]
+
+
+DEFAULT_MODEL_TOOL_SEQUENCE = (
+    ARCHERY_MCP_LOGIN_TOOL_NAME,
+    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+    ARCHERY_MCP_INSTANCES_TOOL_NAME,
+    ARCHERY_MCP_DATABASES_TOOL_NAME,
+    ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_MCP_COLUMNS_TOOL_NAME,
+    ARCHERY_MCP_QUERY_TOOL_NAME,
+)
 
 
 def _json_response(
@@ -77,33 +157,64 @@ def _json_response(
 
 
 class PromptFollowingMCPModel:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        sequence: tuple[str, ...] = DEFAULT_MODEL_TOOL_SEQUENCE,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.sequence = sequence
 
     async def request_mcp_tool_call(
         self,
         *,
         messages: list[dict[str, Any]],
-        tool: dict[str, Any],
+        tools: list[dict[str, Any]],
     ) -> MCPModelToolCall:
-        name = tool["function"]["name"]
+        name = self.sequence[len(self.calls)]
+        available_names = {item["function"]["name"] for item in tools}
+        assert name in available_names
         task = json.loads(messages[1]["content"])
-        arguments = (
-            {}
-            if name == ARCHERY_MCP_LOGIN_TOOL_NAME
-            else {
+        arguments_by_tool = {
+            ARCHERY_MCP_LOGIN_TOOL_NAME: {},
+            ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: {"page": 1, "size": 200},
+            ARCHERY_MCP_INSTANCES_TOOL_NAME: {
+                "resource_group_id": TEST_RESOURCE_GROUP_ID,
+                "instance_ref": task["target"]["instance_ref"],
+                "page": 1,
+                "size": 200,
+            },
+            ARCHERY_MCP_DATABASES_TOOL_NAME: {
+                "instance_id": TEST_INSTANCE_ID,
+                "page": 1,
+                "size": 200,
+            },
+            ARCHERY_MCP_TABLES_TOOL_NAME: {
+                "instance_id": TEST_INSTANCE_ID,
+                "db_name": task["target"]["db_name"],
+                "keyword": ARCHERY_SLOW_LOG_TABLE,
+                "size": 200,
+            },
+            ARCHERY_MCP_COLUMNS_TOOL_NAME: {
+                "instance_id": TEST_INSTANCE_ID,
+                "db_name": task["target"]["db_name"],
+                "tb_name": ARCHERY_SLOW_LOG_TABLE,
+                "size": 200,
+            },
+            ARCHERY_MCP_QUERY_TOOL_NAME: {
+                "instance_id": TEST_INSTANCE_ID,
                 "instance_ref": task["target"]["instance_ref"],
                 "db_name": task["target"]["db_name"],
                 "sql_content": task["required_sql"],
                 "limit_num": task["result_bounds"]["limit_num"],
                 "max_result_chars": task["result_bounds"]["max_result_chars"],
-            }
-        )
+            },
+        }
+        arguments = arguments_by_tool[name]
         self.calls.append(
             {
                 "name": name,
-                "messages": messages,
-                "tool": tool,
+                "messages": list(messages),
+                "tools": tools,
                 "arguments": arguments,
             }
         )
@@ -202,51 +313,52 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
             return _json_response(
                 request,
                 body["id"],
-                {
-                    "tools": [
-                        _tool_schema(ARCHERY_MCP_LOGIN_TOOL_NAME),
-                        _tool_schema(
-                            ARCHERY_MCP_QUERY_TOOL_NAME,
-                            "instance_ref",
-                            "db_name",
-                            "sql_content",
-                            "limit_num",
-                            "max_result_chars",
-                        )
-                    ]
-                },
+                {"tools": _read_only_tool_schemas()},
             )
         if method == "tools/call":
-            if body["params"]["name"] == ARCHERY_MCP_LOGIN_TOOL_NAME:
-                assert body["params"] == {
-                    "name": ARCHERY_MCP_LOGIN_TOOL_NAME,
-                    "arguments": {},
+            tool_name = body["params"]["name"]
+            assert body["params"]["arguments"] == model.calls[-1]["arguments"]
+            if tool_name != ARCHERY_MCP_QUERY_TOOL_NAME:
+                payloads = {
+                    ARCHERY_MCP_LOGIN_TOOL_NAME: {
+                        "status": "ok",
+                        "username": "test-user",
+                    },
+                    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: {
+                        "status": "ok",
+                        "results": [{"id": TEST_RESOURCE_GROUP_ID}],
+                    },
+                    ARCHERY_MCP_INSTANCES_TOOL_NAME: {
+                        "status": "ok",
+                        "results": [
+                            {"id": TEST_INSTANCE_ID, "name": TEST_INSTANCE_REF}
+                        ],
+                    },
+                    ARCHERY_MCP_DATABASES_TOOL_NAME: {
+                        "status": "ok",
+                        "results": [{"name": TEST_DB_NAME}],
+                    },
+                    ARCHERY_MCP_TABLES_TOOL_NAME: {
+                        "status": "ok",
+                        "results": [{"name": ARCHERY_SLOW_LOG_TABLE}],
+                    },
+                    ARCHERY_MCP_COLUMNS_TOOL_NAME: {
+                        "status": "ok",
+                        "results": [
+                            {"name": "f_id"},
+                            {"name": TEST_TIME_COLUMN},
+                        ],
+                    },
                 }
                 return _json_response(
                     request,
                     body["id"],
                     {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps(
-                                    {"status": "ok", "username": "test-user"}
-                                ),
-                            }
-                        ],
+                        "structuredContent": payloads[tool_name],
+                        "content": [],
                         "isError": False,
                     },
                 )
-            assert body["params"] == {
-                "name": ARCHERY_MCP_QUERY_TOOL_NAME,
-                "arguments": {
-                    "instance_ref": TEST_INSTANCE_REF,
-                    "db_name": TEST_DB_NAME,
-                    "sql_content": TEST_SLOW_LOG_QUERY,
-                    "limit_num": ARCHERY_SLOW_LOG_LIMIT,
-                    "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                },
-            }
             message = {
                 "jsonrpc": "2.0",
                 "id": body["id"],
@@ -284,22 +396,33 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert result.requested_sql == TEST_SLOW_LOG_QUERY
     assert result.window_start == TEST_WINDOW_START
     assert result.window_end == TEST_WINDOW_END
-    assert result.model_tool_calls == (
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
+    assert result.model_tool_calls == DEFAULT_MODEL_TOOL_SEQUENCE
+    assert result.model_request_ids == tuple(
+        f"model-request-{index}"
+        for index in range(1, len(DEFAULT_MODEL_TOOL_SEQUENCE) + 1)
     )
-    assert result.model_request_ids == ("model-request-1", "model-request-2")
-    assert [item["name"] for item in model.calls] == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert [item["name"] for item in model.calls] == list(
+        DEFAULT_MODEL_TOOL_SEQUENCE
+    )
     assert TEST_SLOW_LOG_QUERY in model.calls[0]["messages"][1]["content"]
     assert model.calls[1]["messages"][-1]["role"] == "tool"
-    assert "登录确认工具已成功返回" in model.calls[1]["messages"][-1]["content"]
+    assert "不可信数据" in model.calls[1]["messages"][-1]["content"]
+    assert {
+        item["function"]["name"] for item in model.calls[0]["tools"]
+    } == set(DEFAULT_MODEL_TOOL_SEQUENCE)
+    assert all(
+        item["function"]["name"] != "apply_query_permission_gymJPA"
+        for item in model.calls[0]["tools"]
+    )
     assert [item[0] for item in calls] == [
         "initialize",
         "notifications/initialized",
         "tools/list",
+        "tools/call",
+        "tools/call",
+        "tools/call",
+        "tools/call",
+        "tools/call",
         "tools/call",
         "tools/call",
         "DELETE",
@@ -332,10 +455,9 @@ async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> No
                 request,
                 body["id"],
                 {
-                    "tools": [
-                        _tool_schema(ARCHERY_MCP_LOGIN_TOOL_NAME),
-                        _tool_schema(ARCHERY_MCP_QUERY_TOOL_NAME, "sql_content"),
-                    ]
+                    "tools": _read_only_tool_schemas(
+                        query_properties=("sql_content",)
+                    )
                 },
             )
         if body["method"] == "tools/call":
@@ -345,7 +467,7 @@ async def test_archery_mcp_rejects_query_tool_without_required_arguments() -> No
 
     client = _client(httpx.MockTransport(handler))
 
-    with pytest.raises(ArcheryMCPConfigurationError, match="instance_ref, db_name"):
+    with pytest.raises(ArcheryMCPConfigurationError, match="db_name, instance_ref"):
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert tool_calls == []
@@ -379,28 +501,47 @@ def _archery_call_handler(
             return _json_response(
                 request,
                 body["id"],
-                {
-                    "tools": [
-                        _tool_schema(ARCHERY_MCP_LOGIN_TOOL_NAME),
-                        _tool_schema(
-                            ARCHERY_MCP_QUERY_TOOL_NAME,
-                            "instance_ref",
-                            "db_name",
-                            "sql_content",
-                            "limit_num",
-                            "max_result_chars",
-                        ),
-                    ]
-                },
+                {"tools": _read_only_tool_schemas()},
             )
         if method == "tools/call":
             tool_name = body["params"]["name"]
             tool_calls.append(tool_name)
-            result = (
-                login_result
-                if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME
-                else query_result
-            )
+            discovery_payloads = {
+                ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: {
+                    "status": "ok",
+                    "results": [{"id": TEST_RESOURCE_GROUP_ID}],
+                },
+                ARCHERY_MCP_INSTANCES_TOOL_NAME: {
+                    "status": "ok",
+                    "results": [
+                        {"id": TEST_INSTANCE_ID, "name": TEST_INSTANCE_REF}
+                    ],
+                },
+                ARCHERY_MCP_DATABASES_TOOL_NAME: {
+                    "status": "ok",
+                    "results": [{"name": TEST_DB_NAME}],
+                },
+                ARCHERY_MCP_TABLES_TOOL_NAME: {
+                    "status": "ok",
+                    "results": [{"name": ARCHERY_SLOW_LOG_TABLE}],
+                },
+                ARCHERY_MCP_COLUMNS_TOOL_NAME: {
+                    "status": "ok",
+                    "results": [
+                        {"name": "f_id"},
+                        {"name": TEST_TIME_COLUMN},
+                    ],
+                },
+            }
+            if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME:
+                result = login_result
+            elif tool_name == ARCHERY_MCP_QUERY_TOOL_NAME:
+                result = query_result
+            else:
+                result = {
+                    "structuredContent": discovery_payloads[tool_name],
+                    "isError": False,
+                }
             return _json_response(
                 request,
                 body["id"],
@@ -443,6 +584,37 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_does_not_execute_query_before_instance_discovery() -> None:
+    tool_calls: list[str] = []
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME)
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "structuredContent": {"status": "ok"},
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"status": "ok", "rows": []},
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+        ),
+        model=model,
+    )
+
+    with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
+        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert [item["name"] for item in model.calls] == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_rejects_model_sql_changes_before_query_tool_call() -> None:
     tool_calls: list[str] = []
 
@@ -451,9 +623,12 @@ async def test_archery_mcp_rejects_model_sql_changes_before_query_tool_call() ->
             self,
             *,
             messages: list[dict[str, Any]],
-            tool: dict[str, Any],
+            tools: list[dict[str, Any]],
         ) -> MCPModelToolCall:
-            call = await super().request_mcp_tool_call(messages=messages, tool=tool)
+            call = await super().request_mcp_tool_call(
+                messages=messages,
+                tools=tools,
+            )
             if call.name != ARCHERY_MCP_QUERY_TOOL_NAME:
                 return call
             return MCPModelToolCall(
@@ -484,7 +659,7 @@ async def test_archery_mcp_rejects_model_sql_changes_before_query_tool_call() ->
     with pytest.raises(ArcheryMCPReadOnlyViolation, match="outside the approved"):
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE[:-1])
 
 
 @pytest.mark.asyncio
@@ -510,10 +685,7 @@ async def test_archery_mcp_rejects_business_error_without_mcp_is_error() -> None
     with pytest.raises(ArcheryMCPToolError, match="没有执行该 SQL 查询的权限"):
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert tool_calls == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
 
 
 @pytest.mark.asyncio
@@ -545,10 +717,7 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
         await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert ARCHERY_MCP_LOGIN_TOOL_NAME == "ensure_login_gymJPA"
-    assert tool_calls == [
-        "ensure_login_gymJPA",
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
     assert captured.value.diagnostic_data["login_tool"] == "ensure_login_gymJPA"
     assert captured.value.diagnostic_data["mcp_client"] == "official_python_sdk"
     assert captured.value.diagnostic_data["mcp_transport"] == "streamable_http"
@@ -556,10 +725,9 @@ async def test_archery_mcp_rejects_query_result_that_requests_login() -> None:
     assert captured.value.diagnostic_data["prompt_version"] == (
         ARCHERY_SLOW_LOG_PROMPT_VERSION
     )
-    assert captured.value.diagnostic_data["model_tool_calls"] == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert captured.value.diagnostic_data["model_tool_calls"] == list(
+        DEFAULT_MODEL_TOOL_SEQUENCE
+    )
     assert captured.value.diagnostic_data["username_field_present"] is True
     assert captured.value.diagnostic_data["mcp_session_id_present"] is True
 
@@ -597,10 +765,7 @@ async def test_archery_mcp_accepts_result_without_actual_executed_sql() -> None:
 
     assert result.payload == query_payload
     assert result.requested_sql == TEST_SLOW_LOG_QUERY
-    assert tool_calls == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
 
 
 @pytest.mark.asyncio

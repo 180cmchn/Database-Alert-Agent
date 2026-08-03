@@ -264,14 +264,26 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 [`config/mcp/settings.json`](config/mcp/settings.json) 中的 Archery 连接配置，在同一个
 Streamable HTTP 会话中完成初始化和工具发现，再把本次允许的 MCP 工具以 function tools
 交给当前 AI 模型。
-模型按专用提示词先调用 `ensure_login_gymJPA()`；登录成功后，下一轮再调用
-`sql_query_gymJPA`。服务内部提示中的 `ensure_login()` 不是当前 MCP 暴露的工具名。
+模型每轮都能看到 MCP 实际发现到的以下只读工具及其输入 Schema，并自主选择一个下一步调用：
 
-每轮模型只能看到当前步骤允许的一个工具，MCP 工具返回内容不会作为可执行指令继续传给模型。
-Host 还会在发送 Archery 请求前校验工具名、空登录参数、目标实例、数据库、SQL 和结果上限；
-提示词负责让模型完成工具调用，代码校验仍是只读安全边界。模型不能扩大时间范围、改写 SQL
-或选择其他 Archery 工具。查询结构固定，但时间边界由规范化告警的 `occurred_at` 和部署窗口
-计算。默认窗口与慢查询告警规则一致，为截至告警发生时的前 5 分钟：
+- `ensure_login_gymJPA`；
+- `list_resource_groups_gymJPA`；
+- `list_instances_gymJPA`；
+- `list_instance_databases_gymJPA`；
+- `list_db_tables_gymJPA`；
+- `list_table_columns_gymJPA`；
+- `sql_query_gymJPA`。
+
+调用流程不再把登录后的第二步硬编码成 `sql_query_gymJPA`。模型先确认登录，再根据前序结果按需
+发现资源组、实例、数据库、表和字段，使用真实实例 ID 完成范围确认后才执行查询。每个 MCP
+结果经脱敏、长度限制并标记为不可信数据后回传给下一轮模型调用；模型最多执行 10 个只读步骤。
+`apply_query_permission_gymJPA` 等会产生外部状态变更的工具不会传给模型。
+
+Host 仍会在发送 Archery 请求前校验批准的工具集合、空登录参数、分页上限、已发现的实例 ID、
+目标实例、数据库、慢日志表、SQL 和结果上限。提示词负责让模型规划正常的 MCP 调用链，代码校验
+继续作为只读安全边界。模型不能扩大时间范围、改写 SQL、切换目标或调用权限申请工具。查询结构
+固定，但时间边界由规范化告警的 `occurred_at` 和部署窗口计算。默认窗口与慢查询告警规则一致，
+为截至告警发生时的前 5 分钟：
 
 ```sql
 select * from t_slowlog_info
