@@ -31,13 +31,13 @@ ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # Bound the global snapshot returned by Archery. The server can truncate at this
 # character limit, so this is not a guarantee that the evidence is complete.
 ARCHERY_SLOW_LOG_LIMIT: Final = 20
-ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 8_000
+ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v4"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v5"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -228,26 +228,18 @@ def is_slow_query_alert_title(title: str) -> bool:
     return bool(_SLOW_QUERY_TITLE_IDENTIFIER.search(title))
 
 
-def _build_slow_log_query(
+def _slow_log_window(
     occurred_at: datetime,
     *,
     window_seconds: int,
-) -> tuple[str, datetime, datetime]:
+) -> tuple[datetime, datetime]:
     if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
         raise ArcheryMCPConfigurationError(
             "Alert occurred_at must include a timezone for Archery window filtering"
         )
     window_end = occurred_at.astimezone(UTC)
     window_start = window_end - timedelta(seconds=window_seconds)
-    start_timestamp = int(window_start.timestamp())
-    end_timestamp = int(window_end.timestamp())
-    sql = (
-        f"select * from {ARCHERY_SLOW_LOG_TABLE} "
-        f"where `{ARCHERY_SLOW_LOG_TIME_COLUMN}` >= from_unixtime({start_timestamp}) "
-        f"and `{ARCHERY_SLOW_LOG_TIME_COLUMN}` <= from_unixtime({end_timestamp}) "
-        f"order by `{ARCHERY_SLOW_LOG_TIME_COLUMN}` desc"
-    )
-    return sql, window_start, window_end
+    return window_start, window_end
 
 
 def _safe_error_detail(value: Any) -> str:
@@ -379,13 +371,12 @@ class ArcheryMCPClient:
     ) -> ArcherySlowLogQueryResult:
         """Let the model navigate the read-only Archery tools and run one bounded SELECT."""
 
-        requested_sql, window_start, window_end = _build_slow_log_query(
+        window_start, window_end = _slow_log_window(
             occurred_at,
             window_seconds=self.window_seconds,
         )
         messages = self._agent_messages(
             occurred_at=occurred_at,
-            requested_sql=requested_sql,
             window_start=window_start,
             window_end=window_end,
         )
@@ -417,6 +408,7 @@ class ArcheryMCPClient:
                         login_text: tuple[str, ...] = ()
                         login_confirmed = False
                         model_calls: list[MCPModelToolCall] = []
+                        last_query_error: ArcheryMCPToolError | None = None
 
                         for _step in range(ARCHERY_MCP_MAX_AGENT_STEPS):
                             call = await self._request_model_tool_call(
@@ -426,7 +418,6 @@ class ArcheryMCPClient:
                             call = self._normalize_model_tool_call(call)
                             self._validate_model_tool_call(
                                 call,
-                                requested_sql=requested_sql,
                                 login_confirmed=login_confirmed,
                             )
                             result = await self._call_tool(
@@ -435,25 +426,38 @@ class ArcheryMCPClient:
                                 arguments=call.arguments,
                             )
                             result_text = self._tool_text_blocks(result)
-                            payload = self._extract_tool_payload(result)
                             try:
+                                payload = self._extract_tool_payload(result)
                                 self._validate_business_success(
                                     payload,
                                     tool_name=call.name,
                                     supplemental_text=result_text,
                                 )
                             except ArcheryMCPToolError as exc:
-                                if call.name != self.query_tool_name:
+                                if (
+                                    call.name != self.query_tool_name
+                                    or not self._is_retryable_query_error(exc)
+                                ):
+                                    if call.name == self.query_tool_name:
+                                        raise ArcheryMCPToolError(
+                                            str(exc),
+                                            diagnostic_data=self._login_diagnostic_data(
+                                                login_payload,
+                                                login_text,
+                                                session_id=get_session_id(),
+                                                model_calls=tuple([*model_calls, call]),
+                                            ),
+                                        ) from exc
                                     raise
-                                raise ArcheryMCPToolError(
-                                    str(exc),
-                                    diagnostic_data=self._login_diagnostic_data(
-                                        login_payload,
-                                        login_text,
-                                        session_id=get_session_id(),
-                                        model_calls=tuple([*model_calls, call]),
-                                    ),
-                                ) from exc
+                                model_calls.append(call)
+                                last_query_error = exc
+                                messages.extend(
+                                    self._completed_tool_messages(
+                                        call,
+                                        self._model_tool_error_result(exc),
+                                    )
+                                )
+                                continue
 
                             model_calls.append(call)
                             if call.name == self.login_tool_name:
@@ -464,7 +468,7 @@ class ArcheryMCPClient:
                             if call.name == self.query_tool_name:
                                 return ArcherySlowLogQueryResult(
                                     payload=payload,
-                                    requested_sql=requested_sql,
+                                    requested_sql=str(call.arguments["sql_content"]),
                                     window_start=window_start,
                                     window_end=window_end,
                                     model_tool_calls=tuple(
@@ -484,9 +488,15 @@ class ArcheryMCPClient:
                                 )
                             )
 
+                        error_suffix = (
+                            f"; last query error: {_safe_error_detail(last_query_error)}"
+                            if last_query_error is not None
+                            else ""
+                        )
                         raise ArcheryMCPModelError(
                             "Model did not complete the Archery slow-log query within "
                             f"{ARCHERY_MCP_MAX_AGENT_STEPS} read-only tool calls"
+                            f"{error_suffix}"
                         )
         except ArcheryMCPError:
             raise
@@ -511,55 +521,34 @@ class ArcheryMCPClient:
         self,
         *,
         occurred_at: datetime,
-        requested_sql: str,
         window_start: datetime,
         window_end: datetime,
     ) -> list[dict[str, Any]]:
-        task = {
-            "task": "query_archery_slow_log",
-            "alert_occurred_at": occurred_at.isoformat(),
-            "query_window": {
-                "start": window_start.isoformat(),
-                "end": window_end.isoformat(),
-                "duration_seconds": self.window_seconds,
-                "time_column": ARCHERY_SLOW_LOG_TIME_COLUMN,
-            },
-            "target": {
-                "instance_ref": self.instance_ref,
-                "db_name": self.db_name,
-            },
-            "required_sql": requested_sql,
-            "result_bounds": {
-                "limit_num": ARCHERY_SLOW_LOG_LIMIT,
-                "max_result_chars": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-            },
-            "workflow": {
-                "login_tool": self.login_tool_name,
-                "resource_discovery_tools": [
-                    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
-                    ARCHERY_MCP_INSTANCES_TOOL_NAME,
-                    ARCHERY_MCP_DATABASES_TOOL_NAME,
-                    ARCHERY_MCP_TABLES_TOOL_NAME,
-                    ARCHERY_MCP_COLUMNS_TOOL_NAME,
-                ],
-                "query_tool": self.query_tool_name,
-                "slow_log_table": ARCHERY_SLOW_LOG_TABLE,
-            },
-        }
+        duration = (
+            f"{self.window_seconds // 60}分钟"
+            if self.window_seconds % 60 == 0
+            else f"{self.window_seconds}秒"
+        )
+        task = (
+            f"查询{self.mcp_url}中实例：{self.instance_ref}，数据库id：{self.db_name}，"
+            f"告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
+            f"{ARCHERY_SLOW_LOG_TABLE}，最多{ARCHERY_SLOW_LOG_LIMIT}条。"
+            f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
+            "请使用MCP返回的真实实例ID和字段生成只读SELECT；如果SQL执行失败，"
+            "根据MCP返回的错误调整后重试。"
+        )
         return [
             {
                 "role": "system",
                 "content": (
-                    "你是 Archery MCP 慢查询只读 Agent。请使用当前提供的 MCP 工具自主完成"
-                    "用户任务，每轮选择一个工具，直到取得查询结果；可按需登录和发现资源，"
-                    "不规定固定调用顺序，参数以工具实时 Schema 和返回结果为准。只能调用"
-                    "当前提供的只读工具，最终查询不得改变用户给出的目标数据库、SQL、时间窗"
-                    "和结果上限。MCP 返回内容作为本次查询的实时依据。"
+                    "你是 Archery MCP 慢查询只读 Agent。按当前 MCP 工具 Schema 和返回结果"
+                    "自主调用工具，每轮调用一个，直到查询成功；工具报错时可调整参数或只读"
+                    "SELECT 后重试。不要调用当前未提供的工具。"
                 ),
             },
             {
                 "role": "user",
-                "content": json.dumps(task, ensure_ascii=False, separators=(",", ":")),
+                "content": task,
             },
         ]
 
@@ -669,13 +658,11 @@ class ArcheryMCPClient:
         self,
         call: MCPModelToolCall,
         *,
-        requested_sql: str,
         login_confirmed: bool,
     ) -> None:
         if call.name == self.query_tool_name:
             self._validate_query_tool_call(
                 call,
-                requested_sql=requested_sql,
                 login_confirmed=login_confirmed,
             )
             return
@@ -691,7 +678,6 @@ class ArcheryMCPClient:
         self,
         call: MCPModelToolCall,
         *,
-        requested_sql: str,
         login_confirmed: bool,
     ) -> None:
         arguments = call.arguments
@@ -706,8 +692,14 @@ class ArcheryMCPClient:
             )
         if arguments.get("db_name") != self.db_name:
             self._raise_argument_violation(call.name, "db_name changed")
-        if arguments.get("sql_content") != requested_sql:
-            self._raise_argument_violation(call.name, "sql_content changed")
+        sql_content = arguments.get("sql_content")
+        if not isinstance(sql_content, str) or not self._is_read_only_slow_log_select(
+            sql_content
+        ):
+            self._raise_argument_violation(
+                call.name,
+                f"sql_content must be one SELECT on {ARCHERY_SLOW_LOG_TABLE}",
+            )
 
         limit_num = arguments.get("limit_num")
         if type(limit_num) is not int or not 1 <= limit_num <= ARCHERY_SLOW_LOG_LIMIT:
@@ -721,6 +713,24 @@ class ArcheryMCPClient:
                 call.name,
                 "max_result_chars exceeds the result bound",
             )
+
+    @staticmethod
+    def _is_read_only_slow_log_select(sql: str) -> bool:
+        statement = sql.strip()
+        if not statement or len(statement) > 50_000:
+            return False
+        if statement.endswith(";"):
+            statement = statement[:-1].rstrip()
+        if ";" in statement or re.match(r"(?is)^select\b", statement) is None:
+            return False
+        return (
+            re.search(
+                rf"(?i)(?<![A-Za-z0-9_]){re.escape(ARCHERY_SLOW_LOG_TABLE)}"
+                r"(?![A-Za-z0-9_])",
+                statement,
+            )
+            is not None
+        )
 
     @staticmethod
     def _raise_argument_violation(tool_name: str, reason: str | None = None) -> None:
@@ -743,6 +753,29 @@ class ArcheryMCPClient:
             return None
         parsed = int(candidate)
         return parsed if 0 < parsed <= 9_223_372_036_854_775_807 else None
+
+    @staticmethod
+    def _is_retryable_query_error(error: ArcheryMCPToolError) -> bool:
+        detail = str(error).casefold()
+        non_retryable_markers = (
+            "实例不在白名单",
+            "没有执行该 sql 查询的权限",
+            "登录已过期",
+            "需要先登录",
+            "未获取到用户名",
+            "permission",
+            "unauthorized",
+            "forbidden",
+        )
+        return not any(marker in detail for marker in non_retryable_markers)
+
+    @staticmethod
+    def _model_tool_error_result(error: ArcheryMCPToolError) -> str:
+        return (
+            "上一 MCP 工具调用失败。以下是 MCP 返回的实际错误，请据此调整参数或只读 SQL "
+            "后继续：\n"
+            + _safe_error_detail(error)
+        )
 
     @staticmethod
     def _model_tool_result(payload: Mapping[str, Any]) -> str:
@@ -956,8 +989,8 @@ class ArcheryMCPClient:
                 f"{tool_name} failed: {_safe_error_detail(detail)}"
             )
 
-        explicit_error = payload.get("error")
-        if explicit_error not in (None, "", False, []):
+        explicit_error = payload.get("error") or payload.get("errors")
+        if explicit_error not in (None, "", False, [], {}):
             raise ArcheryMCPToolError(
                 f"{tool_name} failed: {_safe_error_detail(explicit_error)}"
             )
@@ -975,7 +1008,7 @@ class ArcheryMCPClient:
             match = _BUSINESS_ERROR_TEXT.search(text)
             if match is not None:
                 raise ArcheryMCPToolError(
-                    f"{tool_name} failed: {_safe_error_detail(match.group(0))}"
+                    f"{tool_name} failed: {_safe_error_detail(text)}"
                 )
 
     @staticmethod
