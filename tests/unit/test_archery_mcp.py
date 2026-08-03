@@ -53,7 +53,7 @@ TEST_SLOW_LOG_QUERY = (
     "select * from t_slowlog_info "
     "where `f_insert_time` >= from_unixtime(1784793300) "
     "and `f_insert_time` <= from_unixtime(1784793600) "
-    "order by `f_insert_time` desc"
+    "order by `f_insert_time` desc limit 20"
 )
 TEST_ALTERNATE_SLOW_LOG_QUERY = (
     "SELECT f_id, f_start_time, f_db, f_user, f_insert_time "
@@ -324,9 +324,45 @@ def test_archery_query_requires_discovered_instance_id_and_accepts_dynamic_datab
             },
         )
     )
-    assert call.arguments["limit_num"] == 20
+    assert "limit_num" not in call.arguments
     assert call.arguments["max_result_chars"] == 24_000
     client._validate_model_tool_call(call, login_confirmed=True)
+
+    model_limit_num_is_delegated = client._normalize_model_tool_call(
+        MCPModelToolCall(
+            call_id="query-with-server-limit",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments={
+                "instance_id": TEST_INSTANCE_ID,
+                "db_name": TEST_DB_NAME,
+                "sql_content": (
+                    "SELECT * FROM t_slowlog_info ORDER BY f_insert_time DESC LIMIT 100"
+                ),
+                "limit_num": 500,
+            },
+        )
+    )
+    assert model_limit_num_is_delegated.arguments["limit_num"] == 500
+    client._validate_model_tool_call(
+        model_limit_num_is_delegated,
+        login_confirmed=True,
+    )
+
+    excessive_sql_limit = client._normalize_model_tool_call(
+        MCPModelToolCall(
+            call_id="query-with-excessive-sql-limit",
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments={
+                "instance_id": TEST_INSTANCE_ID,
+                "db_name": TEST_DB_NAME,
+                "sql_content": (
+                    "SELECT * FROM t_slowlog_info ORDER BY f_insert_time DESC LIMIT 101"
+                ),
+            },
+        )
+    )
+    with pytest.raises(ArcheryMCPReadOnlyViolation, match="LIMIT no greater than 100"):
+        client._validate_model_tool_call(excessive_sql_limit, login_confirmed=True)
 
     reference_only = client._normalize_model_tool_call(
         MCPModelToolCall(
@@ -519,7 +555,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "list_instances和list_instance_databases" in task_prompt
     assert ARCHERY_SLOW_LOG_TABLE in task_prompt
     assert "之前5分钟" in task_prompt
-    assert "最多20条" in task_prompt
+    assert "LIMIT数值不得超过100" in task_prompt
     assert TEST_WINDOW_START.isoformat() in task_prompt
     assert TEST_WINDOW_END.isoformat() in task_prompt
     assert "f_start_time是只含YYYY-MM-DD的varchar(10)" in task_prompt

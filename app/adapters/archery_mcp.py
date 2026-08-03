@@ -28,9 +28,9 @@ ARCHERY_MCP_TABLES_TOOL_NAME: Final = "list_db_tables_gymJPA"
 ARCHERY_MCP_COLUMNS_TOOL_NAME: Final = "list_table_columns_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
-# Bound the global snapshot returned by Archery. The server can truncate at this
-# character limit, so this is not a guarantee that the evidence is complete.
-ARCHERY_SLOW_LOG_LIMIT: Final = 20
+# Bound the generated SELECT and the evidence text returned by Archery. The
+# character limit can still truncate non-empty evidence.
+ARCHERY_SLOW_LOG_LIMIT: Final = 100
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # Backward-compatible constant: this is the default; deployments may override it.
@@ -38,7 +38,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v8"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v9"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -578,7 +578,8 @@ class ArcheryMCPClient:
             "数据库名等线索，结合list_instances和list_instance_databases等MCP实时返回，"
             "自主确定唯一目标。最终查询必须使用MCP返回的真实整数instance_id和数据库名。"
             f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询"
-            f"{ARCHERY_SLOW_LOG_TABLE}，最多{ARCHERY_SLOW_LOG_LIMIT}条。"
+            f"{ARCHERY_SLOW_LOG_TABLE}。最终只读SELECT必须显式包含LIMIT，"
+            f"LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
             "该表中f_start_time是只含YYYY-MM-DD的varchar(10)，f_time_point是"
             "格式未确认的varchar(2000)，f_insert_time是由数据库CURRENT_TIMESTAMP"
@@ -691,15 +692,15 @@ class ArcheryMCPClient:
             arguments["instance_id"] = instance_id
             arguments.pop("instance_ref", None)
         if call.name == self.query_tool_name:
-            for key, default in (
-                ("limit_num", ARCHERY_SLOW_LOG_LIMIT),
-                ("max_result_chars", ARCHERY_SLOW_LOG_MAX_RESULT_CHARS),
-            ):
-                normalized = self._coerce_positive_integer(arguments.get(key))
-                if normalized is not None:
-                    arguments[key] = normalized
-                else:
-                    arguments.setdefault(key, default)
+            normalized = self._coerce_positive_integer(
+                arguments.get("max_result_chars")
+            )
+            if normalized is not None:
+                arguments["max_result_chars"] = normalized
+            else:
+                arguments.setdefault(
+                    "max_result_chars", ARCHERY_SLOW_LOG_MAX_RESULT_CHARS
+                )
         if arguments == call.arguments:
             return call
         return MCPModelToolCall(
@@ -764,10 +765,12 @@ class ArcheryMCPClient:
                 call.name,
                 f"sql_content must be one SELECT on {ARCHERY_SLOW_LOG_TABLE}",
             )
-
-        limit_num = arguments.get("limit_num")
-        if type(limit_num) is not int or not 1 <= limit_num <= ARCHERY_SLOW_LOG_LIMIT:
-            self._raise_argument_violation(call.name, "limit_num exceeds the result bound")
+        sql_limit = self._sql_row_limit(sql_content)
+        if sql_limit is None or sql_limit > ARCHERY_SLOW_LOG_LIMIT:
+            self._raise_argument_violation(
+                call.name,
+                f"sql_content must end with LIMIT no greater than {ARCHERY_SLOW_LOG_LIMIT}",
+            )
         max_result_chars = arguments.get("max_result_chars")
         if (
             type(max_result_chars) is not int
@@ -795,6 +798,18 @@ class ArcheryMCPClient:
             )
             is not None
         )
+
+    @staticmethod
+    def _sql_row_limit(sql: str) -> int | None:
+        statement = sql.strip()
+        if statement.endswith(";"):
+            statement = statement[:-1].rstrip()
+        match = re.search(
+            r"(?is)\blimit\s+(?:(?:\d+)\s*,\s*)?(?P<count>\d+)"
+            r"(?:\s+offset\s+\d+)?\s*$",
+            statement,
+        )
+        return int(match.group("count")) if match is not None else None
 
     @staticmethod
     def _raise_argument_violation(tool_name: str, reason: str | None = None) -> None:
@@ -957,7 +972,6 @@ class ArcheryMCPClient:
         required_query_properties = {
             "db_name",
             "sql_content",
-            "limit_num",
             "max_result_chars",
         }
         if (
@@ -968,7 +982,7 @@ class ArcheryMCPClient:
             raise ArcheryMCPConfigurationError(
                 f"Archery MCP tool {self.query_tool_name!r} does not accept the "
                 "required instance_id or instance_ref, db_name, sql_content, "
-                "limit_num, and max_result_chars arguments"
+                "and max_result_chars arguments"
             )
 
     async def _call_tool(
