@@ -136,6 +136,10 @@ class ArcherySlowLogQueryResult:
     window_end: datetime
     model_tool_calls: tuple[str, ...] = ()
     model_request_ids: tuple[str, ...] = ()
+    executed_sql: str | None = None
+    actual_sql_verified: bool = False
+    instance_id: int | None = None
+    query_time_column: str | None = None
 
 
 def _expand_mcp_setting(
@@ -466,9 +470,18 @@ class ArcheryMCPClient:
                                 login_confirmed = True
 
                             if call.name == self.query_tool_name:
+                                requested_sql = str(call.arguments["sql_content"])
+                                (
+                                    normalized_payload,
+                                    executed_sql,
+                                    actual_sql_verified,
+                                ) = self._normalize_query_payload(
+                                    payload,
+                                    requested_sql=requested_sql,
+                                )
                                 return ArcherySlowLogQueryResult(
-                                    payload=payload,
-                                    requested_sql=str(call.arguments["sql_content"]),
+                                    payload=normalized_payload,
+                                    requested_sql=requested_sql,
                                     window_start=window_start,
                                     window_end=window_end,
                                     model_tool_calls=tuple(
@@ -478,6 +491,14 @@ class ArcheryMCPClient:
                                         item.request_id
                                         for item in model_calls
                                         if item.request_id
+                                    ),
+                                    executed_sql=executed_sql,
+                                    actual_sql_verified=actual_sql_verified,
+                                    instance_id=self._coerce_positive_integer(
+                                        call.arguments.get("instance_id")
+                                    ),
+                                    query_time_column=self._query_time_column(
+                                        executed_sql or requested_sql
                                     ),
                                 )
 
@@ -960,6 +981,90 @@ class ArcheryMCPClient:
             return {"content": list(text_blocks)}
         raise ArcheryMCPProtocolError("Archery MCP tool returned no usable content")
 
+    @classmethod
+    def _normalize_query_payload(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        requested_sql: str,
+    ) -> tuple[dict[str, Any], str | None, bool]:
+        """Extract Archery's text-wrapped SQL result without constraining the Agent."""
+
+        normalized_payload = dict(payload)
+        echoed_sql: str | None = None
+        for text in cls._metadata_text(payload):
+            echoed_sql = echoed_sql or cls._executed_sql_from_text(text)
+            embedded_result = cls._embedded_result_object(text)
+            if embedded_result is not None:
+                normalized_payload = embedded_result
+                break
+
+        full_sql = normalized_payload.get("full_sql")
+        executed_sql = (
+            full_sql.strip()
+            if isinstance(full_sql, str) and full_sql.strip()
+            else echoed_sql
+        )
+        actual_sql_verified = bool(
+            executed_sql
+            and cls._canonical_sql(executed_sql)
+            == cls._canonical_sql(requested_sql)
+        )
+        return normalized_payload, executed_sql, actual_sql_verified
+
+    @staticmethod
+    def _embedded_result_object(text: str) -> dict[str, Any] | None:
+        markers = list(re.finditer(r"结果\s*[：:]", text))
+        decoder = json.JSONDecoder()
+        for marker in reversed(markers):
+            object_start = text.find("{", marker.end())
+            if object_start < 0:
+                continue
+            try:
+                decoded, _end = decoder.raw_decode(text[object_start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+        return None
+
+    @staticmethod
+    def _executed_sql_from_text(text: str) -> str | None:
+        match = re.search(
+            r"(?is)执行的SQL\s*[：:]\s*(?P<sql>.*?)"
+            r"(?:\r?\n\s*\r?\n|\r?\n\s*返回\s*\d+\s*行|"
+            r"\r?\n\s*结果\s*[：:]|$)",
+            text,
+        )
+        if match is None:
+            return None
+        sql = match.group("sql").strip()
+        return sql or None
+
+    @staticmethod
+    def _canonical_sql(sql: str) -> str:
+        candidate = sql.strip()
+        while candidate.endswith(";"):
+            candidate = candidate[:-1].rstrip()
+        return re.sub(r"\s+", " ", candidate).casefold()
+
+    @staticmethod
+    def _query_time_column(sql: str) -> str | None:
+        where = re.search(
+            r"(?is)\bwhere\b(?P<body>.*?)(?:\border\s+by\b|\blimit\b|$)",
+            sql,
+        )
+        if where is None:
+            return None
+        comparison = re.search(
+            r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?(?P<column>[A-Za-z_][A-Za-z0-9_$]*)`?\s*"
+            r"(?:>=|<=|>|<|=|\bbetween\b)",
+            where.group("body"),
+            re.IGNORECASE,
+        )
+        return comparison.group("column") if comparison is not None else None
+
     @staticmethod
     def _validate_business_success(
         payload: Mapping[str, Any],
@@ -1143,15 +1248,37 @@ class ArcherySlowLogEvidenceTool:
 
         result = await self.client.execute_slow_log_query(context.alert.occurred_at)
         row_count = self._row_count(result.payload)
-        row_summary = f"，返回 {row_count} 行" if row_count is not None else ""
+        row_summary = (
+            f"返回 {row_count} 行"
+            if row_count is not None
+            else "返回行数未能从 MCP 响应中解析"
+        )
+        instance_summary = (
+            f"实例 ID {result.instance_id}"
+            if result.instance_id is not None
+            else f"实例 {self.client.instance_ref}"
+        )
+        sql_summary = (
+            "实际执行 SQL 已由 Archery 回显并与模型提交一致"
+            if result.actual_sql_verified
+            else "Archery 未返回可与模型提交内容核对的实际执行 SQL"
+        )
+        truncation_possible = row_count is None or row_count > 0
+        limitations: list[str] = []
+        if not result.actual_sql_verified:
+            limitations.append("实际执行 SQL 未核对")
+        limitations.append("结果尚未按告警指向的受影响数据库实例关联")
+        if truncation_possible:
+            limitations.append("结果受字符上限约束并可能截断")
         return (
-            f"模型已通过项目 MCP Host 完成 Archery 登录确认和慢查询记录只读查询{row_summary}；"
-            "查询请求已按告警时间窗生成，但未校验 Archery 实际执行 SQL，"
-            "且结果尚未按受影响数据库实例关联并可能被截断，只能作为排查线索，"
+            f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "
+            f"{self.client.db_name}，{row_summary}；{sql_summary}。"
+            "该结果尚未与告警指向的受影响数据库实例建立关联，"
             "不能单独证明本次告警根因。",
             {
                 "sql": result.requested_sql,
-                "actual_sql_verified": False,
+                "executed_sql": result.executed_sql,
+                "actual_sql_verified": result.actual_sql_verified,
                 "login_confirmed": True,
                 "login_tool": self.client.login_tool_name,
                 "mcp_tool": self.client.query_tool_name,
@@ -1161,6 +1288,7 @@ class ArcherySlowLogEvidenceTool:
                 "model_request_ids": list(result.model_request_ids),
                 "target": {
                     "instance_ref": self.client.instance_ref,
+                    "instance_id": result.instance_id,
                     "db_name": self.client.db_name,
                 },
                 "query_window": {
@@ -1169,28 +1297,25 @@ class ArcherySlowLogEvidenceTool:
                     "start": result.window_start.isoformat(),
                     "end": result.window_end.isoformat(),
                     "duration_seconds": self.client.window_seconds,
-                    "time_column": self.client.slow_log_time_column,
+                    "time_column": result.query_time_column,
                 },
                 "scope": "requested_alert_time_window_global_slow_log_snapshot",
                 "result_bounds": {
                     "row_limit": ARCHERY_SLOW_LOG_LIMIT,
                     "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                    "truncation_possible": True,
+                    "truncation_possible": truncation_possible,
                 },
                 "root_cause_eligible": False,
-                "root_cause_ineligible_reason": (
-                    "实际执行 SQL 未校验，结果尚未按受影响数据库实例关联，"
-                    "且可能被字符上限截断"
-                ),
+                "root_cause_ineligible_reason": "；".join(limitations),
                 "result": result.payload,
             },
         )
 
     @staticmethod
     def _row_count(result: Mapping[str, Any]) -> int | None:
-        for key in ("rowCount", "row_count", "total"):
+        for key in ("rowCount", "row_count", "total", "affected_rows"):
             value = result.get(key)
-            if isinstance(value, int) and value >= 0:
+            if type(value) is int and value >= 0:
                 return value
         rows = result.get("rows")
         if isinstance(rows, list):

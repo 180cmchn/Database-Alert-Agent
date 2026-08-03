@@ -984,6 +984,66 @@ async def test_archery_mcp_preserves_native_success_payload_without_status_flag(
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_normalizes_text_wrapped_success_result() -> None:
+    tool_calls: list[str] = []
+    query_sql = (
+        "SELECT f_id, f_instances_id, f_time_point FROM t_slowlog_info "
+        "WHERE f_time_point >= '2026-08-03 02:06:57' "
+        "AND f_time_point <= '2026-08-03 02:11:57' "
+        "ORDER BY f_time_point DESC LIMIT 20"
+    )
+    full_sql = query_sql.replace("LIMIT 20", "limit 20") + ";"
+    query_payload = {
+        "full_sql": full_sql,
+        "is_execute": False,
+        "warning": None,
+        "error": None,
+        "rows": [],
+        "column_list": ["f_id", "f_instances_id", "f_time_point"],
+        "status": None,
+        "affected_rows": 0,
+    }
+    wrapped_result = (
+        "SQL 查询已执行。\n"
+        f"执行的SQL：{query_sql}\n\n"
+        "返回 0 行。\n"
+        "结果：\n"
+        f"{json.dumps(query_payload, ensure_ascii=False, indent=2)}"
+    )
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(query_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={
+                "content": [{"type": "text", "text": "Token 认证已就绪。"}],
+                "isError": False,
+            },
+            query_result={
+                "structuredContent": {"result": wrapped_result},
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+        ),
+        model=model,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.payload == query_payload
+    assert result.requested_sql == query_sql
+    assert result.executed_sql == full_sql
+    assert result.actual_sql_verified is True
+    assert result.instance_id == TEST_INSTANCE_ID
+    assert result.query_time_column == "f_time_point"
+    assert tool_calls == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_merges_text_result_with_structured_status() -> None:
     client = _client(
         _archery_call_handler(
@@ -1039,10 +1099,14 @@ class RecordingArcheryClient:
         self.calls += 1
         self.occurred_at = occurred_at
         return ArcherySlowLogQueryResult(
-            payload={"status": "ok", "rows": [{"id": 1}], "rowCount": 1},
+            payload={"status": "ok", "rows": [], "affected_rows": 0},
             requested_sql=TEST_SLOW_LOG_QUERY,
             window_start=TEST_WINDOW_START,
             window_end=TEST_WINDOW_END,
+            executed_sql=TEST_SLOW_LOG_QUERY,
+            actual_sql_verified=True,
+            instance_id=TEST_INSTANCE_ID,
+            query_time_column=TEST_TIME_COLUMN,
         )
 
 
@@ -1082,15 +1146,20 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
 
     assert client.calls == 1
     assert client.occurred_at == TEST_ALERT_OCCURRED_AT
-    assert "返回 1 行" in summary
+    assert "返回 0 行" in summary
+    assert f"实例 ID {TEST_INSTANCE_ID}" in summary
+    assert "实际执行 SQL 已由 Archery 回显并与模型提交一致" in summary
+    assert "可能被截断" not in summary
     assert data["sql"] == TEST_SLOW_LOG_QUERY
+    assert data["executed_sql"] == TEST_SLOW_LOG_QUERY
     assert data["login_confirmed"] is True
     assert data["login_tool"] == ARCHERY_MCP_LOGIN_TOOL_NAME
     assert data["mcp_invocation"] == "model_tool_calling"
     assert data["prompt_version"] == ARCHERY_SLOW_LOG_PROMPT_VERSION
-    assert data["actual_sql_verified"] is False
+    assert data["actual_sql_verified"] is True
     assert data["target"] == {
         "instance_ref": TEST_INSTANCE_REF,
+        "instance_id": TEST_INSTANCE_ID,
         "db_name": TEST_DB_NAME,
     }
     assert data["query_window"] == {
@@ -1102,9 +1171,11 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
         "time_column": TEST_TIME_COLUMN,
     }
     assert data["scope"] == "requested_alert_time_window_global_slow_log_snapshot"
-    assert data["result_bounds"]["truncation_possible"] is True
+    assert data["result_bounds"]["truncation_possible"] is False
     assert data["root_cause_eligible"] is False
-    assert data["result"]["rows"] == [{"id": 1}]
+    assert "实际执行 SQL 未核对" not in data["root_cause_ineligible_reason"]
+    assert "可能截断" not in data["root_cause_ineligible_reason"]
+    assert data["result"]["rows"] == []
 
     with pytest.raises(ArcheryMCPReadOnlyViolation):
         await tool.execute(
@@ -1249,9 +1320,11 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     assert evidence.status.value == "SUCCESS"
     assert evidence.source_system == "archery_mcp"
     assert evidence.request == {}
-    assert evidence.structured_data["result"]["rowCount"] == 1
+    assert evidence.structured_data["result"]["affected_rows"] == 0
     assert evidence.structured_data["login_confirmed"] is True
     assert evidence.structured_data["sql"] == TEST_SLOW_LOG_QUERY
+    assert evidence.structured_data["actual_sql_verified"] is True
+    assert evidence.structured_data["target"]["instance_id"] == TEST_INSTANCE_ID
     assert evidence.structured_data["query_window"]["basis"] == "alert.occurred_at"
     assert evidence.structured_data["root_cause_eligible"] is False
     assert result.recommendation is not None
