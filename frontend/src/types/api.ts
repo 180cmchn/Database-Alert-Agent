@@ -414,6 +414,7 @@ export interface AdminSettings {
   flashduty_poll_lookback_seconds: number;
   flashduty_poll_channel_ids: number[];
   flashduty_poll_integration_ids: number[];
+  archery_mcp_max_agent_steps: number;
   external_knowledge_enabled: boolean;
   external_knowledge_base_url: string;
   external_knowledge_api_key_configured: boolean;
@@ -447,6 +448,7 @@ export interface AdminSettingsPatch {
   flashduty_polling_enabled?: boolean;
   flashduty_poll_interval_seconds?: number;
   flashduty_poll_lookback_seconds?: number;
+  archery_mcp_max_agent_steps?: number;
   external_knowledge_api_key?: string;
 }
 

@@ -99,6 +99,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "ai_api_key": secret,
                 "ai_model": "example-model-v2",
                 "runbook_limit": 7,
+                "archery_mcp_max_agent_steps": 18,
                 "validation_enabled": False,
             },
         )
@@ -107,6 +108,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert body["ai_api_key_configured"] is True
         assert body["ai_model"] == "example-model-v2"
         assert body["runbook_limit"] == 7
+        assert body["archery_mcp_max_agent_steps"] == 18
         assert body["apply_status"] == "applied"
         assert body["worker_refresh_mode"] == "before_each_job"
         assert secret not in response.text
@@ -155,6 +157,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert isinstance(runtime.service.advisor, OpenAICompatibleAdvisor)
         assert runtime.service.advisor._model == "example-model-v2"
         assert runtime.service.runbook_limit == 7
+        assert runtime.settings.archery_mcp_max_agent_steps == 18
         assert runtime.service.validation_enabled is False
 
         rejected = client.patch(
@@ -189,6 +192,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert settings_path.is_file()
     persisted = json.loads(settings_path.read_text(encoding="utf-8"))
     assert persisted["ai_api_key"] == secret
+    assert persisted["archery_mcp_max_agent_steps"] == 18
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert secret not in audit
     assert "ai_api_key" in audit

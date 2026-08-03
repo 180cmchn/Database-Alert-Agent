@@ -324,8 +324,8 @@ ARCHERY_MCP_MAX_AGENT_STEPS=10
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ```
 
-URL、Token、窗口和 Agent 最大步骤数都是部署级配置，不能通过管理 API 修改；启用 Archery MCP
-时必须提供 URL
+URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；Agent 最大步骤数以环境变量为部署
+默认值，也可通过 Runtime Settings 动态调整。启用 Archery MCP 时必须提供 URL
 和 Token，`MCP_SETTINGS_PATH` 指向的文件也必须存在。实例和数据库目标从每条规范化告警中提取，
 再由模型调用 MCP 资源发现工具解析，不读取固定目标配置。当前认证方式是
 `X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的

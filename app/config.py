@@ -40,6 +40,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "flashduty_polling_enabled",
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
+        "archery_mcp_max_agent_steps",
         "external_knowledge_api_key",
         "external_knowledge_api_key_base_url",
     }

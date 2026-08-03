@@ -142,6 +142,7 @@ class RuntimeSettingsPatch(BaseModel):
     flashduty_polling_enabled: bool | None = None
     flashduty_poll_interval_seconds: int | None = Field(default=None, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int | None = Field(default=None, ge=300, le=2678400)
+    archery_mcp_max_agent_steps: int | None = Field(default=None, ge=1, le=100)
     external_knowledge_api_key: str | None = Field(default=None, max_length=8192, repr=False)
 
     def updates(self) -> dict[str, Any]:
@@ -178,6 +179,7 @@ class RuntimeSettingsResponse(BaseModel):
     flashduty_poll_lookback_seconds: int
     flashduty_poll_channel_ids: list[int]
     flashduty_poll_integration_ids: list[int]
+    archery_mcp_max_agent_steps: int
     external_knowledge_enabled: bool
     external_knowledge_base_url: str
     external_knowledge_api_key_configured: bool
@@ -227,6 +229,7 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_poll_lookback_seconds=settings.flashduty_poll_lookback_seconds,
             flashduty_poll_channel_ids=settings.flashduty_poll_channel_ids,
             flashduty_poll_integration_ids=settings.flashduty_poll_integration_ids,
+            archery_mcp_max_agent_steps=settings.archery_mcp_max_agent_steps,
             external_knowledge_enabled=settings.external_knowledge_enabled,
             external_knowledge_base_url=settings.external_knowledge_base_url,
             external_knowledge_api_key_configured=(

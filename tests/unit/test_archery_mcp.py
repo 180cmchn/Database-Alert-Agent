@@ -1328,6 +1328,14 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
 
     apply_runtime_settings(
         runtime,
+        settings.model_copy(update={"archery_mcp_max_agent_steps": 24}),
+    )
+    updated_tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
+    assert isinstance(updated_tool, ArcherySlowLogEvidenceTool)
+    assert updated_tool.client.max_agent_steps == 24
+
+    apply_runtime_settings(
+        runtime,
         settings.model_copy(
             update={
                 "ai_provider": "fake",

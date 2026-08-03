@@ -108,6 +108,7 @@ export function SettingsPage() {
         ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
         react_enabled: form.get("react_enabled") === "on",
         react_max_dynamic_turns: numberField(form, "react_max_dynamic_turns"),
+        archery_mcp_max_agent_steps: numberField(form, "archery_mcp_max_agent_steps"),
         validation_enabled: form.get("validation_enabled") === "on",
         shadow_enabled: form.get("shadow_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
@@ -227,6 +228,7 @@ export function SettingsPage() {
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" required defaultValue={settings.react_max_dynamic_turns} /></label>
+            <label className="field"><span>Archery MCP 最大调用步数</span><input name="archery_mcp_max_agent_steps" type="number" min="1" max="100" required defaultValue={settings.archery_mcp_max_agent_steps} /></label>
             <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>
           </div>
         </SectionCard>

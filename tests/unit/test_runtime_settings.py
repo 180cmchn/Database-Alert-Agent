@@ -54,6 +54,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
             {
                 "ai_model": "persisted-model",
                 "runbook_limit": 9,
+                "archery_mcp_max_agent_steps": 18,
                 "database_url": "sqlite+aiosqlite:///must-not-be-used.db",
             }
         ),
@@ -72,6 +73,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
 
     assert settings.ai_model == "persisted-model"
     assert settings.runbook_limit == 9
+    assert settings.archery_mcp_max_agent_steps == 18
     assert settings.database_url == "sqlite+aiosqlite:///bootstrap.db"
 
 
@@ -306,7 +308,7 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_db_name" not in RUNTIME_SETTINGS_KEYS
-    assert "archery_mcp_max_agent_steps" not in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_max_agent_steps" in RUNTIME_SETTINGS_KEYS
     assert "mcp_settings_path" not in RUNTIME_SETTINGS_KEYS
     assert configured.archery_slow_log_window_seconds == 300
     assert configured.archery_mcp_max_agent_steps == 10
@@ -364,9 +366,14 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         )
 
     payload = RuntimeSettingsPatch(
-        expected_revision="0123456789abcdef", runbook_limit=7
+        expected_revision="0123456789abcdef",
+        runbook_limit=7,
+        archery_mcp_max_agent_steps=18,
     )
-    assert payload.updates() == {"runbook_limit": 7}
+    assert payload.updates() == {
+        "runbook_limit": 7,
+        "archery_mcp_max_agent_steps": 18,
+    }
 
 
 @pytest.mark.asyncio
@@ -493,6 +500,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["ai_fallback_enabled"] is True
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
+    assert body["archery_mcp_max_agent_steps"] == 10
     assert "ai_api_key" not in body
     assert "wecom_webhook_url" not in body
 
