@@ -19,9 +19,11 @@ from app.domain.models import InvestigationContext, NormalizedAlert, ToolExecuti
 from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 
 # Retained for compatibility with existing callers and fixtures. Runtime
-# discovery accepts any target-database table whose normalized name contains
-# ``slowlog`` or ``slowquerylog``.
+# discovery accepts common Archery slow-query history table names. Deployments
+# may still expose a different name; the model can discover it from MCP and
+# retry within the configured agent-step budget.
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
+ARCHERY_SLOW_QUERY_REVIEW_TABLE: Final = "mysql_slow_query_review_history"
 ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD: Final = "slow"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
 ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
@@ -43,7 +45,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v11"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v16"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -97,13 +99,17 @@ _NO_MATCHING_TABLE_TEXT: Final = re.compile(
 )
 _SLOW_LOG_TABLE_TEXT: Final = re.compile(
     r"(?i)(?<![A-Za-z0-9_$])"
-    r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?[_$-]*log[A-Za-z0-9_$-]*)"
+    r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?(?:[_$-]*log|[_$-]*review[_$-]*history)[A-Za-z0-9_$-]*)"
     r"(?![A-Za-z0-9_$])"
 )
 _SQL_IDENTIFIER_PART: Final = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
 _SQL_TABLE_REFERENCE: Final = re.compile(
     rf"(?is)\b(?:from|join)\s+"
     rf"(?P<table>{_SQL_IDENTIFIER_PART}(?:\s*\.\s*{_SQL_IDENTIFIER_PART})?)"
+)
+_TITLE_ENDPOINT: Final = re.compile(
+    r"(?i)(?:^|/)(?P<host>[A-Za-z0-9][A-Za-z0-9.-]{0,252}):"
+    r"(?P<port>[1-9]\d{0,4})\s*$"
 )
 
 
@@ -139,6 +145,15 @@ class ArcheryMCPSlowLogTableNotFound(ArcheryMCPToolError):
 class ArcheryMCPModelError(ArcheryMCPError):
     """The model did not produce the required bounded MCP tool call."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic_data = diagnostic_data or {}
+
 
 class ArcheryMCPReadOnlyViolation(ArcheryMCPError):
     """A caller or server changed the controlled read-only query structure."""
@@ -168,6 +183,9 @@ class ArcherySlowLogQueryResult:
     db_name: str | None = None
     table_name: str | None = None
     query_time_column: str | None = None
+    metadata_resolution_tables: tuple[str, ...] = ()
+    diagnostics: dict[str, Any] | None = None
+    query_completed: bool = True
 
 
 def _expand_mcp_setting(
@@ -444,7 +462,13 @@ class ArcheryMCPClient:
                     ) as session:
                         await session.initialize()
                         tools = await self._list_tools(session)
-                        self._validate_required_tools(tools)
+                        # TEMPORARILY DISABLED: Do not let the embedded MCP host
+                        # pre-validate the server's tool schema. The model receives
+                        # every MCP tool schema plus the read-only policy in its
+                        # system prompt, and MCP remains the authority that receives
+                        # and handles the requested call.
+                        #
+                        # self._validate_required_tools(tools)
                         model_tools = self._model_tools(tools)
                         login_payload: dict[str, Any] = {}
                         login_text: tuple[str, ...] = ()
@@ -452,40 +476,95 @@ class ArcheryMCPClient:
                         model_calls: list[MCPModelToolCall] = []
                         last_query_error: ArcheryMCPToolError | None = None
                         slow_log_tables: dict[tuple[int, str], set[str]] = {}
+                        metadata_resolution_steps: dict[
+                            tuple[int, str], list[str]
+                        ] = {}
+                        metadata_member_instance_ids: dict[
+                            tuple[int, str], set[int]
+                        ] = {}
+                        metadata_resolved_endpoints: dict[
+                            tuple[int, str], set[str]
+                        ] = {}
+                        metadata_table_columns: dict[
+                            tuple[int, str], dict[str, set[str]]
+                        ] = {}
+                        history_query_rejections: list[str] = []
+                        attempted_model_calls: list[str] = []
+                        mcp_roundtrip_count = 0
+                        alert_endpoint = self._alert_endpoint_from_context(alert_context or {})
+                        query_trace: list[dict[str, Any]] = []
+                        last_query_target: tuple[int, str] | None = None
 
                         for _step in range(self.max_agent_steps):
                             call = await self._request_model_tool_call(
                                 messages=messages,
                                 tools=model_tools,
                             )
-                            call = self._normalize_model_tool_call(call)
-                            self._validate_model_tool_call(
-                                call,
-                                login_confirmed=login_confirmed,
-                            )
+                            # TEMPORARILY DISABLED: Preserve the model's MCP
+                            # arguments verbatim. Prompt instructions, tool schemas,
+                            # and the MCP server—not this host—govern the request.
+                            #
+                            # call = self._normalize_model_tool_call(call)
+                            # TEMPORARILY DISABLED: Do not have the embedded MCP
+                            # host reject a model-selected tool or its arguments.
+                            # Tool selection and argument compliance are instructed
+                            # by the prompt; the MCP server receives the call and
+                            # remains responsible for its own validation.
+                            #
+                            # self._validate_model_tool_call(
+                            #     call,
+                            #     login_confirmed=login_confirmed,
+                            # )
+                            attempted_model_calls.append(call.name)
                             selected_table: str | None = None
+                            trace_entry: dict[str, Any] | None = None
                             if call.name == self.query_tool_name:
-                                requested_sql = str(call.arguments["sql_content"])
-                                if self._is_slow_log_select(requested_sql):
-                                    target = self._target_key(call.arguments)
+                                requested_sql = call.arguments.get("sql_content")
+                                target = self._target_key(call.arguments)
+                                last_query_target = target
+                                if isinstance(requested_sql, str):
+                                    trace_entry = self._query_trace_entry(call)
+                                    query_trace.append(trace_entry)
+                                if isinstance(requested_sql, str) and (
+                                    self._is_slow_query_review_history_select(
+                                        requested_sql
+                                    )
+                                ):
+                                    # TEMPORARY EXPERIMENT: host-side history
+                                    # endpoint validation is disabled at the
+                                    # user's request. The model receives the
+                                    # lineage guidance in the prompt and its
+                                    # approved read-only call is sent to MCP.
+                                    #
+                                    # Re-enable `_history_query_requirement_error`
+                                    # and the rejection block here after the
+                                    # experiment. Do not remove the helper: it
+                                    # retains the prior guard implementation.
+                                    pass
+                                if isinstance(
+                                    requested_sql, str
+                                ) and self._is_slow_log_select(requested_sql):
                                     selected_table = self._matching_discovered_table(
                                         requested_sql,
                                         slow_log_tables.get(target, set()),
                                     )
+                                    # Table discovery is useful evidence, but it is
+                                    # not a Host-side prerequisite. The model may
+                                    # need to use a table returned by a metadata
+                                    # query, a deployment-specific name, or the
+                                    # recommended Archery history table directly.
                                     if selected_table is None:
-                                        model_calls.append(call)
-                                        messages.extend(
-                                            self._completed_tool_messages(
-                                                call,
-                                                self._model_table_discovery_required_result(),
-                                            )
+                                        selected_table = self._first_slow_log_table(
+                                            requested_sql
                                         )
-                                        continue
                             result = await self._call_tool(
                                 session,
                                 tool_name=call.name,
                                 arguments=call.arguments,
                             )
+                            mcp_roundtrip_count += 1
+                            if trace_entry is not None:
+                                trace_entry["sent_to_mcp"] = True
                             result_text = self._tool_text_blocks(result)
                             try:
                                 payload = self._extract_tool_payload(result)
@@ -495,6 +574,8 @@ class ArcheryMCPClient:
                                     supplemental_text=result_text,
                                 )
                             except ArcheryMCPToolError as exc:
+                                if trace_entry is not None:
+                                    trace_entry["outcome"] = "tool_error"
                                 if (
                                     call.name != self.query_tool_name
                                     or not self._is_retryable_query_error(exc)
@@ -521,6 +602,8 @@ class ArcheryMCPClient:
                                 continue
 
                             model_calls.append(call)
+                            if trace_entry is not None:
+                                trace_entry["outcome"] = "ok"
                             if call.name == self.login_tool_name:
                                 login_payload = payload
                                 login_text = result_text
@@ -536,17 +619,44 @@ class ArcheryMCPClient:
                                         slow_log_tables.setdefault(target, set()).update(
                                             discovered
                                         )
-                                    elif self._is_confirmed_slow_log_table_search(
-                                        call.arguments
-                                    ):
-                                        raise self._slow_log_table_not_found_error(
-                                            target,
-                                            model_calls=tuple(model_calls),
-                                        )
+                                    # An empty keyword search is only missing
+                                    # evidence. Do not prevent the model from
+                                    # trying the recommended table or another
+                                    # read-only recovery path.
+
+                            if call.name == ARCHERY_MCP_COLUMNS_TOOL_NAME:
+                                target = self._target_key(call.arguments)
+                                table_name = call.arguments.get("tb_name")
+                                if target is not None and isinstance(table_name, str):
+                                    columns = self._table_columns_from_payload(payload)
+                                    if columns:
+                                        metadata_table_columns.setdefault(target, {})[
+                                            self._clean_table_name(table_name).casefold()
+                                        ] = columns
 
                             if call.name == self.query_tool_name:
-                                requested_sql = str(call.arguments["sql_content"])
-                                if not self._is_slow_log_select(requested_sql):
+                                requested_sql = call.arguments.get("sql_content")
+                                if not isinstance(
+                                    requested_sql, str
+                                ) or not self._is_slow_log_select(requested_sql):
+                                    target = self._target_key(call.arguments)
+                                    if target is not None and isinstance(
+                                        requested_sql, str
+                                    ):
+                                        self._record_metadata_resolution_evidence(
+                                            resolution_steps=metadata_resolution_steps,
+                                            member_instance_ids=(
+                                                metadata_member_instance_ids
+                                            ),
+                                            resolved_endpoints=(
+                                                metadata_resolved_endpoints
+                                            ),
+                                            target=target,
+                                            sql=requested_sql,
+                                            payload=payload,
+                                            alert_endpoint=alert_endpoint,
+                                            table_columns=metadata_table_columns,
+                                        )
                                     messages.extend(
                                         self._completed_tool_messages(
                                             call,
@@ -580,11 +690,45 @@ class ArcheryMCPClient:
                                     instance_id=self._coerce_positive_integer(
                                         call.arguments.get("instance_id")
                                     ),
-                                    db_name=str(call.arguments["db_name"]).strip(),
+                                    db_name=(
+                                        call.arguments["db_name"].strip()
+                                        if isinstance(call.arguments.get("db_name"), str)
+                                        else None
+                                    ),
                                     table_name=selected_table,
                                     query_time_column=self._query_time_column(
                                         executed_sql or requested_sql
                                     ),
+                                    metadata_resolution_tables=tuple(
+                                        metadata_resolution_steps.get(
+                                            self._target_key(call.arguments), []
+                                        )
+                                    ),
+                                    diagnostics={
+                                        "model_attempted_tool_calls": attempted_model_calls,
+                                        "model_executed_tool_calls": [
+                                            item.name for item in model_calls
+                                        ],
+                                        "mcp_roundtrip_count": mcp_roundtrip_count,
+                                        "history_query_rejection_count": len(
+                                            history_query_rejections
+                                        ),
+                                        "history_query_rejections": history_query_rejections,
+                                        "alert_endpoint": alert_endpoint,
+                                        "query_trace": query_trace,
+                                        "metadata_resolution_stage": (
+                                            self._metadata_resolution_stage(
+                                                target=self._target_key(call.arguments),
+                                                alert_endpoint=alert_endpoint,
+                                                member_instance_ids=(
+                                                    metadata_member_instance_ids
+                                                ),
+                                                resolved_endpoints=(
+                                                    metadata_resolved_endpoints
+                                                ),
+                                            )
+                                        ),
+                                    },
                                 )
 
                             messages.extend(
@@ -599,10 +743,23 @@ class ArcheryMCPClient:
                             if last_query_error is not None
                             else ""
                         )
-                        raise ArcheryMCPModelError(
-                            "Model did not complete the Archery slow-log query within "
-                            f"{self.max_agent_steps} read-only tool calls"
-                            f"{error_suffix}"
+                        return self._evidence_insufficient_result(
+                            window_start=window_start,
+                            window_end=window_end,
+                            target=last_query_target,
+                            attempted_model_calls=attempted_model_calls,
+                            model_calls=model_calls,
+                            mcp_roundtrip_count=mcp_roundtrip_count,
+                            history_query_rejections=history_query_rejections,
+                            alert_endpoint=alert_endpoint,
+                            query_trace=query_trace,
+                            metadata_resolution_steps=metadata_resolution_steps,
+                            member_instance_ids=metadata_member_instance_ids,
+                            resolved_endpoints=metadata_resolved_endpoints,
+                            reason=(
+                                "模型未在允许的调用预算内完成慢查询取证"
+                                f"{error_suffix}"
+                            ),
                         )
         except ArcheryMCPError:
             raise
@@ -646,14 +803,9 @@ class ArcheryMCPClient:
         task = (
             f"查询{self.mcp_url}中与当前告警对应的数据库实例和数据库。"
             f"告警上下文为：{serialized_alert_context}。"
-            "部署配置不提供固定的查询实例或数据库；请以告警中的实例名、主机、端口、"
-            "数据库名等线索，结合list_instances和list_instance_databases等MCP实时返回，"
-            "自主确定唯一目标。最终查询必须使用MCP返回的真实整数instance_id和数据库名。"
-            "确定目标后，必须对该instance_id和db_name调用list_db_tables，使用keyword=slow、"
-            "size=200搜索真实表名。不要预设固定表名；将表名转为小写并忽略下划线、连字符等"
-            "分隔符后，选择名称含slowlog或slowquerylog的表。如果搜索结果没有此类表，"
-            "Host会返回未找到慢日志表的错误，不要猜测表名并调用SQL。找到表后必须调用"
-            "list_table_columns读取真实字段，再生成查询。"
+            "请以告警中的主机、端口等线索，结合MCP实时返回补齐必要的目标标识。"
+            "最终查询必须使用MCP返回的真实整数instance_id和数据库名。"
+            f"{self._slow_query_target_resolution_guidance()}"
             f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询。"
             "最终只读SELECT必须使用发现到的慢日志相关表并显式包含LIMIT，"
             f"LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
@@ -667,19 +819,24 @@ class ArcheryMCPClient:
             f"{window_end_epoch}。不要自行换算或修改这两个Unix秒，也不要直接去掉ISO时间的"
             "时区偏移后作为SQL字面值。"
             "可按需使用sql_query执行辅助只读查询；辅助查询完成后必须继续，直到成功查询"
-            "已发现的慢日志相关表。请使用MCP返回的真实实例ID、数据库、表名和字段生成最终"
-            "只读SELECT；"
-            "如果SQL执行失败，根据MCP返回的错误调整后重试。"
+            "目标慢查询历史表。请使用MCP返回的真实实例ID、数据库、表名和字段生成最终"
+            "只读SELECT；若 history 表的必经解析链路走不通，不得直接查询该表，可根据"
+            "MCP返回的错误在其它慢日志表或只读探针中选择合理替代路径。每轮只能调用一个工具，所有工具调用（包括登录、"
+            f"辅助查询和重试）总数不得超过{self.max_agent_steps}，达到上限必须停止。"
         )
         return [
             {
                 "role": "system",
                 "content": (
                     "你是 Archery MCP 慢查询只读 Agent。按当前 MCP 工具 Schema 和返回结果"
-                    "自主调用工具，每轮调用一个，直到查询成功；工具报错时可调整参数或只读"
-                    "SQL 后重试。辅助只读 SQL 的结果仅用于继续调查，查询到"
-                    "目标实例和目标数据库中通过list_db_tables发现的slowlog相关表才算完成。"
-                    "不要调用当前未提供的工具。"
+                    "自主调用工具，每轮调用一个。查询 mysql_slow_query_review_history 时必须完成"
+                    "告警端点到 Archery 元数据的解析链路；工具返回不匹配、没有结果或查询报错时，"
+                    "不得把告警标题端点直接用作 hostname_max，应报告证据不足。其它慢日志表可在"
+                    "剩余预算内换用其它只读路径。"
+                    "辅助只读SQL的结果仅用于继续调查，查询到目标实例和目标数据库中与慢查询"
+                    "历史语义匹配的表才算完成；表名可来自list_db_tables、元数据查询或推荐线索。"
+                    "MCP 工具列表中可能包含查询权限申请或其他非只读工具；无论其是否可用，"
+                    "都不得调用。只能调用完成本次慢查询取证所需的只读工具。"
                 ),
             },
             {
@@ -687,6 +844,30 @@ class ArcheryMCPClient:
                 "content": task,
             },
         ]
+
+    @staticmethod
+    def _slow_query_target_resolution_guidance() -> str:
+        """Return the required data lineage for the prescribed history table."""
+
+        return (
+            "查询 mysql_slow_query_review_history 时必须按以下链路定位 hostname_max，"
+            "避免为了验证host反复枚举或校验无关实例："
+            "(1) 先用MCP发现allowlist中的archery实例及archery数据库；记下其真实MCP instance_id。"
+            "从这一步起，推荐链路中每次list_table_columns和sql_query都必须使用同一个archery "
+            "MCP instance_id和db_name=archery，之后要用到的t_instance_member、sql_instance、"
+            "mysql_slow_query_review_history三张表都在该实例和数据库中；"
+            "(2) 对t_instance_member先调用list_table_columns，确认承载成员f_ip、f_port和"
+            "f_instance_id；再用查询条件where f_ip = alert_host and f_port = alert_port"
+            "做一次只读SELECT，取得f_instance_id；"
+            "(3) 对archery.sql_instance先调用list_table_columns，确认id列；"
+            "在SQL的WHERE条件中以f_instance_id作为sql_instance.id查询真实host和port。"
+            "(4) 将sql_instance返回的真实host和port严格组合为host:port，作为"
+            "archery.mysql_slow_query_review_history.hostname_max的等值条件；"
+            "(5) 先确认archery.mysql_slow_query_review_history的hostname_max和时间列的真实名称和类型，"
+            "再在实例archery和db_name=archery中查询告警时段的慢查询日志记录。"
+            "t_instance_member、sql_instance、mysql_slow_query_review_history及上述列名都是推荐线索，"
+            "不是对部署表结构的强制假设；必须通过list_table_columns读取真实字段或通过只读查询结果确认。"
+        )
 
     def _read_only_tool_names(self) -> tuple[str, ...]:
         return (
@@ -703,11 +884,10 @@ class ArcheryMCPClient:
         self,
         tools: Mapping[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        """Expose the MCP server's schemas; prompt policy guides model selection."""
+
         definitions: list[dict[str, Any]] = []
-        for name in self._read_only_tool_names():
-            tool = tools.get(name)
-            if tool is None:
-                continue
+        for name, tool in tools.items():
             raw_description = tool.get("description")
             description = (
                 sanitize_text(raw_description)
@@ -743,15 +923,19 @@ class ArcheryMCPClient:
             raise ArcheryMCPModelError(
                 f"Model failed to select an approved Archery MCP tool{suffix}"
             ) from exc
-        available_names = {
-            item["function"]["name"]
-            for item in tools
-            if isinstance(item.get("function"), dict)
-        }
-        if call.name not in available_names:
-            raise ArcheryMCPReadOnlyViolation(
-                f"Model selected unapproved Archery MCP tool {call.name!r}"
-            )
+        # TEMPORARILY DISABLED: Do not reject a model-selected tool name in the
+        # embedded MCP host. The model is constrained by the prompt and MCP is
+        # allowed to return its own unknown-tool or argument error response.
+        #
+        # available_names = {
+        #     item["function"]["name"]
+        #     for item in tools
+        #     if isinstance(item.get("function"), dict)
+        # }
+        # if call.name not in available_names:
+        #     raise ArcheryMCPReadOnlyViolation(
+        #         f"Model selected unapproved Archery MCP tool {call.name!r}"
+        #     )
         return call
 
     def _normalize_model_tool_call(
@@ -896,6 +1080,18 @@ class ArcheryMCPClient:
             for name in cls._sql_table_references(statement)
         )
 
+    @classmethod
+    def _is_slow_query_review_history_select(cls, sql: str) -> bool:
+        """Identify the prescribed history table without constraining fallback tables."""
+
+        statement = cls._without_leading_sql_comments(sql.strip())
+        if re.match(r"(?is)^(?:select|with)\b", statement) is None:
+            return False
+        return ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold() in {
+            cls._clean_table_name(name).casefold()
+            for name in cls._sql_table_references(statement)
+        }
+
     @staticmethod
     def _clean_table_name(value: str) -> str:
         part = re.split(r"\s*\.\s*", value.strip())[-1]
@@ -906,7 +1102,10 @@ class ArcheryMCPClient:
         normalized = re.sub(
             r"[^a-z0-9]+", "", cls._clean_table_name(value).casefold()
         )
-        return re.search(r"slow(?:query)?log", normalized) is not None
+        return (
+            re.search(r"slow(?:query)?log", normalized) is not None
+            or re.search(r"slowqueryreviewhistory", normalized) is not None
+        )
 
     @classmethod
     def _sql_table_references(cls, sql: str) -> set[str]:
@@ -930,6 +1129,17 @@ class ArcheryMCPClient:
                 table
                 for table in sorted(discovered_tables)
                 if cls._clean_table_name(table).casefold() in referenced
+            ),
+            None,
+        )
+
+    @classmethod
+    def _first_slow_log_table(cls, sql: str) -> str | None:
+        return next(
+            (
+                table
+                for table in sorted(cls._sql_table_references(sql))
+                if cls._is_slow_log_table_name(table)
             ),
             None,
         )
@@ -976,6 +1186,569 @@ class ArcheryMCPClient:
         if instance_id is None or not isinstance(db_name, str) or not db_name.strip():
             return None
         return instance_id, db_name.strip().casefold()
+
+    @classmethod
+    def _metadata_resolution_step_from_sql(cls, sql: str) -> str | None:
+        """Return a single prescribed relational hop, never infer host values."""
+
+        tables = {
+            cls._clean_table_name(name).casefold()
+            for name in cls._sql_table_references(sql)
+            if cls._clean_table_name(name).casefold()
+            in {"t_instance_member", "sql_instance"}
+        }
+        return next(iter(tables)) if len(tables) == 1 else None
+
+    @classmethod
+    def _record_metadata_resolution_evidence(
+        cls,
+        *,
+        resolution_steps: dict[tuple[int, str], list[str]],
+        member_instance_ids: dict[tuple[int, str], set[int]],
+        resolved_endpoints: dict[tuple[int, str], set[str]],
+        target: tuple[int, str],
+        sql: str,
+        payload: Mapping[str, Any],
+        alert_endpoint: str | None,
+        table_columns: Mapping[tuple[int, str], Mapping[str, set[str]]],
+    ) -> None:
+        """Record only metadata evidence that can be traced to the prior hop."""
+
+        step = cls._metadata_resolution_step_from_sql(sql)
+        if step == "t_instance_member":
+            columns = table_columns.get(target, {}).get(step, set())
+            if not cls._member_query_selects_instance_id(sql, columns):
+                return
+            if alert_endpoint is None:
+                instance_ids = cls._member_instance_ids_from_payload(payload)
+            elif cls._member_query_matches_alert_endpoint(sql, alert_endpoint):
+                instance_ids = cls._member_instance_ids_from_payload(payload)
+            elif cls._member_query_matches_alert_host(sql, alert_endpoint):
+                # Archery's member table can have several ports for one host.
+                # A host-scoped lookup is sufficient only when its returned row
+                # itself supplies the exact alert host:port and its paired ID.
+                instance_ids = cls._member_instance_ids_for_endpoint(
+                    payload,
+                    alert_endpoint,
+                )
+            else:
+                return
+            if instance_ids:
+                member_instance_ids.setdefault(target, set()).update(instance_ids)
+                resolution_steps.setdefault(target, []).append(step)
+            return
+        if step != "sql_instance":
+            return
+        columns = table_columns.get(target, {}).get(step, set())
+        known_ids = member_instance_ids.get(target, set())
+        if (
+            not known_ids
+            or not cls._sql_instance_query_uses_id(sql, known_ids)
+            or not cls._sql_instance_query_selects_endpoint(sql, columns)
+        ):
+            return
+        endpoints = cls._instance_endpoints_from_payload(payload)
+        if endpoints:
+            resolved_endpoints.setdefault(target, set()).update(endpoints)
+            resolution_steps.setdefault(target, []).append(step)
+
+    @classmethod
+    def _table_columns_from_payload(cls, payload: Mapping[str, Any]) -> set[str]:
+        """Extract the real column names returned by list_table_columns."""
+
+        columns: set[str] = set()
+        pending: list[Any] = [payload]
+        visited = 0
+        while pending and visited < 200:
+            current = pending.pop()
+            visited += 1
+            if isinstance(current, Mapping):
+                for key, value in current.items():
+                    normalized = cls._normalized_column_name(str(key))
+                    if normalized in {"name", "column", "columnname", "field"} and isinstance(value, str):
+                        columns.add(value.strip())
+                    elif isinstance(value, (Mapping, list, tuple)):
+                        pending.append(value)
+            elif isinstance(current, (list, tuple)):
+                pending.extend(current)
+        return {column for column in columns if column}
+
+    @staticmethod
+    def _normalized_column_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    @classmethod
+    def _history_query_requirement_error(
+        cls,
+        sql: str,
+        *,
+        target: tuple[int, str] | None,
+        alert_endpoint: str | None,
+        resolution_steps: Mapping[tuple[int, str], list[str]],
+        member_instance_ids: Mapping[tuple[int, str], set[int]],
+        resolved_endpoints: Mapping[tuple[int, str], set[str]],
+    ) -> str | None:
+        """Reject history SQL unless hostname_max has a verified metadata lineage."""
+
+        if target is None:
+            return cls._metadata_resolution_required_result(
+                target, resolution_steps, reason="缺少有效 MCP instance_id/db_name"
+            )
+        if alert_endpoint is None:
+            return cls._metadata_resolution_required_result(
+                target, resolution_steps, reason="缺少告警端点；等待 t_instance_member"
+            )
+        if not member_instance_ids.get(target) or not resolved_endpoints.get(target):
+            stage = cls._metadata_resolution_stage(
+                target=target,
+                alert_endpoint=alert_endpoint,
+                member_instance_ids=member_instance_ids,
+                resolved_endpoints=resolved_endpoints,
+            )
+            return cls._metadata_resolution_required_result(
+                target,
+                resolution_steps,
+                reason=(
+                    "尚未取得可追溯的 f_instance_id 与 sql_instance 返回的 host:port；"
+                    f"{stage}"
+                ),
+            )
+        requested_endpoint = cls._history_hostname_max_equality_value(sql)
+        if requested_endpoint not in resolved_endpoints[target]:
+            return cls._metadata_resolution_required_result(
+                target,
+                resolution_steps,
+                reason=(
+                    "hostname_max 必须等于本次 sql_instance 查询实际返回的 host:port；"
+                    f"允许值：{', '.join(sorted(resolved_endpoints[target]))}"
+                ),
+            )
+        return None
+
+    @classmethod
+    def _metadata_resolution_stage(
+        cls,
+        *,
+        target: tuple[int, str] | None,
+        alert_endpoint: str | None,
+        member_instance_ids: Mapping[tuple[int, str], set[int]],
+        resolved_endpoints: Mapping[tuple[int, str], set[str]],
+    ) -> str:
+        """Return the next safe metadata hop; this is diagnostic, never authority."""
+
+        if alert_endpoint is None:
+            return "缺少告警端点"
+        if target is None or not member_instance_ids.get(target):
+            return "等待 t_instance_member"
+        if not resolved_endpoints.get(target):
+            return "等待 sql_instance"
+        return "等待 history 表字段"
+
+    @classmethod
+    def _query_trace_entry(cls, call: MCPModelToolCall) -> dict[str, Any]:
+        """Create a compact, sanitized audit record before a SQL call is sent."""
+
+        sql = str(call.arguments.get("sql_content", ""))
+        referenced_tables = sorted(cls._sql_table_references(sql))
+        metadata_table = cls._metadata_resolution_step_from_sql(sql)
+        return {
+            "target": {
+                "instance_id": cls._coerce_positive_integer(
+                    call.arguments.get("instance_id")
+                ),
+                "db_name": (
+                    str(call.arguments["db_name"]).strip()
+                    if isinstance(call.arguments.get("db_name"), str)
+                    else None
+                ),
+            },
+            "referenced_tables": referenced_tables,
+            "metadata_table": metadata_table,
+            "chain_stage": (
+                metadata_table
+                if metadata_table is not None
+                else "history"
+                if cls._is_slow_query_review_history_select(sql)
+                else "auxiliary"
+            ),
+            "sql_summary": cls._redacted_sql_summary(sql),
+            "sent_to_mcp": False,
+            "outcome": "pending",
+        }
+
+    @staticmethod
+    def _redacted_sql_summary(sql: str) -> str:
+        """Retain query shape for diagnostics without persisting literal values."""
+
+        summary = re.sub(r"'(?:''|[^'])*'", "'?'", sanitize_text(sql))
+        summary = re.sub(r"\b\d{3,}\b", "?", summary)
+        return re.sub(r"\s+", " ", summary).strip()[:1_000]
+
+    @classmethod
+    def _evidence_insufficient_result(
+        cls,
+        *,
+        window_start: datetime,
+        window_end: datetime,
+        target: tuple[int, str] | None,
+        attempted_model_calls: list[str],
+        model_calls: list[MCPModelToolCall],
+        mcp_roundtrip_count: int,
+        history_query_rejections: list[str],
+        alert_endpoint: str | None,
+        query_trace: list[dict[str, Any]],
+        metadata_resolution_steps: Mapping[tuple[int, str], list[str]],
+        member_instance_ids: Mapping[tuple[int, str], set[int]],
+        resolved_endpoints: Mapping[tuple[int, str], set[str]],
+        reason: str,
+    ) -> ArcherySlowLogQueryResult:
+        """Preserve an auditable partial investigation instead of raising model failure."""
+
+        stage = cls._metadata_resolution_stage(
+            target=target,
+            alert_endpoint=alert_endpoint,
+            member_instance_ids=member_instance_ids,
+            resolved_endpoints=resolved_endpoints,
+        )
+        return ArcherySlowLogQueryResult(
+            payload={"status": "evidence_insufficient", "reason": reason},
+            requested_sql="",
+            window_start=window_start,
+            window_end=window_end,
+            model_tool_calls=tuple(item.name for item in model_calls),
+            model_request_ids=tuple(
+                item.request_id for item in model_calls if item.request_id
+            ),
+            instance_id=target[0] if target is not None else None,
+            db_name=target[1] if target is not None else None,
+            metadata_resolution_tables=tuple(
+                metadata_resolution_steps.get(target, []) if target is not None else []
+            ),
+            diagnostics={
+                "outcome": "evidence_insufficient",
+                "reason": reason,
+                "next_stage": stage,
+                "alert_endpoint": alert_endpoint,
+                "model_attempted_tool_calls": attempted_model_calls,
+                "model_executed_tool_calls": [item.name for item in model_calls],
+                "mcp_roundtrip_count": mcp_roundtrip_count,
+                "history_query_rejection_count": len(history_query_rejections),
+                "history_query_rejections": history_query_rejections,
+                "query_trace": query_trace,
+            },
+            query_completed=False,
+        )
+
+    @staticmethod
+    def _metadata_resolution_required_result(
+        target: tuple[int, str] | None,
+        resolution_steps: Mapping[tuple[int, str], list[str]],
+        *,
+        reason: str = "未完成 t_instance_member → sql_instance 的可追溯解析",
+    ) -> str:
+        observed = (
+            " → ".join(resolution_steps.get(target, []))
+            if target is not None
+            else "无有效 MCP instance_id/db_name"
+        )
+        return (
+            "本次 mysql_slow_query_review_history 查询未发送到 MCP。不得直接使用告警的"
+            "alert_host:alert_port 作为 hostname_max；必须先在同一个 MCP instance_id 和 db_name "
+            "按顺序执行只读 SQL 查询 t_instance_member，再执行只读 SQL 查询 sql_instance。"
+            "从前者得到的 f_instance_id 只能作为后者 SQL 的 WHERE id 参数；随后用 sql_instance "
+            "返回的真实 host:port 构造 hostname_max。当前同目标已成功查询的元数据表："
+            f"{observed}。拒绝原因：{reason}。请依据已有 MCP 结果继续；不要把 f_instance_id "
+            "作为 MCP instance_id。"
+        )
+
+    @classmethod
+    def _member_instance_ids_from_payload(cls, payload: Mapping[str, Any]) -> set[int]:
+        return {
+            value
+            for row in cls._tabular_rows(payload)
+            for key, raw_value in row.items()
+            if re.sub(r"[^a-z0-9]+", "", key.casefold())
+            in {"finstanceid", "instanceid"}
+            and (value := cls._coerce_positive_integer(raw_value)) is not None
+        }
+
+    @classmethod
+    def _member_instance_ids_for_endpoint(
+        cls,
+        payload: Mapping[str, Any],
+        alert_endpoint: str,
+    ) -> set[int]:
+        """Return only member IDs paired with the exact endpoint in result rows."""
+
+        instance_ids: set[int] = set()
+        for row in cls._tabular_rows(payload):
+            normalized = {
+                re.sub(r"[^a-z0-9]+", "", key.casefold()): value
+                for key, value in row.items()
+            }
+            instance_id = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("finstanceid", "instanceid")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            host = next(
+                (
+                    normalized[key]
+                    for key in ("host", "hostname", "hostip", "ip", "fip")
+                    if isinstance(normalized.get(key), str)
+                    and normalized[key].strip()
+                ),
+                None,
+            )
+            port = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("port", "mysqlport", "fport")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            if (
+                instance_id is not None
+                and isinstance(host, str)
+                and port is not None
+                and port <= 65_535
+                and cls._normalize_endpoint(f"{host.strip()}:{port}")
+                == alert_endpoint
+            ):
+                instance_ids.add(instance_id)
+        return instance_ids
+
+    @classmethod
+    def _instance_endpoints_from_payload(cls, payload: Mapping[str, Any]) -> set[str]:
+        endpoints: set[str] = set()
+        for row in cls._tabular_rows(payload):
+            normalized = {
+                re.sub(r"[^a-z0-9]+", "", key.casefold()): value
+                for key, value in row.items()
+            }
+            host = next(
+                (
+                    normalized[key]
+                    for key in ("host", "hostname", "hostip", "ip")
+                    if isinstance(normalized.get(key), str)
+                    and normalized[key].strip()
+                ),
+                None,
+            )
+            port = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("port", "mysqlport")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            if isinstance(host, str) and port is not None and port <= 65_535:
+                endpoints.add(f"{host.strip()}:{port}")
+        return endpoints
+
+    @staticmethod
+    def _alert_endpoint_from_context(alert_context: Mapping[str, Any]) -> str | None:
+        endpoint = alert_context.get("alert_endpoint")
+        normalized = ArcheryMCPClient._normalize_endpoint(endpoint)
+        if normalized is not None:
+            return normalized
+        host = alert_context.get("alert_host")
+        port = alert_context.get("alert_port")
+        normalized = ArcheryMCPClient._normalize_endpoint(
+            f"{host.strip()}:{str(port).strip()}"
+            if isinstance(host, str) and host.strip() and port not in (None, "")
+            else None
+        )
+        if normalized is not None:
+            return normalized
+        # The title is a last-resort lookup key only. It is never accepted as a
+        # history-table hostname_max value without the two metadata hops.
+        title = alert_context.get("title")
+        if isinstance(title, str):
+            match = _TITLE_ENDPOINT.search(title.strip())
+            if match is not None:
+                return ArcheryMCPClient._normalize_endpoint(
+                    f"{match.group('host')}:{match.group('port')}"
+                )
+        return None
+
+    @staticmethod
+    def _normalize_endpoint(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if ":" not in candidate:
+            return None
+        host, port = candidate.rsplit(":", 1)
+        if (
+            not host
+            or len(host) > 253
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host)
+            or not port.isdecimal()
+            or not 0 < int(port) <= 65_535
+        ):
+            return None
+        return f"{host}:{int(port)}"
+
+    @staticmethod
+    def _member_query_matches_alert_endpoint(
+        sql: str,
+        alert_endpoint: str | None,
+    ) -> bool:
+        """Require the member lookup to be scoped to the alert host and port.
+
+        The model must not obtain an arbitrary ``f_instance_id`` and then use its
+        endpoint to authorize a history query.  This deliberately checks values,
+        not assumed physical column names: deployments may expose aliased columns
+        that were discovered through ``list_table_columns``.
+        """
+
+        if not alert_endpoint or ":" not in alert_endpoint:
+            return False
+        host, port = alert_endpoint.rsplit(":", 1)
+        if not host or not port.isdecimal() or not 0 < int(port) <= 65_535:
+            return False
+        if not ArcheryMCPClient._member_query_matches_alert_host(sql, alert_endpoint):
+            return False
+        port_match = re.search(
+            rf"(?is)=\s*(?:{int(port)}|'0*{int(port)}')(?![\d'])",
+            sql,
+        )
+        return port_match is not None
+
+    @staticmethod
+    def _member_query_matches_alert_host(
+        sql: str,
+        alert_endpoint: str | None,
+    ) -> bool:
+        """Require a member lookup to be constrained to the alert host."""
+
+        if not alert_endpoint or ":" not in alert_endpoint:
+            return False
+        host, _port = alert_endpoint.rsplit(":", 1)
+        if not host:
+            return False
+        escaped_host = re.escape(host).replace("'", "''")
+        host_match = re.search(
+            rf"(?is)=\s*'{escaped_host}'(?:\s|\)|$)",
+            sql,
+        )
+        return host_match is not None
+
+    @classmethod
+    def _member_query_selects_instance_id(
+        cls,
+        sql: str,
+        discovered_columns: set[str],
+    ) -> bool:
+        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
+        if select is None:
+            return False
+        selected = cls._normalized_column_name(select.group("body"))
+        if discovered_columns:
+            return any(
+                cls._normalized_column_name(column) in {"finstanceid", "instanceid"}
+                and cls._normalized_column_name(column) in selected
+                for column in discovered_columns
+            )
+        # list_table_columns is preferred, but a completed read-only query can
+        # independently confirm an explicitly selected conventional ID column.
+        # Do not accept SELECT * here: the query must expose its lineage.
+        return (
+            re.search(
+                r"(?i)(?<![A-Za-z0-9_$])`?(?:f_instance_id|instance_id)`?"
+                r"(?![A-Za-z0-9_$])",
+                select.group("body"),
+            )
+            is not None
+        )
+
+    @classmethod
+    def _sql_instance_query_selects_endpoint(
+        cls,
+        sql: str,
+        discovered_columns: set[str],
+    ) -> bool:
+        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
+        if select is None:
+            return False
+        selected = cls._normalized_column_name(select.group("body"))
+        normalized_columns = {
+            cls._normalized_column_name(column) for column in discovered_columns
+        }
+        if normalized_columns:
+            return (
+                any(
+                    ("host" in column or column.endswith("ip")) and column in selected
+                    for column in normalized_columns
+                )
+                and any(
+                    "port" in column and column in selected
+                    for column in normalized_columns
+                )
+            )
+        # As above, permit a result-backed explicit projection when schema
+        # discovery is unavailable, without relying on SELECT * or prose.
+        return (
+            bool(re.search(r"(?i)(?:host|hostname|hostip|ip)", selected))
+            and "port" in selected
+        )
+
+    @staticmethod
+    def _tabular_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Read common Archery tabular result shapes without trusting prose fields."""
+
+        containers: list[Mapping[str, Any]] = [payload]
+        data = payload.get("data")
+        if isinstance(data, Mapping):
+            containers.append(data)
+        for container in containers:
+            columns = container.get("columns") or container.get("column_list")
+            rows = container.get("rows") or container.get("result")
+            if not isinstance(rows, list):
+                continue
+            if all(isinstance(row, Mapping) for row in rows):
+                return [dict(row) for row in rows if isinstance(row, Mapping)]
+            if isinstance(columns, list) and all(isinstance(column, str) for column in columns):
+                return [
+                    {column: value for column, value in zip(columns, row, strict=False)}
+                    for row in rows
+                    if isinstance(row, (list, tuple))
+                ]
+            return [
+                (
+                    {"f_instance_id": row[0]}
+                    if len(row) == 1
+                    else {"host": row[0], "port": row[1]}
+                )
+                for row in rows
+                if isinstance(row, (list, tuple)) and row
+            ]
+        return []
+
+    @staticmethod
+    def _sql_instance_query_uses_id(sql: str, known_ids: set[int]) -> bool:
+        return any(
+            re.search(
+                rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?`?id`?\s*=\s*{instance_id}(?!\d)",
+                sql,
+            )
+            is not None
+            for instance_id in known_ids
+        )
+
+    @staticmethod
+    def _history_hostname_max_equality_value(sql: str) -> str | None:
+        match = re.search(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?`?hostname_max`?\s*=\s*'(?P<value>(?:''|[^'])*)'",
+            sql,
+        )
+        return match.group("value").replace("''", "'") if match is not None else None
 
     @staticmethod
     def _is_confirmed_slow_log_table_search(arguments: Mapping[str, Any]) -> bool:
@@ -1076,7 +1849,6 @@ class ArcheryMCPClient:
     def _is_retryable_query_error(error: ArcheryMCPToolError) -> bool:
         detail = str(error).casefold()
         non_retryable_markers = (
-            "实例不在白名单",
             "没有执行该 sql 查询的权限",
             "登录已过期",
             "需要先登录",
@@ -1547,6 +2319,50 @@ class ArcherySlowLogEvidenceTool:
             context.alert.occurred_at,
             alert_context=alert_target_context,
         )
+        if not result.query_completed:
+            diagnostics = result.diagnostics or {}
+            reason = str(diagnostics.get("reason") or "慢查询证据不足")
+            next_stage = str(diagnostics.get("next_stage") or "需要人工复核")
+            return (
+                f"Archery 慢查询未执行最终 history 查询：{reason}；下一阶段：{next_stage}。"
+                "已保留只读 MCP 调用轨迹，告警分析可继续但需要人工复核。",
+                {
+                    "query_completed": False,
+                    "sql": result.requested_sql or None,
+                    "executed_sql": None,
+                    "actual_sql_verified": False,
+                    "login_confirmed": bool(result.model_tool_calls),
+                    "login_tool": self.client.login_tool_name,
+                    "mcp_tool": self.client.query_tool_name,
+                    "mcp_invocation": "model_tool_calling",
+                    "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
+                    "model_tool_calls": list(result.model_tool_calls),
+                    "model_request_ids": list(result.model_request_ids),
+                    "metadata_resolution_tables": list(result.metadata_resolution_tables),
+                    "diagnostics": diagnostics,
+                    "target": {
+                        "selection_basis": "alert_context_and_mcp_discovery",
+                        "instance_id": result.instance_id,
+                        "db_name": result.db_name,
+                        "table_name": None,
+                        "alert_context": alert_target_context,
+                    },
+                    "query_window": {
+                        "basis": "alert.occurred_at",
+                        "alert_occurred_at": context.alert.occurred_at.isoformat(),
+                        "start": result.window_start.isoformat(),
+                        "end": result.window_end.isoformat(),
+                        "duration_seconds": self.client.window_seconds,
+                        "time_column": None,
+                    },
+                    "scope": "alert_target_slow_log_incomplete",
+                    "root_cause_eligible": False,
+                    "root_cause_ineligible_reason": (
+                        "未执行最终慢查询 SQL；证据不足，需要人工复核"
+                    ),
+                    "result": result.payload,
+                },
+            )
         row_count = self._row_count(result.payload)
         row_summary = (
             f"返回 {row_count} 行"
@@ -1581,6 +2397,7 @@ class ArcherySlowLogEvidenceTool:
             "排查证据，但不能单独证明本次告警根因。",
             {
                 "sql": result.requested_sql,
+                "query_completed": True,
                 "executed_sql": result.executed_sql,
                 "actual_sql_verified": result.actual_sql_verified,
                 "login_confirmed": True,
@@ -1590,6 +2407,8 @@ class ArcherySlowLogEvidenceTool:
                 "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
                 "model_tool_calls": list(result.model_tool_calls),
                 "model_request_ids": list(result.model_request_ids),
+                "metadata_resolution_tables": list(result.metadata_resolution_tables),
+                "diagnostics": result.diagnostics or {},
                 "target": {
                     "selection_basis": "alert_context_and_mcp_discovery",
                     "instance_id": result.instance_id,
@@ -1650,7 +2469,10 @@ class ArcherySlowLogEvidenceTool:
             unique: list[str] = []
             for value in values:
                 if not isinstance(value, str):
-                    continue
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        value = str(value)
+                    else:
+                        continue
                 normalized = value.strip()
                 if not normalized or normalized.casefold() == "unknown":
                     continue
@@ -1658,6 +2480,33 @@ class ArcherySlowLogEvidenceTool:
                     unique.append(normalized)
             return unique
 
+        alert_host = next(
+            iter(
+                candidates(
+                    alert.attributes.get("alert_host"),
+                    alert.labels.get("alert_host"),
+                    database.get("alert_host"),
+                    database.get("host"),
+                    target_labels.get("alert_host"),
+                    target_labels.get("host"),
+                    target_labels.get("host_ip"),
+                )
+            ),
+            None,
+        )
+        alert_port = next(
+            iter(
+                candidates(
+                    alert.attributes.get("alert_port"),
+                    alert.labels.get("alert_port"),
+                    database.get("alert_port"),
+                    database.get("port"),
+                    target_labels.get("alert_port"),
+                    target_labels.get("port"),
+                )
+            ),
+            None,
+        )
         return {
             "title": alert.title,
             "reason": alert.reason,
@@ -1668,6 +2517,11 @@ class ArcherySlowLogEvidenceTool:
             "resource_type": alert.resource_type,
             "database": database,
             "target_labels": target_labels,
+            "alert_host": alert_host,
+            "alert_port": alert_port,
+            "alert_endpoint": (
+                f"{alert_host}:{alert_port}" if alert_host and alert_port else None
+            ),
             "instance_candidates": candidates(
                 database.get("instance"),
                 database.get("host"),

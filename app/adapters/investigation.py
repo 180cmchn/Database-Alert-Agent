@@ -233,6 +233,7 @@ class DefaultInvestigationStrategyProvider:
         *,
         alert_context_timeout_seconds: float = 15,
         external_tool_timeout_seconds: float = 45,
+        archery_tool_timeout_seconds: float = 660,
         available_tools: list[str] | None = None,
         metrics_ds_name: str = "",
         logs_ds_name: str = "",
@@ -241,6 +242,7 @@ class DefaultInvestigationStrategyProvider:
         self.max_dynamic_turns = max_dynamic_turns
         self.alert_context_timeout_seconds = alert_context_timeout_seconds
         self.external_tool_timeout_seconds = external_tool_timeout_seconds
+        self.archery_tool_timeout_seconds = archery_tool_timeout_seconds
         self.available_tools = set(
             ["alert_context"] if available_tools is None else available_tools
         )
@@ -357,7 +359,7 @@ class DefaultInvestigationStrategyProvider:
                 ToolExecutionRequest(
                     tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
                     required=True,
-                    timeout_seconds=self.external_tool_timeout_seconds,
+                    timeout_seconds=self.archery_tool_timeout_seconds,
                 )
             )
 

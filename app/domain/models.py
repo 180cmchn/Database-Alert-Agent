@@ -335,7 +335,10 @@ class Recommendation(BaseModel):
 class ToolExecutionRequest(BaseModel):
     tool_name: str
     parameters: dict[str, Any] = Field(default_factory=dict)
-    timeout_seconds: float = Field(default=10, gt=0, le=120)
+    # A bounded multi-step MCP investigation can legitimately outlive the
+    # former single-request ceiling. This remains an internal strategy value;
+    # API callers cannot supply tool plans directly.
+    timeout_seconds: float = Field(default=10, gt=0, le=1200)
     required: bool = False
 
 

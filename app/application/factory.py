@@ -226,6 +226,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     strategy_provider = DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
+        archery_tool_timeout_seconds=settings.archery_mcp_tool_timeout_seconds,
         available_tools=sorted(available_tools),
         metrics_ds_name=settings.flashduty_metrics_ds_name,
         logs_ds_name=settings.flashduty_logs_ds_name,
@@ -318,6 +319,7 @@ def build_runtime(
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
+        archery_tool_timeout_seconds=settings.archery_mcp_tool_timeout_seconds,
         available_tools=tool_registry.available_names(),
         metrics_ds_name=settings.flashduty_metrics_ds_name,
         logs_ds_name=settings.flashduty_logs_ds_name,

@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
     archery_mcp_max_agent_steps: int = Field(default=10, ge=1, le=100)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
+    # A slow-query investigation is an agent loop, not one MCP request. Keep its
+    # outer ToolExecutor deadline above a single MCP read timeout so the detail
+    # page reports the actual Archery/agent failure instead of a generic timeout.
+    archery_mcp_tool_timeout_seconds: float = Field(default=660, gt=0, le=1200)
 
     # External knowledge deployment coordinates are intentionally not runtime
     # editable. Production content is approved before it enters the index, so it
