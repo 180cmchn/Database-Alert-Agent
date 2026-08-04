@@ -279,9 +279,10 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 `slow_queryable` 等更长标识符），调查策略会新增一个必需的
 `query_archery_slow_logs` 取证任务。项目自身作为 MCP Host，加载
 [`config/mcp/settings.json`](config/mcp/settings.json) 中的 Archery 连接配置，在同一个
-Streamable HTTP 会话中完成初始化和工具发现，再把本次允许的 MCP 工具以 function tools
+Streamable HTTP 会话中完成初始化和工具发现，再把 MCP 返回的工具以 function tools
 交给当前 AI 模型。
-模型每轮都能看到 MCP 实际发现到的以下只读工具及其输入 Schema，并自主选择一个下一步调用：
+模型每轮都能看到 MCP 实际发现到的工具及其输入 Schema，并自主选择一个下一步调用。慢查询
+取证通常会使用：
 
 - `ensure_login_gymJPA`；
 - `list_resource_groups_gymJPA`；
@@ -292,32 +293,29 @@ Streamable HTTP 会话中完成初始化和工具发现，再把本次允许的 
 - `sql_query_gymJPA`。
 
 Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名、主机、端口、数据库名等目标线索、
-告警时间窗、慢日志表和最多返回行数。部署配置不再固定查询实例和数据库。模型根据告警上下文、
-工具实时 Schema 与资源发现结果自主确定目标，并决定是否查询资源组、实例、数据库、表和字段。
+告警时间窗、推荐的实例映射链路和最多返回行数。部署配置不再固定查询实例和数据库。模型根据
+告警上下文、工具实时 Schema 与资源发现结果自主确定目标，并决定是否查询资源组、实例、数据库、
+表和字段。
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法等可重试错误也会原样回传，
-模型可据此调整只读查询继续执行。模型最多执行 `ARCHERY_MCP_MAX_AGENT_STEPS` 个只读步骤，
-默认值为 10。`apply_query_permission_gymJPA`
-等会产生外部状态变更的工具不会传给模型。
+模型可据此调整只读查询继续执行。模型最多执行 `ARCHERY_MCP_MAX_AGENT_STEPS` 个工具调用步骤，
+默认值为 10。MCP 返回的工具中可能包含 `apply_query_permission_gymJPA` 等会产生外部状态变更的
+工具，系统提示明确禁止模型调用它们。
 
-Host 不再重复实现各资源发现工具的参数规则；登录、资源组、实例、数据库、表和字段调用直接使用
-MCP 实时输入 Schema，由模型结合前序结果自主规划，并由 MCP 服务端校验。Host 仅保留只读工具
-白名单以及查询的登录状态、MCP 发现得到的正整数实例 ID、非空数据库名、单条只读 SQL 和
-最多 24,000 字符校验。模型可先执行 `SELECT`、`WITH`、`SHOW`、`DESCRIBE` 或 `EXPLAIN` 等
-辅助只读 SQL，Host 会将结果回传模型并继续调查。模型必须先在告警定位出的实例和数据库中调用
-`list_db_tables_gymJPA(keyword="slow")`，并从真实返回中选择表名忽略大小写和分隔符后包含
-`slowlog` 或 `slowquerylog` 的表，再读取其真实字段；不再固定为 `t_slowlog_info`。搜索确认没有
-候选表时返回 `ArcheryMCPSlowLogTableNotFound`。只有查询已发现的候选表且 SQL 的 `LIMIT` 不超过
-100 时才视为最终慢日志结果。`limit_num` 参数
-交由 MCP 服务自身处理；Host 不再逐字比对预生成 SQL，也不解析模型
-选择的字段和时间表达式。提示词中的目标时间窗由规范化告警的 `occurred_at` 和部署窗口计算，
-默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在预览确认步骤。
+Host 不再重复实现 MCP 工具 Schema、工具名、调用参数、SQL 形态、表发现前置条件或
+`hostname_max` 来源链路的校验。模型生成的调用参数会原样发送给 MCP，由 MCP 服务端返回真实的
+成功或错误结果；Host 再把结果回传模型，使其可以修正只读查询并重试。提示词要求模型仅使用本次
+慢查询取证需要的只读工具，并优先按 `alert_host/alert_port → t_instance_member.f_instance_id →
+sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链路查询。表和字段发现是
+可选的恢复手段，不再是 Host 侧前置条件。提示词中的目标时间窗由规范化告警的 `occurred_at` 和
+部署窗口计算，默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在
+预览确认步骤。
 
 查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。若 Archery
 以“SQL 查询已执行 / 执行的SQL / 结果”文本包裹返回数据，Host 会拆出其中的实际 SQL 和结果
 JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使用的实例 ID、时间字段和返回行数。
 空结果会明确显示为 0 行且不会误报为可能截断。证据会记录由告警上下文与 MCP 资源发现共同
 确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
-非空结果的查询 SQL 仍受 `LIMIT 100` 和 24,000 字符上限约束。
+提示词要求最终查询使用 `LIMIT 100` 以内的范围，回传给模型的单次结果文本最多保留 24,000 字符。
 传输失败、登录确认失败、鉴权失败、缺少查询范围、超时、MCP 标准错误或 Archery 业务错误只会
 形成失败证据。
 

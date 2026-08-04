@@ -24,8 +24,6 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
-    ArcheryMCPConfigurationError,
-    ArcheryMCPModelError,
     ArcheryMCPReadOnlyViolation,
     ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
@@ -293,148 +291,6 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
 
 
-def test_archery_discovery_arguments_are_delegated_to_mcp_schema() -> None:
-    client = _client(
-        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
-    )
-    for arguments in (
-        {},
-        {"resource_group_id": TEST_RESOURCE_GROUP_ID},
-        {"instance_ref": ""},
-        {"instance_ref": TEST_INSTANCE_REF},
-        {"instance_ref": "another-instance"},
-        {"instance_ref": {"server_specific": True}},
-    ):
-        client._validate_model_tool_call(
-            MCPModelToolCall(
-                call_id="discovery-call",
-                name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
-                arguments=arguments,
-            ),
-            login_confirmed=True,
-        )
-
-
-def test_archery_query_requires_discovered_instance_id_and_accepts_dynamic_database() -> None:
-    client = _client(
-        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
-    )
-    call = client._normalize_model_tool_call(
-        MCPModelToolCall(
-            call_id="query-call",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments={
-                "instance_id": str(TEST_INSTANCE_ID),
-                "db_name": "database-from-alert",
-                "sql_content": TEST_ALTERNATE_SLOW_LOG_QUERY,
-            },
-        )
-    )
-    assert "limit_num" not in call.arguments
-    assert call.arguments["max_result_chars"] == 24_000
-    client._validate_model_tool_call(call, login_confirmed=True)
-
-    model_limit_num_is_delegated = client._normalize_model_tool_call(
-        MCPModelToolCall(
-            call_id="query-with-server-limit",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments={
-                "instance_id": TEST_INSTANCE_ID,
-                "db_name": TEST_DB_NAME,
-                "sql_content": (
-                    "WITH recent AS (SELECT * FROM t_slowlog_info) "
-                    "SELECT * FROM recent ORDER BY f_insert_time DESC LIMIT 100"
-                ),
-                "limit_num": 500,
-                "max_result_chars": 99_999,
-            },
-        )
-    )
-    assert model_limit_num_is_delegated.arguments["limit_num"] == 500
-    assert model_limit_num_is_delegated.arguments["max_result_chars"] == 24_000
-    client._validate_model_tool_call(
-        model_limit_num_is_delegated,
-        login_confirmed=True,
-    )
-
-    excessive_sql_limit = client._normalize_model_tool_call(
-        MCPModelToolCall(
-            call_id="query-with-excessive-sql-limit",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments={
-                "instance_id": TEST_INSTANCE_ID,
-                "db_name": TEST_DB_NAME,
-                "sql_content": (
-                    "SELECT * FROM t_slowlog_info ORDER BY f_insert_time DESC LIMIT 101"
-                ),
-            },
-        )
-    )
-    with pytest.raises(ArcheryMCPReadOnlyViolation, match="LIMIT no greater than 100"):
-        client._validate_model_tool_call(excessive_sql_limit, login_confirmed=True)
-
-    diagnostic_query = client._normalize_model_tool_call(
-        MCPModelToolCall(
-            call_id="diagnostic-query",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments={
-                "instance_id": TEST_INSTANCE_ID,
-                "db_name": TEST_DB_NAME,
-                "sql_content": "```sql\nSELECT NOW() AS server_time\n```",
-            },
-        )
-    )
-    assert diagnostic_query.arguments["sql_content"] == "SELECT NOW() AS server_time"
-    client._validate_model_tool_call(diagnostic_query, login_confirmed=True)
-
-    reference_only = client._normalize_model_tool_call(
-        MCPModelToolCall(
-            call_id="query-with-reference",
-            name=ARCHERY_MCP_QUERY_TOOL_NAME,
-            arguments={
-                "instance_ref": TEST_INSTANCE_REF,
-                "db_name": TEST_DB_NAME,
-                "sql_content": TEST_ALTERNATE_SLOW_LOG_QUERY,
-            },
-        )
-    )
-    with pytest.raises(ArcheryMCPReadOnlyViolation, match="positive instance_id"):
-        client._validate_model_tool_call(
-            reference_only,
-            login_confirmed=True,
-        )
-
-
-def test_archery_normalizes_numeric_instance_id_without_tracking_discovery() -> None:
-    client = _client(
-        httpx.MockTransport(lambda request: httpx.Response(500, request=request))
-    )
-    for arguments in (
-        {"instance_id": str(TEST_INSTANCE_ID), "page": 1},
-        {
-            "instance_id": TEST_INSTANCE_ID,
-            "instance_ref": TEST_INSTANCE_REF,
-            "page": 1,
-        },
-    ):
-        normalized = client._normalize_model_tool_call(
-            MCPModelToolCall(
-                call_id="database-discovery",
-                name=ARCHERY_MCP_DATABASES_TOOL_NAME,
-                arguments=arguments,
-            )
-        )
-
-        assert normalized.arguments == {
-            "instance_id": TEST_INSTANCE_ID,
-            "page": 1,
-        }
-        client._validate_model_tool_call(
-            normalized,
-            login_confirmed=True,
-        )
-
-
 @pytest.mark.asyncio
 async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -> None:
     calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
@@ -471,7 +327,16 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
             return _json_response(
                 request,
                 body["id"],
-                {"tools": _read_only_tool_schemas()},
+                {
+                    "tools": [
+                        *_read_only_tool_schemas(),
+                        _tool_schema(
+                            "apply_query_permission_gymJPA",
+                            "instance_id",
+                            "db_name",
+                        ),
+                    ]
+                },
             )
         if method == "tools/call":
             tool_name = body["params"]["name"]
@@ -574,10 +439,10 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "https://archery.example.test/mcp" in task_prompt
     assert "db-prod-01:3306" in task_prompt
     assert TEST_DB_NAME in task_prompt
-    assert "部署配置不提供固定的查询实例或数据库" in task_prompt
+    assert "最终查询必须使用MCP返回的真实整数instance_id和数据库名" in task_prompt
     assert "结合MCP实时返回补齐必要的目标标识" in task_prompt
     assert "必须按以下链路定位 hostname_max" in task_prompt
-    assert "alert_host和alert_port" in task_prompt
+    assert "f_ip = alert_host and f_port = alert_port" in task_prompt
     assert "t_instance_member" in task_prompt
     assert "f_instance_id" in task_prompt
     assert "sql_instance.id" in task_prompt
@@ -586,10 +451,8 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "严格组合为host:port" in task_prompt
     assert "避免为了验证host反复枚举或校验无关实例" in task_prompt
     assert "三张表都在该实例和数据库中" in task_prompt
-    assert "f_instance_id只是SQL参数" in task_prompt
-    assert "绝不能作为任何MCP工具的instance_id" in task_prompt
-    assert "推荐链路不通" in task_prompt
-    assert "在剩余调用预算内选择其它只读探针并重试" in task_prompt
+    assert "若 history 表的必经解析链路走不通" in task_prompt
+    assert "MCP返回的错误在其它慢日志表或只读探针中选择合理替代路径" in task_prompt
     assert "总数不得超过10" in task_prompt
     assert "表名可来自list_db_tables、元数据查询或推荐线索" in (
         model.calls[0]["messages"][0]["content"]
@@ -610,11 +473,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "实时证据" in model.calls[1]["messages"][-1]["content"]
     assert {
         item["function"]["name"] for item in model.calls[0]["tools"]
-    } == set(DEFAULT_MODEL_TOOL_SEQUENCE)
-    assert all(
-        item["function"]["name"] != "apply_query_permission_gymJPA"
-        for item in model.calls[0]["tools"]
-    )
+    } == {*DEFAULT_MODEL_TOOL_SEQUENCE, "apply_query_permission_gymJPA"}
     query_arguments = model.calls[-1]["arguments"]
     assert query_arguments["instance_id"] == TEST_INSTANCE_ID
     assert "instance_ref" not in query_arguments
@@ -1056,8 +915,8 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_sends_direct_history_lookup_during_host_guard_experiment() -> None:
-    """The temporary experiment delegates history endpoint selection to the model."""
+async def test_archery_mcp_sends_direct_history_lookup_without_host_lineage_gate() -> None:
+    """The Host delegates history endpoint selection to the model and MCP."""
 
     tool_calls: list[str] = []
     query_sql_calls: list[str] = []
@@ -1123,8 +982,8 @@ def test_archery_mcp_recognizes_member_id_in_real_multicolumn_projection() -> No
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_sends_title_endpoint_history_during_host_guard_experiment() -> None:
-    """The temporary experiment does not reject title-derived history SQL."""
+async def test_archery_mcp_sends_title_endpoint_history_without_host_lineage_gate() -> None:
+    """The Host does not reject a model-selected title-derived history query."""
 
     query_sql_calls: list[str] = []
     title_endpoint = "100.84.97.113:3306"
@@ -1161,7 +1020,7 @@ async def test_archery_mcp_sends_title_endpoint_history_during_host_guard_experi
 
 @pytest.mark.asyncio
 async def test_archery_mcp_sends_history_query_without_host_guard() -> None:
-    """The temporary experiment sends the model's first history query to MCP."""
+    """The Host sends the model's first history query directly to MCP."""
 
     query_sql_calls: list[str] = []
     direct_history_sql = (
