@@ -11,6 +11,7 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_mcp import (
+    ARCHERY_INSTANCE_MEMBER_TABLE,
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
@@ -18,6 +19,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_METADATA_DB_NAME,
     ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
     ARCHERY_SLOW_LOG_PROMPT_VERSION,
     ARCHERY_SLOW_LOG_TABLE,
@@ -553,6 +555,7 @@ def _archery_call_handler(
     tool_calls: list[str],
     tables_payload: dict[str, Any] | None = None,
     query_sql_calls: list[str] | None = None,
+    query_argument_calls: list[dict[str, Any]] | None = None,
 ) -> httpx.MockTransport:
     query_results = query_result if isinstance(query_result, list) else [query_result]
     query_index = 0
@@ -619,8 +622,11 @@ def _archery_call_handler(
             if tool_name == ARCHERY_MCP_LOGIN_TOOL_NAME:
                 result = login_result
             elif tool_name == ARCHERY_MCP_QUERY_TOOL_NAME:
+                query_arguments = body["params"]["arguments"]
                 if query_sql_calls is not None:
-                    query_sql_calls.append(body["params"]["arguments"]["sql_content"])
+                    query_sql_calls.append(query_arguments["sql_content"])
+                if query_argument_calls is not None:
+                    query_argument_calls.append(query_arguments)
                 result = query_results[min(query_index, len(query_results) - 1)]
                 query_index += 1
             else:
@@ -1050,6 +1056,219 @@ async def test_archery_mcp_sends_history_query_without_host_guard() -> None:
     assert query_sql_calls == [direct_history_sql]
     assert result.query_completed is True
     assert result.requested_sql == direct_history_sql
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_verifies_different_endpoints_with_same_member_id() -> None:
+    alert_endpoint = "100.84.97.113:3306"
+    slow_log_endpoint = "10.23.45.67:3306"
+    f_instance_id = 53
+    history_sql = (
+        "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+    )
+    query_sql_calls: list[str] = []
+    query_argument_calls: list[dict[str, Any]] = []
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(history_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["hostname_max", "sample"],
+                        "rows": [[slow_log_endpoint, "select 1"]],
+                        "rowCount": 1,
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[f_instance_id]],
+                        "rowCount": 1,
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[f_instance_id]],
+                        "rowCount": 1,
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=[],
+            query_sql_calls=query_sql_calls,
+            query_argument_calls=query_argument_calls,
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context={"title": f"MySQL/mysql_slow_query/{alert_endpoint}"},
+    )
+
+    expected_alert_lookup = (
+        f"SELECT f_instance_id FROM {ARCHERY_INSTANCE_MEMBER_TABLE} "
+        "WHERE f_ip = '100.84.97.113' AND f_port = 3306 LIMIT 2"
+    )
+    expected_slow_log_lookup = (
+        f"SELECT f_instance_id FROM {ARCHERY_INSTANCE_MEMBER_TABLE} "
+        "WHERE f_ip = '10.23.45.67' AND f_port = 3306 LIMIT 2"
+    )
+    assert query_sql_calls == [
+        history_sql,
+        expected_alert_lookup,
+        expected_slow_log_lookup,
+    ]
+    assert query_argument_calls[1]["db_name"] == ARCHERY_METADATA_DB_NAME
+    assert query_argument_calls[2]["db_name"] == ARCHERY_METADATA_DB_NAME
+    assert result.model_tool_calls == (
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+    assert result.instance_identity_verification is not None
+    assert result.instance_identity_verification["status"] == "MATCHED"
+    assert result.instance_identity_verification["same_instance"] is True
+    assert result.instance_identity_verification["f_instance_id"] == f_instance_id
+    assert result.instance_identity_verification["alert_endpoint"] == alert_endpoint
+    assert (
+        result.instance_identity_verification["slow_log_endpoint"]
+        == slow_log_endpoint
+    )
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_marks_different_member_ids_as_mismatched() -> None:
+    alert_endpoint = "100.84.97.113:3306"
+    slow_log_endpoint = "10.23.45.67:3306"
+    history_sql = (
+        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+    )
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(history_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["hostname_max"],
+                        "rows": [[slow_log_endpoint]],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[53]],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[99]],
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=[],
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context={"title": f"MySQL/mysql_slow_query/{alert_endpoint}"},
+    )
+
+    assert result.instance_identity_verification is not None
+    assert result.instance_identity_verification["status"] == "MISMATCHED"
+    assert result.instance_identity_verification["same_instance"] is False
+    assert result.instance_identity_verification["alert_f_instance_ids"] == [53]
+    assert result.instance_identity_verification["slow_log_f_instance_ids"] == [99]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_treats_missing_member_mapping_as_unverified() -> None:
+    alert_endpoint = "100.84.97.113:3306"
+    slow_log_endpoint = "10.23.45.67:3306"
+    history_sql = (
+        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+    )
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(history_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["hostname_max"],
+                        "rows": [[slow_log_endpoint]],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[53]],
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=[],
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context={"title": f"MySQL/mysql_slow_query/{alert_endpoint}"},
+    )
+
+    assert result.instance_identity_verification is not None
+    assert result.instance_identity_verification["status"] == "UNVERIFIED"
+    assert result.instance_identity_verification["same_instance"] is None
+    assert (
+        result.instance_identity_verification["reason_code"]
+        == "member_mapping_missing_or_ambiguous"
+    )
+    assert "不能判定为不相等" in result.instance_identity_verification["reason"]
 
 
 @pytest.mark.asyncio
@@ -1486,10 +1705,21 @@ class RecordingArcheryClient:
     slow_log_time_column = TEST_TIME_COLUMN
     window_seconds = 300
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        payload: dict[str, Any] | None = None,
+        instance_identity_verification: dict[str, Any] | None = None,
+    ) -> None:
         self.calls = 0
         self.occurred_at: datetime | None = None
         self.alert_context: dict[str, Any] | None = None
+        self.payload = payload or {
+            "status": "ok",
+            "rows": [],
+            "affected_rows": 0,
+        }
+        self.instance_identity_verification = instance_identity_verification
 
     async def execute_slow_log_query(
         self,
@@ -1501,7 +1731,7 @@ class RecordingArcheryClient:
         self.occurred_at = occurred_at
         self.alert_context = alert_context
         return ArcherySlowLogQueryResult(
-            payload={"status": "ok", "rows": [], "affected_rows": 0},
+            payload=self.payload,
             requested_sql=TEST_SLOW_LOG_QUERY,
             window_start=TEST_WINDOW_START,
             window_end=TEST_WINDOW_END,
@@ -1511,6 +1741,7 @@ class RecordingArcheryClient:
             db_name=TEST_DB_NAME,
             table_name=ARCHERY_SLOW_LOG_TABLE,
             query_time_column=TEST_TIME_COLUMN,
+            instance_identity_verification=self.instance_identity_verification,
         )
 
 
@@ -1629,6 +1860,68 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
             _context("慢查询过多", title="MySQL/mysql_slow_queryable_400/db-1:3306"),
         )
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "same_instance", "analysis_usable", "summary_text"),
+    [
+        ("MATCHED", True, True, "实例归属验证通过"),
+        ("MISMATCHED", False, False, "本次慢查询日志证据不可用于该告警"),
+        ("UNVERIFIED", None, False, "实例归属无法确认"),
+    ],
+)
+async def test_archery_evidence_usability_follows_instance_identity_verification(
+    status: str,
+    same_instance: bool | None,
+    analysis_usable: bool,
+    summary_text: str,
+) -> None:
+    slow_log_ids = {
+        "MATCHED": [53],
+        "MISMATCHED": [99],
+        "UNVERIFIED": [],
+    }[status]
+    verification: dict[str, Any] = {
+        "status": status,
+        "reason_code": status.casefold(),
+        "reason": "test identity result",
+        "alert_endpoint": "db-alert:3306",
+        "slow_log_endpoint": "db-history:3306",
+        "alert_f_instance_ids": [53],
+        "slow_log_f_instance_ids": slow_log_ids,
+        "same_instance": same_instance,
+        "mcp_call_count": 2,
+    }
+    if status == "MATCHED":
+        verification["f_instance_id"] = 53
+    client = RecordingArcheryClient(
+        payload={
+            "status": "ok",
+            "columns": ["hostname_max", "sample"],
+            "rows": [["db-history:3306", "select 1"]],
+            "rowCount": 1,
+        },
+        instance_identity_verification=verification,
+    )
+    tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
+
+    summary, data = await tool.execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-alert:3306",
+        ),
+    )
+
+    assert summary_text in summary
+    assert data["instance_identity_verification"] == verification
+    assert data["analysis_usable"] is analysis_usable
+    assert data["root_cause_eligible"] is analysis_usable
+    if analysis_usable:
+        assert data["root_cause_ineligible_reason"] == ""
+    else:
+        assert "test identity result" in data["root_cause_ineligible_reason"]
 
 
 @pytest.mark.asyncio

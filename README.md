@@ -310,6 +310,15 @@ sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链�
 部署窗口计算，默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在
 预览确认步骤。
 
+慢查询结果非空后，Host 会在同一个 MCP 会话内执行独立的实例归属核验：分别把告警端点和结果中
+唯一的 `hostname_max` 拆成 host、port，在 Archery 实例的 `archery.t_instance_member` 中用
+`f_ip`、`f_port` 等值查询 `f_instance_id`。两个端点都返回唯一且相同的 ID 时，核验状态为
+`MATCHED`，即使两个 IP 字面值不同，日志仍可作为本告警的实时证据；唯一 ID 不同时为
+`MISMATCHED`，日志不可用于本告警；调用失败、空结果、多映射或无法解析唯一端点时为
+`UNVERIFIED`，只表示归属证据缺失，不能推断实例不同。这两次查询是主慢查询成功后的固定只读
+核验，不属于模型自主调用预算，也不是调用 MCP 前的 Host 校验，不会阻断模型在主流程中根据 MCP
+错误调整查询并重试。
+
 查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。若 Archery
 以“SQL 查询已执行 / 执行的SQL / 结果”文本包裹返回数据，Host 会拆出其中的实际 SQL 和结果
 JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使用的实例 ID、时间字段和返回行数。
