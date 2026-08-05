@@ -531,6 +531,20 @@ def _visual_search_text(items: list[RunbookVisualEvidence]) -> str:
     )
 
 
+def _cause_search_text(items: list[RunbookCause]) -> str:
+    return "\n".join(
+        part
+        for item in items
+        for part in (
+            item.hypothesis,
+            *item.supporting_evidence,
+            *item.contradicting_evidence,
+            *(probe.objective for probe in item.probes),
+        )
+        if part
+    )
+
+
 def _bm25_score(
     query_terms: Counter[str],
     document_terms: Counter[str],
@@ -580,7 +594,9 @@ def _score_section(
     if not _match_conditions(match_metadata, condition_blob=condition_blob):
         return 0, []
     visual_evidence = _section_visual_evidence(document, section)
+    section_causes = _section_causes(document, section)
     visual_searchable = _normalized_match_text(_visual_search_text(visual_evidence))
+    cause_searchable = _normalized_match_text(_cause_search_text(section_causes))
     annotations = [
         *match_metadata.get("alert_names", []),
         *match_metadata.get("metric_names", []),
@@ -596,6 +612,7 @@ def _score_section(
                 section.content,
                 *annotations,
                 visual_searchable,
+                cause_searchable,
             ]
         )
     )
@@ -794,6 +811,9 @@ class LocalPDFRunbookLibrary:
                             section.content,
                             _visual_search_text(
                                 _section_visual_evidence(document, section)
+                            ),
+                            _cause_search_text(
+                                _section_causes(document, section)
                             ),
                         ]
                     )

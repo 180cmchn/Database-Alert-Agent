@@ -133,9 +133,18 @@ async def test_generate_typed_pdf_datasets_and_evaluate_them(tmp_path: Path) -> 
     assert "review_status" not in matching[0]
     assert matching[0]["source"]["page_count"] == 1
     assert len(matching[0]["source"]["content_sha256"]) == 64
+    assert matching[0]["source"]["source_alert_type"] == "mysql_slow_query_400"
+    assert matching[1]["alert"]["alert_type"].startswith(
+        "unrelated_evaluation_"
+    )
+    assert matching[1]["source"]["case_role"] == "unknown_type_no_match"
+    assert matching[1]["source"]["source_alert_type"] == "mysql_slow_query_400"
     assert diagnosis[0]["gold_runbook_id"] == "slow-query"
     assert diagnosis[0]["expected_cause_ids"] == ["full-table-scan"]
     assert "full table scan" in diagnosis[0]["alert"]["description"]
+    assert diagnosis[0]["alert"]["error_summary"] == (
+        "A query performs a full table scan."
+    )
 
     evaluation = await evaluate_runbooks.evaluate(
         Namespace(
@@ -165,6 +174,92 @@ async def test_generate_typed_pdf_datasets_and_evaluate_them(tmp_path: Path) -> 
         "passed": True,
         "failures": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_multi_type_runbook_generates_each_cause_once_for_best_profile(
+    tmp_path: Path,
+) -> None:
+    pdf_dir = tmp_path / "typed"
+    runbook_id = "shared-guide"
+    base_annotation = {
+        "runbook_id": runbook_id,
+        "knowledge_type": "runbook",
+        "alert_type_profiles": {
+            "first_condition": {"alert_names": ["First condition"]},
+            "second_condition": {"alert_names": ["Second condition"]},
+        },
+        "match": {
+            "alert_names": ["First condition", "Second condition"],
+            "metric_names": [],
+            "aliases": [],
+            "keywords": [],
+        },
+        "scope": {},
+        "sections": [
+            {"id": "first", "title": "First diagnosis", "pages": [1]},
+            {"id": "second", "title": "Second diagnosis", "pages": [1]},
+        ],
+        "causes": [
+            {
+                "cause_id": "first-cause",
+                "hypothesis": "First condition is caused by alpha pressure.",
+                "section_ids": ["first"],
+            },
+            {
+                "cause_id": "second-cause",
+                "hypothesis": "Second condition is caused by beta pressure.",
+                "section_ids": ["second"],
+            },
+        ],
+    }
+    for alert_type in ("first_condition", "second_condition"):
+        type_dir = pdf_dir / alert_type
+        type_dir.mkdir(parents=True)
+        _write_text_pdf(
+            type_dir / f"{runbook_id}.pdf",
+            "[WARNING] Shared diagnostic guide with alpha and beta checks.",
+        )
+        annotation = {**base_annotation, "alert_type": alert_type}
+        (type_dir / "index.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "alert_type": alert_type,
+                    "runbooks": [annotation],
+                }
+            ),
+            encoding="utf-8",
+        )
+    output_dir = tmp_path / "datasets"
+
+    report = generate_evaluation_datasets(pdf_dir, output_dir)
+    diagnosis = _read_jsonl(output_dir / "root_cause_diagnosis.jsonl")
+
+    assert report["diagnosis_case_count"] == 2
+    assert {
+        (
+            item["expected_cause_ids"][0],
+            item["alert"]["alert_type"],
+        )
+        for item in diagnosis
+    } == {
+        ("first-cause", "first_condition"),
+        ("second-cause", "second_condition"),
+    }
+
+    evaluation = await evaluate_runbooks.evaluate(
+        Namespace(
+            pdf_dir=pdf_dir,
+            min_score=12.0,
+            min_confidence=0.35,
+            matching_dataset=output_dir / "runbook_matching.jsonl",
+            diagnosis_dataset=output_dir / "root_cause_diagnosis.jsonl",
+        )
+    )
+    assert evaluation["metrics"]["no_match_accuracy"] == 1.0
+    assert evaluation["metrics"]["cause_candidate_recall"] == 1.0
+    assert evaluation["metrics"]["cause_case_coverage"] == 1.0
 
 
 def test_generate_flat_pdf_dataset_from_pdf_text(tmp_path: Path) -> None:

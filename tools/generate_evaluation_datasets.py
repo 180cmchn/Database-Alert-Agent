@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,20 @@ def _string_values(value: Any) -> list[str]:
     else:
         return []
     return [item.strip() for item in values if item.strip()]
+
+
+def _search_signature(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _search_terms(value: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", normalized)
+        if token
+    }
 
 
 def _read_index(path: Path | None) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -436,7 +451,60 @@ def _source_metadata(source: _RunbookSource) -> dict[str, Any]:
         "page_count": source.content.page_count,
         "content_sha256": source.content.sha256,
         "alert_type_source": source.alert_type_source,
+        "source_alert_type": source.alert_type,
     }
+
+
+def _cause_search_text(source: _RunbookSource, cause: dict[str, Any]) -> str:
+    referenced_sections = set(_string_values(cause.get("section_ids")))
+    section_values: list[str] = []
+    for section in source.annotation.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("id") or "")
+        if referenced_sections and section_id not in referenced_sections:
+            continue
+        section_values.extend(
+            [
+                str(section.get("title") or ""),
+                *_string_values(section.get("match_terms")),
+            ]
+        )
+    return "\n".join(
+        [
+            str(cause.get("hypothesis") or ""),
+            *_string_values(cause.get("supporting_evidence")),
+            *section_values,
+        ]
+    )
+
+
+def _cause_source_affinity(
+    source: _RunbookSource,
+    cause: dict[str, Any],
+) -> tuple[int, int]:
+    """Rank one shared runbook cause against its alert-type profiles."""
+
+    cause_text = _cause_search_text(source, cause)
+    cause_signature = _search_signature(cause_text)
+    cause_terms = _search_terms(cause_text)
+    match = runbook_match_metadata(source.annotation, source.alert_type)
+    identity_values = [
+        source.alert_type,
+        *(
+            value
+            for field in ("alert_names", "metric_names", "aliases", "keywords")
+            for value in _string_values(match.get(field))
+        ),
+    ]
+    exact_score = 0
+    overlap_score = 0
+    for value in identity_values:
+        signature = _search_signature(value)
+        if len(signature) >= 3 and signature in cause_signature:
+            exact_score += 1
+        overlap_score += len(_search_terms(value) & cause_terms)
+    return exact_score, overlap_score
 
 
 def _build_records(
@@ -444,6 +512,10 @@ def _build_records(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], int]:
     matching: list[dict[str, Any]] = []
     diagnosis: list[dict[str, Any]] = []
+    diagnosis_candidates: dict[
+        tuple[str, str, str],
+        list[tuple[_RunbookSource, dict[str, Any], dict[str, Any]]],
+    ] = {}
     skipped_no_causes: list[str] = []
     skipped_ineligible = 0
     seen_matching_ids: set[str] = set()
@@ -485,33 +557,51 @@ def _build_records(
             continue
         for cause in causes:
             cause_id = str(cause["cause_id"])
-            diagnosis_id = _case_id(
-                "pdf-cause",
-                source.alert_type,
-                source.runbook_id,
-                cause_id,
-                source.content.sha256,
+            key = (source.runbook_id, cause_id, source.content.sha256)
+            diagnosis_candidates.setdefault(key, []).append(
+                (source, cause, alert)
             )
-            if diagnosis_id in seen_diagnosis_ids:
-                raise RunbookError(f"Duplicate generated diagnosis case: {diagnosis_id}")
-            seen_diagnosis_ids.add(diagnosis_id)
-            diagnosis_alert = dict(alert)
-            description_parts = [
-                str(alert.get("description") or "").strip(),
-                str(cause["hypothesis"]).strip(),
-            ]
-            diagnosis_alert["description"] = "\n".join(
-                item for item in description_parts if item
-            )[:2000]
-            diagnosis.append(
-                {
-                    "case_id": diagnosis_id,
-                    "alert": diagnosis_alert,
-                    "gold_runbook_id": source.runbook_id,
-                    "expected_cause_ids": [cause_id],
-                    "source": metadata,
-                }
-            )
+
+    for (_, cause_id, _), candidates in sorted(diagnosis_candidates.items()):
+        source, cause, alert = min(
+            candidates,
+            key=lambda item: (
+                -_cause_source_affinity(item[0], item[1])[0],
+                -_cause_source_affinity(item[0], item[1])[1],
+                item[0].alert_type,
+                item[0].relative_path,
+            ),
+        )
+        diagnosis_id = _case_id(
+            "pdf-cause",
+            source.alert_type,
+            source.runbook_id,
+            cause_id,
+            source.content.sha256,
+        )
+        if diagnosis_id in seen_diagnosis_ids:
+            raise RunbookError(f"Duplicate generated diagnosis case: {diagnosis_id}")
+        seen_diagnosis_ids.add(diagnosis_id)
+        diagnosis_alert = dict(alert)
+        hypothesis = str(cause["hypothesis"]).strip()
+        description_parts = [
+            str(alert.get("description") or "").strip(),
+            hypothesis,
+            *_string_values(cause.get("supporting_evidence")),
+        ]
+        diagnosis_alert["description"] = "\n".join(
+            item for item in description_parts if item
+        )[:2000]
+        diagnosis_alert["error_summary"] = hypothesis[:2000]
+        diagnosis.append(
+            {
+                "case_id": diagnosis_id,
+                "alert": diagnosis_alert,
+                "gold_runbook_id": source.runbook_id,
+                "expected_cause_ids": [cause_id],
+                "source": _source_metadata(source),
+            }
+        )
 
     first_source_by_alert_type: dict[str, _RunbookSource] = {}
     for source in sources:
@@ -522,6 +612,7 @@ def _build_records(
         first_source_by_alert_type.setdefault(source.alert_type, source)
     for alert_type, source in sorted(first_source_by_alert_type.items()):
         token = hashlib.sha256(alert_type.encode("utf-8")).hexdigest()[:16]
+        unrelated_alert_type = f"unrelated_evaluation_{token}"
         no_match_id = _case_id("pdf-no-match", alert_type, token)
         if no_match_id in seen_matching_ids:
             raise RunbookError(f"Duplicate generated matching case: {no_match_id}")
@@ -533,7 +624,7 @@ def _build_records(
                     "severity": "WARNING",
                     "title": f"unrelated-evaluation-{token}",
                     "reason": f"unrelated_evaluation_{token}",
-                    "alert_type": alert_type,
+                    "alert_type": unrelated_alert_type,
                     "alert_name": f"unrelated-evaluation-{token}",
                     "environment": "evaluation",
                 },
@@ -541,7 +632,7 @@ def _build_records(
                 "gold_sections": [],
                 "source": {
                     **_source_metadata(source),
-                    "case_role": "in_type_no_match",
+                    "case_role": "unknown_type_no_match",
                 },
             }
         )

@@ -74,7 +74,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     no_match_total = 0
     no_match_hits = 0
     evaluated_runbook_types: set[tuple[str, str]] = set()
-    evaluated_causes: set[tuple[str, str, str]] = set()
+    evaluated_causes: set[tuple[str, str]] = set()
     generated_case_count = 0
     fresh_generated_case_count = 0
     failures: list[dict[str, Any]] = []
@@ -126,9 +126,8 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         )
         available = {cause.cause_id for cause in result.causes} if result else set()
         expected = set(case.get("expected_cause_ids") or [])
-        case_alert_type = str(case["alert"].get("alert_type") or "")
         evaluated_causes.update(
-            (str(case["gold_runbook_id"]), case_alert_type, str(cause_id))
+            (str(case["gold_runbook_id"]), str(cause_id))
             for cause_id in expected
         )
         cause_expected += len(expected)
@@ -159,12 +158,8 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         if getattr(item, "id", "")
     }
     eligible_causes = {
-        (str(getattr(item, "id", "")), alert_type, cause.cause_id)
+        (str(getattr(item, "id", "")), cause.cause_id)
         for item in eligible
-        for alert_type in (
-            _metadata_strings(getattr(item, "metadata", {}), "alert_types")
-            or _metadata_strings(getattr(item, "metadata", {}), "alert_type")
-        )
         for cause in getattr(item, "causes", [])
         if getattr(item, "id", "")
     }
@@ -185,6 +180,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             continue
         generated_case_count += 1
         alert_type = str(case.get("alert", {}).get("alert_type") or "")
+        source_alert_type = str(source.get("source_alert_type") or alert_type)
         runbook_ids = list(case.get("gold_runbook_ids") or [])
         if not runbook_ids and case.get("gold_runbook_id"):
             runbook_ids = [case["gold_runbook_id"]]
@@ -194,7 +190,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             runbook_ids = [runbook_id] if runbook_id else []
         expected_hash = str(source.get("content_sha256") or "")
         if expected_hash and runbook_ids and all(
-            current_hashes.get((str(runbook_id), alert_type)) == expected_hash
+            current_hashes.get((str(runbook_id), source_alert_type)) == expected_hash
             for runbook_id in runbook_ids
         ):
             fresh_generated_case_count += 1
