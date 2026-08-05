@@ -5,8 +5,8 @@ info:
   description: >
     Optional vendor-neutral contract for retrieving external database alert knowledge.
     This specification conforms to the KnowledgePack (LangChain + Chroma) service API.
-    Retrieved content is approved knowledge guidance but never live evidence for the
-    current incident. Approval is enforced before content enters the production index.
+    Retrieved content is knowledge guidance but never live evidence for the current
+    incident. The API does not expose per-document quality or review states.
 servers:
   - url: "{baseUrl}"
     variables:

@@ -607,7 +607,7 @@ export function AlertDetailPage() {
                   </ol>
                 </SectionCard>
               )}
-              <SectionCard eyebrow="BASIS" title="判断依据" description="已审批知识依据同级展示，AI 分析列在其后">
+              <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
                 {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref">{basis.source === "EXTERNAL_KNOWLEDGE" ? <ExternalLink size={13} /> : <BookCheck size={13} />} {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
               </SectionCard>
               <SectionCard eyebrow="RISK GUARD" title="风险提示" className="risk-card">

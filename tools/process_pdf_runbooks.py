@@ -17,6 +17,38 @@ from app.adapters.pdf_runbooks import derive_runbook_alert_type
 from app.domain.errors import RunbookError
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_LEGACY_REVIEW_FIELDS = frozenset(
+    {
+        "quality_status",
+        "review_status",
+        "review_notes",
+        "visual_review_complete",
+    }
+)
+
+
+def _remove_legacy_review_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _remove_legacy_review_fields(item)
+            for key, item in value.items()
+            if key not in _LEGACY_REVIEW_FIELDS
+        }
+    if isinstance(value, list):
+        return [_remove_legacy_review_fields(item) for item in value]
+    return value
+
+
+def _sanitize_annotation(annotation: dict[str, Any]) -> dict[str, Any]:
+    """Copy an annotation without legacy runbook review fields."""
+
+    sanitized = _remove_legacy_review_fields(annotation)
+    if (
+        annotation.get("quality_status") == "deprecated"
+        and "deprecated" not in annotation
+    ):
+        sanitized["deprecated"] = True
+    return sanitized
 
 
 def _read_source_index(path: Path) -> dict[str, dict[str, Any]]:
@@ -93,7 +125,9 @@ def process_pdf_runbooks(
         if not _SAFE_RUNBOOK_ID.fullmatch(path.stem):
             raise RunbookError(f"PDF has an invalid runbook ID: {path.name}")
         source_ids.add(path.stem)
-        annotation = dict(annotations.get(path.stem) or {"runbook_id": path.stem})
+        annotation = _sanitize_annotation(
+            dict(annotations.get(path.stem) or {"runbook_id": path.stem})
+        )
         alert_type = derive_runbook_alert_type(_extract_text(path), annotation)
         annotation["runbook_id"] = path.stem
         annotation["alert_type"] = alert_type

@@ -29,7 +29,6 @@ from app.domain.models import (
     RunbookDocument,
     RunbookExcerpt,
     RunbookKnowledgeType,
-    RunbookQualityStatus,
     RunbookSection,
     RunbookVisualEvidence,
 )
@@ -108,7 +107,7 @@ def derive_runbook_alert_type(
 ) -> str:
     """Derive one canonical alert type for a PDF processing result.
 
-    A reviewed ``alert_type`` annotation wins. Existing structured alert/metric
+    An explicit ``alert_type`` annotation wins. Existing structured alert/metric
     identities are the next safest processing result. Otherwise a labelled alert
     type in the PDF text is used, and legacy indexes may use their primary alias.
     Ambiguous structured identities are rejected instead of placing a PDF in a
@@ -476,7 +475,7 @@ def _score_section(
 ) -> tuple[float, list[str]]:
     if document.knowledge_type == RunbookKnowledgeType.INCOMPLETE:
         return 0, []
-    if document.quality_status == RunbookQualityStatus.DEPRECATED:
+    if document.deprecated:
         return 0, []
     value_blob, condition_blob, identifier_blob = _alert_filter_blobs(alert)
     if not _scope_matches(
@@ -693,7 +692,7 @@ class LocalPDFRunbookLibrary:
                 ]
             )
             if document.knowledge_type != RunbookKnowledgeType.INCOMPLETE
-            and document.quality_status != RunbookQualityStatus.DEPRECATED
+            and not document.deprecated
         ]
         term_counters = [
             Counter(
@@ -746,17 +745,13 @@ class LocalPDFRunbookLibrary:
                 match_reasons=reasons,
                 page_refs=section.pages,
                 knowledge_type=document.knowledge_type,
-                quality_status=document.quality_status,
                 causes=_section_causes(document, section),
                 actions=_section_actions(document, section),
                 visual_evidence=_section_visual_evidence(document, section),
                 metadata={
                     **document.metadata,
                     "section_title": section.title,
-                    "retrieval": (
-                        "structured_exact+visual_evidence+bm25_char_ngram"
-                        "+quality_rerank"
-                    ),
+                    "retrieval": "structured_exact+visual_evidence+bm25_char_ngram",
                 },
             )
             current = best_by_runbook.get(document.id)
@@ -1012,9 +1007,9 @@ class LocalPDFRunbookLibrary:
             knowledge_type = RunbookKnowledgeType(
                 annotation.get("knowledge_type", RunbookKnowledgeType.RUNBOOK)
             )
-            quality_status = RunbookQualityStatus(
-                annotation.get("quality_status", RunbookQualityStatus.DRAFT)
-            )
+            deprecated = annotation.get("deprecated", False)
+            if not isinstance(deprecated, bool):
+                raise ValueError("deprecated must be a boolean")
             causes = [RunbookCause.model_validate(item) for item in annotation.get("causes", [])]
             actions = [
                 RunbookAction.model_validate(item) for item in annotation.get("actions", [])
@@ -1086,18 +1081,6 @@ class LocalPDFRunbookLibrary:
         match_metadata = annotation.get("match") or {}
         visual_annotated_pages = sorted({item.page for item in visual_evidence})
         unannotated_image_pages = sorted(set(image_pages) - set(visual_annotated_pages))
-        if quality_status == RunbookQualityStatus.APPROVED and unannotated_image_pages:
-            raise RunbookError(
-                f"Approved runbook has unannotated image pages for {path.name}: "
-                f"{unannotated_image_pages}"
-            )
-        if quality_status == RunbookQualityStatus.APPROVED and any(
-            item.review_status != RunbookQualityStatus.APPROVED
-            for item in visual_evidence
-        ):
-            raise RunbookError(
-                f"Approved runbook has unapproved visual evidence: {path.name}"
-            )
         document = RunbookDocument(
             id=path.stem,
             title=_title_from_text(content, path.stem),
@@ -1117,7 +1100,7 @@ class LocalPDFRunbookLibrary:
                 ),
             },
             knowledge_type=knowledge_type,
-            quality_status=quality_status,
+            deprecated=deprecated,
             sections=sections,
             causes=causes,
             actions=actions,
@@ -1135,19 +1118,11 @@ class LocalPDFRunbookLibrary:
                 "visual_annotated_pages": visual_annotated_pages,
                 "unannotated_image_pages": unannotated_image_pages,
                 "visual_coverage_complete": not unannotated_image_pages,
-                "visual_review_complete": (
-                    not unannotated_image_pages
-                    and all(
-                        item.review_status == RunbookQualityStatus.APPROVED
-                        for item in visual_evidence
-                    )
-                ),
                 "annotation_source": (
                     str(annotation_path) if annotation and annotation_path else None
                 ),
                 "scope": annotation.get("scope") or {},
                 "match": match_metadata,
-                "review_notes": annotation.get("review_notes") or [],
             },
             version=1,
             updated_at=datetime.fromtimestamp(file_stat.st_mtime, UTC),

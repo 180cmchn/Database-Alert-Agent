@@ -9,20 +9,21 @@
 
 1. 一份手册对应一个 `.pdf` 文件，文件名（不含扩展名）作为稳定的手册 ID；PDF 和处理结果必须
    放在由告警类型规范化得到的同一类型目录中；
-2. PDF 必须未加密，并带可提取的文字层；扫描件应先完成 OCR，但 OCR 不能替代图片视觉审核；
+2. PDF 必须未加密，并带可提取的文字层；扫描件应先完成 OCR，含图页面还应提取图片中的关键信息；
 3. 每个类型目录的 `index.json` 使用 `schema_version=3`，顶层 `alert_type` 必须与目录名一致；其中
    的 `runbook_id` 必须对应该目录现有 PDF，章节页码不得超出 PDF 页数；
 4. 对每个含图页面渲染检查图片，提取红框/高亮报错、命令、配置值、界面字段和流程分支，写入带
    `page`、`kind`、`text`、`keywords`、可选 `section_ids` 的 `visual_evidence`；
 5. 原因和动作可用 `section_ids` 绑定章节，动作可用 `cause_id` 与原因一一对应；同页包含多个原因时，
    必须为章节配置互不混淆的 `match_terms`；
-6. 新资料先标为 `draft` 或 `review_required`；数据库专家同时复核文字和视觉证据后，才能把手册及
-   对应视觉证据改为 `approved`；含图页面未标注或视觉证据未批准时，服务拒绝加载 `approved` 手册；
-7. `incomplete` 和 `deprecated` 不参与检索，未批准资料的分析结果必须人工复核；
+6. 含图页面必须按第 4 条完成 `visual_evidence` 标注；手册和视觉证据不维护质量等级或审核状态，
+   所有可检索手册按相同规则参与匹配；
+7. `knowledge_type=incomplete` 或 `deprecated=true` 的资料不参与检索；`deprecated` 只表示资料已停用，
+   不表示质量等级；
 8. 变更类动作必须标记 `execution_class=change` 和 `approval_required=true`；
 9. 替换、新增或删除 PDF/索引后重启 API 与 Worker，使各进程使用同一版本；
 10. 不维护网页地址、Cookie、Bearer Token 或内网页面白名单；
-11. 管理 API 和前端手册页只读，不提供在线修改或审批。
+11. 管理 API 和前端手册页只读，不提供在线修改；
 12. 告警分析只检索 `alert_type` 对应的目录，不跨类型兜底；目录不存在时返回
     `匹配本地pdf失败，pdf中没有该类型告警的处理方法`。
 
@@ -47,12 +48,11 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 ```
 
 输出目录必须尚不存在，处理过程不会覆盖原始 PDF。目录中任意 PDF 缺少文字层、已加密、损坏、超过大小限制，或索引引用缺失 PDF/无效页码时，
-服务会明确报错，不会悄悄回退。批准前请运行：
+服务会明确报错，不会悄悄回退。提交或部署手册目录前请运行：
 
 ```bash
 .venv/bin/python tools/audit_runbook_visuals.py
 .venv/bin/python tools/evaluate_runbooks.py --enforce-gates
 ```
 
-第一条命令在存在未覆盖的含图页面时失败；正式批准时追加 `--require-approved`，确保所有视觉证据
-也已由专家批准。
+第一条命令在存在未覆盖的含图页面时失败；第二条命令按生产准入策略校验检索与诊断覆盖率。

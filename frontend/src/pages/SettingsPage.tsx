@@ -213,8 +213,8 @@ export function SettingsPage() {
 
         <SectionCard eyebrow="KNOWLEDGE SOURCES" title="Agent 参考依据" description="本地 PDF 与外部知识库可独立选择或同时使用；选择外部知识库即启用连接，取消选择即停用连接。" action={<span className={`configured-chip ${externalKnowledgeSelected ? "yes" : "no"}`}><ShieldCheck size={13} />{externalKnowledgeSelected ? "外部知识库已选择" : "外部知识库未选择"}</span>}>
           <div className="switch-stack">
-            <label className="switch-row"><span><Sparkles size={17} /><span><strong>本地 PDF 手册</strong><small>从本地 runbooks/pdfs 目录检索已审批的 PDF 处置手册</small></span></span><input name="knowledge_local_pdf" type="checkbox" defaultChecked={settings.knowledge_sources.includes("local_pdf")} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>外部知识库</strong><small>选中后连接并检索已审批的 KnowledgePack 内容；取消后不再建立连接</small></span></span><input name="knowledge_external" type="checkbox" checked={externalKnowledgeSelected} onChange={(event) => setExternalKnowledgeSelected(event.target.checked)} /><i /></label>
+            <label className="switch-row"><span><Sparkles size={17} /><span><strong>本地 PDF 手册</strong><small>从本地 runbooks/pdfs 目录检索已配置的 PDF 处置手册</small></span></span><input name="knowledge_local_pdf" type="checkbox" defaultChecked={settings.knowledge_sources.includes("local_pdf")} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>外部知识库</strong><small>选中后连接并检索 KnowledgePack 内容；取消后不再建立连接</small></span></span><input name="knowledge_external" type="checkbox" checked={externalKnowledgeSelected} onChange={(event) => setExternalKnowledgeSelected(event.target.checked)} /><i /></label>
           </div>
           <div className="form-grid two-cols">
             <label className="field"><span>本地 PDF 最低匹配置信度（部署配置）</span><input value={settings.runbook_match_min_confidence.toFixed(2)} readOnly /></label>

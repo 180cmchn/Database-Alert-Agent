@@ -1,6 +1,6 @@
 ---
 name: analyze-database-alerts
-description: Identify and analyze database alerts using structured alert semantics, approved local PDF and external knowledge sources, read-only live evidence, and reviewed incident cases. Use when an alert Agent must normalize a database alert, classify its affected engine, object, and signal, form and test root-cause hypotheses, choose the next read-only probe, distinguish supported, contradicted, and unknown causes, or produce an evidence-grounded recommendation with safe human review.
+description: Identify and analyze database alerts using structured alert semantics, configured local PDF and external knowledge sources, read-only live evidence, and reviewed incident cases. Use when an alert Agent must normalize a database alert, classify its affected engine, object, and signal, form and test root-cause hypotheses, choose the next read-only probe, distinguish supported, contradicted, and unknown causes, or produce an evidence-grounded recommendation with safe human review.
 ---
 
 # Analyze Database Alerts
@@ -13,9 +13,8 @@ database changes.
 
 Apply two independent precedence rules:
 
-1. For operational guidance, treat every selected deployment knowledge source as a peer. Content
-   in both the local PDF corpus and the production external index is approved before deployment;
-   do not infer authority from its source type.
+1. For operational guidance, treat every selected deployment knowledge source as a peer. Do not
+   infer authority from its source type or from legacy quality and review metadata.
 2. For incident truth, prefer successful live evidence from the affected system. An alert payload,
    runbook, external article, or historical case can suggest a cause but cannot prove that cause
    occurred in this incident.
@@ -68,9 +67,9 @@ engine, alert type, metric or error signature, resource, service, and environmen
 retrieved `runbook_id`, section, and page reference.
 
 For the external source, follow
-[references/external-knowledge-api.yaml](references/external-knowledge-api.yaml). Approval happens
-before content enters the production KnowledgePack index. An API failure or empty response is
-missing knowledge evidence; continue with other selected sources and general reasoning.
+[references/external-knowledge-api.yaml](references/external-knowledge-api.yaml). An API failure or
+empty response is missing knowledge evidence; continue with other selected sources and general
+reasoning.
 
 Apply each source's configured minimum threshold. Reject candidates below threshold. If no
 selected source matches, state the rejection explicitly and cap confidence at `0.45`.
@@ -136,7 +135,7 @@ Stop and request human review instead of forcing a conclusion when:
 
 - no live evidence can distinguish the plausible causes;
 - the affected database target or alert window is ambiguous;
-- approved knowledge guidance conflicts with current system evidence;
+- retrieved knowledge guidance conflicts with current system evidence;
 - only unsafe or write-capable probes could resolve the uncertainty;
 - external knowledge lacks traceable provenance;
 - the proposed action can alter data, availability, topology, sessions, or configuration.

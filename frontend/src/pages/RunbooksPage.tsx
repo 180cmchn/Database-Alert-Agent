@@ -1,4 +1,4 @@
-import { BookOpenCheck, FileText, KeyRound, Search } from "lucide-react";
+import { BookOpen, FileText, KeyRound, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AdminUnlock,
@@ -98,8 +98,8 @@ export function RunbooksPage() {
               <div className="runbook-list">
                 {filtered.map((runbook) => (
                   <button type="button" key={runbook.id} className={selectedId === runbook.id ? "active" : ""} onClick={() => setSelectedId(runbook.id)}>
-                    <span className="runbook-list-icon"><BookOpenCheck size={18} /></span>
-                    <span><strong>{runbook.title}</strong><small>{metadataString(runbook, "page_count")} 页 · {runbook.knowledge_type} · {runbook.quality_status}</small><em>{formatDateTime(runbook.updated_at)}</em></span>
+                    <span className="runbook-list-icon"><BookOpen size={18} /></span>
+                    <span><strong>{runbook.title}</strong><small>{metadataString(runbook, "page_count")} 页 · {runbook.knowledge_type}</small><em>{formatDateTime(runbook.updated_at)}</em></span>
                   </button>
                 ))}
               </div>
@@ -119,10 +119,9 @@ export function RunbooksPage() {
                     <div><dt>大小</dt><dd>{metadataString(selected, "file_size_bytes")} bytes</dd></div>
                     <div><dt>手册 ID</dt><dd>{selected.id}</dd></div>
                     <div><dt>知识类型</dt><dd>{selected.knowledge_type}</dd></div>
-                    <div><dt>质量状态</dt><dd>{selected.quality_status}</dd></div>
                   </dl>
                   {selected.severities.length > 0 && <div className="runbook-severities">{selected.severities.map((severity) => <SeverityBadge key={severity} severity={severity} />)}</div>}
-                  <p className="runbook-readonly-note">PDF 是审计原文；章节、诊断图和质量状态来自只读结构化索引。review_required/draft 资料不能通过生产准入门槛。</p>
+                  <p className="runbook-readonly-note">PDF 是审计原文；章节、诊断图和图片证据来自只读结构化索引，所有可检索手册按相同规则参与匹配。</p>
                   <pre className="runbook-content-preview">{selected.content}</pre>
                 </div>
               </>

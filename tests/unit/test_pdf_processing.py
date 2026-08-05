@@ -67,15 +67,35 @@ async def test_processing_splits_pdfs_and_results_by_alert_type(
                     {
                         "runbook_id": "slow-query",
                         "alert_type": "MySQL/Slow Query 400",
+                        "quality_status": "approved",
                         "match": {
                             "alert_names": ["MySQL/Slow Query 400"],
                             "metric_names": [],
                             "aliases": [],
                             "keywords": [],
                         },
+                        "visual_evidence": [
+                            {
+                                "page": 1,
+                                "kind": "screenshot",
+                                "text": "Query latency chart",
+                                "review_status": "approved",
+                                "keywords": ["latency"],
+                                "metadata": {
+                                    "review_notes": "checked",
+                                    "owner": "database-team",
+                                },
+                            }
+                        ],
+                        "metadata": {
+                            "review_status": "source-reviewed",
+                            "visual_review_complete": True,
+                            "owner": "database-team",
+                        },
                     },
                     {
                         "runbook_id": "replica-lag",
+                        "quality_status": "deprecated",
                         "match": {
                             "alert_names": ["ReplicaLag"],
                             "metric_names": [],
@@ -104,6 +124,18 @@ async def test_processing_splits_pdfs_and_results_by_alert_type(
     )
     assert typed_index["schema_version"] == 3
     assert typed_index["alert_type"] == "mysql_slow_query_400"
+    annotation = typed_index["runbooks"][0]
+    assert "quality_status" not in annotation
+    assert "review_status" not in annotation["visual_evidence"][0]
+    assert annotation["visual_evidence"][0]["keywords"] == ["latency"]
+    assert annotation["visual_evidence"][0]["metadata"] == {
+        "owner": "database-team"
+    }
+    assert annotation["metadata"] == {"owner": "database-team"}
+    replica_annotation = json.loads(
+        (output / "replicalag" / "index.json").read_text(encoding="utf-8")
+    )["runbooks"][0]
+    assert replica_annotation["deprecated"] is True
 
     alert = CanonicalAlertSourceAdapter().normalize(
         {

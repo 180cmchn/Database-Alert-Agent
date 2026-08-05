@@ -74,13 +74,6 @@ class RunbookKnowledgeType(StrEnum):
     INCOMPLETE = "incomplete"
 
 
-class RunbookQualityStatus(StrEnum):
-    DRAFT = "draft"
-    REVIEW_REQUIRED = "review_required"
-    APPROVED = "approved"
-    DEPRECATED = "deprecated"
-
-
 class ExecutionClass(StrEnum):
     READ_ONLY = "read_only"
     CHANGE = "change"
@@ -181,7 +174,6 @@ class RunbookVisualEvidence(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
     keywords: list[str] = Field(default_factory=list)
     section_ids: list[str] = Field(default_factory=list)
-    review_status: RunbookQualityStatus = RunbookQualityStatus.REVIEW_REQUIRED
 
 
 class RunbookExcerpt(BaseModel):
@@ -194,7 +186,6 @@ class RunbookExcerpt(BaseModel):
     match_reasons: list[str] = Field(default_factory=list)
     page_refs: list[int] = Field(default_factory=list)
     knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
-    quality_status: RunbookQualityStatus = RunbookQualityStatus.DRAFT
     causes: list[RunbookCause] = Field(default_factory=list)
     actions: list[RunbookAction] = Field(default_factory=list)
     visual_evidence: list[RunbookVisualEvidence] = Field(default_factory=list)
@@ -202,7 +193,7 @@ class RunbookExcerpt(BaseModel):
 
 
 class ExternalKnowledgeExcerpt(BaseModel):
-    """Approved excerpt returned by the configured external knowledge service."""
+    """Excerpt returned by the configured external knowledge service."""
 
     knowledge_id: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=300)
@@ -210,7 +201,6 @@ class ExternalKnowledgeExcerpt(BaseModel):
     source_uri: str = Field(min_length=1, max_length=2048)
     score: float = Field(ge=0, le=1)
     raw_score: float = Field(ge=0)
-    quality_status: RunbookQualityStatus = RunbookQualityStatus.APPROVED
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -223,7 +213,7 @@ class RunbookDocument(BaseModel):
     severities: list[str] = Field(default_factory=list)
     labels: dict[str, str] = Field(default_factory=dict)
     knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
-    quality_status: RunbookQualityStatus = RunbookQualityStatus.DRAFT
+    deprecated: bool = False
     sections: list[RunbookSection] = Field(default_factory=list)
     causes: list[RunbookCause] = Field(default_factory=list)
     actions: list[RunbookAction] = Field(default_factory=list)

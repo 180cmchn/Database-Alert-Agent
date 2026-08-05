@@ -10,7 +10,7 @@ from typing import Any
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.domain.errors import RunbookAlertTypeNotFoundError
-from app.domain.models import RunbookKnowledgeType, RunbookQualityStatus
+from app.domain.models import RunbookKnowledgeType
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -119,10 +119,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         item
         for item in documents
         if item.knowledge_type != RunbookKnowledgeType.INCOMPLETE
-        and item.quality_status != RunbookQualityStatus.DEPRECATED
-    ]
-    approved = [
-        item for item in eligible if item.quality_status == RunbookQualityStatus.APPROVED
+        and not item.deprecated
     ]
     metrics = {
         "runbook_recall_at_5": _ratio(recall_hits, match_total),
@@ -130,7 +127,6 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "no_match_accuracy": _ratio(no_match_hits, no_match_total),
         "section_hit_rate": _ratio(section_hits, match_total),
         "cause_candidate_recall": _ratio(cause_found, cause_expected),
-        "approved_runbook_ratio": _ratio(len(approved), len(eligible)),
     }
     all_reviewed = all(
         item.get("review_status") == "approved"
@@ -142,7 +138,6 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "matching_cases": len(matching_cases),
             "diagnosis_cases": len(diagnosis_cases),
             "eligible_runbooks": len(eligible),
-            "approved_runbooks": len(approved),
         },
         "dataset_reviewed": all_reviewed,
         "failures": failures,

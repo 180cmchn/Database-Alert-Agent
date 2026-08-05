@@ -112,7 +112,6 @@ export interface ExternalKnowledgeExcerpt {
   source_uri: string;
   score: number;
   raw_score: number;
-  quality_status: "draft" | "review_required" | "approved" | "deprecated";
   metadata: Record<string, unknown>;
 }
 
@@ -126,7 +125,6 @@ export interface RunbookExcerpt {
   match_reasons: string[];
   page_refs: number[];
   knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
-  quality_status: "draft" | "review_required" | "approved" | "deprecated";
   metadata: Record<string, unknown>;
 }
 
@@ -365,7 +363,7 @@ export interface RunbookRecord {
   severities: Severity[];
   labels: Record<string, string>;
   knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
-  quality_status: "draft" | "review_required" | "approved" | "deprecated";
+  deprecated: boolean;
   sections: Array<{ id: string; title: string; pages: number[]; content: string }>;
   causes: Array<{
     cause_id: string;

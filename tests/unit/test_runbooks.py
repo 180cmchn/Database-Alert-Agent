@@ -17,6 +17,7 @@ from app.domain.errors import (
     RunbookAlertTypeNotFoundError,
     RunbookError,
 )
+from app.domain.models import RunbookDocument, RunbookExcerpt, RunbookVisualEvidence
 
 SOURCE_PDFS = Path(__file__).parents[2] / "runbooks" / "pdfs"
 TIKV_PDF = (
@@ -119,7 +120,6 @@ def _self_contained_library(
                         "runbook_id": runbook_id,
                         "alert_type": "replica_lag",
                         "knowledge_type": "runbook",
-                        "quality_status": "approved",
                         "scope": scope or {},
                         "match": {
                             "alert_names": ["ReplicaLag"],
@@ -247,6 +247,12 @@ def test_alert_type_directory_name_is_shared_and_path_safe() -> None:
     )
 
 
+def test_runbook_models_do_not_expose_quality_or_review_status_fields() -> None:
+    assert "quality_status" not in RunbookExcerpt.model_fields
+    assert "quality_status" not in RunbookDocument.model_fields
+    assert "review_status" not in RunbookVisualEvidence.model_fields
+
+
 @pytest.mark.asyncio
 @requires_repository_annotations
 async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
@@ -292,7 +298,7 @@ async def test_local_pdf_runbook_get_rejects_unsafe_id(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @requires_repository_annotations
-async def test_repository_annotations_provide_sections_quality_and_diagnosis_graph() -> None:
+async def test_repository_annotations_provide_sections_and_diagnosis_graph() -> None:
     library = LocalPDFRunbookLibrary(SOURCE_PDFS)
     documents = await library.list()
     template = next(item for item in documents if item.id == "SYNTHETIC-RUNBOOK-ID")
@@ -309,7 +315,6 @@ async def test_repository_annotations_provide_sections_quality_and_diagnosis_gra
     matches = await library.search(alert)
 
     assert template.knowledge_type.value == "incomplete"
-    assert template.quality_status.value == "draft"
     assert all(item.runbook_id != template.id for item in matches)
     assert matches[0].section != "PDF"
     assert matches[0].page_refs
@@ -326,7 +331,7 @@ async def test_repository_annotations_provide_sections_quality_and_diagnosis_gra
     assert tikv.metadata["image_pages"] == [1, 2, 3]
     assert tikv.metadata["unannotated_image_pages"] == []
     assert tikv.metadata["visual_coverage_complete"] is True
-    assert tikv.metadata["visual_review_complete"] is False
+    assert "visual_review_complete" not in tikv.metadata
 
 
 @pytest.mark.asyncio
@@ -541,7 +546,9 @@ async def test_database_scope_tolerates_present_target_with_unknown_engine(
 
 @pytest.mark.asyncio
 @requires_repository_annotations
-async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) -> None:
+async def test_runbook_without_visual_annotations_reports_incomplete_coverage(
+    tmp_path: Path,
+) -> None:
     pdf_dir = tmp_path / "pdfs"
     alert_type_dir = pdf_dir / "synthetic_replica_lag_high"
     alert_type_dir.mkdir(parents=True)
@@ -556,7 +563,6 @@ async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) 
                     {
                         "runbook_id": TIKV_PDF.stem,
                         "knowledge_type": "runbook",
-                        "quality_status": "approved",
                     }
                 ],
             }
@@ -564,5 +570,8 @@ async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    with pytest.raises(RunbookError, match="unannotated image pages"):
-        await LocalPDFRunbookLibrary(pdf_dir).list()
+    documents = await LocalPDFRunbookLibrary(pdf_dir).list()
+
+    assert len(documents) == 1
+    assert documents[0].metadata["unannotated_image_pages"]
+    assert documents[0].metadata["visual_coverage_complete"] is False

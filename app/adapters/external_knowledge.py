@@ -6,8 +6,7 @@ FlashDuty adapter: typed errors, bounded retries, and graceful degradation.
 
 Per the deployment and skill contracts:
 - Results are advisory data, never live evidence.
-- KnowledgePack content is approved before indexing, so results are treated as
-  approved knowledge guidance just like the configured local PDFs.
+- KnowledgePack results and configured local PDFs are peer knowledge sources.
 - API failure or an empty response degrades gracefully to other selected sources.
 """
 
@@ -325,7 +324,6 @@ def format_items_for_advisor(
                 source_uri=_safe_source_uri(source),
                 score=round(item.relevance, 4),
                 raw_score=item.raw_score,
-                quality_status="approved",
                 metadata=sanitize(item.metadata),
             )
         )

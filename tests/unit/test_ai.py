@@ -17,6 +17,7 @@ from app.domain.models import (
     RecommendationStep,
     RunbookExcerpt,
     RunbookReference,
+    RunbookVisualEvidence,
 )
 
 
@@ -83,9 +84,55 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
 
 
 @pytest.mark.asyncio
+async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    captured_payload: dict[str, object] = {}
+    model_response = Recommendation(
+        summary="No semantic match",
+        analysis_bases=[
+            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")
+        ],
+        steps=[RecommendationStep(order=1, action="check read-only metrics")],
+        requires_human=True,
+        confidence=0.3,
+        manual_matched=False,
+    )
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        captured_payload.update(json.loads(messages[1]["content"]))
+        return model_response.model_dump_json(), object()
+
+    advisor._complete = complete
+    runbook = RunbookExcerpt(
+        runbook_id="rb-1",
+        title="Replica guide",
+        section="triage",
+        content="Check replica apply rate.",
+        visual_evidence=[
+            RunbookVisualEvidence(
+                page=1,
+                kind="screenshot",
+                text="Replica apply rate chart",
+            )
+        ],
+    )
+
+    await advisor.advise(make_alert(), [runbook])
+
+    excerpt = captured_payload["runbook_excerpts"][0]  # type: ignore[index]
+    assert "quality_status" not in excerpt
+    assert "review_status" not in excerpt["visual_evidence"][0]
+
+
+@pytest.mark.asyncio
 async def test_matched_runbook_bases_are_ordered_before_ai() -> None:
     runbook = RunbookExcerpt(
-        runbook_id="rb-1", title="RB", section="triage", content="approved"
+        runbook_id="rb-1",
+        title="RB",
+        section="triage",
+        content="diagnostic guidance",
     )
 
     recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [runbook])
@@ -120,7 +167,14 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
             RunbookReference(runbook_id="unknown-rb", section="PDF")
         ],
     )
-    runbooks = [RunbookExcerpt(runbook_id="rb-1", title="RB", section="PDF", content="approved")]
+    runbooks = [
+        RunbookExcerpt(
+            runbook_id="rb-1",
+            title="RB",
+            section="PDF",
+            content="diagnostic guidance",
+        )
+    ]
     result = _validate_manual_policy(recommendation, runbooks)
 
     # Invalid runbook reference dropped, valid references kept.
@@ -171,7 +225,14 @@ def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None
         manual_matched=False,
         runbook_references=[reference],
     )
-    runbooks = [RunbookExcerpt(runbook_id="rb-1", title="RB", section="triage", content="approved")]
+    runbooks = [
+        RunbookExcerpt(
+            runbook_id="rb-1",
+            title="RB",
+            section="triage",
+            content="diagnostic guidance",
+        )
+    ]
     result = _validate_manual_policy(recommendation, runbooks)
     assert result.manual_matched is False
     assert result.runbook_references == []
