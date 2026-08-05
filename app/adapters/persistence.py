@@ -8,14 +8,17 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     MetaData,
     String,
     Table,
     Text,
     UniqueConstraint,
+    delete,
     desc,
     event,
+    exists,
     inspect,
     select,
     text,
@@ -82,7 +85,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0009"
+DATABASE_SCHEMA_REVISION = "0010"
 
 
 class Base(DeclarativeBase):
@@ -99,7 +102,10 @@ _alembic_version = Table(
 
 class AlertRow(Base):
     __tablename__ = "alerts"
-    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_alert_identity"),)
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_alert_identity"),
+        Index("ix_alerts_status_created_at", "status", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     source: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
@@ -316,6 +322,31 @@ class SQLAlchemyAlertRepository:
         async with self.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
             await self._assert_schema_current(connection)
+
+    async def cleanup_expired_alerts(self, cutoff: datetime) -> int:
+        """Delete expired terminal alerts that have never received human feedback.
+
+        The ``NOT EXISTS`` predicate is intentionally part of the delete itself,
+        rather than a preceding lookup, so a concurrent feedback submission cannot
+        cause its alert (and the feedback row through FK cascade) to be removed.
+        """
+
+        if cutoff.tzinfo is None:
+            raise ValueError("cleanup cutoff must be timezone-aware")
+        async with self.session_factory() as session:
+            feedback_exists = exists(
+                select(FeedbackRow.id).where(FeedbackRow.alert_id == AlertRow.id)
+            )
+            statement = delete(AlertRow).where(
+                AlertRow.created_at < cutoff.astimezone(UTC),
+                AlertRow.status.in_(
+                    [AlertStatus.COMPLETED.value, AlertStatus.FAILED.value]
+                ),
+                ~feedback_exists,
+            )
+            result = await session.execute(statement)
+            await session.commit()
+            return int(result.rowcount or 0)
 
     @staticmethod
     def _schema_snapshot(connection) -> dict[str, set[str]]:  # type: ignore[no-untyped-def]

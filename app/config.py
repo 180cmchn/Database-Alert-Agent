@@ -192,6 +192,11 @@ class Settings(BaseSettings):
     scheduler_workers: int = Field(default=1, ge=1, le=16)
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
     tool_max_result_chars: int = Field(default=12000, ge=1000, le=100000)
+    # Retention runs only at the configured weekly calendar slot; startup never
+    # triggers an immediate cleanup. Human-reviewed alerts are always excluded
+    # by the repository-level retention query.
+    alert_retention_enabled: bool = True
+    alert_retention_days: int = Field(default=7, ge=7, le=3650)
     react_enabled: bool = False
     react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
     validation_enabled: bool = True

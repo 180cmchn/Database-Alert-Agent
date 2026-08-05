@@ -37,6 +37,7 @@ from app.application.scheduler import (
     InMemoryAnalysisScheduler,
     KafkaAnalysisScheduler,
     ManualAnalysisScheduler,
+    WeeklyAlertRetentionCleaner,
 )
 from app.config import Settings, get_settings
 from app.domain.errors import (
@@ -88,6 +89,7 @@ def create_app(
     flashduty_poller = FlashDutyAlertPoller(
         settings, runtime.service, scheduler, runtime.flashduty_client
     )
+    retention_cleaner = WeeklyAlertRetentionCleaner(settings, runtime.repository)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -96,11 +98,14 @@ def create_app(
         app.state.runtime = runtime
         app.state.scheduler = scheduler
         app.state.flashduty_poller = flashduty_poller
+        app.state.retention_cleaner = retention_cleaner
         await scheduler.start()
         await flashduty_poller.start()
+        await retention_cleaner.start()
         try:
             yield
         finally:
+            await retention_cleaner.stop()
             await flashduty_poller.stop()
             await scheduler.stop()
             await runtime.service.close()
@@ -119,6 +124,7 @@ def create_app(
     app.state.runbook_store = runbook_store
     app.state.audit_logger = audit_logger
     app.state.flashduty_poller = flashduty_poller
+    app.state.retention_cleaner = retention_cleaner
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allowed_origins,

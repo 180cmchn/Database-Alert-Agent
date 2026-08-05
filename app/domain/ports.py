@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from app.domain.models import (
@@ -115,6 +116,8 @@ class AlertRepository(Protocol):
     async def initialize(self) -> None: ...
 
     async def ping(self) -> None: ...
+
+    async def cleanup_expired_alerts(self, cutoff: datetime) -> int: ...
 
     async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]: ...
 

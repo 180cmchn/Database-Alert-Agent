@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone
 
 from aiokafka import AIOKafkaProducer
 
@@ -14,6 +15,32 @@ from app.config import Settings
 from app.domain.models import AlertStatus, StoredAlert
 
 logger = logging.getLogger(__name__)
+
+# China Standard Time has no daylight-saving transitions, so a fixed UTC+08:00
+# offset precisely represents Asia/Shanghai while also working on minimal Windows
+# images that do not ship the IANA time-zone database or the optional tzdata wheel.
+SHANGHAI_TIME_ZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+WEEKLY_RETENTION_WEEKDAY = 4  # Friday, matching datetime.weekday().
+
+
+def next_weekly_retention_run(now: datetime | None = None) -> datetime:
+    """Return the next Friday 12:00 Asia/Shanghai slot as a UTC datetime.
+
+    A slot equal to ``now`` has already begun, so it returns the following week.
+    This prevents a process starting exactly at noon from cleaning immediately.
+    """
+
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    local_now = current.astimezone(SHANGHAI_TIME_ZONE)
+    days_until_friday = (WEEKLY_RETENTION_WEEKDAY - local_now.weekday()) % 7
+    scheduled = (local_now + timedelta(days=days_until_friday)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    if scheduled <= local_now:
+        scheduled += timedelta(days=7)
+    return scheduled.astimezone(UTC)
 
 
 def _remaining_poll_delay(
@@ -308,6 +335,62 @@ class FlashDutyAlertPoller:
                     finished_at=time.monotonic(),
                 )
             )
+
+
+class WeeklyAlertRetentionCleaner:
+    """Delete only unreviewed expired terminal alerts each Friday at 12:00 CST.
+
+    The loop deliberately waits for the next calendar slot before its first run;
+    unlike polling, service startup must never perform retention cleanup.
+    """
+
+    def __init__(self, settings: Settings, repository) -> None:  # type: ignore[no-untyped-def]
+        self.settings = settings
+        self.repository = repository
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.settings.alert_retention_enabled
+
+    async def start(self) -> None:
+        if not self.enabled or self._task is not None:
+            return
+        self._task = asyncio.create_task(
+            self._loop(), name="weekly-alert-retention-cleaner"
+        )
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    async def run_once(self, *, now: datetime | None = None) -> int:
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        cutoff = current.astimezone(UTC) - timedelta(days=self.settings.alert_retention_days)
+        deleted = await self.repository.cleanup_expired_alerts(cutoff)
+        logger.info(
+            "alert_retention_completed cutoff=%s deleted=%s retention_days=%s",
+            cutoff.isoformat(),
+            deleted,
+            self.settings.alert_retention_days,
+        )
+        return deleted
+
+    async def _loop(self) -> None:
+        while True:
+            scheduled = next_weekly_retention_run()
+            await asyncio.sleep(max(0.0, (scheduled - datetime.now(UTC)).total_seconds()))
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("alert_retention_failed scheduled=%s", scheduled.isoformat())
 
 
 class InMemoryAnalysisScheduler:
