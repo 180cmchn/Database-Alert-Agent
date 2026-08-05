@@ -39,7 +39,7 @@ ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # Bound the generated SELECT and the evidence text returned by Archery. The
 # character limit can still truncate non-empty evidence.
-ARCHERY_SLOW_LOG_LIMIT: Final = 100
+ARCHERY_SLOW_LOG_LIMIT: Final = 20
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # Backward-compatible constant: this is the default; deployments may override it.
@@ -47,7 +47,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v17"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v18"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -600,6 +600,12 @@ class ArcheryMCPClient:
                                     if target is not None and isinstance(
                                         requested_sql, str
                                     ):
+                                        metadata_payload, _, _ = (
+                                            self._normalize_query_payload(
+                                                payload,
+                                                requested_sql=requested_sql,
+                                            )
+                                        )
                                         self._record_metadata_resolution_evidence(
                                             resolution_steps=metadata_resolution_steps,
                                             member_instance_ids=(
@@ -610,7 +616,7 @@ class ArcheryMCPClient:
                                             ),
                                             target=target,
                                             sql=requested_sql,
-                                            payload=payload,
+                                            payload=metadata_payload,
                                             alert_endpoint=alert_endpoint,
                                             table_columns=metadata_table_columns,
                                         )
@@ -629,12 +635,21 @@ class ArcheryMCPClient:
                                     payload,
                                     requested_sql=requested_sql,
                                 )
+                                normalized_payload = self._limit_result_rows(
+                                    normalized_payload,
+                                    limit=ARCHERY_SLOW_LOG_LIMIT,
+                                )
                                 instance_identity_verification = (
                                     await self._verify_slow_log_instance_identity(
                                         session,
                                         query_arguments=call.arguments,
                                         alert_endpoint=alert_endpoint,
                                         slow_log_payload=normalized_payload,
+                                        verified_executed_sql=(
+                                            executed_sql
+                                            if actual_sql_verified
+                                            else None
+                                        ),
                                     )
                                 )
                                 mcp_roundtrip_count += int(
@@ -779,7 +794,8 @@ class ArcheryMCPClient:
             f"{self._slow_query_target_resolution_guidance()}"
             f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询。"
             "最终只读SELECT必须使用发现到的慢日志相关表、返回hostname_max并显式包含LIMIT，"
-            f"LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
+            f"无论符合条件的记录有多少，LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}，"
+            f"sql_query的limit_num也不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
             "必须依据list_table_columns返回的真实字段名和类型选择慢查询时间字段，不要猜测。"
             "对于DATETIME或TIMESTAMP字段，可直接使用Host给出的Unix秒配合FROM_UNIXTIME；"
@@ -1220,12 +1236,26 @@ class ArcheryMCPClient:
         query_arguments: Mapping[str, Any],
         alert_endpoint: str | None,
         slow_log_payload: Mapping[str, Any],
+        verified_executed_sql: str | None,
     ) -> dict[str, Any]:
         """Compare alert and slow-log endpoints through Archery member IDs."""
 
         normalized_alert_endpoint = self._normalize_endpoint(alert_endpoint)
         slow_log_endpoints = self._slow_log_endpoints_from_payload(slow_log_payload)
         row_count = self._payload_row_count(slow_log_payload)
+        slow_log_endpoint_source = "result_rows" if slow_log_endpoints else None
+        if (
+            not slow_log_endpoints
+            and row_count is not None
+            and row_count > 0
+            and verified_executed_sql is not None
+        ):
+            verified_sql_endpoint = self._hostname_max_endpoint_from_sql(
+                verified_executed_sql
+            )
+            if verified_sql_endpoint is not None:
+                slow_log_endpoints.add(verified_sql_endpoint)
+                slow_log_endpoint_source = "verified_executed_sql_filter"
         base: dict[str, Any] = {
             "comparison_basis": (
                 f"{ARCHERY_METADATA_DB_NAME}.{ARCHERY_INSTANCE_MEMBER_TABLE}."
@@ -1233,6 +1263,7 @@ class ArcheryMCPClient:
             ),
             "alert_endpoint": normalized_alert_endpoint,
             "slow_log_endpoints": sorted(slow_log_endpoints),
+            "slow_log_endpoint_source": slow_log_endpoint_source,
             "same_instance": None,
             "mcp_call_count": 0,
             "queries": [],
@@ -1388,6 +1419,25 @@ class ArcheryMCPClient:
             f"WHERE f_ip = '{host}' AND f_port = {int(port)} LIMIT 2"
         )
 
+    @classmethod
+    def _hostname_max_endpoint_from_sql(cls, sql: str) -> str | None:
+        """Recover a result scope only from a verified SELECT and equality filter."""
+
+        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
+        if select is None or re.search(
+            r"(?i)(?<![A-Za-z0-9_$])`?hostname_max`?(?![A-Za-z0-9_$])",
+            select.group("body"),
+        ) is None:
+            return None
+        match = re.search(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?hostname_max`?\s*=\s*'(?P<endpoint>(?:''|[^'])*)'",
+            sql,
+        )
+        if match is None:
+            return None
+        return cls._normalize_endpoint(match.group("endpoint").replace("''", "'"))
+
     @staticmethod
     def _identity_query_arguments(
         source_arguments: Mapping[str, Any],
@@ -1411,9 +1461,10 @@ class ArcheryMCPClient:
 
     @staticmethod
     def _payload_row_count(payload: Mapping[str, Any]) -> int | None:
-        rows = payload.get("rows")
-        if isinstance(rows, list):
-            return len(rows)
+        for key in ("rows", "result"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return len(rows)
         for key in ("rowCount", "row_count", "total"):
             value = payload.get(key)
             if type(value) is int and value >= 0:
@@ -1427,6 +1478,34 @@ class ArcheryMCPClient:
             if type(affected_rows) is int and affected_rows >= 0
             else None
         )
+
+    @classmethod
+    def _limit_result_rows(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Bound parsed result rows without rejecting or rewriting the MCP call."""
+
+        bounded = dict(payload)
+        for row_key in ("rows", "result"):
+            rows = bounded.get(row_key)
+            if not isinstance(rows, list):
+                continue
+            if len(rows) <= limit:
+                return bounded
+            reported_count = cls._payload_row_count(bounded) or len(rows)
+            bounded[row_key] = rows[:limit]
+            bounded["rowCount"] = len(bounded[row_key])
+            if reported_count is not None and reported_count > limit:
+                bounded["mcp_reported_row_count"] = reported_count
+                bounded["rows_limited_to"] = limit
+            return bounded
+        data = bounded.get("data")
+        if isinstance(data, Mapping):
+            bounded["data"] = cls._limit_result_rows(data, limit=limit)
+        return bounded
 
     @classmethod
     def _member_instance_ids_from_payload(cls, payload: Mapping[str, Any]) -> set[int]:
@@ -1893,12 +1972,22 @@ class ArcheryMCPClient:
 
         normalized_payload = dict(payload)
         echoed_sql: str | None = None
+        reported_row_count: int | None = None
         for text in cls._metadata_text(payload):
             echoed_sql = echoed_sql or cls._executed_sql_from_text(text)
+            if reported_row_count is None:
+                reported_row_count = cls._reported_row_count_from_text(text)
             embedded_result = cls._embedded_result_object(text)
             if embedded_result is not None:
                 normalized_payload = embedded_result
                 break
+
+        if (
+            cls._payload_row_count(normalized_payload) is None
+            and reported_row_count is not None
+        ):
+            normalized_payload["rowCount"] = reported_row_count
+            normalized_payload["row_count_source"] = "archery_text"
 
         full_sql = normalized_payload.get("full_sql")
         executed_sql = (
@@ -1911,7 +2000,70 @@ class ArcheryMCPClient:
             and cls._canonical_sql(executed_sql)
             == cls._canonical_sql(requested_sql)
         )
+        if actual_sql_verified:
+            normalized_payload = cls._with_inferred_query_columns(
+                normalized_payload,
+                sql=requested_sql,
+            )
         return normalized_payload, executed_sql, actual_sql_verified
+
+    @staticmethod
+    def _reported_row_count_from_text(text: str) -> int | None:
+        match = re.search(r"返回\s*(?P<count>\d+)\s*行", text)
+        return int(match.group("count")) if match is not None else None
+
+    @classmethod
+    def _with_inferred_query_columns(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        sql: str,
+    ) -> dict[str, Any]:
+        """Label positional rows from a verified projection when Archery omits columns."""
+
+        normalized = dict(payload)
+        rows = normalized.get("rows")
+        has_columns = isinstance(
+            normalized.get("columns") or normalized.get("column_list"),
+            list,
+        )
+        projected_columns = cls._simple_select_columns(sql)
+        if (
+            not has_columns
+            and projected_columns
+            and isinstance(rows, list)
+            and rows
+            and all(
+                isinstance(row, (list, tuple))
+                and len(row) == len(projected_columns)
+                for row in rows
+            )
+        ):
+            normalized["columns"] = list(projected_columns)
+            normalized["columns_source"] = "verified_sql_projection"
+            return normalized
+        data = normalized.get("data")
+        if isinstance(data, Mapping):
+            normalized["data"] = cls._with_inferred_query_columns(data, sql=sql)
+        return normalized
+
+    @staticmethod
+    def _simple_select_columns(sql: str) -> tuple[str, ...]:
+        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
+        if select is None:
+            return ()
+        columns: list[str] = []
+        for expression in select.group("body").split(","):
+            match = re.fullmatch(
+                r"(?is)\s*(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                r"`?(?P<source>[A-Za-z_][A-Za-z0-9_$]*)`?"
+                r"(?:\s+(?:as\s+)?`?(?P<alias>[A-Za-z_][A-Za-z0-9_$]*)`?)?\s*",
+                expression,
+            )
+            if match is None:
+                return ()
+            columns.append(match.group("alias") or match.group("source"))
+        return tuple(columns)
 
     @staticmethod
     def _embedded_result_object(text: str) -> dict[str, Any] | None:
@@ -1957,10 +2109,19 @@ class ArcheryMCPClient:
         )
         if where is None:
             return None
-        comparison = re.search(
+        column_pattern = (
             r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
             r"`?(?P<column>[A-Za-z_][A-Za-z0-9_$]*)`?\s*"
-            r"(?:>=|<=|>|<|=|\bbetween\b)",
+        )
+        range_comparison = re.search(
+            column_pattern + r"(?:>=|<=|>|<|\bbetween\b)",
+            where.group("body"),
+            re.IGNORECASE,
+        )
+        if range_comparison is not None:
+            return range_comparison.group("column")
+        comparison = re.search(
+            column_pattern + r"=",
             where.group("body"),
             re.IGNORECASE,
         )
@@ -2436,9 +2597,10 @@ class ArcherySlowLogEvidenceTool:
             value = result.get(key)
             if type(value) is int and value >= 0:
                 return value
-        rows = result.get("rows")
-        if isinstance(rows, list):
-            return len(rows)
+        for key in ("rows", "result"):
+            rows = result.get(key)
+            if isinstance(rows, list):
+                return len(rows)
         data = result.get("data")
         if isinstance(data, dict):
             return ArcherySlowLogEvidenceTool._row_count(data)

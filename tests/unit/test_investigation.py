@@ -65,6 +65,36 @@ class PermissionDeniedTool:
         raise PermissionDeniedError("not allowed")
 
 
+class LargeControlledTool:
+    name = "large_controlled"
+    source_system = "archery_mcp"
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        return "large evidence", {
+            "query_completed": True,
+            "instance_identity_verification": {
+                "status": "UNVERIFIED",
+                "reason_code": "member_lookup_failed",
+                "reason": "identity evidence missing",
+                "same_instance": None,
+                "mcp_call_count": 2,
+                "queries": [{"sql": "SELECT " + "x" * 1000}],
+            },
+            "analysis_usable": False,
+            "root_cause_eligible": False,
+            "root_cause_ineligible_reason": "identity evidence missing",
+            "result": {"sample": "x" * 3000},
+        }
+
+
+class LargeUnqualifiedTool:
+    name = "large_unqualified"
+    source_system = "live_test_system"
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        return "large evidence without eligibility", {"sample": "x" * 3000}
+
+
 def make_context() -> InvestigationContext:
     alert = CanonicalAlertSourceAdapter().normalize(
         {
@@ -96,6 +126,49 @@ async def test_tool_executor_returns_success() -> None:
     assert record.summary == "evidence collected"
     assert record.structured_data == {"value": 42}
     assert record.error is None
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_preserves_decision_fields_when_result_is_truncated() -> None:
+    executor = ToolExecutor(
+        InvestigationToolRegistry([LargeControlledTool()]),
+        max_result_chars=800,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name="large_controlled"),
+        make_context(),
+    )
+
+    assert record.truncated is True
+    assert record.structured_data["query_completed"] is True
+    assert record.structured_data["analysis_usable"] is False
+    assert record.structured_data["root_cause_eligible"] is False
+    assert record.structured_data["root_cause_ineligible_reason"] == (
+        "identity evidence missing"
+    )
+    verification = record.structured_data["instance_identity_verification"]
+    assert verification["status"] == "UNVERIFIED"
+    assert verification["reason_code"] == "member_lookup_failed"
+    assert "queries" not in verification
+    assert record.is_root_cause_support_eligible() is False
+
+
+@pytest.mark.asyncio
+async def test_truncated_evidence_without_explicit_eligibility_fails_closed() -> None:
+    executor = ToolExecutor(
+        InvestigationToolRegistry([LargeUnqualifiedTool()]),
+        max_result_chars=200,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name="large_unqualified"),
+        make_context(),
+    )
+
+    assert record.truncated is True
+    assert "root_cause_eligible" not in record.structured_data
+    assert record.is_root_cause_support_eligible() is False
 
 
 @pytest.mark.asyncio

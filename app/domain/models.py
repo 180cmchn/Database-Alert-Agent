@@ -385,6 +385,10 @@ class EvidenceRecord(BaseModel):
         return (
             self.status == ToolStatus.SUCCESS
             and self.source_system != "alert_platform"
+            and (
+                not self.truncated
+                or self.structured_data.get("root_cause_eligible") is True
+            )
             and self.structured_data.get("root_cause_eligible") is not False
         )
 

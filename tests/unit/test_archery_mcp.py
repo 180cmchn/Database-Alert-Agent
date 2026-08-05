@@ -462,7 +462,8 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "list_table_columns读取真实字段" in task_prompt
     assert ARCHERY_SLOW_LOG_TABLE not in task_prompt
     assert "之前5分钟" in task_prompt
-    assert "LIMIT数值不得超过100" in task_prompt
+    assert "LIMIT数值不得超过20" in task_prompt
+    assert "limit_num也不得超过20" in task_prompt
     assert TEST_WINDOW_START.isoformat() in task_prompt
     assert TEST_WINDOW_END.isoformat() in task_prompt
     assert "依据list_table_columns返回的真实字段名和类型" in task_prompt
@@ -717,9 +718,7 @@ async def test_archery_mcp_does_not_require_table_discovery_before_slow_log_quer
 async def test_archery_mcp_queries_discovered_dynamic_slow_log_table() -> None:
     tool_calls: list[str] = []
     table_name = "mysql_slow_log"
-    query_sql = (
-        f"SELECT * FROM {table_name} ORDER BY start_time DESC LIMIT 100"
-    )
+    query_sql = f"SELECT * FROM {table_name} ORDER BY start_time DESC LIMIT 20"
     model = PromptFollowingMCPModel(
         query_sqls=(query_sql,),
         slow_log_table=table_name,
@@ -1269,6 +1268,154 @@ async def test_archery_mcp_treats_missing_member_mapping_as_unverified() -> None
         == "member_mapping_missing_or_ambiguous"
     )
     assert "不能判定为不相等" in result.instance_identity_verification["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("embedded_result_complete", [False, True])
+async def test_archery_mcp_verifies_identity_from_wrapped_positional_rows(
+    embedded_result_complete: bool,
+) -> None:
+    alert_endpoint = "100.84.97.135:3306"
+    slow_log_endpoint = "100.84.97.139:3306"
+    f_instance_id = 37
+    history_sql = (
+        "SELECT hostname_max, db_max, sample, ts_min, ts_max "
+        "FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{slow_log_endpoint}' "
+        "AND ts_min >= FROM_UNIXTIME(1785735702) "
+        "AND ts_min <= FROM_UNIXTIME(1785736002) "
+        "ORDER BY ts_min LIMIT 20"
+    )
+    embedded_result = (
+        json.dumps(
+            {
+                "full_sql": history_sql + ";",
+                "rows": [
+                    [
+                        slow_log_endpoint,
+                        "store_asset",
+                        f"select {index}",
+                        "2026-08-03T13:42:26",
+                        "2026-08-03T13:42:26",
+                    ]
+                    for index in range(20)
+                ],
+            },
+            ensure_ascii=False,
+        )
+        if embedded_result_complete
+        else '{"full_sql":"truncated","rows":[["100.84.97.139:3306"'
+    )
+    wrapped_result = (
+        "SQL 查询已执行。\n"
+        f"执行的SQL：{history_sql}\n\n"
+        "返回 20 行。\n"
+        "结果：\n"
+        f"{embedded_result}"
+    )
+    query_sql_calls: list[str] = []
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(history_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {"result": wrapped_result},
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "columns": ["f_instance_id"],
+                        "rows": [[f_instance_id]],
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "columns": ["f_instance_id"],
+                        "rows": [[f_instance_id]],
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=[],
+            query_sql_calls=query_sql_calls,
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context={"title": f"MySQL/mysql_slow_query_400/{alert_endpoint}"},
+    )
+
+    if embedded_result_complete:
+        assert len(result.payload["rows"]) == 20
+        assert "row_count_source" not in result.payload
+        assert result.payload["columns"][0] == "hostname_max"
+        assert result.payload["columns_source"] == "verified_sql_projection"
+    else:
+        assert result.payload["rowCount"] == 20
+        assert result.payload["row_count_source"] == "archery_text"
+    assert result.query_time_column == "ts_min"
+    assert result.instance_identity_verification is not None
+    assert result.instance_identity_verification["status"] == "MATCHED"
+    assert result.instance_identity_verification["same_instance"] is True
+    assert result.instance_identity_verification["f_instance_id"] == f_instance_id
+    expected_endpoint_source = (
+        "result_rows"
+        if embedded_result_complete
+        else "verified_executed_sql_filter"
+    )
+    assert (
+        result.instance_identity_verification["slow_log_endpoint_source"]
+        == expected_endpoint_source
+    )
+    assert result.instance_identity_verification["slow_log_endpoint"] == slow_log_endpoint
+    assert len(query_sql_calls) == 3
+    assert "f_ip = '100.84.97.135' AND f_port = 3306" in query_sql_calls[1]
+    assert "f_ip = '100.84.97.139' AND f_port = 3306" in query_sql_calls[2]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_limits_parsed_slow_log_rows_to_twenty() -> None:
+    slow_log_endpoint = "db-history:3306"
+    history_sql = (
+        "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+    )
+    rows = [[slow_log_endpoint, f"select {index}"] for index in range(25)]
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(history_sql,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result={
+                "structuredContent": {
+                    "columns": ["hostname_max", "sample"],
+                    "rows": rows,
+                    "rowCount": len(rows),
+                },
+                "isError": False,
+            },
+            tool_calls=[],
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert len(result.payload["rows"]) == 20
+    assert result.payload["rowCount"] == 20
+    assert result.payload["mcp_reported_row_count"] == 25
+    assert result.payload["rows_limited_to"] == 20
 
 
 @pytest.mark.asyncio

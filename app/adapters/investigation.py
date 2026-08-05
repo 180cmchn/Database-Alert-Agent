@@ -24,6 +24,28 @@ from app.domain.models import (
 )
 from app.domain.ports import InvestigationTool
 
+_TRUNCATION_CONTROL_KEYS = (
+    "query_completed",
+    "analysis_usable",
+    "root_cause_eligible",
+    "root_cause_ineligible_reason",
+)
+_IDENTITY_VERIFICATION_CONTROL_KEYS = (
+    "comparison_basis",
+    "alert_endpoint",
+    "slow_log_endpoints",
+    "slow_log_endpoint",
+    "slow_log_endpoint_source",
+    "alert_f_instance_ids",
+    "slow_log_f_instance_ids",
+    "same_instance",
+    "status",
+    "reason_code",
+    "reason",
+    "f_instance_id",
+    "mcp_call_count",
+)
+
 
 class InvestigationToolRegistry:
     def __init__(self, tools: list[InvestigationTool] | None = None) -> None:
@@ -92,10 +114,7 @@ class ToolExecutor:
             serialized = json.dumps(safe_data, ensure_ascii=False, default=str)
             truncated = len(serialized) > self.max_result_chars
             if truncated:
-                safe_data = {
-                    "truncated_preview": serialized[: self.max_result_chars],
-                    "original_char_count": len(serialized),
-                }
+                safe_data = self._truncate_structured_data(safe_data, serialized)
             return self._record(
                 request,
                 context,
@@ -107,6 +126,7 @@ class ToolExecutor:
                 started_at=started_at,
                 started=started,
             )
+
         except TimeoutError:
             return self._record(
                 request,
@@ -131,6 +151,39 @@ class ToolExecutor:
                 started_at=started_at,
                 started=started,
             )
+
+    def _truncate_structured_data(
+        self,
+        safe_data: Any,
+        serialized: str,
+    ) -> dict[str, Any]:
+        """Keep decision-critical fields outside the bounded diagnostic preview."""
+
+        preserved: dict[str, Any] = {}
+        if isinstance(safe_data, dict):
+            preserved.update(
+                (key, safe_data[key])
+                for key in _TRUNCATION_CONTROL_KEYS
+                if key in safe_data
+            )
+            verification = safe_data.get("instance_identity_verification")
+            if isinstance(verification, dict):
+                compact_verification = {
+                    key: verification[key]
+                    for key in _IDENTITY_VERIFICATION_CONTROL_KEYS
+                    if key in verification
+                }
+                if compact_verification:
+                    preserved["instance_identity_verification"] = compact_verification
+
+        preserved["original_char_count"] = len(serialized)
+        preview_container = {**preserved, "truncated_preview": ""}
+        preview_overhead = len(
+            json.dumps(preview_container, ensure_ascii=False, default=str)
+        )
+        preview_limit = max(self.max_result_chars - preview_overhead, 0)
+        preserved["truncated_preview"] = serialized[:preview_limit]
+        return preserved
 
     @staticmethod
     def _failure_data(exc: Exception) -> dict[str, Any]:
