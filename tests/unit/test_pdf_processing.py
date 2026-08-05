@@ -482,6 +482,114 @@ def test_auto_annotations_are_cached_and_sync_replaces_generated_output(
     assert not (output / "connections_high").exists()
 
 
+def test_sync_copies_staging_when_windows_denies_directory_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    _write_text_pdf(
+        source / "shared-guide.pdf",
+        "Shared database troubleshooting guide with diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={
+            "shared-guide": {
+                "runbook_id": "shared-guide",
+                "alert_types": ["replica_lag"],
+            }
+        },
+    )
+    original_rename = Path.rename
+    denied_staging_renames: list[str] = []
+
+    def windows_like_rename(path: Path, target: Path) -> Path:
+        if path.name.startswith(f".{output.name}.processing-"):
+            denied_staging_renames.append(path.name)
+            raise PermissionError("simulated Windows directory rename denial")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", windows_like_rename)
+
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={
+            "shared-guide": {
+                "runbook_id": "shared-guide",
+                "alert_types": ["connections_high"],
+            }
+        },
+        replace_output=True,
+    )
+
+    assert len(denied_staging_renames) == 1
+    assert (output / "connections_high" / "shared-guide.pdf").is_file()
+    assert not (output / "replica_lag").exists()
+    assert not list(output.parent.glob(f".{output.name}.backup-*"))
+    assert not list(output.parent.glob(f".{output.name}.processing-*"))
+
+
+def test_sync_restores_backup_when_windows_copy_fallback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    _write_text_pdf(
+        source / "shared-guide.pdf",
+        "Shared database troubleshooting guide with diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={
+            "shared-guide": {
+                "runbook_id": "shared-guide",
+                "alert_types": ["replica_lag"],
+            }
+        },
+    )
+    original_rename = Path.rename
+
+    def windows_like_rename(path: Path, target: Path) -> Path:
+        if path.name.startswith(f".{output.name}.processing-"):
+            raise PermissionError("simulated Windows directory rename denial")
+        return original_rename(path, target)
+
+    def failed_copytree(*_: object, **__: object) -> None:
+        raise OSError("simulated Windows copy failure")
+
+    monkeypatch.setattr(Path, "rename", windows_like_rename)
+    monkeypatch.setattr(process_module.shutil, "copytree", failed_copytree)
+
+    with pytest.raises(OSError, match="simulated Windows copy failure"):
+        process_pdf_runbooks(
+            source,
+            None,
+            output,
+            generated_annotations={
+                "shared-guide": {
+                    "runbook_id": "shared-guide",
+                    "alert_types": ["connections_high"],
+                }
+            },
+            replace_output=True,
+        )
+
+    assert (output / "replica_lag" / "shared-guide.pdf").is_file()
+    assert not (output / "connections_high").exists()
+    assert not list(output.parent.glob(f".{output.name}.backup-*"))
+    assert not list(output.parent.glob(f".{output.name}.processing-*"))
+
+
 @pytest.mark.asyncio
 async def test_auto_index_reuses_unchanged_cached_annotation_without_ai(
     tmp_path: Path,

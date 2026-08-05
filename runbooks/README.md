@@ -48,7 +48,8 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 
 持续接入新 PDF 时使用自动摄取命令；它会调用项目已配置的 AI 模型抽取所有告警类型和结构化
 诊断内容，同步评测样本并执行覆盖率门槛。首轮类型为空时会自动复查案件标题、触发条件和
-处置流程，并对明确的应急处置标题使用受限的原文回退。重复运行只处理新增或内容发生变化的 PDF：
+处置流程，并对明确的应急处置标题使用受限的原文回退。重复运行只处理新增或内容发生变化的 PDF；
+Windows 拒绝目录重命名时，`--sync` 会自动改用完整复制，失败则恢复原目录：
 
 ```powershell
 python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output-dir .\runbooks\pdfs-typed --auto-index --sync --enforce-gates

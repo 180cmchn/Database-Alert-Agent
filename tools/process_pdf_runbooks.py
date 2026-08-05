@@ -251,6 +251,33 @@ async def _generate_auto_annotations(
     }
 
 
+def _install_staged_output(staging: Path, output_dir: Path) -> None:
+    """Install a complete staging tree without replacing an existing directory.
+
+    Windows can reject ``os.replace`` for a directory tree when a file watcher or
+    antivirus briefly opens one of its children. Once the old output has been
+    moved aside, a non-overwriting rename is preferred; a copy is the portable
+    fallback when Windows still denies the directory rename.
+    """
+
+    if output_dir.exists():
+        raise RunbookError(
+            f"Cannot install generated output because target still exists: {output_dir}"
+        )
+    try:
+        staging.rename(output_dir)
+        return
+    except PermissionError:
+        if output_dir.exists():
+            raise
+    try:
+        shutil.copytree(staging, output_dir, copy_function=shutil.copy2)
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+    shutil.rmtree(staging, ignore_errors=True)
+
+
 def process_pdf_runbooks(
     source_pdf_dir: Path,
     source_index: Path | None,
@@ -349,12 +376,24 @@ def process_pdf_runbooks(
                 )
             )
             backup.rmdir()
-            output_dir.replace(backup)
+            output_dir.rename(backup)
         try:
-            staging.replace(output_dir)
-        except Exception:
-            if backup is not None and backup.exists() and not output_dir.exists():
-                backup.replace(output_dir)
+            _install_staged_output(staging, output_dir)
+        except Exception as install_error:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            if backup is not None and backup.exists():
+                if output_dir.exists():
+                    raise RunbookError(
+                        "Cannot remove partial generated output or restore the "
+                        f"previous output; backup remains at: {backup}"
+                    ) from install_error
+                try:
+                    backup.rename(output_dir)
+                except OSError as rollback_error:
+                    raise RunbookError(
+                        "Cannot restore the previous generated output; backup "
+                        f"remains at: {backup}"
+                    ) from rollback_error
             raise
         if backup is not None:
             shutil.rmtree(backup, ignore_errors=True)
