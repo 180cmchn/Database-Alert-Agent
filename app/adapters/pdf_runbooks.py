@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -15,7 +16,12 @@ from pydantic import ValidationError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
-from app.domain.errors import InvalidRunbookIdError, RunbookError, RunbookNotFoundError
+from app.domain.errors import (
+    InvalidRunbookIdError,
+    RunbookAlertTypeNotFoundError,
+    RunbookError,
+    RunbookNotFoundError,
+)
 from app.domain.models import (
     NormalizedAlert,
     RunbookAction,
@@ -29,6 +35,7 @@ from app.domain.models import (
 )
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_MAX_ALERT_TYPE_DIRECTORY_LENGTH = 128
 _SEVERITY_PATTERN = re.compile(r"(?i)\[(critical|warning|info)\]")
 _LATIN_TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9_-]{2,}")
 _CHINESE_RUN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}")
@@ -36,6 +43,13 @@ _FILTER_OPERATOR_SPACING = re.compile(r"\s*(>=|<=|!=|==|=|>|<)\s*")
 _ASCII_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 _IDENTIFIER_WORD_CHAR = r"a-z0-9\u4e00-\u9fff"
 _IGNORED_VALUES = {"", "unknown", "none", "null", "n/a"}
+_ALERT_TYPE_LABEL_PATTERNS = (
+    re.compile(
+        r"(?im)^(?:告警类型|告警名称|告警项|alert[ _-]*(?:type|name))\s*[：:]\s*"
+        r"([^\n]{2,200})$"
+    ),
+    re.compile(r"(?i)([a-z][a-z0-9_.:-]{3,})\s*告警"),
+)
 _STOP_TERMS = {
     "alert",
     "alarm",
@@ -57,6 +71,81 @@ _STOP_TERMS = {
 class _CachedPDF:
     signature: tuple[int, int, int, int]
     document: RunbookDocument
+
+
+@dataclass(frozen=True)
+class _CachedAnnotations:
+    signature: tuple[int, int]
+    annotations: dict[str, dict[str, Any]]
+
+
+def alert_type_directory_name(value: str) -> str:
+    """Return the shared, path-safe key used by processing and retrieval.
+
+    Alert types are case-insensitive identifiers. Punctuation and whitespace are
+    normalized to underscores so an incoming alert and its processed PDF always
+    resolve to the same directory without using fuzzy matching.
+    """
+
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    characters = [
+        character if character.isalnum() or character == "_" else "_"
+        for character in normalized
+    ]
+    key = re.sub(r"_+", "_", "".join(characters)).strip("_")
+    if not key or key in _IGNORED_VALUES:
+        raise ValueError("alert_type must contain a usable identifier")
+    if len(key) > _MAX_ALERT_TYPE_DIRECTORY_LENGTH:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+        prefix_length = _MAX_ALERT_TYPE_DIRECTORY_LENGTH - len(digest) - 1
+        key = f"{key[:prefix_length].rstrip('_')}_{digest}"
+    return key
+
+
+def derive_runbook_alert_type(
+    pdf_text: str,
+    annotation: dict[str, Any] | None = None,
+) -> str:
+    """Derive one canonical alert type for a PDF processing result.
+
+    A reviewed ``alert_type`` annotation wins. Existing structured alert/metric
+    identities are the next safest processing result. Otherwise a labelled alert
+    type in the PDF text is used, and legacy indexes may use their primary alias.
+    Ambiguous structured identities are rejected instead of placing a PDF in a
+    wrong directory.
+    """
+
+    annotation = annotation or {}
+    explicit = annotation.get("alert_type")
+    if isinstance(explicit, str) and explicit.strip():
+        return alert_type_directory_name(explicit)
+
+    match_metadata = annotation.get("match") or {}
+    structured_candidates: set[str] = set()
+    for field in ("alert_names", "metric_names"):
+        for value in _metadata_strings(match_metadata, field):
+            structured_candidates.add(alert_type_directory_name(value))
+    if len(structured_candidates) == 1:
+        return next(iter(structured_candidates))
+    if len(structured_candidates) > 1:
+        raise RunbookError(
+            "PDF processing found multiple structured alert types; add one alert_type "
+            "to its annotation"
+        )
+
+    for pattern in _ALERT_TYPE_LABEL_PATTERNS:
+        match = pattern.search(pdf_text[:20_000])
+        if match:
+            candidate = match.group(1).strip(" \t-—_:：,，。.;；[]【】()（）")
+            if candidate:
+                return alert_type_directory_name(candidate)
+
+    aliases = _metadata_strings(match_metadata, "aliases")
+    if aliases:
+        return alert_type_directory_name(aliases[0])
+    raise RunbookError(
+        "Cannot derive alert type from PDF; add an alert_type annotation"
+    )
 
 
 def _normalize_pdf_text(value: str) -> str:
@@ -564,25 +653,29 @@ class LocalPDFRunbookLibrary:
         *,
         max_file_bytes: int = 20_000_000,
         max_text_chars: int = 200_000,
-        annotation_path: Path | None = None,
         min_score: float = 12.0,
         min_confidence: float = 0.35,
     ) -> None:
         self._directory = directory
         self._max_file_bytes = max_file_bytes
         self._max_text_chars = max_text_chars
-        self._annotation_path = annotation_path or directory.parent / "index.json"
         self._min_score = min_score
         self._min_confidence = min_confidence
         self._cache: dict[Path, _CachedPDF] = {}
-        self._annotations_signature: tuple[int, int] | None = None
-        self._annotations: dict[str, dict[str, Any]] = {}
+        self._annotation_cache: dict[Path, _CachedAnnotations] = {}
         self._lock = asyncio.Lock()
 
     async def search(
         self, alert: NormalizedAlert, limit: int = 5
     ) -> list[RunbookExcerpt]:
-        documents = await self.list()
+        try:
+            alert_type = alert_type_directory_name(alert.alert_type)
+        except ValueError as exc:
+            raise RunbookAlertTypeNotFoundError(alert.alert_type) from exc
+        async with self._lock:
+            documents = await asyncio.to_thread(
+                self._list_alert_type_sync, alert_type
+            )
         candidates = [
             (document, section)
             for document in documents
@@ -680,36 +773,69 @@ class LocalPDFRunbookLibrary:
             return await asyncio.to_thread(self._list_sync)
 
     async def get(self, runbook_id: str) -> RunbookDocument:
-        path = self._path_for(runbook_id)
         async with self._lock:
-            annotations = self._read_annotations_sync()
+            path = await asyncio.to_thread(self._path_for, runbook_id)
+            alert_type_directory = path.parent
+            annotations, signature, annotation_path = self._read_annotations_sync(
+                alert_type_directory
+            )
             return await asyncio.to_thread(
-                self._read_sync, path, runbook_id, annotations.get(runbook_id)
+                self._read_sync,
+                path,
+                runbook_id,
+                annotations.get(runbook_id),
+                signature,
+                annotation_path,
+                alert_type_directory.name,
             )
 
-    def _read_annotations_sync(self) -> dict[str, dict[str, Any]]:
-        if not self._annotation_path.exists():
-            self._annotations_signature = None
-            self._annotations = {}
-            return {}
-        if not self._annotation_path.is_file() or self._annotation_path.is_symlink():
+    def _read_annotations_sync(
+        self,
+        alert_type_directory: Path,
+    ) -> tuple[dict[str, dict[str, Any]], tuple[int, int], Path]:
+        annotation_path = alert_type_directory / "index.json"
+        if not annotation_path.exists():
+            self._annotation_cache.pop(annotation_path, None)
+            return {}, (0, 0), annotation_path
+        if not annotation_path.is_file() or annotation_path.is_symlink():
             raise RunbookError(
-                f"Runbook annotation index must be a regular file: {self._annotation_path}"
+                f"Runbook annotation index must be a regular file: {annotation_path}"
             )
-        stat = self._annotation_path.stat()
+        stat = annotation_path.stat()
         signature = (stat.st_mtime_ns, stat.st_size)
-        if signature == self._annotations_signature:
-            return self._annotations
+        cached = self._annotation_cache.get(annotation_path)
+        if cached and signature == cached.signature:
+            return cached.annotations, signature, annotation_path
         try:
-            payload = json.loads(self._annotation_path.read_text(encoding="utf-8"))
+            payload = json.loads(annotation_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RunbookError(
-                f"Cannot read runbook annotation index: {self._annotation_path}"
+                f"Cannot read runbook annotation index: {annotation_path}"
             ) from exc
-        if payload.get("schema_version") not in {1, 2} or not isinstance(
+        schema_version = payload.get("schema_version")
+        if schema_version not in {1, 2, 3} or not isinstance(
             payload.get("runbooks"), list
         ):
-            raise RunbookError("Runbook annotation index must use schema_version=1 or 2")
+            raise RunbookError(
+                "Runbook annotation index must use schema_version=1, 2 or 3"
+            )
+        if schema_version == 3:
+            declared_alert_type = payload.get("alert_type")
+            if not isinstance(declared_alert_type, str):
+                raise RunbookError(
+                    f"Runbook annotation index has no alert_type: {annotation_path}"
+                )
+            try:
+                declared_directory = alert_type_directory_name(declared_alert_type)
+            except ValueError as exc:
+                raise RunbookError(
+                    f"Runbook annotation index has invalid alert_type: {annotation_path}"
+                ) from exc
+            if declared_directory != alert_type_directory.name:
+                raise RunbookError(
+                    "Runbook annotation alert_type does not match its directory: "
+                    f"{annotation_path}"
+                )
         annotations: dict[str, dict[str, Any]] = {}
         for item in payload["runbooks"]:
             if not isinstance(item, dict) or not _SAFE_RUNBOOK_ID.fullmatch(
@@ -720,52 +846,129 @@ class LocalPDFRunbookLibrary:
             if runbook_id in annotations:
                 raise RunbookError(f"Duplicate runbook annotation: {runbook_id}")
             annotations[runbook_id] = item
-        self._annotations_signature = signature
-        self._annotations = annotations
-        self._cache.clear()
-        return annotations
+        self._annotation_cache[annotation_path] = _CachedAnnotations(
+            signature=signature,
+            annotations=annotations,
+        )
+        return annotations, signature, annotation_path
 
     def _list_sync(self) -> list[RunbookDocument]:
-        if not self._directory.exists():
-            raise RunbookError(f"PDF runbook directory does not exist: {self._directory}")
-        if not self._directory.is_dir():
-            raise RunbookError(f"PDF runbook path is not a directory: {self._directory}")
+        alert_type_directories = self._alert_type_directories_sync()
+        documents: list[RunbookDocument] = []
+        active_paths: set[Path] = set()
+        seen_ids: set[str] = set()
+        for alert_type_directory in alert_type_directories:
+            type_documents, type_paths = self._list_directory_sync(
+                alert_type_directory
+            )
+            duplicate_ids = {item.id for item in type_documents} & seen_ids
+            if duplicate_ids:
+                raise RunbookError(
+                    "Runbook IDs must be unique across alert type directories: "
+                    + ", ".join(sorted(duplicate_ids))
+                )
+            seen_ids.update(item.id for item in type_documents)
+            documents.extend(type_documents)
+            active_paths.update(type_paths)
+        self._cache = {
+            path: cached for path, cached in self._cache.items() if path in active_paths
+        }
+        return documents
 
-        annotations = self._read_annotations_sync()
+    def _list_alert_type_sync(self, alert_type: str) -> list[RunbookDocument]:
+        self._assert_root_directory()
+        alert_type_directory = self._directory / alert_type
+        if not alert_type_directory.exists():
+            raise RunbookAlertTypeNotFoundError(alert_type)
+        self._assert_alert_type_directory(alert_type_directory)
+        documents, _ = self._list_directory_sync(alert_type_directory)
+        return documents
+
+    def _list_directory_sync(
+        self,
+        alert_type_directory: Path,
+    ) -> tuple[list[RunbookDocument], set[Path]]:
+        annotations, annotation_signature, annotation_path = (
+            self._read_annotations_sync(alert_type_directory)
+        )
         documents: list[RunbookDocument] = []
         active_paths: set[Path] = set()
         pdf_ids: set[str] = set()
-        for path in sorted(self._directory.glob("*.pdf")):
-            self._assert_regular_pdf(path)
+        for path in sorted(alert_type_directory.glob("*.pdf")):
+            self._assert_regular_pdf(path, alert_type_directory)
             active_paths.add(path)
             pdf_ids.add(path.stem)
-            documents.append(self._read_sync(path, path.stem, annotations.get(path.stem)))
+            documents.append(
+                self._read_sync(
+                    path,
+                    path.stem,
+                    annotations.get(path.stem),
+                    annotation_signature,
+                    annotation_path,
+                    alert_type_directory.name,
+                )
+            )
         unknown_annotations = set(annotations) - pdf_ids
         if unknown_annotations:
             raise RunbookError(
                 "Runbook annotations reference missing PDFs: "
                 + ", ".join(sorted(unknown_annotations))
             )
-        self._cache = {
-            path: cached for path, cached in self._cache.items() if path in active_paths
-        }
-        return documents
+        return documents, active_paths
+
+    def _alert_type_directories_sync(self) -> list[Path]:
+        self._assert_root_directory()
+        flat_pdfs = sorted(self._directory.glob("*.pdf"))
+        if flat_pdfs:
+            raise RunbookError(
+                "PDF runbooks must be organized under alert type directories: "
+                + ", ".join(path.name for path in flat_pdfs)
+            )
+        directories: list[Path] = []
+        for path in sorted(self._directory.iterdir()):
+            if path.name.startswith(".") or not path.is_dir():
+                continue
+            self._assert_alert_type_directory(path)
+            directories.append(path)
+        return directories
+
+    def _assert_root_directory(self) -> None:
+        if not self._directory.exists():
+            raise RunbookError(f"PDF runbook directory does not exist: {self._directory}")
+        if not self._directory.is_dir():
+            raise RunbookError(f"PDF runbook path is not a directory: {self._directory}")
+
+    def _assert_alert_type_directory(self, path: Path) -> None:
+        root = self._directory.resolve()
+        try:
+            canonical_name = alert_type_directory_name(path.name)
+        except ValueError as exc:
+            raise RunbookError(f"Invalid alert type directory: {path.name}") from exc
+        if (
+            path.is_symlink()
+            or not path.is_dir()
+            or path.resolve().parent != root
+            or canonical_name != path.name
+        ):
+            raise RunbookError(f"Invalid alert type directory: {path.name}")
 
     def _read_sync(
         self,
         path: Path,
         requested_id: str,
         annotation: dict[str, Any] | None = None,
+        annotation_signature: tuple[int, int] = (0, 0),
+        annotation_path: Path | None = None,
+        alert_type: str = "",
     ) -> RunbookDocument:
         if not path.exists():
             raise RunbookNotFoundError(f"PDF runbook not found: {requested_id}")
-        self._assert_regular_pdf(path)
+        self._assert_regular_pdf(path, path.parent)
         file_stat = path.stat()
         if file_stat.st_size > self._max_file_bytes:
             raise RunbookError(
                 f"PDF runbook exceeds RUNBOOK_PDF_MAX_FILE_BYTES: {path.name}"
             )
-        annotation_signature = self._annotations_signature or (0, 0)
         signature = (
             file_stat.st_mtime_ns,
             file_stat.st_size,
@@ -923,6 +1126,8 @@ class LocalPDFRunbookLibrary:
             metadata={
                 "source_type": "local_pdf",
                 "file_name": path.name,
+                "alert_type": alert_type,
+                "alert_type_directory": alert_type,
                 "page_count": len(reader.pages),
                 "file_size_bytes": file_stat.st_size,
                 "text_truncated": truncated,
@@ -938,7 +1143,7 @@ class LocalPDFRunbookLibrary:
                     )
                 ),
                 "annotation_source": (
-                    str(self._annotation_path) if annotation else None
+                    str(annotation_path) if annotation and annotation_path else None
                 ),
                 "scope": annotation.get("scope") or {},
                 "match": match_metadata,
@@ -955,14 +1160,21 @@ class LocalPDFRunbookLibrary:
             raise InvalidRunbookIdError(
                 "PDF runbook ID must use 1-128 letters, digits, underscores or hyphens"
             )
-        root = self._directory.resolve()
-        path = self._directory / f"{runbook_id}.pdf"
-        if path.resolve(strict=False).parent != root:
-            raise InvalidRunbookIdError("PDF runbook path escapes the configured directory")
+        self._assert_root_directory()
+        candidates = sorted(self._directory.glob(f"*/{runbook_id}.pdf"))
+        if not candidates:
+            raise RunbookNotFoundError(f"PDF runbook not found: {runbook_id}")
+        if len(candidates) > 1:
+            raise RunbookError(
+                f"Duplicate PDF runbook ID across alert types: {runbook_id}"
+            )
+        path = candidates[0]
+        self._assert_alert_type_directory(path.parent)
+        self._assert_regular_pdf(path, path.parent)
         return path
 
-    def _assert_regular_pdf(self, path: Path) -> None:
-        root = self._directory.resolve()
+    def _assert_regular_pdf(self, path: Path, managed_directory: Path) -> None:
+        root = managed_directory.resolve()
         if (
             path.suffix.casefold() != ".pdf"
             or path.is_symlink()

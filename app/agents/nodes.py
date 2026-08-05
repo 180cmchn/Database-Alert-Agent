@@ -13,6 +13,7 @@ from app.adapters.external_knowledge import (
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.state import AgentState
 from app.application.sanitization import sanitize
+from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import (
     AdvisorMetadata,
     AlertStatus,
@@ -208,13 +209,19 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
                 await ctx.runbook_provider.search(alert, limit=ctx.runbook_limit),
                 None,
             )
+        except RunbookAlertTypeNotFoundError as exc:
+            logger.info(
+                "local_runbook_alert_type_missing alert_type=%s",
+                sanitize(exc.alert_type),
+            )
+            return [], str(exc)
         except Exception as exc:
             logger.warning(
                 "local_runbook_search_failed error=%s: %s",
                 type(exc).__name__,
                 sanitize(str(exc)),
             )
-            return [], type(exc).__name__
+            return [], f"本地 PDF 查询失败（{type(exc).__name__}），未作为分析依据"
 
     async def _search_external_knowledge() -> tuple[
         list[ExternalKnowledgeExcerpt], int, str | None
@@ -266,9 +273,7 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     source_summaries: list[str] = []
     if local_pdf_enabled:
         if local_error:
-            source_summaries.append(
-                f"本地 PDF 查询失败（{local_error}），未作为分析依据"
-            )
+            source_summaries.append(local_error)
         elif runbooks:
             source_summaries.append(f"本地 PDF 命中 {len(runbooks)} 条")
         else:

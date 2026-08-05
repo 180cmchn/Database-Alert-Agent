@@ -176,6 +176,32 @@ def settings_for(tmp_path: Path) -> Settings:
 
 
 @pytest.mark.asyncio
+async def test_missing_alert_type_pdf_directory_is_reported_to_main_analysis(
+    tmp_path: Path,
+) -> None:
+    runtime = build_runtime(settings_for(tmp_path))
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "missing-local-pdf-type",
+            "severity": "WARNING",
+            "title": "MySQL slow query alert",
+            "reason": "mysql_slow_query_400",
+        },
+    )
+
+    assert result.recommendation is not None
+    assert (
+        "匹配本地pdf失败，pdf中没有该类型告警的处理方法"
+        in result.recommendation.knowledge_match_summary
+    )
+    assert result.manual_matches == []
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("severity", ["CRITICAL", "WARNING", "INFO"])
 async def test_every_severity_sends_one_final_ai_result(
     tmp_path: Path, severity: str

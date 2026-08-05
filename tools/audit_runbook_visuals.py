@@ -12,10 +12,7 @@ from app.domain.models import RunbookQualityStatus
 
 
 async def audit(args: argparse.Namespace) -> dict[str, Any]:
-    library = LocalPDFRunbookLibrary(
-        args.pdf_dir,
-        annotation_path=args.annotation,
-    )
+    library = LocalPDFRunbookLibrary(args.pdf_dir)
     documents = await library.list()
     records: list[dict[str, Any]] = []
     missing_coverage: list[str] = []
@@ -61,7 +58,6 @@ def main() -> int:
         description="Audit image-page coverage and review state for PDF runbooks"
     )
     parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
-    parser.add_argument("--annotation", type=Path, default=Path("runbooks/index.json"))
     parser.add_argument(
         "--require-approved",
         action="store_true",

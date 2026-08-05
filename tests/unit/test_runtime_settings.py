@@ -143,7 +143,10 @@ def test_pdf_runbook_readiness_requires_directory_and_pdf(
     empty = tmp_path / "empty"
     empty.mkdir()
     settings = Settings(_env_file=None, ai_provider="fake", runbook_pdf_dir=empty)
-    assert any("No PDF runbooks found" in issue for issue in settings.readiness_issues())
+    assert any(
+        "No alert-type PDF runbook directories found" in issue
+        for issue in settings.readiness_issues()
+    )
 
 
 def test_knowledge_sources_are_deduplicated_and_cannot_be_empty() -> None:

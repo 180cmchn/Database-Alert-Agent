@@ -8,38 +8,53 @@ from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, StreamObject
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
-from app.domain.errors import InvalidRunbookIdError, RunbookError
+from app.adapters.pdf_runbooks import (
+    LocalPDFRunbookLibrary,
+    alert_type_directory_name,
+)
+from app.domain.errors import (
+    InvalidRunbookIdError,
+    RunbookAlertTypeNotFoundError,
+    RunbookError,
+)
 
 SOURCE_PDFS = Path(__file__).parents[2] / "runbooks" / "pdfs"
 TIKV_PDF = (
     SOURCE_PDFS
+    / "synthetic_replica_lag_high"
     / "SYNTHETIC-RUNBOOK-ID.pdf"
 )
-DMP_PDF = SOURCE_PDFS / "SYNTHETIC-RUNBOOK-ID.pdf"
-MYSQL_CRASH_PDF = SOURCE_PDFS / "SYNTHETIC-RUNBOOK-ID.pdf"
-PT_ARCHIVER_PDF = SOURCE_PDFS / "SYNTHETIC-RUNBOOK-ID.pdf"
-RUNBOOK_INDEX = SOURCE_PDFS.parent / "index.json"
+DMP_PDF = (
+    SOURCE_PDFS / "synthetic_backup_task_failed" / "SYNTHETIC-RUNBOOK-ID.pdf"
+)
+MYSQL_CRASH_PDF = (
+    SOURCE_PDFS / "mysql_crash" / "SYNTHETIC-RUNBOOK-ID.pdf"
+)
+PT_ARCHIVER_PDF = (
+    SOURCE_PDFS
+    / "synthetic_archive_task_failed"
+    / "SYNTHETIC-RUNBOOK-ID.pdf"
+)
 
 
 def _repository_annotations_available() -> bool:
-    if not RUNBOOK_INDEX.is_file():
+    indexes = sorted(SOURCE_PDFS.glob("*/index.json"))
+    if not indexes:
         return False
-    try:
-        payload = json.loads(RUNBOOK_INDEX.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    runbooks = payload.get("runbooks")
-    if not isinstance(runbooks, list):
-        return False
-    runbook_ids = [
-        item.get("runbook_id") for item in runbooks if isinstance(item, dict)
-    ]
-    return bool(runbook_ids) and all(
-        isinstance(runbook_id, str)
-        and (SOURCE_PDFS / f"{runbook_id}.pdf").is_file()
-        for runbook_id in runbook_ids
-    )
+    for index in indexes:
+        try:
+            payload = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        runbooks = payload.get("runbooks")
+        if not isinstance(runbooks, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("runbook_id"), str)
+            and (index.parent / f"{item['runbook_id']}.pdf").is_file()
+            for item in runbooks
+        ):
+            return False
+    return True
 
 
 requires_repository_annotations = pytest.mark.skipif(
@@ -86,20 +101,23 @@ def _self_contained_library(
     match: dict[str, Any] | None = None,
 ) -> LocalPDFRunbookLibrary:
     pdf_dir = tmp_path / "pdfs"
-    pdf_dir.mkdir()
+    alert_type_dir = pdf_dir / "replica_lag"
+    alert_type_dir.mkdir(parents=True)
     runbook_id = "replica-lag-runbook"
     _write_text_pdf(
-        pdf_dir / f"{runbook_id}.pdf",
+        alert_type_dir / f"{runbook_id}.pdf",
         "Replica lag diagnostic guide with safe investigation steps and evidence.",
     )
-    annotation_path = tmp_path / "index.json"
+    annotation_path = alert_type_dir / "index.json"
     annotation_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
+                "alert_type": "replica_lag",
                 "runbooks": [
                     {
                         "runbook_id": runbook_id,
+                        "alert_type": "replica_lag",
                         "knowledge_type": "runbook",
                         "quality_status": "approved",
                         "scope": scope or {},
@@ -123,15 +141,19 @@ def _self_contained_library(
         ),
         encoding="utf-8",
     )
-    return LocalPDFRunbookLibrary(pdf_dir, annotation_path=annotation_path)
+    return LocalPDFRunbookLibrary(pdf_dir)
 
 
 @pytest.mark.asyncio
 async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
     tmp_path: Path,
 ) -> None:
-    tikv_pdf = tmp_path / "tikv-sample.pdf"
-    unrelated_pdf = tmp_path / "urman-sample.pdf"
+    tikv_directory = tmp_path / "synthetic_replica_lag_high"
+    urman_directory = tmp_path / "synthetic_backup_task_failed"
+    tikv_directory.mkdir()
+    urman_directory.mkdir()
+    tikv_pdf = tikv_directory / "tikv-sample.pdf"
+    unrelated_pdf = urman_directory / "urman-sample.pdf"
     _write_text_pdf(
         tikv_pdf,
         "Synthetic replica lag alert diagnosis guide and safe investigation steps.",
@@ -164,9 +186,13 @@ async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
 
 
 @pytest.mark.asyncio
-async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) -> None:
+async def test_local_pdf_runbook_reports_missing_alert_type_directory(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "synthetic_backup_task_failed"
+    directory.mkdir()
     _write_text_pdf(
-        tmp_path / "urman-sample.pdf",
+        directory / "urman-sample.pdf",
         "URMAN task permission failure diagnosis and connectivity investigation.",
     )
     library = LocalPDFRunbookLibrary(tmp_path)
@@ -178,7 +204,47 @@ async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) 
         }
     )
 
-    assert await library.search(alert) == []
+    with pytest.raises(
+        RunbookAlertTypeNotFoundError,
+        match="匹配本地pdf失败，pdf中没有该类型告警的处理方法",
+    ):
+        await library.search(alert)
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_search_never_falls_back_to_another_alert_type(
+    tmp_path: Path,
+) -> None:
+    requested_directory = tmp_path / "mysql_slow_query_400"
+    other_directory = tmp_path / "replica_lag"
+    requested_directory.mkdir()
+    other_directory.mkdir()
+    _write_text_pdf(
+        requested_directory / "unrelated.pdf",
+        "Connection pool troubleshooting guide with safe diagnostic steps.",
+    )
+    _write_text_pdf(
+        other_directory / "strong-but-wrong-type.pdf",
+        "MySQL slow query 400 troubleshooting guide and diagnostic steps.",
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "MySQL slow query 400",
+            "reason": "mysql_slow_query_400",
+        }
+    )
+
+    assert await LocalPDFRunbookLibrary(tmp_path).search(alert) == []
+
+
+def test_alert_type_directory_name_is_shared_and_path_safe() -> None:
+    assert alert_type_directory_name(" MySQL/Slow Query 400 ") == (
+        "mysql_slow_query_400"
+    )
+    assert alert_type_directory_name("DM-validator.binlog") == (
+        "dm_validator_binlog"
+    )
 
 
 @pytest.mark.asyncio
@@ -186,7 +252,9 @@ async def test_local_pdf_runbook_does_not_match_unrelated_alert(tmp_path: Path) 
 async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
     tmp_path: Path,
 ) -> None:
-    copy2(MYSQL_CRASH_PDF, tmp_path / MYSQL_CRASH_PDF.name)
+    directory = tmp_path / "mysql_crash"
+    directory.mkdir()
+    copy2(MYSQL_CRASH_PDF, directory / MYSQL_CRASH_PDF.name)
     library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
         {"severity": "WARNING", "title": "Synthetic database crash", "reason": "Synthetic database crash"}
@@ -199,9 +267,11 @@ async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
 
 @pytest.mark.asyncio
 async def test_local_pdf_runbook_rejects_image_only_pdf(tmp_path: Path) -> None:
+    directory = tmp_path / "image_only"
+    directory.mkdir()
     writer = PdfWriter()
     writer.add_blank_page(width=100, height=100)
-    with (tmp_path / "image-only.pdf").open("wb") as handle:
+    with (directory / "image-only.pdf").open("wb") as handle:
         writer.write(handle)
 
     with pytest.raises(RunbookError, match="OCR is required"):
@@ -299,6 +369,7 @@ async def test_pt_archiver_three_causes_map_to_distinct_sections_and_actions(
         {
             "severity": "WARNING",
             "title": "Synthetic archive task failed",
+            "alert_type": "Synthetic archive task failed",
             "reason": reason,
             "error_pattern": error_pattern,
             "database": {"engine": engine},
@@ -322,6 +393,7 @@ async def test_visual_error_text_participates_in_matching() -> None:
         {
             "severity": "CRITICAL",
             "title": "TiKV service exited",
+            "alert_type": "SyntheticReplicaLagHigh",
             "reason": "tiflash service entered failed state",
             "error_pattern": "code=killed, status=9/KILL",
             "database": {"engine": "TiDB"},
@@ -467,13 +539,15 @@ async def test_database_scope_tolerates_present_target_with_unknown_engine(
 @requires_repository_annotations
 async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) -> None:
     pdf_dir = tmp_path / "pdfs"
-    pdf_dir.mkdir()
-    copy2(TIKV_PDF, pdf_dir / TIKV_PDF.name)
-    annotation_path = tmp_path / "index.json"
+    alert_type_dir = pdf_dir / "synthetic_replica_lag_high"
+    alert_type_dir.mkdir(parents=True)
+    copy2(TIKV_PDF, alert_type_dir / TIKV_PDF.name)
+    annotation_path = alert_type_dir / "index.json"
     annotation_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
+                "alert_type": "synthetic_replica_lag_high",
                 "runbooks": [
                     {
                         "runbook_id": TIKV_PDF.stem,
@@ -487,6 +561,4 @@ async def test_approved_runbook_rejects_unannotated_image_pages(tmp_path: Path) 
     )
 
     with pytest.raises(RunbookError, match="unannotated image pages"):
-        await LocalPDFRunbookLibrary(
-            pdf_dir, annotation_path=annotation_path
-        ).list()
+        await LocalPDFRunbookLibrary(pdf_dir).list()

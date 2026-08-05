@@ -9,6 +9,7 @@ from typing import Any
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
+from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import RunbookKnowledgeType, RunbookQualityStatus
 
 
@@ -31,11 +32,20 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 0.0
 
 
+async def _search(
+    library: LocalPDFRunbookLibrary,
+    alert: Any,
+) -> list[Any]:
+    try:
+        return await library.search(alert, limit=5)
+    except RunbookAlertTypeNotFoundError:
+        return []
+
+
 async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     adapter = CanonicalAlertSourceAdapter()
     library = LocalPDFRunbookLibrary(
         args.pdf_dir,
-        annotation_path=args.annotation,
         min_score=args.min_score,
         min_confidence=args.min_confidence,
     )
@@ -51,7 +61,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     for case in matching_cases:
         alert = adapter.normalize({"external_id": case["case_id"], **case["alert"]})
-        results = await library.search(alert, limit=5)
+        results = await _search(library, alert)
         retrieved_ids = [item.runbook_id for item in results]
         gold_ids = list(case.get("gold_runbook_ids") or [])
         if not gold_ids:
@@ -87,7 +97,7 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     cause_found = 0
     for case in diagnosis_cases:
         alert = adapter.normalize({"external_id": case["case_id"], **case["alert"]})
-        results = await library.search(alert, limit=5)
+        results = await _search(library, alert)
         result = next(
             (item for item in results if item.runbook_id == case["gold_runbook_id"]), None
         )
@@ -164,7 +174,6 @@ def main() -> int:
         description="Evaluate runbook retrieval and diagnosis coverage"
     )
     parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
-    parser.add_argument("--annotation", type=Path, default=Path("runbooks/index.json"))
     parser.add_argument(
         "--matching-dataset",
         type=Path,

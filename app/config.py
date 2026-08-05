@@ -488,8 +488,11 @@ class Settings(BaseSettings):
                 issues.append(
                     f"PDF runbook path is not a directory: {self.runbook_pdf_dir}"
                 )
-            elif not any(self.runbook_pdf_dir.glob("*.pdf")):
-                issues.append(f"No PDF runbooks found in: {self.runbook_pdf_dir}")
+            elif not any(self.runbook_pdf_dir.glob("*/*.pdf")):
+                issues.append(
+                    "No alert-type PDF runbook directories found in: "
+                    f"{self.runbook_pdf_dir}"
+                )
         if (
             "external_knowledge" in self.knowledge_sources
             and not self.external_knowledge_base_url.strip()

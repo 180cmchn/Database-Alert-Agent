@@ -51,6 +51,38 @@ async def test_no_runbook_forces_low_confidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_advisor_preserves_application_knowledge_match_summary() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    model_response = Recommendation(
+        summary="Model analysis",
+        knowledge_match_summary="model-overwritten-value",
+        analysis_bases=[
+            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")
+        ],
+        steps=[RecommendationStep(order=1, action="check read-only metrics")],
+        requires_human=True,
+        confidence=0.3,
+        manual_matched=False,
+    )
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        return model_response.model_dump_json(), object()
+
+    advisor._complete = complete
+    expected = "匹配本地pdf失败，pdf中没有该类型告警的处理方法"
+
+    recommendation, _ = await advisor.advise(
+        make_alert(),
+        [],
+        knowledge_match_summary=expected,
+    )
+
+    assert recommendation.knowledge_match_summary == expected
+
+
+@pytest.mark.asyncio
 async def test_matched_runbook_bases_are_ordered_before_ai() -> None:
     runbook = RunbookExcerpt(
         runbook_id="rb-1", title="RB", section="triage", content="approved"

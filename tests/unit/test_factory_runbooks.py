@@ -5,6 +5,7 @@ import pytest
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.application.factory import build_runtime
 from app.config import Settings
+from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import NormalizedAlert, RunbookDocument, RunbookExcerpt
 
 
@@ -52,7 +53,8 @@ async def test_default_provider_and_inventory_share_local_pdf_library(
             "reason": "connection_exhausted",
         },
     )
-    assert await runtime.runbook_provider.search(alert) == []
+    with pytest.raises(RunbookAlertTypeNotFoundError):
+        await runtime.runbook_provider.search(alert)
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

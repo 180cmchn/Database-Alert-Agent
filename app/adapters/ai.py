@@ -359,6 +359,9 @@ class OpenAICompatibleAdvisor:
             recommendation = _validate_manual_policy(
                 recommendation, runbooks, external_knowledge
             )
+            recommendation = recommendation.model_copy(
+                update={"knowledge_match_summary": knowledge_match_summary}
+            )
             return recommendation, first_meta
         except (ValidationError, AdvisorError) as first_error:
             repair_messages = [
@@ -377,6 +380,9 @@ class OpenAICompatibleAdvisor:
                 recommendation = Recommendation.model_validate(_extract_json(second_content))
                 recommendation = _validate_manual_policy(
                     recommendation, runbooks, external_knowledge
+                )
+                recommendation = recommendation.model_copy(
+                    update={"knowledge_match_summary": knowledge_match_summary}
                 )
             except (ValidationError, AdvisorError) as exc:
                 raise AdvisorError(f"Model output invalid after repair: {exc}") from exc
