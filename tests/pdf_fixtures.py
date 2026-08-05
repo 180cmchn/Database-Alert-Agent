@@ -4,12 +4,9 @@ from pathlib import Path
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-TIKV_RUNBOOK_ID = (
-    "SYNTHETIC-RUNBOOK-ID"
-    "SyntheticReplicaLagHigh-210726-1007-4073"
-)
+TIKV_RUNBOOK_ID = "synthetic-replica-lag-runbook"
 TIKV_RUNBOOK_PDF_NAME = f"{TIKV_RUNBOOK_ID}.pdf"
-TIKV_METRIC_NAME = "SyntheticReplicaLagHigh"
+TIKV_METRIC_NAME = "synthetic_replica_lag_high"
 TIKV_ALERT_TYPE_DIRECTORY = "synthetic_replica_lag_high"
 _TIKV_RUNBOOK_TEXT = (
     f"{TIKV_METRIC_NAME} troubleshooting runbook: inspect TiKV logs and server health."

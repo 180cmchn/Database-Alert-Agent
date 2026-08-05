@@ -520,7 +520,7 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
                 "external_id": "local-pdf-flow-1",
                 "severity": "CRITICAL",
                 "title": "Synthetic replica lag alert",
-                "reason": "SyntheticReplicaLagHigh",
+                "reason": TIKV_METRIC_NAME,
                 "environment": "test",
                 "service_name": "orders-api",
                 "database": {"engine": "TiDB"},

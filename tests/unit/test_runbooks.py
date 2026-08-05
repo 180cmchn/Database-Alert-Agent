@@ -167,7 +167,7 @@ async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
         {
             "severity": "CRITICAL",
             "title": "Synthetic replica lag alert",
-            "reason": "SyntheticReplicaLagHigh",
+            "reason": "synthetic_replica_lag_high",
             "database": {"engine": "TiDB"},
             "labels": {"type": "unreachable"},
         }
@@ -257,7 +257,11 @@ async def test_local_pdf_runbook_matches_identifier_terms_split_by_chinese(
     copy2(MYSQL_CRASH_PDF, directory / MYSQL_CRASH_PDF.name)
     library = LocalPDFRunbookLibrary(tmp_path)
     alert = CanonicalAlertSourceAdapter().normalize(
-        {"severity": "WARNING", "title": "Synthetic database crash", "reason": "Synthetic database crash"}
+        {
+            "severity": "WARNING",
+            "title": "Synthetic database crash",
+            "reason": "Synthetic database crash",
+        }
     )
 
     matches = await library.search(alert)
@@ -296,7 +300,7 @@ async def test_repository_annotations_provide_sections_quality_and_diagnosis_gra
         {
             "severity": "CRITICAL",
             "title": "Synthetic replica lag alert",
-            "reason": "SyntheticReplicaLagHigh",
+            "reason": "synthetic_replica_lag_high",
             "database": {"engine": "TiDB"},
             "labels": {"type": "unreachable"},
         }
@@ -393,7 +397,7 @@ async def test_visual_error_text_participates_in_matching() -> None:
         {
             "severity": "CRITICAL",
             "title": "TiKV service exited",
-            "alert_type": "SyntheticReplicaLagHigh",
+            "alert_type": "synthetic_replica_lag_high",
             "reason": "tiflash service entered failed state",
             "error_pattern": "code=killed, status=9/KILL",
             "database": {"engine": "TiDB"},
