@@ -85,7 +85,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0010"
+DATABASE_SCHEMA_REVISION = "0011"
 
 
 class Base(DeclarativeBase):
@@ -140,6 +140,9 @@ class InvestigationRunRow(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     config_snapshot_json: Mapped[dict | None] = mapped_column(JSON)
+    recommendation_json: Mapped[dict | None] = mapped_column(JSON)
+    runbooks_json: Mapped[list | None] = mapped_column(JSON)
+    advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, default=_utc_now
     )
@@ -600,6 +603,35 @@ class SQLAlchemyAlertRepository:
             )
         return summaries
 
+    @staticmethod
+    def _archive_legacy_alert_result(
+        run_row: InvestigationRunRow | None,
+        alert_row: AlertRow,
+    ) -> None:
+        """Attach the last pre-0011 alert result before a newer run replaces it."""
+
+        if run_row is None or any(
+            value is not None
+            for value in (
+                run_row.runbooks_json,
+                run_row.recommendation_json,
+                run_row.advisor_metadata_json,
+            )
+        ):
+            return
+        run_row.runbooks_json = list(alert_row.runbooks_json or [])
+        run_row.recommendation_json = alert_row.recommendation_json
+        run_row.advisor_metadata_json = alert_row.advisor_metadata_json
+
+    @staticmethod
+    def _clear_current_alert_result(alert_row: AlertRow) -> None:
+        """Clear the denormalized current view after its result has been archived."""
+
+        alert_row.runbooks_json = []
+        alert_row.recommendation_json = None
+        alert_row.advisor_metadata_json = None
+        alert_row.error = None
+
     async def create_run(
         self, alert_id: str, lease_owner: str, lease_seconds: int
     ) -> InvestigationRun | None:
@@ -628,6 +660,7 @@ class SQLAlchemyAlertRepository:
                 latest.current_stage = InvestigationStage.FAILED.value
                 latest.error = "Investigation lease expired"
                 latest.updated_at = now
+            self._archive_legacy_alert_result(latest, alert_row)
             attempt = (latest.attempt + 1) if latest else 1
             run = InvestigationRun(
                 alert_id=alert_id,
@@ -648,6 +681,7 @@ class SQLAlchemyAlertRepository:
                     updated_at=run.updated_at,
                 )
             )
+            self._clear_current_alert_result(alert_row)
             alert_row.status = AlertStatus.ANALYZING.value
             alert_row.updated_at = now
             try:
@@ -691,6 +725,7 @@ class SQLAlchemyAlertRepository:
                 latest.current_stage = InvestigationStage.FAILED.value
                 latest.error = "Investigation lease expired"
                 latest.updated_at = now
+            self._archive_legacy_alert_result(latest, alert_row)
             attempt = (latest.attempt + 1) if latest else 1
             run = InvestigationRun(
                 alert_id=alert_id,
@@ -713,8 +748,8 @@ class SQLAlchemyAlertRepository:
                     updated_at=run.updated_at,
                 )
             )
+            self._clear_current_alert_result(alert_row)
             alert_row.status = AlertStatus.ANALYZING.value
-            alert_row.error = None  # Clear previous error
             alert_row.updated_at = now
             try:
                 await session.commit()
@@ -943,13 +978,36 @@ class SQLAlchemyAlertRepository:
             row.updated_at = _utc_now()
             await session.commit()
 
-    async def save_runbooks(self, alert_id: str, runbooks: list[RunbookExcerpt]) -> None:
+    async def save_runbooks(
+        self,
+        alert_id: str,
+        runbooks: list[RunbookExcerpt],
+        *,
+        run_id: str | None = None,
+    ) -> None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
             if not row:
                 return
-            row.runbooks_json = [item.model_dump(mode="json") for item in runbooks]
-            row.updated_at = _utc_now()
+            serialized = [item.model_dump(mode="json") for item in runbooks]
+            now = _utc_now()
+            update_current = run_id is None
+            if run_id:
+                run_row = await session.get(InvestigationRunRow, run_id)
+                if run_row is None or run_row.alert_id != alert_id:
+                    return
+                run_row.runbooks_json = serialized
+                run_row.updated_at = now
+                latest_run_id = await session.scalar(
+                    select(InvestigationRunRow.id)
+                    .where(InvestigationRunRow.alert_id == alert_id)
+                    .order_by(desc(InvestigationRunRow.attempt))
+                    .limit(1)
+                )
+                update_current = latest_run_id == run_id
+            if update_current:
+                row.runbooks_json = serialized
+                row.updated_at = now
             await session.commit()
 
     async def save_analysis(
@@ -960,30 +1018,62 @@ class SQLAlchemyAlertRepository:
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
             if not row:
                 return
-            row.status = status.value
-            if runbooks is not None:
-                row.runbooks_json = [item.model_dump(mode="json") for item in runbooks]
-            row.recommendation_json = (
+            serialized_runbooks = (
+                [item.model_dump(mode="json") for item in runbooks]
+                if runbooks is not None
+                else None
+            )
+            serialized_recommendation = (
                 recommendation.model_dump(mode="json") if recommendation else None
             )
-            row.advisor_metadata_json = (
+            serialized_advisor_metadata = (
                 advisor_metadata.model_dump(mode="json") if advisor_metadata else None
             )
-            row.error = error
-            row.updated_at = _utc_now()
+            now = _utc_now()
+            update_current = run_id is None
+            if run_id:
+                run_row = await session.get(InvestigationRunRow, run_id)
+                if run_row is None or run_row.alert_id != alert_id:
+                    return
+                if serialized_runbooks is not None:
+                    run_row.runbooks_json = serialized_runbooks
+                run_row.recommendation_json = serialized_recommendation
+                run_row.advisor_metadata_json = serialized_advisor_metadata
+                run_row.updated_at = now
+                latest_run_id = await session.scalar(
+                    select(InvestigationRunRow.id)
+                    .where(InvestigationRunRow.alert_id == alert_id)
+                    .order_by(desc(InvestigationRunRow.attempt))
+                    .limit(1)
+                )
+                update_current = latest_run_id == run_id
+            if update_current:
+                row.status = status.value
+                if serialized_runbooks is not None:
+                    row.runbooks_json = serialized_runbooks
+                row.recommendation_json = serialized_recommendation
+                row.advisor_metadata_json = serialized_advisor_metadata
+                row.error = error
+                row.updated_at = now
             await session.commit()
 
-    async def get(self, alert_id: str) -> StoredAlert | None:
+    async def get(self, alert_id: str, run_id: str | None = None) -> StoredAlert | None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
             if not row:
                 return None
-            return await self._to_stored(session, row)
+            selected_run_row: InvestigationRunRow | None = None
+            if run_id:
+                selected_run_row = await session.get(InvestigationRunRow, run_id)
+                if selected_run_row is None or selected_run_row.alert_id != alert_id:
+                    return None
+            return await self._to_stored(session, row, selected_run_row=selected_run_row)
 
     async def _find_by_identity(
         self, session: AsyncSession, source: str, external_id: str
@@ -993,7 +1083,13 @@ class SQLAlchemyAlertRepository:
         )
         return (await session.execute(query)).scalar_one_or_none()
 
-    async def _to_stored(self, session: AsyncSession, row: AlertRow) -> StoredAlert:
+    async def _to_stored(
+        self,
+        session: AsyncSession,
+        row: AlertRow,
+        *,
+        selected_run_row: InvestigationRunRow | None = None,
+    ) -> StoredAlert:
         # Get all runs for this alert (for history display)
         all_runs_query = (
             select(InvestigationRunRow)
@@ -1003,14 +1099,9 @@ class SQLAlchemyAlertRepository:
         all_run_rows = (await session.execute(all_runs_query)).scalars().all()
         all_runs = [self._run(run_row) for run_row in all_run_rows]
         latest_run = all_runs[0] if all_runs else None
-
-        run_query = (
-            select(InvestigationRunRow)
-            .where(InvestigationRunRow.alert_id == row.id)
-            .order_by(desc(InvestigationRunRow.attempt))
-            .limit(1)
-        )
-        run_row = (await session.execute(run_query)).scalar_one_or_none()
+        latest_run_row = all_run_rows[0] if all_run_rows else None
+        run_row = selected_run_row or latest_run_row
+        selected_run = self._run(run_row) if run_row else None
         progress: list[ProgressRecord] = []
         evidence_records: list[EvidenceRecord] = []
         validations: list[ValidationRecord] = []
@@ -1110,22 +1201,69 @@ class SQLAlchemyAlertRepository:
             normalized_alert.fingerprint_version,
             limit=3,
         )
+
+        selected_result_available = False
+        selected_status = AlertStatus(row.status)
+        selected_error = row.error
+        recommendation_json: dict | None = row.recommendation_json
+        runbooks_json: list = list(row.runbooks_json or [])
+        advisor_metadata_json: dict | None = row.advisor_metadata_json
+        if run_row:
+            selected_status = {
+                RunStatus.RUNNING.value: AlertStatus.ANALYZING,
+                RunStatus.COMPLETED.value: AlertStatus.COMPLETED,
+                RunStatus.REVIEW_REQUIRED.value: AlertStatus.REVIEW_REQUIRED,
+                RunStatus.FAILED.value: AlertStatus.FAILED,
+            }[run_row.status]
+            selected_error = run_row.error
+            selected_result_available = any(
+                value is not None
+                for value in (
+                    run_row.runbooks_json,
+                    run_row.recommendation_json,
+                    run_row.advisor_metadata_json,
+                )
+            )
+            if selected_result_available:
+                recommendation_json = run_row.recommendation_json
+                runbooks_json = list(run_row.runbooks_json or [])
+                advisor_metadata_json = run_row.advisor_metadata_json
+            elif (
+                latest_run_row is not None
+                and run_row.id == latest_run_row.id
+                and run_row.status != RunStatus.RUNNING.value
+            ):
+                # The current terminal result may predate migration 0011. It remains
+                # readable from the alert row and is archived onto this run before
+                # the next analysis starts.
+                selected_result_available = True
+            else:
+                recommendation_json = None
+                runbooks_json = []
+                advisor_metadata_json = None
+        else:
+            selected_result_available = bool(
+                recommendation_json or runbooks_json or advisor_metadata_json
+            )
+
         return StoredAlert(
             alert=normalized_alert,
-            status=AlertStatus(row.status),
+            status=selected_status,
             recommendation=(
-                Recommendation.model_validate(row.recommendation_json)
-                if row.recommendation_json
+                Recommendation.model_validate(recommendation_json)
+                if recommendation_json
                 else None
             ),
-            manual_matches=[RunbookExcerpt.model_validate(item) for item in row.runbooks_json],
+            manual_matches=[RunbookExcerpt.model_validate(item) for item in runbooks_json],
             advisor_metadata=(
-                AdvisorMetadata.model_validate(row.advisor_metadata_json)
-                if row.advisor_metadata_json
+                AdvisorMetadata.model_validate(advisor_metadata_json)
+                if advisor_metadata_json
                 else None
             ),
-            error=row.error,
+            error=selected_error,
             latest_run=latest_run,
+            selected_run=selected_run,
+            selected_run_result_available=selected_result_available,
             all_runs=all_runs,
             progress=progress,
             evidence_records=evidence_records,

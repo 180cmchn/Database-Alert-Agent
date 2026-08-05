@@ -466,7 +466,8 @@ Compose 默认只把前端、API 和 Kafka 外部端口绑定到本机。内置 
 ## API
 
 - `POST /api/v1/alerts/canonical/analyze`：接收告警并异步开始分析。
-- `GET /api/v1/alerts/{id}`：查看手册匹配、分析进度、可能原因和有序依据。
+- `GET /api/v1/alerts/{id}`：查看手册匹配、分析进度、可能原因和有序依据；传入
+  `run_id` 查询参数可读取指定运行独立保存的 PDF 命中、工具证据、AI 建议与校验记录。
 - `GET /api/v1/alerts`：分页查询告警。
 - `GET /api/v1/dashboard/summary`：查看分析概览。
 - `GET /api/v1/admin/runbooks`、`GET /api/v1/admin/runbooks/{id}`：只读查看本地 PDF 手册及提取正文。

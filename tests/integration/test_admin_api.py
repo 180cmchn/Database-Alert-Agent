@@ -596,3 +596,66 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
             "REVIEW_REQUIRED",
             "REPORTING",
         ]
+
+
+def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "run-history-results-1",
+                "severity": "CRITICAL",
+                "title": "Synthetic replica lag alert",
+                "reason": TIKV_METRIC_NAME,
+                "environment": "test",
+                "service_name": "orders-api",
+                "database": {"engine": "TiDB"},
+            },
+        )
+        assert accepted.status_code == 202
+        alert_id = accepted.json()["alert_id"]
+        endpoint = f"/api/v1/alerts/{alert_id}"
+        assert client.portal is not None
+        client.portal.call(runtime.service.analyze_by_id, alert_id)
+
+        first = client.get(endpoint).json()
+        first_run_id = first["latest_run"]["id"]
+        assert first["selected_run"]["id"] == first_run_id
+        assert first["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
+        assert first["recommendation"]["manual_matched"] is True
+
+        runtime.service.knowledge_sources = []
+        reanalyzed = client.post(
+            f"{endpoint}/reanalyze",
+            headers=ADMIN_HEADERS,
+            json={"force": False},
+        )
+        assert reanalyzed.status_code == 202
+        second_run_id = reanalyzed.json()["run_id"]
+
+        latest = client.get(endpoint).json()
+        assert latest["latest_run"]["id"] == second_run_id
+        assert latest["selected_run"]["id"] == second_run_id
+        assert latest["manual_matches"] == []
+        assert latest["recommendation"]["manual_matched"] is False
+
+        historical = client.get(endpoint, params={"run_id": first_run_id})
+        assert historical.status_code == 200
+        history_body = historical.json()
+        assert history_body["latest_run"]["id"] == second_run_id
+        assert history_body["selected_run"]["id"] == first_run_id
+        assert history_body["selected_run_result_available"] is True
+        assert history_body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
+        assert history_body["recommendation"]["manual_matched"] is True
+        assert all(item["run_id"] == first_run_id for item in history_body["progress"])
+        assert all(
+            item["run_id"] == first_run_id for item in history_body["evidence_records"]
+        )
+        assert all(item["run_id"] == first_run_id for item in history_body["validations"])
+
+        missing_run = client.get(
+            endpoint,
+            params={"run_id": "00000000-0000-0000-0000-000000000000"},
+        )
+        assert missing_run.status_code == 404

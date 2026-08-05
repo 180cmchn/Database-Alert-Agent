@@ -101,8 +101,10 @@ export const api = {
   getAlerts: (filters: AlertFilters) =>
     request<AlertListResponse>(`/api/v1/alerts${queryString(filters)}`),
 
-  getAlert: (alertId: string) =>
-    request<StoredAlert>(`/api/v1/alerts/${encodeURIComponent(alertId)}`),
+  getAlert: (alertId: string, runId?: string | null) =>
+    request<StoredAlert>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}${queryString({ run_id: runId || undefined })}`,
+    ),
 
   createAlert: (payload: CanonicalAlertPayload) =>
     request<AlertAccepted>("/api/v1/alerts/canonical/analyze", {

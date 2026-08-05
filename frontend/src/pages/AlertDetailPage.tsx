@@ -28,7 +28,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
 import {
   EmptyState,
@@ -113,6 +113,8 @@ function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | nu
 
 export function AlertDetailPage() {
   const { alertId = "" } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedRunId = searchParams.get("run_id");
   const { token, unlocked, unlock, lock } = useAdminAuth();
   const [record, setRecord] = useState<StoredAlert | null>(null);
   const [loading, setLoading] = useState(true);
@@ -133,7 +135,7 @@ export function AlertDetailPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const result = await api.getAlert(alertId);
+      const result = await api.getAlert(alertId, selectedRunId);
       setRecord(result);
       setError("");
     } catch (requestError) {
@@ -142,7 +144,7 @@ export function AlertDetailPage() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [alertId]);
+  }, [alertId, selectedRunId]);
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
@@ -158,18 +160,28 @@ export function AlertDetailPage() {
     setFeedbackKey(newFeedbackKey());
     setFeedbackError("");
     setFeedbackNotice("");
-  }, [alertId]);
+  }, [alertId, selectedRunId]);
 
-  const currentStage = useMemo(
-    () => record?.latest_run?.current_stage || record?.progress.at(-1)?.stage || null,
+  const selectedRun = useMemo(
+    () => record?.selected_run || record?.latest_run || null,
     [record],
   );
-  const isTracking = Boolean(
-    (record && (
-      activeStatuses.includes(record.status)
-      || (record.latest_run && (!currentStage || !terminalStages.includes(currentStage)))
-    )),
+  const isViewingLatest = Boolean(
+    selectedRun && record?.latest_run && selectedRun.id === record.latest_run.id,
   );
+  const currentStage = useMemo(
+    () => selectedRun?.current_stage || record?.progress.at(-1)?.stage || null,
+    [record, selectedRun],
+  );
+  const isTracking = Boolean(
+    record
+    && selectedRun
+    && selectedRun.status === "RUNNING"
+    && (activeStatuses.includes(record.status)
+      || !currentStage
+      || !terminalStages.includes(currentStage)),
+  );
+  const latestRunIsActive = record?.latest_run?.status === "RUNNING";
 
   useEffect(() => {
     if (!record || !isTracking) return;
@@ -203,13 +215,13 @@ export function AlertDetailPage() {
   async function submitFeedback(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
-    if (!record || !feedbackStatuses.includes(record.status)) {
-      setFeedbackError("只有已完成或待人工复核的调查可以提交反馈。");
+    if (!record || !isViewingLatest || !feedbackStatuses.includes(record.status)) {
+      setFeedbackError("只有最新一次已完成或待人工复核的调查可以提交反馈。");
       return;
     }
     if (
-      record.latest_run
-      && record.feedback.some((item) => item.run_id === record.latest_run?.id)
+      selectedRun
+      && record.feedback.some((item) => item.run_id === selectedRun.id)
     ) {
       setFeedbackError("本次调查的人工审核已经提交，审核意见不可重复修改。");
       return;
@@ -364,9 +376,10 @@ export function AlertDetailPage() {
     setReanalyzing(true);
     setReanalyzeError("");
     try {
-      await api.reanalyzeAlert(alertId, { force }, token);
-      // Start tracking the new run
-      await load(true);
+      const started = await api.reanalyzeAlert(alertId, { force }, token);
+      const nextSearchParams = new URLSearchParams(searchParams);
+      nextSearchParams.set("run_id", started.run_id);
+      setSearchParams(nextSearchParams);
     } catch (reanalyzeErr) {
       if (reanalyzeErr instanceof ApiError && [401, 403].includes(reanalyzeErr.status)) {
         setReanalyzeError("管理员令牌无效或已过期，请锁定后重新输入。");
@@ -380,16 +393,26 @@ export function AlertDetailPage() {
     }
   }
 
+  function showRun(runId: string) {
+    const nextSearchParams = new URLSearchParams(searchParams);
+    nextSearchParams.set("run_id", runId);
+    setSearchParams(nextSearchParams);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
   if (loading && !record) return <LoadingState label="正在读取完整排查链路…" />;
   if (error && !record) return <ErrorState message={error} onRetry={() => void load()} />;
   if (!record) return <EmptyState title="告警不存在" description="该记录可能已被删除，或链接中的 ID 不正确。" />;
 
   const { alert, recommendation } = record;
   const isActive = isTracking;
-  const currentFeedback = record.latest_run
-    ? record.feedback.find((item) => item.run_id === record.latest_run?.id)
+  const currentFeedback = selectedRun
+    ? record.feedback.find((item) => item.run_id === selectedRun.id)
     : undefined;
-  const feedbackStatusAllowed = feedbackStatuses.includes(record.status);
+  const selectedFeedback = selectedRun
+    ? record.feedback.filter((item) => item.run_id === selectedRun.id)
+    : [];
+  const feedbackStatusAllowed = isViewingLatest && feedbackStatuses.includes(record.status);
   const singleManualMatch = record.manual_matches.length === 1 ? record.manual_matches[0] : null;
   const successfulEvidence = record.evidence_records.filter(
     (evidence) => evidence.status === "SUCCESS",
@@ -426,11 +449,35 @@ export function AlertDetailPage() {
         <div><span><Clock3 size={15} /> 发生时间</span><strong>{formatDateTime(alert.occurred_at)}</strong></div>
       </section>
 
+      {!isViewingLatest && selectedRun && (
+        <div className="historical-run-banner">
+          <History size={18} />
+          <div>
+            <strong>正在查看第 {selectedRun.attempt} 次运行</strong>
+            <span>页面中的排查轨迹、PDF 命中、MCP 请求 JSON、AI 建议和校验均属于这一次运行。</span>
+          </div>
+          {record.latest_run && (
+            <button type="button" className="button secondary small" onClick={() => showRun(record.latest_run!.id)}>
+              查看最新运行
+            </button>
+          )}
+        </div>
+      )}
+
+      {selectedRun
+        && selectedRun.status !== "RUNNING"
+        && !record.selected_run_result_available && (
+          <div className="historical-result-warning">
+            <CircleAlert size={17} />
+            <span>该运行早于运行级结果存储功能，原有进度、MCP 证据和校验仍可查看，但当时的 PDF 命中与 AI 建议已无法恢复。</span>
+          </div>
+        )}
+
       <section className="detail-grid workflow-grid">
         <SectionCard
           eyebrow="LIVE WORKFLOW"
           title="Agent 排查轨迹"
-          description={`第 ${record.latest_run?.attempt || 1} 次执行 · ${record.latest_run?.strategy_id || "等待选择策略"}`}
+          description={`第 ${selectedRun?.attempt || 1} 次执行 · ${selectedRun?.strategy_id || "等待选择策略"}`}
         >
           <StageTimeline currentStage={currentStage} progress={record.progress} />
         </SectionCard>
@@ -456,6 +503,8 @@ export function AlertDetailPage() {
                 </details>
               ))}
             </div>
+          ) : selectedRun?.status !== "RUNNING" && !record.selected_run_result_available ? (
+            <EmptyState title="历史 PDF 结果不可恢复" description="该次运行只保留了进度和现场证据，未保存独立的 PDF 匹配结果。" />
           ) : isActive && !runbookSearchFinished ? (
             <div className="waiting-panel"><BookCheck size={24} /><strong>正在检索处置手册</strong><span>结果会在匹配阶段完成后显示</span></div>
           ) : (
@@ -618,7 +667,11 @@ export function AlertDetailPage() {
         </section>
       ) : (
         <SectionCard eyebrow="AI ADVICE" title="处理建议">
-          <div className="waiting-panel large"><Bot size={29} /><strong>{isActive ? "Agent 正在形成处理建议" : "本次分析未生成建议"}</strong><span>{isActive ? "建议将在证据采集与独立校验结束后显示。" : "请查看上方错误和校验记录，并安排人工介入。"}</span></div>
+          <div className="waiting-panel large">
+            <Bot size={29} />
+            <strong>{isActive ? "Agent 正在形成处理建议" : !record.selected_run_result_available ? "历史 AI 建议不可恢复" : "本次分析未生成建议"}</strong>
+            <span>{isActive ? "建议将在证据采集与独立校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录，并安排人工介入。"}</span>
+          </div>
         </SectionCard>
       )}
 
@@ -655,12 +708,12 @@ export function AlertDetailPage() {
         id="feedback"
         eyebrow="EXPERT REVIEW"
         title="人工反馈与训练记录"
-        description="反馈由管理员提交并写入审计链路；确认或修正且已恢复的记录可形成同类历史案例。"
-        action={<span className="evidence-count">{record.feedback.length} 条反馈</span>}
+        description="展示当前所选运行的人工反馈；确认或修正且已恢复的记录可形成同类历史案例。"
+        action={<span className="evidence-count">{selectedFeedback.length} 条反馈</span>}
       >
-        {record.feedback.length > 0 ? (
+        {selectedFeedback.length > 0 ? (
           <div className="feedback-history">
-            {record.feedback.map((feedback) => (
+            {selectedFeedback.map((feedback) => (
               <article
                 key={feedback.id}
                 className={`feedback-record feedback-${feedback.verdict.toLowerCase()}`}
@@ -769,6 +822,11 @@ export function AlertDetailPage() {
             <span>
               本次调查的人工审核已完成，审核意见已经固定，不能再次提交或覆盖。
             </span>
+          </div>
+        ) : !isViewingLatest ? (
+          <div className="feedback-not-ready">
+            <History size={17} />
+            <span>历史运行仅供查看，人工反馈只能在最新一次运行中提交。</span>
           </div>
         ) : !feedbackStatusAllowed ? (
           <div className="feedback-not-ready">
@@ -1042,8 +1100,8 @@ export function AlertDetailPage() {
                 className="button primary"
                 type="button"
                 onClick={() => handleReanalyze(false)}
-                disabled={reanalyzing || isActive}
-                title={isActive ? "当前有分析正在运行，请使用强制重新分析" : "使用当前配置重新分析"}
+                disabled={reanalyzing || latestRunIsActive}
+                title={latestRunIsActive ? "当前有分析正在运行，请使用强制重新分析" : "使用当前配置重新分析"}
               >
                 {reanalyzing ? (
                   "正在启动..."
@@ -1051,7 +1109,7 @@ export function AlertDetailPage() {
                   <><RefreshCw size={15} /> 重新分析</>
                 )}
               </button>
-              {isActive && (
+              {latestRunIsActive && (
                 <button
                   className="button secondary"
                   type="button"
@@ -1076,30 +1134,38 @@ export function AlertDetailPage() {
         <SectionCard
           eyebrow="ANALYSIS HISTORY"
           title="分析历史记录"
-          description="此告警的所有分析运行记录，包括每次运行时使用的配置快照。"
+          description="点击任意运行即可切换到当时的完整告警分析页；URL 可直接分享和回看。"
           action={<span className="evidence-count">{record.all_runs.length} 次运行</span>}
         >
           <div className="analysis-history-list">
             {record.all_runs.map((run) => (
               <article
                 key={run.id}
-                className={`analysis-history-item ${run.id === record.latest_run?.id ? "current" : ""}`}
+                className={`analysis-history-item ${run.id === record.latest_run?.id ? "current" : ""} ${run.id === selectedRun?.id ? "selected" : ""}`}
               >
                 <header>
                   <div className="run-header-main">
-                    <span className="run-attempt">第 {run.attempt} 次运行</span>
+                    <button type="button" className="run-attempt" onClick={() => showRun(run.id)}>
+                      第 {run.attempt} 次运行
+                    </button>
                     <span className={`run-status-badge run-status-${run.status.toLowerCase()}`}>
                       {run.status === "RUNNING" ? "运行中" :
                        run.status === "COMPLETED" ? "已完成" :
                        run.status === "REVIEW_REQUIRED" ? "待复核" : "失败"}
                     </span>
                     {run.id === record.latest_run?.id && (
-                      <span className="current-badge">当前</span>
+                      <span className="current-badge">最新</span>
+                    )}
+                    {run.id === selectedRun?.id && (
+                      <span className="selected-badge">正在查看</span>
                     )}
                   </div>
-                  <time dateTime={run.created_at}>
-                    {formatDateTime(run.created_at)}
-                  </time>
+                  <div className="run-history-actions">
+                    <time dateTime={run.created_at}>{formatDateTime(run.created_at)}</time>
+                    <button type="button" className="run-open-button" onClick={() => showRun(run.id)}>
+                      <Eye size={13} /> 打开本次分析
+                    </button>
+                  </div>
                 </header>
                 {run.error && (
                   <div className="run-error">

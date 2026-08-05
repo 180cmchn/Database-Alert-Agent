@@ -296,7 +296,11 @@ class AlertAnalysisService:
                 ),
             )
             await self.repository.save_analysis(
-                alert_id, AlertStatus.FAILED, runbooks=None, error=error
+                alert_id,
+                AlertStatus.FAILED,
+                runbooks=None,
+                error=error,
+                run_id=str(run.id),
             )
             raise AnalysisFailedError(alert_id, error) from exc
 
@@ -539,11 +543,12 @@ class AlertAnalysisService:
             raise FeedbackAlreadySubmittedError(alert_id, str(stored.latest_run.id))
         return saved
 
-    async def get(self, alert_id: str) -> StoredAlert:
+    async def get(self, alert_id: str, run_id: str | None = None) -> StoredAlert:
         """Get an alert by ID.
 
         Args:
             alert_id: The alert ID
+            run_id: Optional investigation run whose persisted result should be shown
 
         Returns:
             The stored alert
@@ -551,7 +556,11 @@ class AlertAnalysisService:
         Raises:
             AlertNotFoundError: If the alert doesn't exist
         """
-        stored = await self.repository.get(alert_id)
+        stored = (
+            await self.repository.get(alert_id)
+            if run_id is None
+            else await self.repository.get(alert_id, run_id=run_id)
+        )
         if not stored:
             raise AlertNotFoundError(alert_id)
         return stored

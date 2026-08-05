@@ -303,6 +303,8 @@ export interface StoredAlert {
   } | null;
   error?: string | null;
   latest_run?: InvestigationRun | null;
+  selected_run?: InvestigationRun | null;
+  selected_run_result_available: boolean;
   all_runs: InvestigationRun[];
   progress: ProgressRecord[];
   evidence_records: EvidenceRecord[];

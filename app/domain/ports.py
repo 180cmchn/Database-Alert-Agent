@@ -7,6 +7,7 @@ from app.domain.models import (
     AdvisorMetadata,
     AlertListResult,
     AlertStatus,
+    AnalysisConfigSnapshot,
     AnalysisResultEvent,
     DashboardSummary,
     EvidenceRecord,
@@ -123,7 +124,13 @@ class AlertRepository(Protocol):
 
     async def set_status(self, alert_id: str, status: AlertStatus) -> None: ...
 
-    async def save_runbooks(self, alert_id: str, runbooks: list[RunbookExcerpt]) -> None: ...
+    async def save_runbooks(
+        self,
+        alert_id: str,
+        runbooks: list[RunbookExcerpt],
+        *,
+        run_id: str | None = None,
+    ) -> None: ...
 
     async def save_analysis(
         self,
@@ -133,9 +140,10 @@ class AlertRepository(Protocol):
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
+        run_id: str | None = None,
     ) -> None: ...
 
-    async def get(self, alert_id: str) -> StoredAlert | None: ...
+    async def get(self, alert_id: str, run_id: str | None = None) -> StoredAlert | None: ...
 
     async def list_by_status(self, statuses: set[AlertStatus]) -> list[StoredAlert]: ...
 
@@ -155,6 +163,14 @@ class AlertRepository(Protocol):
 
     async def create_run(
         self, alert_id: str, lease_owner: str, lease_seconds: int
+    ) -> InvestigationRun | None: ...
+
+    async def create_run_for_reanalyze(
+        self,
+        alert_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+        config_snapshot: AnalysisConfigSnapshot,
     ) -> InvestigationRun | None: ...
 
     async def update_run(

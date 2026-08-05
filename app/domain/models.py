@@ -539,6 +539,8 @@ class StoredAlert(BaseModel):
     advisor_metadata: AdvisorMetadata | None = None
     error: str | None = None
     latest_run: InvestigationRun | None = None
+    selected_run: InvestigationRun | None = None
+    selected_run_result_available: bool = False
     all_runs: list[InvestigationRun] = Field(default_factory=list)
     progress: list[ProgressRecord] = Field(default_factory=list)
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)

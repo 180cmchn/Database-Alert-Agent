@@ -301,7 +301,7 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
             "所选知识来源均未命中，Agent 将仅使用告警、实时证据和通用推理。"
         )
 
-    await ctx.repository.save_runbooks(alert_id, runbooks)
+    await ctx.repository.save_runbooks(alert_id, runbooks, run_id=str(run.id))
 
     if external_knowledge:
         await _update_progress(
@@ -848,7 +848,11 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ),
         )
         await ctx.repository.save_analysis(
-            alert_id, AlertStatus.FAILED, runbooks=runbooks, error=error
+            alert_id,
+            AlertStatus.FAILED,
+            runbooks=runbooks,
+            error=error,
+            run_id=str(run.id),
         )
         return {
             "current_stage": InvestigationStage.FAILED,
@@ -907,6 +911,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         runbooks=runbooks,
         recommendation=recommendation,
         advisor_metadata=advisor_metadata,
+        run_id=str(run.id),
     )
 
     return {

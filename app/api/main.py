@@ -311,8 +311,11 @@ def create_app(
         return await runtime.service.dashboard_summary()
 
     @app.get("/api/v1/alerts/{alert_id}", response_model=StoredAlert, tags=["alerts"])
-    async def get_alert(alert_id: str) -> StoredAlert:
-        return await runtime.service.get(alert_id)
+    async def get_alert(
+        alert_id: str,
+        run_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    ) -> StoredAlert:
+        return await runtime.service.get(alert_id, run_id=run_id)
 
     @app.post(
         "/api/v1/alerts/{alert_id}/feedback",
