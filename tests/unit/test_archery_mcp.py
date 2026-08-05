@@ -16,6 +16,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
     ARCHERY_MCP_LOGIN_TOOL_NAME,
+    ARCHERY_MCP_MAX_AGENT_STEPS,
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
@@ -59,7 +60,14 @@ TEST_SLOW_LOG_QUERY = (
 )
 TEST_ALTERNATE_SLOW_LOG_QUERY = (
     "SELECT f_id, f_start_time, f_db, f_user, f_insert_time "
-    "FROM t_slowlog_info ORDER BY f_start_time DESC LIMIT 5"
+    "FROM t_slowlog_info "
+    "WHERE f_start_time >= FROM_UNIXTIME(1784793300) "
+    "AND f_start_time <= FROM_UNIXTIME(1784793600) "
+    "ORDER BY f_start_time DESC LIMIT 5"
+)
+TEST_HISTORY_TIME_CLAUSE = (
+    "AND ts_min >= FROM_UNIXTIME(1784793300) "
+    "AND ts_min <= FROM_UNIXTIME(1784793600) "
 )
 
 
@@ -244,7 +252,7 @@ def _client(
     transport: httpx.AsyncBaseTransport,
     *,
     model: PromptFollowingMCPModel | None = None,
-    max_agent_steps: int = 10,
+    max_agent_steps: int = ARCHERY_MCP_MAX_AGENT_STEPS,
 ) -> ArcheryMCPClient:
     return ArcheryMCPClient(
         MCPServerSettings(
@@ -455,7 +463,7 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "三张表都在该实例和数据库中" in task_prompt
     assert "若 history 表的必经解析链路走不通" in task_prompt
     assert "MCP返回的错误在其它慢日志表或只读探针中选择合理替代路径" in task_prompt
-    assert "总数不得超过10" in task_prompt
+    assert "总数不得超过12" in task_prompt
     assert "表名可来自list_db_tables、元数据查询或推荐线索" in (
         model.calls[0]["messages"][0]["content"]
     )
@@ -464,6 +472,9 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "之前5分钟" in task_prompt
     assert "LIMIT数值不得超过20" in task_prompt
     assert "limit_num也不得超过20" in task_prompt
+    assert "hostname_max等值条件和告警时间范围条件" in task_prompt
+    assert "缺少其中任一条件的成功查询只算辅助探针" in task_prompt
+    assert "无WHERE的LIMIT 1样例" in task_prompt
     assert TEST_WINDOW_START.isoformat() in task_prompt
     assert TEST_WINDOW_END.isoformat() in task_prompt
     assert "依据list_table_columns返回的真实字段名和类型" in task_prompt
@@ -718,7 +729,12 @@ async def test_archery_mcp_does_not_require_table_discovery_before_slow_log_quer
 async def test_archery_mcp_queries_discovered_dynamic_slow_log_table() -> None:
     tool_calls: list[str] = []
     table_name = "mysql_slow_log"
-    query_sql = f"SELECT * FROM {table_name} ORDER BY start_time DESC LIMIT 20"
+    query_sql = (
+        f"SELECT * FROM {table_name} "
+        "WHERE start_time >= FROM_UNIXTIME(1784793300) "
+        "AND start_time <= FROM_UNIXTIME(1784793600) "
+        "ORDER BY start_time DESC LIMIT 20"
+    )
     model = PromptFollowingMCPModel(
         query_sqls=(query_sql,),
         slow_log_table=table_name,
@@ -828,7 +844,7 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
     )
     history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = 'db-1:3306' LIMIT 1"
+        f"WHERE hostname_max = 'db-1:3306' {TEST_HISTORY_TIME_CLAUSE}LIMIT 1"
     )
 
     class AllowlistRetryModel(PromptFollowingMCPModel):
@@ -927,7 +943,8 @@ async def test_archery_mcp_sends_direct_history_lookup_without_host_lineage_gate
     query_sql_calls: list[str] = []
     direct_history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = '100.84.97.113:3306' LIMIT 20"
+        "WHERE hostname_max = '100.84.97.113:3306' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
         sequence=(
@@ -994,7 +1011,8 @@ async def test_archery_mcp_sends_title_endpoint_history_without_host_lineage_gat
     title_endpoint = "100.84.97.113:3306"
     direct_history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        f"WHERE hostname_max = '{title_endpoint}' LIMIT 20"
+        f"WHERE hostname_max = '{title_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
         sequence=(
@@ -1030,7 +1048,8 @@ async def test_archery_mcp_sends_history_query_without_host_guard() -> None:
     query_sql_calls: list[str] = []
     direct_history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = '100.84.97.113:3306' LIMIT 20"
+        "WHERE hostname_max = '100.84.97.113:3306' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
         sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
@@ -1057,6 +1076,116 @@ async def test_archery_mcp_sends_history_query_without_host_guard() -> None:
     assert result.requested_sql == direct_history_sql
 
 
+def test_archery_mcp_history_completion_requires_endpoint_and_time_scope() -> None:
+    table = "mysql_slow_query_review_history"
+    unscoped = f"SELECT hostname_max, ts_min, ts_max FROM {table} LIMIT 1"
+    time_only = (
+        f"SELECT hostname_max, ts_min FROM {table} "
+        "WHERE ts_min >= FROM_UNIXTIME(1784793300) "
+        "AND ts_min <= FROM_UNIXTIME(1784793600) LIMIT 20"
+    )
+    host_only = (
+        f"SELECT hostname_max FROM {table} "
+        "WHERE hostname_max = '10.23.45.67:3306' LIMIT 20"
+    )
+    scoped = (
+        f"SELECT hostname_max, ts_min FROM {table} "
+        "WHERE hostname_max = '10.23.45.67:3306' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
+    )
+
+    assert ArcheryMCPClient._slow_log_query_completion_issue(unscoped) == (
+        "缺少hostname_max等值查询条件；缺少告警时间范围条件"
+    )
+    assert ArcheryMCPClient._slow_log_query_completion_issue(time_only) == (
+        "缺少hostname_max等值查询条件"
+    )
+    assert ArcheryMCPClient._slow_log_query_completion_issue(host_only) == (
+        "缺少告警时间范围条件"
+    )
+    assert ArcheryMCPClient._slow_log_query_completion_issue(scoped) is None
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -> None:
+    """A successful LIMIT 1 sample must not replace alert-window evidence."""
+
+    arbitrary_endpoint = "10.126.106.205:3306"
+    resolved_endpoint = "100.84.97.139:3306"
+    probe_sql = (
+        "SELECT hostname_max, ts_min, ts_max "
+        "FROM mysql_slow_query_review_history LIMIT 1"
+    )
+    final_sql = (
+        "SELECT hostname_max, ts_min, ts_max "
+        "FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '{resolved_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}ORDER BY ts_min LIMIT 20"
+    )
+    query_sql_calls: list[str] = []
+    model = PromptFollowingMCPModel(
+        sequence=(
+            ARCHERY_MCP_LOGIN_TOOL_NAME,
+            ARCHERY_MCP_QUERY_TOOL_NAME,
+            ARCHERY_MCP_QUERY_TOOL_NAME,
+        ),
+        query_sqls=(probe_sql, final_sql),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {
+                        "columns": ["hostname_max", "ts_min", "ts_max"],
+                        "rows": [
+                            [
+                                arbitrary_endpoint,
+                                "2024-05-16T06:39:34",
+                                "2024-05-16T06:41:18",
+                            ]
+                        ],
+                        "rowCount": 1,
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "columns": ["hostname_max", "ts_min", "ts_max"],
+                        "rows": [],
+                        "rowCount": 0,
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=[],
+            query_sql_calls=query_sql_calls,
+        ),
+        model=model,
+        max_agent_steps=3,
+    )
+
+    result = await client.execute_slow_log_query(
+        TEST_ALERT_OCCURRED_AT,
+        alert_context={"title": "MySQL/mysql_slow_query/100.84.97.135:3306"},
+    )
+
+    assert query_sql_calls == [probe_sql, final_sql]
+    assert result.requested_sql == final_sql
+    assert result.query_completed is True
+    assert result.payload["rows"] == []
+    assert result.query_time_column == "ts_min"
+    assert result.instance_identity_verification is not None
+    assert result.instance_identity_verification["status"] == "NOT_APPLICABLE"
+    probe_feedback = model.calls[-1]["messages"][-1]["content"]
+    assert "仍是辅助探针" in probe_feedback
+    assert "缺少hostname_max等值查询条件" in probe_feedback
+    assert "缺少告警时间范围条件" in probe_feedback
+    assert result.diagnostics is not None
+    assert result.diagnostics["query_trace"][0]["outcome"] == "probe_ok"
+    assert result.diagnostics["query_trace"][0]["completion"] == "probe"
+
+
 @pytest.mark.asyncio
 async def test_archery_mcp_verifies_different_endpoints_with_same_member_id() -> None:
     alert_endpoint = "100.84.97.113:3306"
@@ -1064,7 +1193,8 @@ async def test_archery_mcp_verifies_different_endpoints_with_same_member_id() ->
     f_instance_id = 53
     history_sql = (
         "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
-        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+        f"WHERE hostname_max = '{slow_log_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     query_sql_calls: list[str] = []
     query_argument_calls: list[dict[str, Any]] = []
@@ -1155,7 +1285,8 @@ async def test_archery_mcp_marks_different_member_ids_as_mismatched() -> None:
     slow_log_endpoint = "10.23.45.67:3306"
     history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+        f"WHERE hostname_max = '{slow_log_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
         sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
@@ -1214,7 +1345,8 @@ async def test_archery_mcp_treats_missing_member_mapping_as_unverified() -> None
     slow_log_endpoint = "10.23.45.67:3306"
     history_sql = (
         "SELECT hostname_max FROM mysql_slow_query_review_history "
-        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+        f"WHERE hostname_max = '{slow_log_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
         sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
@@ -1386,7 +1518,8 @@ async def test_archery_mcp_limits_parsed_slow_log_rows_to_twenty() -> None:
     slow_log_endpoint = "db-history:3306"
     history_sql = (
         "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
-        f"WHERE hostname_max = '{slow_log_endpoint}' LIMIT 20"
+        f"WHERE hostname_max = '{slow_log_endpoint}' "
+        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     rows = [[slow_log_endpoint, f"select {index}"] for index in range(25)]
     model = PromptFollowingMCPModel(

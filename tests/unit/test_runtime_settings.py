@@ -352,7 +352,7 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     assert "archery_mcp_max_agent_steps" in RUNTIME_SETTINGS_KEYS
     assert "mcp_settings_path" not in RUNTIME_SETTINGS_KEYS
     assert configured.archery_slow_log_window_seconds == 300
-    assert configured.archery_mcp_max_agent_steps == 10
+    assert configured.archery_mcp_max_agent_steps == 12
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
     # Legacy target variables remain loadable but no longer gate or scope MCP.
@@ -552,7 +552,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["scheduler_workers"] == 1
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
-    assert body["archery_mcp_max_agent_steps"] == 10
+    assert body["archery_mcp_max_agent_steps"] == 12
     assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
     assert "wecom_feedback_form_url" in RUNTIME_SETTINGS_KEYS

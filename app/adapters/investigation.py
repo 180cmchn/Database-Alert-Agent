@@ -286,7 +286,7 @@ class DefaultInvestigationStrategyProvider:
         *,
         alert_context_timeout_seconds: float = 15,
         external_tool_timeout_seconds: float = 45,
-        archery_tool_timeout_seconds: float = 660,
+        archery_tool_timeout_seconds: float = 780,
         available_tools: list[str] | None = None,
         metrics_ds_name: str = "",
         logs_ds_name: str = "",

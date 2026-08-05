@@ -298,12 +298,18 @@ Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名�
 表和字段。
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法等可重试错误也会原样回传，
 模型可据此调整只读查询继续执行。模型最多执行 `ARCHERY_MCP_MAX_AGENT_STEPS` 个工具调用步骤，
-默认值为 10。MCP 返回的工具中可能包含 `apply_query_permission_gymJPA` 等会产生外部状态变更的
+默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP 返回的工具中可能包含
+`apply_query_permission_gymJPA` 等会产生外部状态变更的
 工具，系统提示明确禁止模型调用它们。
 
-Host 不再重复实现 MCP 工具 Schema、工具名、调用参数、SQL 形态、表发现前置条件或
-`hostname_max` 来源链路的校验。模型生成的调用参数会原样发送给 MCP，由 MCP 服务端返回真实的
-成功或错误结果；Host 再把结果回传模型，使其可以修正只读查询并重试。提示词要求模型仅使用本次
+Host 不在调用前重复实现 MCP 工具 Schema、工具名、调用参数、表发现前置条件或
+`hostname_max` 来源链路校验。模型生成的调用参数会原样发送给 MCP，由 MCP 服务端返回真实的
+成功或错误结果；Host 再把结果回传模型，使其可以修正只读查询并重试。成功执行慢日志表查询后，
+Host 只判断它是否已形成告警窗口证据：最终慢日志查询必须包含时间范围条件；对于
+`mysql_slow_query_review_history`，还必须同时包含由元数据链路得到的 `hostname_max` 等值条件。
+无 `WHERE` 的 `LIMIT 1` 样例、仅字段探测、仅端点条件或仅时间条件都作为成功的辅助探针回传模型，
+不会被提前当成最终证据，也不会触发实例归属核验。这个判断发生在 MCP 已执行并返回之后，不会
+拦截调用；模型仍可在剩余预算内基于真实结果继续调用或重试。提示词要求模型仅使用本次
 慢查询取证需要的只读工具，并优先按 `alert_host/alert_port → t_instance_member.f_instance_id →
 sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链路查询。表和字段发现是
 可选的恢复手段，不再是 Host 侧前置条件。提示词中的目标时间窗由规范化告警的 `occurred_at` 和
@@ -354,8 +360,9 @@ MCP_SETTINGS_PATH=./config/mcp/settings.json
 ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
 ARCHERY_MCP_TOKEN=archery_replace-with-your-token
 ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
-ARCHERY_MCP_MAX_AGENT_STEPS=10
+ARCHERY_MCP_MAX_AGENT_STEPS=12
 ARCHERY_MCP_TIMEOUT_SECONDS=60
+ARCHERY_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
 URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；Agent 最大步骤数以环境变量为部署

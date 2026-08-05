@@ -43,11 +43,11 @@ ARCHERY_SLOW_LOG_LIMIT: Final = 20
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # Backward-compatible constant: this is the default; deployments may override it.
-ARCHERY_MCP_MAX_AGENT_STEPS: Final = 10
+ARCHERY_MCP_MAX_AGENT_STEPS: Final = 12
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v18"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v19"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -484,6 +484,7 @@ class ArcheryMCPClient:
                         alert_endpoint = self._alert_endpoint_from_context(alert_context or {})
                         query_trace: list[dict[str, Any]] = []
                         last_query_target: tuple[int, str] | None = None
+                        last_slow_log_probe_issue: str | None = None
 
                         for _step in range(self.max_agent_steps):
                             call = await self._request_model_tool_call(
@@ -639,6 +640,31 @@ class ArcheryMCPClient:
                                     normalized_payload,
                                     limit=ARCHERY_SLOW_LOG_LIMIT,
                                 )
+                                completion_issue = (
+                                    self._slow_log_query_completion_issue(requested_sql)
+                                )
+                                if completion_issue is not None:
+                                    # A schema/sample query can be useful, so send it to
+                                    # MCP first and return the real result to the model.
+                                    # It is not final alert-window evidence, however, and
+                                    # must not trigger endpoint identity verification.
+                                    last_slow_log_probe_issue = completion_issue
+                                    if trace_entry is not None:
+                                        trace_entry["outcome"] = "probe_ok"
+                                        trace_entry["completion"] = "probe"
+                                        trace_entry["continuation_reason"] = (
+                                            completion_issue
+                                        )
+                                    messages.extend(
+                                        self._completed_tool_messages(
+                                            call,
+                                            self._model_slow_log_probe_result(
+                                                normalized_payload,
+                                                completion_issue=completion_issue,
+                                            ),
+                                        )
+                                    )
+                                    continue
                                 instance_identity_verification = (
                                     await self._verify_slow_log_instance_identity(
                                         session,
@@ -730,6 +756,12 @@ class ArcheryMCPClient:
                             if last_query_error is not None
                             else ""
                         )
+                        probe_suffix = (
+                            f"；最后一条成功的慢日志查询仍是辅助探针："
+                            f"{last_slow_log_probe_issue}"
+                            if last_slow_log_probe_issue is not None
+                            else ""
+                        )
                         return self._evidence_insufficient_result(
                             window_start=window_start,
                             window_end=window_end,
@@ -744,7 +776,7 @@ class ArcheryMCPClient:
                             resolved_endpoints=metadata_resolved_endpoints,
                             reason=(
                                 "模型未在允许的调用预算内完成慢查询取证"
-                                f"{error_suffix}"
+                                f"{error_suffix}{probe_suffix}"
                             ),
                         )
         except ArcheryMCPError:
@@ -797,6 +829,10 @@ class ArcheryMCPClient:
             f"无论符合条件的记录有多少，LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}，"
             f"sql_query的limit_num也不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
+            "查询mysql_slow_query_review_history时，最终SELECT的WHERE必须同时包含由元数据"
+            "链路得到的hostname_max等值条件和告警时间范围条件；缺少其中任一条件的成功"
+            "查询只算辅助探针，必须利用其返回继续调用MCP，不能作为最终慢查询结果。"
+            "无WHERE的LIMIT 1样例、字段确认或任意历史行查询也只算辅助探针。"
             "必须依据list_table_columns返回的真实字段名和类型选择慢查询时间字段，不要猜测。"
             "对于DATETIME或TIMESTAMP字段，可直接使用Host给出的Unix秒配合FROM_UNIXTIME；"
             "若真实字段中同时存在f_insert_time、f_start_time和f_time_point，分钟级窗口优先使用"
@@ -823,6 +859,8 @@ class ArcheryMCPClient:
                     "剩余预算内换用其它只读路径。"
                     "辅助只读SQL的结果仅用于继续调查，查询到目标实例和目标数据库中与慢查询"
                     "历史语义匹配的表才算完成；表名可来自list_db_tables、元数据查询或推荐线索。"
+                    "成功查询到慢日志表的一条样例并不等于完成：最终查询必须限定告警时间范围；"
+                    "对于mysql_slow_query_review_history还必须同时包含hostname_max等值条件。"
                     "MCP 工具列表中可能包含查询权限申请或其他非只读工具；无论其是否可用，"
                     "都不得调用。只能调用完成本次慢查询取证所需的只读工具。"
                 ),
@@ -853,7 +891,8 @@ class ArcheryMCPClient:
             "archery.mysql_slow_query_review_history.hostname_max的等值条件；"
             "(5) 先确认archery.mysql_slow_query_review_history的hostname_max和时间列的"
             "真实名称和类型，"
-            "再在实例archery和db_name=archery中查询告警时段的慢查询日志记录。"
+            "再在实例archery和db_name=archery中用hostname_max等值条件和告警时间范围条件"
+            "共同查询慢查询日志记录；两类WHERE条件缺一不可。"
             "最终结果必须返回hostname_max；查询成功后，Host会额外用告警端点和结果端点分别"
             "等值查询archery.t_instance_member.f_ip/f_port并比较f_instance_id，这两次只读"
             "归属验证不占用模型自主调用预算。"
@@ -927,6 +966,25 @@ class ArcheryMCPClient:
             cls._clean_table_name(name).casefold()
             for name in cls._sql_table_references(statement)
         }
+
+    @classmethod
+    def _slow_log_query_completion_issue(cls, sql: str) -> str | None:
+        """Explain why a successful slow-log SELECT is still only a probe.
+
+        This is deliberately a post-execution completion check, not an MCP call
+        guard. The model receives successful probe output and can keep navigating
+        deployment-specific schemas within its normal tool-call budget.
+        """
+
+        issues: list[str] = []
+        if (
+            cls._is_slow_query_review_history_select(sql)
+            and cls._hostname_max_filter_endpoint_from_sql(sql) is None
+        ):
+            issues.append("缺少hostname_max等值查询条件")
+        if cls._query_range_time_column(sql) is None:
+            issues.append("缺少告警时间范围条件")
+        return "；".join(issues) if issues else None
 
     @staticmethod
     def _clean_table_name(value: str) -> str:
@@ -1429,6 +1487,12 @@ class ArcheryMCPClient:
             select.group("body"),
         ) is None:
             return None
+        return cls._hostname_max_filter_endpoint_from_sql(sql)
+
+    @classmethod
+    def _hostname_max_filter_endpoint_from_sql(cls, sql: str) -> str | None:
+        """Read the normalized endpoint from a hostname_max equality predicate."""
+
         match = re.search(
             r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
             r"`?hostname_max`?\s*=\s*'(?P<endpoint>(?:''|[^'])*)'",
@@ -1855,6 +1919,23 @@ class ArcheryMCPClient:
             + serialized
         )
 
+    @classmethod
+    def _model_slow_log_probe_result(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        completion_issue: str,
+    ) -> str:
+        """Return a successful probe to the model with its missing final scope."""
+
+        return (
+            cls._model_tool_result(payload)
+            + "\nHost完成状态：该只读查询已由MCP成功执行，但它仍是辅助探针，"
+            + completion_issue
+            + "。请利用以上真实返回继续调用MCP，形成限定告警实例和告警时间窗的最终慢查询；"
+            "不要把本次样例行当作告警日志。"
+        )
+
     @staticmethod
     def _completed_tool_messages(
         call: MCPModelToolCall,
@@ -2102,12 +2183,17 @@ class ArcheryMCPClient:
         return re.sub(r"\s+", " ", candidate).casefold()
 
     @staticmethod
-    def _query_time_column(sql: str) -> str | None:
+    def _where_body(sql: str) -> str | None:
         where = re.search(
             r"(?is)\bwhere\b(?P<body>.*?)(?:\border\s+by\b|\blimit\b|$)",
             sql,
         )
-        if where is None:
+        return where.group("body") if where is not None else None
+
+    @classmethod
+    def _query_range_time_column(cls, sql: str) -> str | None:
+        where_body = cls._where_body(sql)
+        if where_body is None:
             return None
         column_pattern = (
             r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
@@ -2115,14 +2201,30 @@ class ArcheryMCPClient:
         )
         range_comparison = re.search(
             column_pattern + r"(?:>=|<=|>|<|\bbetween\b)",
-            where.group("body"),
+            where_body,
             re.IGNORECASE,
         )
-        if range_comparison is not None:
-            return range_comparison.group("column")
+        return (
+            range_comparison.group("column")
+            if range_comparison is not None
+            else None
+        )
+
+    @classmethod
+    def _query_time_column(cls, sql: str) -> str | None:
+        range_column = cls._query_range_time_column(sql)
+        if range_column is not None:
+            return range_column
+        where_body = cls._where_body(sql)
+        if where_body is None:
+            return None
+        column_pattern = (
+            r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?(?P<column>[A-Za-z_][A-Za-z0-9_$]*)`?\s*"
+        )
         comparison = re.search(
             column_pattern + r"=",
-            where.group("body"),
+            where_body,
             re.IGNORECASE,
         )
         return comparison.group("column") if comparison is not None else None
