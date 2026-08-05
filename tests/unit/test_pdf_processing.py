@@ -1,18 +1,26 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, StreamObject
 
+import tools.process_pdf_runbooks as process_module
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import (
     LocalPDFRunbookLibrary,
     derive_runbook_alert_type,
 )
 from app.domain.errors import RunbookError
-from tools.process_pdf_runbooks import main, process_pdf_runbooks
+from tools.process_pdf_runbooks import (
+    _content_sha256,
+    _extract_pages,
+    _load_generated_annotation_cache,
+    main,
+    process_pdf_runbooks,
+)
 
 
 def _write_text_pdf(path: Path, text: str) -> None:
@@ -326,6 +334,69 @@ def test_cli_allows_omitting_source_index(
     assert (output / "replica_lag_diagnostic" / "index.json").is_file()
 
 
+def test_cli_auto_index_needs_no_source_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    _write_text_pdf(
+        source / "shared-guide.pdf",
+        "Shared database troubleshooting guide with safe diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+
+    async def generate_annotations(
+        source_pdf_dir: Path,
+        source_index: Path | None,
+        output_dir: Path,
+    ) -> tuple[dict[str, dict[str, object]], dict[str, int]]:
+        assert source_pdf_dir == source
+        assert source_index is None
+        assert output_dir == output
+        return (
+            {
+                "shared-guide": {
+                    "runbook_id": "shared-guide",
+                    "alert_types": ["replica_lag", "connections_high"],
+                }
+            },
+            {"cache_hits": 0, "model_indexed_pdfs": 1},
+        )
+
+    monkeypatch.setattr(
+        process_module,
+        "_generate_auto_annotations",
+        generate_annotations,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "process_pdf_runbooks.py",
+            "--source-pdf-dir",
+            str(source),
+            "--output-dir",
+            str(output),
+            "--auto-index",
+            "--skip-evaluation-datasets",
+        ],
+    )
+
+    assert main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["source_index"] is None
+    assert report["generated_annotation_count"] == 1
+    assert report["auto_index"] == {
+        "cache_hits": 0,
+        "model_indexed_pdfs": 1,
+    }
+    assert (output / "replica_lag" / "shared-guide.pdf").is_file()
+    assert (output / "connections_high" / "shared-guide.pdf").is_file()
+
+
 def test_processing_derives_multiple_pdf_labels_without_source_index(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +418,115 @@ def test_processing_derives_multiple_pdf_labels_without_source_index(
     }
     assert (output / "connectionshigh" / "shared-guide.pdf").is_file()
     assert (output / "replicalag" / "shared-guide.pdf").is_file()
+
+
+def test_auto_annotations_are_cached_and_sync_replaces_generated_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    _write_text_pdf(
+        source / "shared-guide.pdf",
+        "Shared database troubleshooting guide with diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+    content_sha256 = _content_sha256(_extract_pages(source / "shared-guide.pdf"))
+    auto_metadata = {
+        "auto_index": {
+            "generator": "openai_compatible",
+            "model": "index-model",
+            "prompt_version": "runbook-auto-index-v1",
+            "content_sha256": content_sha256,
+        }
+    }
+    first_annotation = {
+        "runbook_id": "shared-guide",
+        "alert_types": ["replica_lag", "connections_high"],
+        "alert_type_profiles": {
+            "replica_lag": {"alert_names": ["Replica Lag"]},
+            "connections_high": {"alert_names": ["Connections High"]},
+        },
+        "metadata": auto_metadata,
+    }
+
+    report = process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={"shared-guide": first_annotation},
+    )
+
+    assert report["generated_annotation_count"] == 1
+    cached = _load_generated_annotation_cache(output)
+    assert cached["shared-guide"]["alert_types"] == [
+        "connections_high",
+        "replica_lag",
+    ]
+
+    second_annotation = {
+        **first_annotation,
+        "alert_types": ["replica_lag"],
+        "alert_type_profiles": {
+            "replica_lag": {"alert_names": ["Replica Lag"]}
+        },
+    }
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={"shared-guide": second_annotation},
+        replace_output=True,
+    )
+
+    assert (output / "replica_lag" / "shared-guide.pdf").is_file()
+    assert not (output / "connections_high").exists()
+
+
+@pytest.mark.asyncio
+async def test_auto_index_reuses_unchanged_cached_annotation_without_ai(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    pdf_path = source / "shared-guide.pdf"
+    _write_text_pdf(
+        pdf_path,
+        "Shared database troubleshooting guide with diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+    annotation = {
+        "runbook_id": "shared-guide",
+        "alert_types": ["replica_lag"],
+        "metadata": {
+            "auto_index": {
+                "generator": "openai_compatible",
+                "model": "index-model",
+                "prompt_version": "runbook-auto-index-v1",
+                "content_sha256": _content_sha256(_extract_pages(pdf_path)),
+            }
+        },
+    }
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={"shared-guide": annotation},
+    )
+    monkeypatch.setattr(
+        process_module,
+        "get_settings",
+        lambda: SimpleNamespace(ai_provider="fake", ai_model="index-model"),
+    )
+
+    generated, report = await process_module._generate_auto_annotations(
+        source,
+        None,
+        output,
+    )
+
+    assert generated["shared-guide"]["alert_types"] == ["replica_lag"]
+    assert report == {"cache_hits": 1, "model_indexed_pdfs": 0}
 
 
 def test_processing_rejects_an_explicit_missing_source_index(tmp_path: Path) -> None:

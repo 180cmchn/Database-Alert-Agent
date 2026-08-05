@@ -32,6 +32,21 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 0.0
 
 
+def _coverage_ratio(numerator: int, denominator: int) -> float:
+    """Treat an empty set of required targets as fully covered."""
+
+    return round(numerator / denominator, 4) if denominator else 1.0
+
+
+def _metadata_strings(metadata: dict[str, Any], key: str) -> list[str]:
+    value = metadata.get(key)
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    return []
+
+
 async def _search(
     library: LocalPDFRunbookLibrary,
     alert: Any,
@@ -58,12 +73,20 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     section_hits = 0
     no_match_total = 0
     no_match_hits = 0
+    evaluated_runbook_types: set[tuple[str, str]] = set()
+    evaluated_causes: set[tuple[str, str, str]] = set()
+    generated_case_count = 0
+    fresh_generated_case_count = 0
     failures: list[dict[str, Any]] = []
     for case in matching_cases:
         alert = adapter.normalize({"external_id": case["case_id"], **case["alert"]})
         results = await _search(library, alert)
         retrieved_ids = [item.runbook_id for item in results]
         gold_ids = list(case.get("gold_runbook_ids") or [])
+        case_alert_type = str(case["alert"].get("alert_type") or "")
+        evaluated_runbook_types.update(
+            (str(runbook_id), case_alert_type) for runbook_id in gold_ids
+        )
         if not gold_ids:
             no_match_total += 1
             if not results:
@@ -103,6 +126,11 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         )
         available = {cause.cause_id for cause in result.causes} if result else set()
         expected = set(case.get("expected_cause_ids") or [])
+        case_alert_type = str(case["alert"].get("alert_type") or "")
+        evaluated_causes.update(
+            (str(case["gold_runbook_id"]), case_alert_type, str(cause_id))
+            for cause_id in expected
+        )
         cause_expected += len(expected)
         cause_found += len(expected & available)
         if not expected.issubset(available):
@@ -121,25 +149,93 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         if item.knowledge_type != RunbookKnowledgeType.INCOMPLETE
         and not item.deprecated
     ]
+    eligible_runbook_types = {
+        (str(getattr(item, "id", "")), alert_type)
+        for item in eligible
+        for alert_type in (
+            _metadata_strings(getattr(item, "metadata", {}), "alert_types")
+            or _metadata_strings(getattr(item, "metadata", {}), "alert_type")
+        )
+        if getattr(item, "id", "")
+    }
+    eligible_causes = {
+        (str(getattr(item, "id", "")), alert_type, cause.cause_id)
+        for item in eligible
+        for alert_type in (
+            _metadata_strings(getattr(item, "metadata", {}), "alert_types")
+            or _metadata_strings(getattr(item, "metadata", {}), "alert_type")
+        )
+        for cause in getattr(item, "causes", [])
+        if getattr(item, "id", "")
+    }
+    current_hashes = {
+        (str(getattr(item, "id", "")), alert_type): str(
+            getattr(item, "metadata", {}).get("content_sha256") or ""
+        )
+        for item in eligible
+        for alert_type in (
+            _metadata_strings(getattr(item, "metadata", {}), "alert_types")
+            or _metadata_strings(getattr(item, "metadata", {}), "alert_type")
+        )
+        if getattr(item, "id", "")
+    }
+    for case in [*matching_cases, *diagnosis_cases]:
+        source = case.get("source") or {}
+        if not isinstance(source, dict) or source.get("kind") != "pdf_runbook":
+            continue
+        generated_case_count += 1
+        alert_type = str(case.get("alert", {}).get("alert_type") or "")
+        runbook_ids = list(case.get("gold_runbook_ids") or [])
+        if not runbook_ids and case.get("gold_runbook_id"):
+            runbook_ids = [case["gold_runbook_id"]]
+        if not runbook_ids:
+            pdf_path = str(source.get("pdf_path") or "")
+            runbook_id = Path(pdf_path).stem if pdf_path else ""
+            runbook_ids = [runbook_id] if runbook_id else []
+        expected_hash = str(source.get("content_sha256") or "")
+        if expected_hash and runbook_ids and all(
+            current_hashes.get((str(runbook_id), alert_type)) == expected_hash
+            for runbook_id in runbook_ids
+        ):
+            fresh_generated_case_count += 1
+        else:
+            failures.append(
+                {
+                    "case_id": case.get("case_id"),
+                    "failure": "stale_generated_case",
+                }
+            )
     metrics = {
         "runbook_recall_at_5": _ratio(recall_hits, match_total),
         "runbook_precision_at_1": _ratio(top_one_hits, match_total),
         "no_match_accuracy": _ratio(no_match_hits, no_match_total),
         "section_hit_rate": _ratio(section_hits, match_total),
-        "cause_candidate_recall": _ratio(cause_found, cause_expected),
+        "cause_candidate_recall": _coverage_ratio(cause_found, cause_expected),
+        "runbook_case_coverage": _coverage_ratio(
+            len(eligible_runbook_types & evaluated_runbook_types),
+            len(eligible_runbook_types),
+        ),
+        "cause_case_coverage": _coverage_ratio(
+            len(eligible_causes & evaluated_causes),
+            len(eligible_causes),
+        ),
+        "generated_case_freshness": _coverage_ratio(
+            fresh_generated_case_count,
+            generated_case_count,
+        ),
     }
-    all_reviewed = all(
-        item.get("review_status") == "approved"
-        for item in [*matching_cases, *diagnosis_cases]
-    )
     return {
         "metrics": metrics,
         "counts": {
             "matching_cases": len(matching_cases),
+            "positive_matching_cases": match_total,
+            "no_match_cases": no_match_total,
             "diagnosis_cases": len(diagnosis_cases),
             "eligible_runbooks": len(eligible),
+            "eligible_runbook_alert_types": len(eligible_runbook_types),
+            "annotated_cause_targets": len(eligible_causes),
+            "generated_cases": generated_case_count,
         },
-        "dataset_reviewed": all_reviewed,
         "failures": failures,
     }
 
@@ -148,15 +244,14 @@ def _gate_report(report: dict[str, Any], gates: dict[str, Any]) -> dict[str, Any
     failures: list[str] = []
     dataset_policy = gates.get("dataset_policy") or {}
     counts = report["counts"]
-    if dataset_policy.get("require_all_cases_reviewed") and not report["dataset_reviewed"]:
-        failures.append("evaluation datasets still contain unapproved cases")
     for count_key, policy_key in (
-        ("matching_cases", "minimum_matching_cases"),
-        ("diagnosis_cases", "minimum_diagnosis_cases"),
+        ("positive_matching_cases", "minimum_positive_matching_cases"),
+        ("no_match_cases", "minimum_no_match_cases"),
     ):
         minimum = int(dataset_policy.get(policy_key, 0))
-        if counts[count_key] < minimum:
-            failures.append(f"{count_key}={counts[count_key]} is below {minimum}")
+        actual_count = int(counts.get(count_key, 0))
+        if actual_count < minimum:
+            failures.append(f"{count_key}={actual_count} is below {minimum}")
     for metric, threshold in (gates.get("metric_thresholds") or {}).items():
         actual = float(report["metrics"].get(metric, 0))
         if actual < float(threshold):

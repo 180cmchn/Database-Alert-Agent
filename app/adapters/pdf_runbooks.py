@@ -313,6 +313,34 @@ def _metadata_strings(metadata: dict[str, Any], key: str) -> list[str]:
     return [item.strip() for item in values if item.strip()]
 
 
+def runbook_match_metadata(
+    annotation: dict[str, Any],
+    alert_type: str,
+) -> dict[str, Any]:
+    """Select alert-type-specific identities while retaining shared match gates."""
+
+    raw_match = annotation.get("match") or {}
+    if not isinstance(raw_match, dict):
+        raise RunbookError("Runbook annotation match must be an object")
+    result = dict(raw_match)
+    raw_profiles = annotation.get("alert_type_profiles")
+    if raw_profiles is None:
+        return result
+    if not isinstance(raw_profiles, dict):
+        raise RunbookError("Runbook annotation alert_type_profiles must be an object")
+    profile = raw_profiles.get(alert_type)
+    if profile is None:
+        return result
+    if not isinstance(profile, dict):
+        raise RunbookError(
+            f"Runbook annotation profile must be an object: {alert_type}"
+        )
+    for field in ("alert_names", "metric_names", "aliases", "keywords"):
+        if field in profile:
+            result[field] = _metadata_strings(profile, field)
+    return result
+
+
 def _scalar_filter_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -1155,7 +1183,7 @@ class LocalPDFRunbookLibrary:
                 f"Runbook annotation actions reference unknown causes for {path.name}: "
                 f"{sorted(unknown_action_causes)}"
             )
-        match_metadata = annotation.get("match") or {}
+        match_metadata = runbook_match_metadata(annotation, alert_type)
         visual_annotated_pages = sorted({item.page for item in visual_evidence})
         unannotated_image_pages = sorted(set(image_pages) - set(visual_annotated_pages))
         document = RunbookDocument(
@@ -1191,6 +1219,9 @@ class LocalPDFRunbookLibrary:
                 "alert_type_directory": alert_type,
                 "page_count": len(reader.pages),
                 "file_size_bytes": file_stat.st_size,
+                "content_sha256": hashlib.sha256(
+                    full_text.encode("utf-8")
+                ).hexdigest(),
                 "text_truncated": truncated,
                 "image_pages": image_pages,
                 "visual_annotated_pages": visual_annotated_pages,

@@ -101,10 +101,18 @@ PDF 时，就绪检查不会把实例标记为可用。普通自动化测试使�
   --output-dir /path/to/typed-pdfs
 ```
 
-`--source-index` 可选；需要人工指定类型或一个 PDF 覆盖多个类型时，在源索引中分别使用
-`alert_type` 或 `alert_types`。处理工具其次使用旧处理结果中的结构化告警名或指标名，再识别 PDF
-文字层中所有明确标注的告警类型，最后兼容主别名。无法确定任何类型时会指出具体失败的 PDF。
-省略参数才会启用自动推导；如果显式传入 `--source-index`，对应文件必须真实存在。
+推荐使用 AI 自动摄取模式。它读取项目现有 `.env`/运行时 AI 配置，按 PDF 分页正文抽取一个或
+多个告警类型、类型专属匹配字段、章节、正文明确列出的候选原因和动作，生成类型目录和索引，
+随后同步自动回归数据并执行覆盖率准入。`--sync` 允许重复执行：内容哈希未变化的 PDF 直接复用
+已有索引，只对新增或变更 PDF 调用模型。
+
+```powershell
+python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output-dir .\runbooks\pdfs-typed --auto-index --sync --enforce-gates
+```
+
+自动模式不需要 `source-index.json`。`--source-index` 仅作为可选的显式覆盖；其中可分别使用
+`alert_type` 或 `alert_types`。不使用 `--auto-index` 时，处理工具只能依赖索引、结构化字段或 PDF
+文字层中的明确类型标签，不能从普通叙述中做语义推断。显式传入的索引路径必须真实存在。
 
 ```json
 {
@@ -554,14 +562,15 @@ Content-Type: application/json
 
 ## 离线评测与生产准入
 
-从当前本地 PDF 和每个类型目录的 `index.json` 重新生成待审核的评测初标：
+从当前本地 PDF 和每个类型目录的 `index.json` 单独同步自动回归数据：
 
 ```bash
-.venv/bin/python tools/generate_evaluation_datasets.py --force
+.venv/bin/python tools/generate_evaluation_datasets.py --sync
 ```
 
-生成器实际读取 PDF 文字层；匹配样本从正文和结构化匹配字段生成，根因样本只使用索引中已有的
-`cause_id`。生成结果全部为 `review_required`，仍需数据库专家复核。
+生成器实际读取 PDF 文字层；每个有效的“手册 × 告警类型”自动生成正向召回样本，每个告警类型
+生成同目录拒识样本，每个已抽取 `cause_id` 生成诊断覆盖样本。`--sync` 只替换
+`source.kind=pdf_runbook` 的自动样本，独立的历史事故样本会保留。
 
 运行当前检索与诊断知识覆盖基准：
 
@@ -576,9 +585,10 @@ Content-Type: application/json
 .venv/bin/python tools/evaluate_runbooks.py --enforce-gates
 ```
 
-数据集位于 `evaluation/datasets/`，门槛位于 `policies/production-gates.json`。当前仓库中的评测
-样本来自保守初标或合成改写，因此准入检查预期失败；必须由数据库专家审核评测样本，并用真实、
-按事故/时间隔离的历史样本扩充到门槛要求后才能批准上线。
+数据集位于 `evaluation/datasets/`，门槛位于 `policies/production-gates.json`。准入不再要求两个
+数据集各凑 100 条或逐条修改审核状态，而是要求当前所有有效“手册 × 告警类型”、所有已抽取原因
+都被最新自动样本覆盖，且召回、拒识、章节和原因指标达到阈值。自动样本只证明摄取与检索回归，
+不会被描述成独立的真实效果验证；真实准确率仍通过影子运行、事故反馈和按时间隔离的历史样本统计。
 
 ## 验证
 

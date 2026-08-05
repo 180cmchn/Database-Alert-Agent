@@ -17,6 +17,7 @@ from pypdf.errors import PdfReadError
 from app.adapters.pdf_runbooks import (
     alert_type_directory_name,
     derive_runbook_alert_types,
+    runbook_match_metadata,
 )
 from app.domain.errors import RunbookError
 
@@ -395,9 +396,7 @@ def _severity(text: str) -> str:
 
 
 def _base_alert(source: _RunbookSource) -> dict[str, Any]:
-    match = source.annotation.get("match") or {}
-    if not isinstance(match, dict):
-        raise RunbookError("Runbook annotation match must be an object")
+    match = runbook_match_metadata(source.annotation, source.alert_type)
     alert_names = _string_values(match.get("alert_names"))
     metric_names = _string_values(match.get("metric_names"))
     aliases = _string_values(match.get("aliases"))
@@ -476,7 +475,6 @@ def _build_records(
                 "alert": alert,
                 "gold_runbook_ids": [source.runbook_id],
                 "gold_sections": section_ids,
-                "review_status": "review_required",
                 "source": metadata,
             }
         )
@@ -511,10 +509,42 @@ def _build_records(
                     "alert": diagnosis_alert,
                     "gold_runbook_id": source.runbook_id,
                     "expected_cause_ids": [cause_id],
-                    "review_status": "review_required",
                     "source": metadata,
                 }
             )
+
+    first_source_by_alert_type: dict[str, _RunbookSource] = {}
+    for source in sources:
+        if source.annotation.get("deprecated") is True or source.annotation.get(
+            "knowledge_type"
+        ) == "incomplete":
+            continue
+        first_source_by_alert_type.setdefault(source.alert_type, source)
+    for alert_type, source in sorted(first_source_by_alert_type.items()):
+        token = hashlib.sha256(alert_type.encode("utf-8")).hexdigest()[:16]
+        no_match_id = _case_id("pdf-no-match", alert_type, token)
+        if no_match_id in seen_matching_ids:
+            raise RunbookError(f"Duplicate generated matching case: {no_match_id}")
+        seen_matching_ids.add(no_match_id)
+        matching.append(
+            {
+                "case_id": no_match_id,
+                "alert": {
+                    "severity": "WARNING",
+                    "title": f"unrelated-evaluation-{token}",
+                    "reason": f"unrelated_evaluation_{token}",
+                    "alert_type": alert_type,
+                    "alert_name": f"unrelated-evaluation-{token}",
+                    "environment": "evaluation",
+                },
+                "gold_runbook_ids": [],
+                "gold_sections": [],
+                "source": {
+                    **_source_metadata(source),
+                    "case_role": "in_type_no_match",
+                },
+            }
+        )
     return matching, diagnosis, skipped_no_causes, skipped_ineligible
 
 
@@ -533,35 +563,80 @@ def _write_datasets(
     diagnosis: list[dict[str, Any]],
     *,
     force: bool,
-) -> None:
+    sync: bool,
+) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     targets = {name: output_dir / name for name in _DATASET_FILENAMES}
     existing = [path for path in targets.values() if path.exists()]
-    if existing and not force:
+    if existing and not force and not sync:
         raise RunbookError(
-            "Evaluation dataset already exists; pass --force to replace: "
+            "Evaluation dataset already exists; pass --force to replace or --sync "
+            "to update generated cases: "
             + ", ".join(str(path) for path in existing)
         )
     for path in existing:
         if not path.is_file() or path.is_symlink():
             raise RunbookError(f"Evaluation dataset is not a regular file: {path}")
 
-    staging = Path(
-        tempfile.mkdtemp(prefix=".evaluation-datasets-", dir=output_dir)
-    )
+    records_by_name = {
+        "runbook_matching.jsonl": matching,
+        "root_cause_diagnosis.jsonl": diagnosis,
+    }
+    preserved_count = 0
+    if sync and not force:
+        for name, path in targets.items():
+            if not path.exists():
+                continue
+            preserved: list[dict[str, Any]] = []
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RunbookError(
+                        f"Invalid evaluation JSONL at {path}:{line_number}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise RunbookError(
+                        f"Evaluation JSONL record must be an object: "
+                        f"{path}:{line_number}"
+                    )
+                source = record.get("source") or {}
+                if not isinstance(source, dict) or source.get("kind") != "pdf_runbook":
+                    preserved.append(record)
+            preserved_count += len(preserved)
+            generated_ids = {
+                str(record.get("case_id")) for record in records_by_name[name]
+            }
+            duplicate_ids = {
+                str(record.get("case_id")) for record in preserved
+            } & generated_ids
+            if duplicate_ids:
+                raise RunbookError(
+                    "Preserved evaluation cases conflict with generated IDs: "
+                    + ", ".join(sorted(duplicate_ids))
+                )
+            records_by_name[name] = [*preserved, *records_by_name[name]]
+
+    staging = Path(tempfile.mkdtemp(prefix=".evaluation-datasets-", dir=output_dir))
     try:
         (staging / "runbook_matching.jsonl").write_text(
-            _jsonl(matching),
+            _jsonl(records_by_name["runbook_matching.jsonl"]),
             encoding="utf-8",
         )
         (staging / "root_cause_diagnosis.jsonl").write_text(
-            _jsonl(diagnosis),
+            _jsonl(records_by_name["root_cause_diagnosis.jsonl"]),
             encoding="utf-8",
         )
         for name, target in targets.items():
             (staging / name).replace(target)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    return preserved_count
 
 
 def generate_evaluation_datasets(
@@ -570,9 +645,13 @@ def generate_evaluation_datasets(
     *,
     source_index: Path | None = None,
     force: bool = False,
+    sync: bool = False,
     strict_alert_types: bool = False,
 ) -> dict[str, Any]:
-    """Generate deterministic, review-required JSONL cases from local PDF runbooks."""
+    """Generate deterministic acceptance cases from local PDF runbooks."""
+
+    if force and sync:
+        raise RunbookError("Evaluation generation cannot use force and sync together")
 
     layout, sources = _discover_sources(
         pdf_dir,
@@ -582,7 +661,16 @@ def generate_evaluation_datasets(
     matching, diagnosis, skipped_no_causes, skipped_ineligible = _build_records(sources)
     if not matching:
         raise RunbookError("No eligible PDF runbooks were available for dataset generation")
-    _write_datasets(output_dir, matching, diagnosis, force=force)
+    preserved_case_count = _write_datasets(
+        output_dir,
+        matching,
+        diagnosis,
+        force=force,
+        sync=sync,
+    )
+    positive_matching_count = sum(
+        bool(record.get("gold_runbook_ids")) for record in matching
+    )
     return {
         "pdf_dir": str(pdf_dir),
         "layout": layout,
@@ -590,16 +678,18 @@ def generate_evaluation_datasets(
         "output_dir": str(output_dir),
         "pdf_count": len({source.path.resolve() for source in sources}),
         "matching_case_count": len(matching),
+        "positive_matching_case_count": positive_matching_count,
+        "no_match_case_count": len(matching) - positive_matching_count,
         "diagnosis_case_count": len(diagnosis),
+        "preserved_case_count": preserved_case_count,
         "skipped_ineligible_count": skipped_ineligible,
         "skipped_root_cause_runbooks": skipped_no_causes,
-        "review_status": "review_required",
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate review-required evaluation JSONL from PDF runbooks"
+        description="Generate deterministic acceptance JSONL from PDF runbooks"
     )
     parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
     parser.add_argument(
@@ -612,10 +702,16 @@ def main() -> int:
         type=Path,
         help="Optional legacy global index for a flat PDF directory",
     )
-    parser.add_argument(
+    output_mode = parser.add_mutually_exclusive_group()
+    output_mode.add_argument(
         "--force",
         action="store_true",
-        help="Replace existing generated JSONL files",
+        help="Replace all existing JSONL records",
+    )
+    output_mode.add_argument(
+        "--sync",
+        action="store_true",
+        help="Replace PDF-generated cases while preserving independently sourced cases",
     )
     parser.add_argument(
         "--strict-alert-types",
@@ -629,6 +725,7 @@ def main() -> int:
         args.output_dir,
         source_index=args.source_index,
         force=args.force,
+        sync=args.sync,
         strict_alert_types=args.strict_alert_types,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -52,24 +52,42 @@ async def test_evaluation_has_no_handbook_approval_metrics(
     assert report["counts"]["eligible_runbooks"] == 1
     assert "approved_runbooks" not in report["counts"]
     assert "approved_runbook_ratio" not in report["metrics"]
-    assert report["dataset_reviewed"] is True
+    assert "dataset_reviewed" not in report
+    assert report["metrics"]["runbook_case_coverage"] == 1.0
+    assert report["metrics"]["cause_case_coverage"] == 1.0
 
 
-def test_evaluation_case_review_gate_is_preserved() -> None:
+def test_evaluation_gate_uses_automatic_coverage_instead_of_fixed_volume() -> None:
     report = {
-        "counts": {"matching_cases": 1, "diagnosis_cases": 1},
-        "metrics": {},
-        "dataset_reviewed": False,
+        "counts": {
+            "positive_matching_cases": 1,
+            "no_match_cases": 1,
+        },
+        "metrics": {
+            "runbook_case_coverage": 0.5,
+            "cause_case_coverage": 1.0,
+        },
     }
 
     gate = evaluate_runbooks._gate_report(
         report,
-        {"dataset_policy": {"require_all_cases_reviewed": True}},
+        {
+            "dataset_policy": {
+                "minimum_positive_matching_cases": 1,
+                "minimum_no_match_cases": 1,
+                "minimum_matching_cases": 100,
+                "minimum_diagnosis_cases": 100,
+            },
+            "metric_thresholds": {
+                "runbook_case_coverage": 1.0,
+                "cause_case_coverage": 1.0,
+            },
+        },
     )
 
     assert gate == {
         "passed": False,
-        "failures": ["evaluation datasets still contain unapproved cases"],
+        "failures": ["runbook_case_coverage=0.5000 is below 1.0000"],
     }
 
 

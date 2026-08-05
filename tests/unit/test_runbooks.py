@@ -410,6 +410,69 @@ async def test_identical_multi_alert_copies_are_deduplicated_globally(
 
 
 @pytest.mark.asyncio
+async def test_multi_alert_copy_uses_its_alert_type_profile(tmp_path: Path) -> None:
+    first_type = "connection_failure"
+    second_type = "replica_lag"
+    runbook_id = "profiled-diagnosis"
+    first_directory = tmp_path / first_type
+    second_directory = tmp_path / second_type
+    first_directory.mkdir()
+    second_directory.mkdir()
+    first_pdf = first_directory / f"{runbook_id}.pdf"
+    _write_text_pdf(
+        first_pdf,
+        "Shared database troubleshooting guide with safe investigation steps.",
+    )
+    copy2(first_pdf, second_directory / first_pdf.name)
+    annotation_fields = {
+        "match": {
+            "alert_names": ["Connection Failure", "Replica Lag"],
+            "metric_names": ["connection_errors", "replica_delay_seconds"],
+        },
+        "alert_type_profiles": {
+            first_type: {
+                "alert_names": ["Connection Failure"],
+                "metric_names": ["connection_errors"],
+            },
+            second_type: {
+                "alert_names": ["Replica Lag"],
+                "metric_names": ["replica_delay_seconds"],
+            },
+        },
+    }
+    _write_minimal_index(
+        first_directory,
+        first_type,
+        runbook_id,
+        annotation_fields=annotation_fields,
+    )
+    _write_minimal_index(
+        second_directory,
+        second_type,
+        runbook_id,
+        annotation_fields=annotation_fields,
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica Lag",
+            "reason": "replica_delay_seconds",
+            "alert_name": "Replica Lag",
+            "metric_name": "replica_delay_seconds",
+            "alert_type": second_type,
+        }
+    )
+
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert [item.runbook_id for item in matches] == [runbook_id]
+    assert matches[0].metadata["match"]["alert_names"] == ["Replica Lag"]
+    assert matches[0].metadata["match"]["metric_names"] == [
+        "replica_delay_seconds"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_conflicting_multi_alert_copies_are_rejected(
     tmp_path: Path,
 ) -> None:

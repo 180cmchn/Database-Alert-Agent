@@ -106,11 +106,13 @@ async def test_generate_typed_pdf_datasets_and_evaluate_them(tmp_path: Path) -> 
         "source_index": None,
         "output_dir": str(output_dir),
         "pdf_count": 1,
-        "matching_case_count": 1,
+        "matching_case_count": 2,
+        "positive_matching_case_count": 1,
+        "no_match_case_count": 1,
         "diagnosis_case_count": 1,
+        "preserved_case_count": 0,
         "skipped_ineligible_count": 0,
         "skipped_root_cause_runbooks": [],
-        "review_status": "review_required",
     }
     matching = _read_jsonl(output_dir / "runbook_matching.jsonl")
     diagnosis = _read_jsonl(output_dir / "root_cause_diagnosis.jsonl")
@@ -128,7 +130,7 @@ async def test_generate_typed_pdf_datasets_and_evaluate_them(tmp_path: Path) -> 
     }
     assert matching[0]["gold_runbook_ids"] == ["slow-query"]
     assert matching[0]["gold_sections"] == ["diagnosis"]
-    assert matching[0]["review_status"] == "review_required"
+    assert "review_status" not in matching[0]
     assert matching[0]["source"]["page_count"] == 1
     assert len(matching[0]["source"]["content_sha256"]) == 64
     assert diagnosis[0]["gold_runbook_id"] == "slow-query"
@@ -144,11 +146,25 @@ async def test_generate_typed_pdf_datasets_and_evaluate_them(tmp_path: Path) -> 
             diagnosis_dataset=output_dir / "root_cause_diagnosis.jsonl",
         )
     )
-    assert evaluation["counts"]["matching_cases"] == 1
+    assert evaluation["counts"]["matching_cases"] == 2
+    assert evaluation["counts"]["positive_matching_cases"] == 1
+    assert evaluation["counts"]["no_match_cases"] == 1
     assert evaluation["counts"]["diagnosis_cases"] == 1
     assert evaluation["metrics"]["runbook_recall_at_5"] == 1.0
     assert evaluation["metrics"]["cause_candidate_recall"] == 1.0
-    assert evaluation["dataset_reviewed"] is False
+    assert evaluation["metrics"]["runbook_case_coverage"] == 1.0
+    assert evaluation["metrics"]["cause_case_coverage"] == 1.0
+    assert evaluation["metrics"]["generated_case_freshness"] == 1.0
+    assert "dataset_reviewed" not in evaluation
+    gates = json.loads(
+        (Path(__file__).parents[2] / "policies" / "production-gates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evaluate_runbooks._gate_report(evaluation, gates) == {
+        "passed": True,
+        "failures": [],
+    }
 
 
 def test_generate_flat_pdf_dataset_from_pdf_text(tmp_path: Path) -> None:
@@ -167,7 +183,9 @@ def test_generate_flat_pdf_dataset_from_pdf_text(tmp_path: Path) -> None:
     )
 
     assert report["layout"] == "flat"
-    assert report["matching_case_count"] == 1
+    assert report["matching_case_count"] == 2
+    assert report["positive_matching_case_count"] == 1
+    assert report["no_match_case_count"] == 1
     assert report["diagnosis_case_count"] == 0
     assert report["skipped_root_cause_runbooks"] == ["replica_lag/replica-lag"]
     matching = _read_jsonl(output_dir / "runbook_matching.jsonl")
@@ -192,7 +210,7 @@ def test_flat_pdf_title_selects_one_candidate_from_full_text(tmp_path: Path) -> 
 
     report = generate_evaluation_datasets(pdf_dir, output_dir)
 
-    assert report["matching_case_count"] == 1
+    assert report["matching_case_count"] == 2
     matching = _read_jsonl(output_dir / "runbook_matching.jsonl")
     assert matching[0]["alert"]["alert_type"] == "replicalag"
     assert matching[0]["source"]["alert_type_source"] == "pdf_text_title_match"
@@ -211,3 +229,42 @@ def test_generation_rejects_pdf_without_text_before_writing(tmp_path: Path) -> N
         generate_evaluation_datasets(pdf_dir, output_dir)
 
     assert not output_dir.exists()
+
+
+def test_dataset_sync_replaces_generated_cases_and_preserves_independent_cases(
+    tmp_path: Path,
+) -> None:
+    pdf_dir = tmp_path / "flat"
+    pdf_dir.mkdir()
+    _write_text_pdf(
+        pdf_dir / "replica-lag.pdf",
+        "Alert type: replica_lag",
+    )
+    output_dir = tmp_path / "datasets"
+    generate_evaluation_datasets(pdf_dir, output_dir)
+    matching_path = output_dir / "runbook_matching.jsonl"
+    independent = {
+        "case_id": "historical-incident-1",
+        "alert": {
+            "severity": "WARNING",
+            "title": "Historical incident",
+            "reason": "replica_lag",
+            "alert_type": "replica_lag",
+        },
+        "gold_runbook_ids": ["replica-lag"],
+        "source": {"kind": "historical_incident"},
+    }
+    matching_path.write_text(
+        matching_path.read_text(encoding="utf-8")
+        + json.dumps(independent)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = generate_evaluation_datasets(pdf_dir, output_dir, sync=True)
+
+    assert report["preserved_case_count"] == 1
+    records = _read_jsonl(matching_path)
+    assert len(records) == 3
+    assert sum(item["case_id"] == "historical-incident-1" for item in records) == 1
+    assert all("review_status" not in item for item in records[:2])

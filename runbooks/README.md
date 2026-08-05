@@ -46,8 +46,15 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
   --output-dir /path/to/typed-pdfs
 ```
 
-`--source-index` 是可选参数。需要显式指定单个类型时使用 `alert_type`；一份 PDF 覆盖多个类型时，
-在源索引中使用 `alert_types`。省略参数才会启用自动推导；显式传入的索引路径必须存在：
+持续接入新 PDF 时使用自动摄取命令；它会调用项目已配置的 AI 模型抽取所有告警类型和结构化
+诊断内容，同步评测样本并执行覆盖率门槛。重复运行只处理新增或内容发生变化的 PDF：
+
+```powershell
+python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output-dir .\runbooks\pdfs-typed --auto-index --sync --enforce-gates
+```
+
+自动模式不需要源索引。`--source-index` 仅用于显式覆盖；指定单个类型时使用 `alert_type`，一份
+PDF 覆盖多个类型时使用 `alert_types`，且显式传入的路径必须存在：
 
 ```json
 {
@@ -61,10 +68,12 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 }
 ```
 
-转换工具会为每个类型生成一份 PDF 副本和单数 `alert_type` 注解。运行时仅在这些副本的 PDF
+转换工具会为每个类型生成一份 PDF 副本和单数 `alert_type` 注解。AI 自动结果还包含
+`alert_type_profiles`，使同一手册在不同类型目录使用各自的告警名、指标名和别名。运行时仅在副本的 PDF
 字节及除目录归属外的结构化注解完全一致时按稳定 ID 聚合，否则拒绝加载，避免引用歧义。
 
-输出目录必须尚不存在，处理过程不会覆盖原始 PDF。目录中任意 PDF 缺少文字层、已加密、损坏、超过大小限制，或索引引用缺失 PDF/无效页码时，
+默认模式要求输出目录尚不存在；`--sync` 会先在同级临时目录完整生成并校验，再原子替换已有的
+派生目录，始终不会改写平铺源 PDF。目录中任意 PDF 缺少文字层、已加密、损坏、超过大小限制，或索引引用缺失 PDF/无效页码时，
 服务会明确报错，不会悄悄回退。提交或部署手册目录前请运行：
 
 ```bash
