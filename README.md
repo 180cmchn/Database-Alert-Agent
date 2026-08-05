@@ -554,6 +554,15 @@ Content-Type: application/json
 
 ## 离线评测与生产准入
 
+从当前本地 PDF 和每个类型目录的 `index.json` 重新生成待审核的评测初标：
+
+```bash
+.venv/bin/python tools/generate_evaluation_datasets.py --force
+```
+
+生成器实际读取 PDF 文字层；匹配样本从正文和结构化匹配字段生成，根因样本只使用索引中已有的
+`cause_id`。生成结果全部为 `review_required`，仍需数据库专家复核。
+
 运行当前检索与诊断知识覆盖基准：
 
 ```bash
