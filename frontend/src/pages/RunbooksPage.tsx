@@ -18,6 +18,12 @@ function metadataString(record: RunbookRecord, key: string): string {
   return typeof value === "string" || typeof value === "number" ? String(value) : "—";
 }
 
+function metadataStrings(record: RunbookRecord, key: string): string[] {
+  const value = record.metadata[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && Boolean(item));
+}
+
 export function RunbooksPage() {
   const { token, unlocked, lock } = useAdminAuth();
   const [runbooks, setRunbooks] = useState<RunbookRecord[]>([]);
@@ -55,11 +61,18 @@ export function RunbooksPage() {
     const term = search.trim().toLowerCase();
     if (!term) return runbooks;
     return runbooks.filter((item) =>
-      [item.id, item.title, item.content, metadataString(item, "file_name")]
+      [
+        item.id,
+        item.title,
+        item.content,
+        metadataString(item, "file_name"),
+        ...metadataStrings(item, "alert_types"),
+      ]
         .some((value) => value.toLowerCase().includes(term)),
     );
   }, [runbooks, search]);
   const selected = runbooks.find((item) => item.id === selectedId) || null;
+  const selectedAlertTypes = selected ? metadataStrings(selected, "alert_types") : [];
 
   if (!unlocked) {
     return <AdminUnlock title="解锁处置手册" description="查看本地 PDF 手册清单和已提取正文需要管理员令牌。" />;
@@ -119,6 +132,7 @@ export function RunbooksPage() {
                     <div><dt>大小</dt><dd>{metadataString(selected, "file_size_bytes")} bytes</dd></div>
                     <div><dt>手册 ID</dt><dd>{selected.id}</dd></div>
                     <div><dt>知识类型</dt><dd>{selected.knowledge_type}</dd></div>
+                    <div><dt>适用告警类型</dt><dd>{selectedAlertTypes.join(", ") || "—"}</dd></div>
                   </dl>
                   {selected.severities.length > 0 && <div className="runbook-severities">{selected.severities.map((severity) => <SeverityBadge key={severity} severity={severity} />)}</div>}
                   <p className="runbook-readonly-note">PDF 是审计原文；章节、诊断图和图片证据来自只读结构化索引，所有可检索手册按相同规则参与匹配。</p>

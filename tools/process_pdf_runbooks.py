@@ -13,7 +13,7 @@ from typing import Any
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
-from app.adapters.pdf_runbooks import derive_runbook_alert_type
+from app.adapters.pdf_runbooks import derive_runbook_alert_types
 from app.domain.errors import RunbookError
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -51,9 +51,11 @@ def _sanitize_annotation(annotation: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
-def _read_source_index(path: Path) -> dict[str, dict[str, Any]]:
-    if not path.exists():
+def _read_source_index(path: Path | None) -> dict[str, dict[str, Any]]:
+    if path is None:
         return {}
+    if not path.exists():
+        raise RunbookError(f"Source annotation index does not exist: {path}")
     if not path.is_file() or path.is_symlink():
         raise RunbookError(f"Runbook annotation index must be a regular file: {path}")
     try:
@@ -102,7 +104,7 @@ def _extract_text(path: Path) -> str:
 
 def process_pdf_runbooks(
     source_pdf_dir: Path,
-    source_index: Path,
+    source_index: Path | None,
     output_dir: Path,
 ) -> dict[str, Any]:
     """Classify flat source PDFs and emit one self-contained directory per type."""
@@ -125,13 +127,21 @@ def process_pdf_runbooks(
         if not _SAFE_RUNBOOK_ID.fullmatch(path.stem):
             raise RunbookError(f"PDF has an invalid runbook ID: {path.name}")
         source_ids.add(path.stem)
-        annotation = _sanitize_annotation(
+        source_annotation = _sanitize_annotation(
             dict(annotations.get(path.stem) or {"runbook_id": path.stem})
         )
-        alert_type = derive_runbook_alert_type(_extract_text(path), annotation)
-        annotation["runbook_id"] = path.stem
-        annotation["alert_type"] = alert_type
-        grouped[alert_type].append((path, annotation))
+        pdf_text = _extract_text(path)
+        try:
+            alert_types = derive_runbook_alert_types(pdf_text, source_annotation)
+        except (RunbookError, ValueError) as exc:
+            raise RunbookError(f"Cannot classify PDF {path.name}: {exc}") from exc
+
+        source_annotation.pop("alert_types", None)
+        source_annotation["runbook_id"] = path.stem
+        for alert_type in alert_types:
+            annotation = dict(source_annotation)
+            annotation["alert_type"] = alert_type
+            grouped[alert_type].append((path, annotation))
 
     unknown_annotations = set(annotations) - source_ids
     if unknown_annotations:
@@ -169,9 +179,10 @@ def process_pdf_runbooks(
 
     return {
         "source_pdf_dir": str(source_pdf_dir),
-        "source_index": str(source_index),
+        "source_index": str(source_index) if source_index is not None else None,
         "output_dir": str(output_dir),
         "runbook_count": len(source_pdfs),
+        "emitted_runbook_count": sum(len(records) for records in grouped.values()),
         "alert_type_count": len(grouped),
         "alert_types": {
             alert_type: [path.stem for path, _ in records]
@@ -187,9 +198,26 @@ def main() -> int:
             "PDF/index directories"
         )
     )
-    parser.add_argument("--source-pdf-dir", type=Path, required=True)
-    parser.add_argument("--source-index", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--source-pdf-dir",
+        type=Path,
+        required=True,
+        help="Flat directory containing the source PDF files",
+    )
+    parser.add_argument(
+        "--source-index",
+        type=Path,
+        help=(
+            "Optional source annotation index; use alert_types for a PDF that "
+            "covers multiple alert types"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="New output directory for per-alert-type PDF indexes",
+    )
     args = parser.parse_args()
 
     report = process_pdf_runbooks(

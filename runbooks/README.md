@@ -7,8 +7,8 @@
 
 维护规则：
 
-1. 一份手册对应一个 `.pdf` 文件，文件名（不含扩展名）作为稳定的手册 ID；PDF 和处理结果必须
-   放在由告警类型规范化得到的同一类型目录中；
+1. 一份手册对应一个 `.pdf` 文件，文件名（不含扩展名）作为稳定的手册 ID；单类型 PDF 放在对应
+   类型目录中，多类型 PDF 以相同 ID、相同字节和等价注解复制到每个对应类型目录；
 2. PDF 必须未加密，并带可提取的文字层；扫描件应先完成 OCR，含图页面还应提取图片中的关键信息；
 3. 每个类型目录的 `index.json` 使用 `schema_version=3`，顶层 `alert_type` 必须与目录名一致；其中
    的 `runbook_id` 必须对应该目录现有 PDF，章节页码不得超出 PDF 页数；
@@ -43,9 +43,26 @@ RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
 ```bash
 .venv/bin/python tools/process_pdf_runbooks.py \
   --source-pdf-dir /path/to/flat-pdfs \
-  --source-index /path/to/index.json \
   --output-dir /path/to/typed-pdfs
 ```
+
+`--source-index` 是可选参数。需要显式指定单个类型时使用 `alert_type`；一份 PDF 覆盖多个类型时，
+在源索引中使用 `alert_types`。省略参数才会启用自动推导；显式传入的索引路径必须存在：
+
+```json
+{
+  "schema_version": 2,
+  "runbooks": [
+    {
+      "runbook_id": "shared-database-guide",
+      "alert_types": ["mysql_crash", "mysql_connections_high"]
+    }
+  ]
+}
+```
+
+转换工具会为每个类型生成一份 PDF 副本和单数 `alert_type` 注解。运行时仅在这些副本的 PDF
+字节及除目录归属外的结构化注解完全一致时按稳定 ID 聚合，否则拒绝加载，避免引用歧义。
 
 输出目录必须尚不存在，处理过程不会覆盖原始 PDF。目录中任意 PDF 缺少文字层、已加密、损坏、超过大小限制，或索引引用缺失 PDF/无效页码时，
 服务会明确报错，不会悄悄回退。提交或部署手册目录前请运行：

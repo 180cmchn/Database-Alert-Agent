@@ -72,7 +72,8 @@ LangGraph 调查图：fingerprint → knowledge → runbook → strategy
 同目录的 `index.json` 是该类型对应的结构化检索和诊断结果。索引记录知识类型、停用标志、
 适用范围、告警别名、真实章节/页码、候选原因、支持证据、反证、只读核查动作、需要审批的
 变更动作，以及图片中红框/高亮的关键报错、代码和界面字段。文件名（不含 `.pdf`）仍是稳定
-手册 ID。
+手册 ID。同一 PDF 覆盖多个告警类型时，处理工具会把相同字节和等价注解复制到各类型目录；
+运行时按稳定手册 ID 聚合为一份手册，并保留全部适用告警类型。
 
 检索先把告警的 `alert_type` 转换为与处理阶段相同的安全目录名，只读取这个目录，再按数据库
 适用范围过滤，并组合结构化字段、图片关键报错/关键词精确召回、BM25/中文字符片段召回和
@@ -97,12 +98,25 @@ PDF 时，就绪检查不会把实例标记为可用。普通自动化测试使�
 ```bash
 .venv/bin/python tools/process_pdf_runbooks.py \
   --source-pdf-dir /path/to/flat-pdfs \
-  --source-index /path/to/index.json \
   --output-dir /path/to/typed-pdfs
 ```
 
-处理工具优先使用索引中显式配置的 `alert_type`，其次使用旧处理结果中的结构化告警名或指标名，再识别
-PDF 文字层中的告警类型，最后兼容主别名；无法唯一确定类型时会停止，避免把手册放入错误目录。
+`--source-index` 可选；需要人工指定类型或一个 PDF 覆盖多个类型时，在源索引中分别使用
+`alert_type` 或 `alert_types`。处理工具其次使用旧处理结果中的结构化告警名或指标名，再识别 PDF
+文字层中所有明确标注的告警类型，最后兼容主别名。无法确定任何类型时会指出具体失败的 PDF。
+省略参数才会启用自动推导；如果显式传入 `--source-index`，对应文件必须真实存在。
+
+```json
+{
+  "schema_version": 2,
+  "runbooks": [
+    {
+      "runbook_id": "shared-database-guide",
+      "alert_types": ["mysql_crash", "mysql_connections_high"]
+    }
+  ]
+}
+```
 
 相关环境变量：
 

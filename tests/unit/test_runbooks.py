@@ -11,6 +11,8 @@ from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import (
     LocalPDFRunbookLibrary,
     alert_type_directory_name,
+    derive_runbook_alert_type,
+    derive_runbook_alert_types,
 )
 from app.domain.errors import (
     InvalidRunbookIdError,
@@ -93,6 +95,32 @@ def _write_text_pdf(path: Path, text: str) -> None:
     page[NameObject("/Contents")] = writer._add_object(stream)
     with path.open("wb") as handle:
         writer.write(handle)
+
+
+def _write_minimal_index(
+    directory: Path,
+    alert_type: str,
+    runbook_id: str,
+    *,
+    annotation_fields: dict[str, Any] | None = None,
+) -> None:
+    (directory / "index.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "alert_type": alert_type,
+                "runbooks": [
+                    {
+                        "runbook_id": runbook_id,
+                        "alert_type": alert_type,
+                        "knowledge_type": "runbook",
+                        **(annotation_fields or {}),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _self_contained_library(
@@ -247,6 +275,43 @@ def test_alert_type_directory_name_is_shared_and_path_safe() -> None:
     )
 
 
+def test_derive_runbook_alert_types_collects_all_normalized_candidates() -> None:
+    assert derive_runbook_alert_types(
+        "ignored",
+        {
+            "alert_type": "Replica Lag",
+            "alert_types": ["Replica Lag", "MySQL/Crash", "Replica Lag"],
+        },
+    ) == ["replica_lag", "mysql_crash"]
+    assert derive_runbook_alert_types(
+        "This text does not need a labelled fallback.",
+        {
+            "match": {
+                "alert_names": ["Replica Lag", "MySQL/Crash"],
+                "metric_names": ["Replica Lag"],
+            }
+        },
+    ) == ["mysql_crash", "replica_lag"]
+    assert derive_runbook_alert_types(
+        "Alert Type: MySQL/Crash, Replica Lag\nAlert Name: MySQL/Crash"
+    ) == ["mysql_crash", "replica_lag"]
+    assert derive_runbook_alert_types("告警名称: ReplicaLag 告警") == ["replicalag"]
+
+    with pytest.raises(RunbookError, match="multiple alert types"):
+        derive_runbook_alert_type(
+            "ignored",
+            {"match": {"alert_names": ["Replica Lag", "MySQL/Crash"]}},
+        )
+    with pytest.raises(RunbookError, match="must also be included"):
+        derive_runbook_alert_types(
+            "ignored",
+            {
+                "alert_type": "Disk Full",
+                "alert_types": ["Replica Lag", "MySQL/Crash"],
+            },
+        )
+
+
 def test_runbook_models_do_not_expose_quality_or_review_status_fields() -> None:
     assert "quality_status" not in RunbookExcerpt.model_fields
     assert "quality_status" not in RunbookDocument.model_fields
@@ -294,6 +359,144 @@ async def test_local_pdf_runbook_get_rejects_unsafe_id(tmp_path: Path) -> None:
 
     with pytest.raises(InvalidRunbookIdError):
         await library.get("../escape")
+
+
+@pytest.mark.asyncio
+async def test_identical_multi_alert_copies_are_deduplicated_globally(
+    tmp_path: Path,
+) -> None:
+    first_type = "connection_failure"
+    second_type = "replica_lag"
+    runbook_id = "shared-diagnosis"
+    first_directory = tmp_path / first_type
+    second_directory = tmp_path / second_type
+    first_directory.mkdir()
+    second_directory.mkdir()
+    first_pdf = first_directory / f"{runbook_id}.pdf"
+    second_pdf = second_directory / f"{runbook_id}.pdf"
+    _write_text_pdf(
+        first_pdf,
+        "Shared database diagnosis guide with safe investigation steps.",
+    )
+    copy2(first_pdf, second_pdf)
+    _write_minimal_index(first_directory, first_type, runbook_id)
+    _write_minimal_index(second_directory, second_type, runbook_id)
+    library = LocalPDFRunbookLibrary(
+        tmp_path,
+        min_score=0,
+        min_confidence=0,
+    )
+
+    documents = await library.list()
+    document = await library.get(runbook_id)
+    second_type_alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Replica lag",
+            "reason": second_type,
+            "alert_type": second_type,
+        }
+    )
+    second_type_matches = await library.search(second_type_alert)
+
+    assert [item.id for item in documents] == [runbook_id]
+    assert documents[0].metadata["alert_types"] == [first_type, second_type]
+    assert documents[0].metadata["alert_type"] == first_type
+    assert document.id == runbook_id
+    assert document.metadata["alert_types"] == [first_type, second_type]
+    assert [item.runbook_id for item in second_type_matches] == [runbook_id]
+    assert second_type_matches[0].metadata["alert_type"] == second_type
+    assert second_type_matches[0].metadata["alert_types"] == [second_type]
+
+
+@pytest.mark.asyncio
+async def test_conflicting_multi_alert_copies_are_rejected(
+    tmp_path: Path,
+) -> None:
+    first_type = "connection_failure"
+    second_type = "replica_lag"
+    runbook_id = "conflicting-diagnosis"
+    first_directory = tmp_path / first_type
+    second_directory = tmp_path / second_type
+    first_directory.mkdir()
+    second_directory.mkdir()
+    _write_text_pdf(
+        first_directory / f"{runbook_id}.pdf",
+        "Connection failure diagnosis guide with safe investigation steps.",
+    )
+    _write_text_pdf(
+        second_directory / f"{runbook_id}.pdf",
+        "Replica lag diagnosis guide with different investigation steps.",
+    )
+    _write_minimal_index(first_directory, first_type, runbook_id)
+    _write_minimal_index(second_directory, second_type, runbook_id)
+    library = LocalPDFRunbookLibrary(tmp_path)
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Connection failure",
+            "reason": first_type,
+            "alert_type": first_type,
+        }
+    )
+
+    with pytest.raises(RunbookError, match="Conflicting PDF runbook copies"):
+        await library.list()
+    with pytest.raises(RunbookError, match="Conflicting PDF runbook copies"):
+        await library.get(runbook_id)
+    with pytest.raises(RunbookError, match="Conflicting PDF runbook copies"):
+        await library.search(alert)
+
+
+@pytest.mark.asyncio
+async def test_multi_alert_copies_with_conflicting_annotations_are_rejected(
+    tmp_path: Path,
+) -> None:
+    first_type = "connection_failure"
+    second_type = "replica_lag"
+    runbook_id = "annotation-conflict"
+    first_directory = tmp_path / first_type
+    second_directory = tmp_path / second_type
+    first_directory.mkdir()
+    second_directory.mkdir()
+    first_pdf = first_directory / f"{runbook_id}.pdf"
+    _write_text_pdf(
+        first_pdf,
+        "Shared database diagnosis guide with safe investigation steps.",
+    )
+    copy2(first_pdf, second_directory / first_pdf.name)
+    _write_minimal_index(first_directory, first_type, runbook_id)
+    _write_minimal_index(
+        second_directory,
+        second_type,
+        runbook_id,
+        annotation_fields={"deprecated": True},
+    )
+    library = LocalPDFRunbookLibrary(tmp_path)
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "Connection failure",
+            "reason": first_type,
+            "alert_type": first_type,
+        }
+    )
+
+    with pytest.raises(
+        RunbookError,
+        match="different structured annotations",
+    ):
+        await library.list()
+    with pytest.raises(
+        RunbookError,
+        match="different structured annotations",
+    ):
+        await library.get(runbook_id)
+    with pytest.raises(
+        RunbookError,
+        match="different structured annotations",
+    ):
+        await library.search(alert)
 
 
 @pytest.mark.asyncio

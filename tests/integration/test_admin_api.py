@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from shutil import copy2
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
 from tests.pdf_fixtures import (
+    TIKV_ALERT_TYPE_DIRECTORY,
     TIKV_METRIC_NAME,
     TIKV_RUNBOOK_ID,
     TIKV_RUNBOOK_PDF_NAME,
@@ -414,6 +416,47 @@ def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
         assert client.delete(
             f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
         ).status_code == 405
+
+
+def test_runbook_api_deduplicates_one_pdf_used_by_multiple_alert_types(
+    tmp_path: Path,
+) -> None:
+    client, _ = create_admin_client(tmp_path)
+    runbooks = tmp_path / "runbooks"
+    source_directory = runbooks / TIKV_ALERT_TYPE_DIRECTORY
+    second_alert_type = "synthetic_replica_lag_alternate"
+    second_directory = runbooks / second_alert_type
+    second_directory.mkdir()
+    copy2(
+        source_directory / TIKV_RUNBOOK_PDF_NAME,
+        second_directory / TIKV_RUNBOOK_PDF_NAME,
+    )
+    payload = json.loads(
+        (source_directory / "index.json").read_text(encoding="utf-8")
+    )
+    payload["alert_type"] = second_alert_type
+    payload["runbooks"][0]["alert_type"] = second_alert_type
+    (second_directory / "index.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    with client:
+        listed = client.get("/api/v1/admin/runbooks", headers=ADMIN_HEADERS)
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        assert listed.json()["items"][0]["metadata"]["alert_types"] == sorted(
+            [TIKV_ALERT_TYPE_DIRECTORY, second_alert_type]
+        )
+
+        detail = client.get(
+            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
+            headers=ADMIN_HEADERS,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["metadata"]["alert_types"] == sorted(
+            [TIKV_ALERT_TYPE_DIRECTORY, second_alert_type]
+        )
 
 
 def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -> None:
