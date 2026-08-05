@@ -435,7 +435,7 @@ def test_auto_annotations_are_cached_and_sync_replaces_generated_output(
         "auto_index": {
             "generator": "openai_compatible",
             "model": "index-model",
-            "prompt_version": "runbook-auto-index-v1",
+            "prompt_version": "runbook-auto-index-v2",
             "content_sha256": content_sha256,
         }
     }
@@ -502,7 +502,7 @@ async def test_auto_index_reuses_unchanged_cached_annotation_without_ai(
             "auto_index": {
                 "generator": "openai_compatible",
                 "model": "index-model",
-                "prompt_version": "runbook-auto-index-v1",
+                "prompt_version": "runbook-auto-index-v2",
                 "content_sha256": _content_sha256(_extract_pages(pdf_path)),
             }
         },

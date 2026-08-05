@@ -104,7 +104,8 @@ PDF 时，就绪检查不会把实例标记为可用。普通自动化测试使�
 推荐使用 AI 自动摄取模式。它读取项目现有 `.env`/运行时 AI 配置，按 PDF 分页正文抽取一个或
 多个告警类型、类型专属匹配字段、章节、正文明确列出的候选原因和动作，生成类型目录和索引，
 随后同步自动回归数据并执行覆盖率准入。`--sync` 允许重复执行：内容哈希未变化的 PDF 直接复用
-已有索引，只对新增或变更 PDF 调用模型。
+已有索引，只对新增或变更 PDF 调用模型。如果首轮严格抽取未识别类型，工具会自动复查
+案件标题、触发条件和处置流程；明确标注的应急处置标题还有受限的原文回退，不需要人工补写索引。
 
 ```powershell
 python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output-dir .\runbooks\pdfs-typed --auto-index --sync --enforce-gates
