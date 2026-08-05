@@ -308,7 +308,7 @@ Host 不在调用前重复实现 MCP 工具 Schema、工具名、调用参数、
 Host 只判断它是否已形成告警窗口证据：最终慢日志查询必须包含时间范围条件；对于
 `mysql_slow_query_review_history`，还必须同时包含由元数据链路得到的 `hostname_max` 等值条件。
 无 `WHERE` 的 `LIMIT 1` 样例、仅字段探测、仅端点条件或仅时间条件都作为成功的辅助探针回传模型，
-不会被提前当成最终证据，也不会触发实例归属核验。这个判断发生在 MCP 已执行并返回之后，不会
+不会被提前当成最终证据。这个判断发生在 MCP 已执行并返回之后，不会
 拦截调用；模型仍可在剩余预算内基于真实结果继续调用或重试。提示词要求模型仅使用本次
 慢查询取证需要的只读工具，并优先按 `alert_host/alert_port → t_instance_member.f_instance_id →
 sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链路查询。表和字段发现是
@@ -316,21 +316,19 @@ sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链�
 部署窗口计算，默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在
 预览确认步骤。
 
-慢查询结果非空后，Host 会在同一个 MCP 会话内执行独立的实例归属核验：分别把告警端点和结果中
-唯一的 `hostname_max` 拆成 host、port，在 Archery 实例的 `archery.t_instance_member` 中用
-`f_ip`、`f_port` 等值查询 `f_instance_id`。两个端点都返回唯一且相同的 ID 时，核验状态为
-`MATCHED`，即使两个 IP 字面值不同，日志仍可作为本告警的实时证据；唯一 ID 不同时为
-`MISMATCHED`，日志不可用于本告警；调用失败、空结果、多映射或无法解析唯一端点时为
-`UNVERIFIED`，只表示归属证据缺失，不能推断实例不同。这两次查询是主慢查询成功后的固定只读
-核验，不属于模型自主调用预算，也不是调用 MCP 前的 Host 校验，不会阻断模型在主流程中根据 MCP
-错误调整查询并重试。
+最终慢日志查询成功并返回日志内容后，结果直接作为当前告警窗口的实时证据，不再对告警端点和
+`hostname_max` 结果端点追加 `t_instance_member.f_instance_id` 查询，也不生成 `MATCHED`、
+`MISMATCHED`、`UNVERIFIED` 或 `analysis_usable` 等归属状态。AI 分析和独立验收提示词明确禁止
+比较告警标题端点与 `hostname_max` 的 IP/端口字面值，不能因二者不同而弃用证据，也不能在结论中
+提出或描述额外的实例归属核验。查询成功但明确返回 0 行时仍记录查询事实，但没有日志内容可用于
+支持具体根因。
 
 查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。若 Archery
 以“SQL 查询已执行 / 执行的SQL / 结果”文本包裹返回数据，Host 会拆出其中的实际 SQL 和结果
 JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使用的实例 ID、时间字段和返回行数。
 若 Archery 的内层结果因字符上限不完整或位置数组没有列名，Host 只有在查询明确返回正行数且
-Archery 回显 SQL 与请求完全一致时，才会从已核对 SQL 的 `hostname_max` 等值条件恢复日志端点，
-继续执行实例归属核验。证据整体需要截断时，实例归属状态和根因支持资格仍会作为独立字段保留。
+Archery 回显 SQL 与请求完全一致时，才会从已核对 SQL 投影恢复缺失的列名；文本中的明确行数也会
+保留下来。证据整体需要截断时，非空查询的根因支持资格仍会作为独立字段保留。
 空结果会明确显示为 0 行且不会误报为可能截断。证据会记录由告警上下文与 MCP 资源发现共同
 确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
 提示词要求最终查询和 `sql_query` 的 `limit_num` 都不得超过 20；即使 MCP 返回更多已解析行，

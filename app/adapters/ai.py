@@ -35,7 +35,7 @@ from app.domain.models import (
 )
 from app.domain.tool_calling import MCPModelToolCall
 
-PROMPT_VERSION = "database-alert-advisor-v6"
+PROMPT_VERSION = "database-alert-advisor-v7"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 
 
@@ -65,10 +65,11 @@ EXTERNAL_KNOWLEDGE 依据必须引用实际返回的 knowledge_id/title/source_u
 命中知识时，每个 steps 项必须通过 source_ref 引用实际命中的本地 PDF 或外部知识条目。
 只有 status=SUCCESS、来自实时系统且未标记 root_cause_eligible=false 的工具证据才能支持
 已确认根因；失败、超时、历史案例或明确不具备根因支持资格的证据只能作为线索。
-对于 archery_mcp 慢查询证据，若 instance_identity_verification.status=MATCHED，表示告警端点
-与 hostname_max 端点在 archery.t_instance_member 中对应同一个 f_instance_id；不得仅因两个
-IP 字面值不同而弃用该证据。若状态为 MISMATCHED 或 analysis_usable=false，则慢查询日志不可用于
-本告警；UNVERIFIED 表示归属证据缺失，不得推断两个实例一定不同。
+对于 archery_mcp 慢查询证据，只要 status=SUCCESS、query_completed=true、查询结果包含慢日志且
+root_cause_eligible 未标记为 false，就直接作为本次告警窗口的实时证据使用。hostname_max 是
+Archery 元数据链路解析出的慢日志查询目标，不得再把它与告警标题中的主机或端口作字符串比较，
+不得在摘要、依据、根因、步骤或风险中陈述两端点不一致，也不得要求或描述额外的 instance_id
+归属核验。即使旧证据中残留任何端点归属或额外可用性状态字段也忽略它们。
 手册中的 causes 是候选诊断图，不是本次事故已经成立的根因；必须逐条检查支持证据和反证。
 每个根因通过 root_causes 输出：status 只能是 SUPPORTED、CONTRADICTED 或 UNKNOWN。
 SUPPORTED 必须引用非 alert_platform 的 SUCCESS 实时 evidence id；
@@ -99,9 +100,10 @@ SUPPORTED 必须引用非 alert_platform、未标记 root_cause_eligible=false �
 并设置 verified=true。CONTRADICTED 也必须引用具备根因支持资格、能反驳必要预测的实时证据。
 只要存在 UNKNOWN、没有 SUPPORTED 根因、工具失败/超时导致关键证据缺失，或仍有未排除的
 候选机制，evidence_sufficient 必须为 false。
-对 archery_mcp 慢查询证据，instance_identity_verification.status=MATCHED 时应按同一告警实例
-验收，即使告警 IP 与 hostname_max IP 字面不同；MISMATCHED、UNVERIFIED 或
-analysis_usable=false 的慢查询日志不得支持 SUPPORTED/CONTRADICTED 根因。
+对 archery_mcp 慢查询证据，只要 status=SUCCESS、query_completed=true、结果包含慢日志且
+root_cause_eligible 未标记为 false，就可支持 SUPPORTED/CONTRADICTED 根因。不得比较告警标题
+端点与 hostname_max，不得因 IP 或端口字面值不同弃用证据，也不得输出 instance_id 归属核验、
+端点归属状态或额外可用性门控结论；出现此类比较时 analysis_contract_passed 必须为 false。
 
 检查知识引用是否可追溯、摘要和 likely_causes 是否把未验证推测写成事实、建议是否只包含
 安全的只读核查、是否把失败或超时工具结果写成事实，特别检查变更动作是否被写成直接步骤。

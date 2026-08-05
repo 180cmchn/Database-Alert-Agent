@@ -24,8 +24,6 @@ from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 # retry within the configured agent-step budget.
 ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
 ARCHERY_SLOW_QUERY_REVIEW_TABLE: Final = "mysql_slow_query_review_history"
-ARCHERY_METADATA_DB_NAME: Final = "archery"
-ARCHERY_INSTANCE_MEMBER_TABLE: Final = "t_instance_member"
 ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD: Final = "slow"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
 ARCHERY_MCP_LOGIN_TOOL_NAME: Final = "ensure_login_gymJPA"
@@ -47,7 +45,7 @@ ARCHERY_MCP_MAX_AGENT_STEPS: Final = 12
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v19"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v20"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -182,7 +180,6 @@ class ArcherySlowLogQueryResult:
     table_name: str | None = None
     query_time_column: str | None = None
     metadata_resolution_tables: tuple[str, ...] = ()
-    instance_identity_verification: dict[str, Any] | None = None
     diagnostics: dict[str, Any] | None = None
     query_completed: bool = True
 
@@ -646,8 +643,8 @@ class ArcheryMCPClient:
                                 if completion_issue is not None:
                                     # A schema/sample query can be useful, so send it to
                                     # MCP first and return the real result to the model.
-                                    # It is not final alert-window evidence, however, and
-                                    # must not trigger endpoint identity verification.
+                                    # It is not final alert-window evidence, however, so
+                                    # return it to the model and continue the MCP loop.
                                     last_slow_log_probe_issue = completion_issue
                                     if trace_entry is not None:
                                         trace_entry["outcome"] = "probe_ok"
@@ -665,24 +662,6 @@ class ArcheryMCPClient:
                                         )
                                     )
                                     continue
-                                instance_identity_verification = (
-                                    await self._verify_slow_log_instance_identity(
-                                        session,
-                                        query_arguments=call.arguments,
-                                        alert_endpoint=alert_endpoint,
-                                        slow_log_payload=normalized_payload,
-                                        verified_executed_sql=(
-                                            executed_sql
-                                            if actual_sql_verified
-                                            else None
-                                        ),
-                                    )
-                                )
-                                mcp_roundtrip_count += int(
-                                    instance_identity_verification.get(
-                                        "mcp_call_count", 0
-                                    )
-                                )
                                 return ArcherySlowLogQueryResult(
                                     payload=normalized_payload,
                                     requested_sql=requested_sql,
@@ -715,9 +694,6 @@ class ArcheryMCPClient:
                                             self._target_key(call.arguments), []
                                         )
                                     ),
-                                    instance_identity_verification=(
-                                        instance_identity_verification
-                                    ),
                                     diagnostics={
                                         "model_attempted_tool_calls": attempted_model_calls,
                                         "model_executed_tool_calls": [
@@ -725,9 +701,6 @@ class ArcheryMCPClient:
                                         ],
                                         "mcp_roundtrip_count": mcp_roundtrip_count,
                                         "alert_endpoint": alert_endpoint,
-                                        "instance_identity_verification": (
-                                            instance_identity_verification
-                                        ),
                                         "query_trace": query_trace,
                                         "metadata_resolution_stage": (
                                             self._metadata_resolution_stage(
@@ -893,9 +866,8 @@ class ArcheryMCPClient:
             "真实名称和类型，"
             "再在实例archery和db_name=archery中用hostname_max等值条件和告警时间范围条件"
             "共同查询慢查询日志记录；两类WHERE条件缺一不可。"
-            "最终结果必须返回hostname_max；查询成功后，Host会额外用告警端点和结果端点分别"
-            "等值查询archery.t_instance_member.f_ip/f_port并比较f_instance_id，这两次只读"
-            "归属验证不占用模型自主调用预算。"
+            "最终结果必须返回hostname_max；最终慢日志查询成功并返回日志内容后即完成取证，"
+            "不需要再比较告警端点和结果端点，也不要追加实例归属查询。"
             "t_instance_member、sql_instance、mysql_slow_query_review_history及上述列名都是推荐线索，"
             "不是对部署表结构的强制假设；必须通过list_table_columns读取真实字段或通过只读查询结果确认。"
         )
@@ -1287,208 +1259,6 @@ class ArcheryMCPClient:
             query_completed=False,
         )
 
-    async def _verify_slow_log_instance_identity(
-        self,
-        session: ClientSession,
-        *,
-        query_arguments: Mapping[str, Any],
-        alert_endpoint: str | None,
-        slow_log_payload: Mapping[str, Any],
-        verified_executed_sql: str | None,
-    ) -> dict[str, Any]:
-        """Compare alert and slow-log endpoints through Archery member IDs."""
-
-        normalized_alert_endpoint = self._normalize_endpoint(alert_endpoint)
-        slow_log_endpoints = self._slow_log_endpoints_from_payload(slow_log_payload)
-        row_count = self._payload_row_count(slow_log_payload)
-        slow_log_endpoint_source = "result_rows" if slow_log_endpoints else None
-        if (
-            not slow_log_endpoints
-            and row_count is not None
-            and row_count > 0
-            and verified_executed_sql is not None
-        ):
-            verified_sql_endpoint = self._hostname_max_endpoint_from_sql(
-                verified_executed_sql
-            )
-            if verified_sql_endpoint is not None:
-                slow_log_endpoints.add(verified_sql_endpoint)
-                slow_log_endpoint_source = "verified_executed_sql_filter"
-        base: dict[str, Any] = {
-            "comparison_basis": (
-                f"{ARCHERY_METADATA_DB_NAME}.{ARCHERY_INSTANCE_MEMBER_TABLE}."
-                "f_instance_id"
-            ),
-            "alert_endpoint": normalized_alert_endpoint,
-            "slow_log_endpoints": sorted(slow_log_endpoints),
-            "slow_log_endpoint_source": slow_log_endpoint_source,
-            "same_instance": None,
-            "mcp_call_count": 0,
-            "queries": [],
-        }
-        if row_count == 0:
-            return {
-                **base,
-                "status": "NOT_APPLICABLE",
-                "reason_code": "no_slow_log_rows",
-                "reason": "慢查询结果为空，无日志端点需要验证。",
-            }
-        if normalized_alert_endpoint is None:
-            return {
-                **base,
-                "status": "UNVERIFIED",
-                "reason_code": "missing_alert_endpoint",
-                "reason": "无法从告警标题或规范化字段解析唯一的host:port。",
-            }
-        if len(slow_log_endpoints) != 1:
-            return {
-                **base,
-                "status": "UNVERIFIED",
-                "reason_code": "missing_unique_slow_log_endpoint",
-                "reason": "慢查询结果未返回唯一可解析的hostname_max。",
-            }
-
-        mcp_instance_id = self._coerce_positive_integer(
-            query_arguments.get("instance_id")
-        )
-        if mcp_instance_id is None:
-            return {
-                **base,
-                "status": "UNVERIFIED",
-                "reason_code": "missing_archery_mcp_instance_id",
-                "reason": "最终慢查询调用未提供可复用的Archery MCP instance_id。",
-            }
-
-        slow_log_endpoint = next(iter(slow_log_endpoints))
-        instance_ids_by_scope: dict[str, list[int]] = {}
-        errors: dict[str, str] = {}
-        query_records: list[dict[str, Any]] = []
-        mcp_call_count = 0
-        for scope, endpoint in (
-            ("alert", normalized_alert_endpoint),
-            ("slow_log", slow_log_endpoint),
-        ):
-            sql = self._member_identity_query(endpoint)
-            arguments = self._identity_query_arguments(query_arguments, sql=sql)
-            mcp_call_count += 1
-            record: dict[str, Any] = {
-                "scope": scope,
-                "endpoint": endpoint,
-                "sql": sql,
-            }
-            try:
-                raw_result = await self._call_tool(
-                    session,
-                    tool_name=self.query_tool_name,
-                    arguments=arguments,
-                )
-                result_text = self._tool_text_blocks(raw_result)
-                payload = self._extract_tool_payload(raw_result)
-                self._validate_business_success(
-                    payload,
-                    tool_name=self.query_tool_name,
-                    supplemental_text=result_text,
-                )
-                normalized_payload, executed_sql, actual_sql_verified = (
-                    self._normalize_query_payload(payload, requested_sql=sql)
-                )
-                record["executed_sql"] = executed_sql
-                record["actual_sql_verified"] = actual_sql_verified
-                if executed_sql is not None and not actual_sql_verified:
-                    errors[scope] = "Archery回显的实例归属SQL与请求不一致。"
-                else:
-                    instance_ids_by_scope[scope] = sorted(
-                        self._member_instance_ids_from_payload(normalized_payload)
-                    )
-            except Exception as exc:
-                errors[scope] = (
-                    f"{type(exc).__name__}: {_safe_error_detail(exc)}"
-                ).rstrip(": ")
-            query_records.append(record)
-
-        result: dict[str, Any] = {
-            **base,
-            "slow_log_endpoint": slow_log_endpoint,
-            "archery_mcp_instance_id": mcp_instance_id,
-            "archery_db_name": ARCHERY_METADATA_DB_NAME,
-            "alert_f_instance_ids": instance_ids_by_scope.get("alert", []),
-            "slow_log_f_instance_ids": instance_ids_by_scope.get("slow_log", []),
-            "mcp_call_count": mcp_call_count,
-            "queries": query_records,
-        }
-        if errors:
-            return {
-                **result,
-                "status": "UNVERIFIED",
-                "reason_code": "member_lookup_failed",
-                "reason": "实例归属查询失败；这是缺失证据，不代表两个端点属于不同实例。",
-                "errors": errors,
-            }
-
-        alert_ids = instance_ids_by_scope.get("alert", [])
-        slow_log_ids = instance_ids_by_scope.get("slow_log", [])
-        if len(alert_ids) != 1 or len(slow_log_ids) != 1:
-            return {
-                **result,
-                "status": "UNVERIFIED",
-                "reason_code": "member_mapping_missing_or_ambiguous",
-                "reason": (
-                    "t_instance_member未为两个端点分别返回唯一f_instance_id；"
-                    "无法确认归属，也不能判定为不相等。"
-                ),
-            }
-        if alert_ids[0] == slow_log_ids[0]:
-            return {
-                **result,
-                "status": "MATCHED",
-                "reason_code": "same_f_instance_id",
-                "reason": "两个端点在t_instance_member中对应同一个f_instance_id。",
-                "same_instance": True,
-                "f_instance_id": alert_ids[0],
-            }
-        return {
-            **result,
-            "status": "MISMATCHED",
-            "reason_code": "different_f_instance_id",
-            "reason": "两个端点在t_instance_member中对应不同的f_instance_id。",
-            "same_instance": False,
-        }
-
-    @classmethod
-    def _slow_log_endpoints_from_payload(
-        cls,
-        payload: Mapping[str, Any],
-    ) -> set[str]:
-        endpoints: set[str] = set()
-        for row in cls._tabular_rows(payload):
-            for key, value in row.items():
-                if cls._normalized_column_name(str(key)) != "hostnamemax":
-                    continue
-                endpoint = cls._normalize_endpoint(value)
-                if endpoint is not None:
-                    endpoints.add(endpoint)
-        return endpoints
-
-    @staticmethod
-    def _member_identity_query(endpoint: str) -> str:
-        host, port = endpoint.rsplit(":", 1)
-        return (
-            f"SELECT f_instance_id FROM {ARCHERY_INSTANCE_MEMBER_TABLE} "
-            f"WHERE f_ip = '{host}' AND f_port = {int(port)} LIMIT 2"
-        )
-
-    @classmethod
-    def _hostname_max_endpoint_from_sql(cls, sql: str) -> str | None:
-        """Recover a result scope only from a verified SELECT and equality filter."""
-
-        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
-        if select is None or re.search(
-            r"(?i)(?<![A-Za-z0-9_$])`?hostname_max`?(?![A-Za-z0-9_$])",
-            select.group("body"),
-        ) is None:
-            return None
-        return cls._hostname_max_filter_endpoint_from_sql(sql)
-
     @classmethod
     def _hostname_max_filter_endpoint_from_sql(cls, sql: str) -> str | None:
         """Read the normalized endpoint from a hostname_max equality predicate."""
@@ -1501,27 +1271,6 @@ class ArcheryMCPClient:
         if match is None:
             return None
         return cls._normalize_endpoint(match.group("endpoint").replace("''", "'"))
-
-    @staticmethod
-    def _identity_query_arguments(
-        source_arguments: Mapping[str, Any],
-        *,
-        sql: str,
-    ) -> dict[str, Any]:
-        arguments = dict(source_arguments)
-        arguments["db_name"] = ARCHERY_METADATA_DB_NAME
-        arguments["sql_content"] = sql
-        if "limit_num" in arguments:
-            arguments["limit_num"] = 2
-        if "max_result_chars" in arguments:
-            arguments["max_result_chars"] = min(
-                ArcheryMCPClient._coerce_positive_integer(
-                    arguments.get("max_result_chars")
-                )
-                or ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-            )
-        return arguments
 
     @staticmethod
     def _payload_row_count(payload: Mapping[str, Any]) -> int | None:
@@ -2435,17 +2184,6 @@ class ArcherySlowLogEvidenceTool:
                     "model_tool_calls": list(result.model_tool_calls),
                     "model_request_ids": list(result.model_request_ids),
                     "metadata_resolution_tables": list(result.metadata_resolution_tables),
-                    "instance_identity_verification": (
-                        result.instance_identity_verification
-                        or {
-                            "status": "UNVERIFIED",
-                            "reason_code": "slow_log_query_incomplete",
-                            "reason": "最终慢查询未完成，无法执行实例归属验证。",
-                            "same_instance": None,
-                            "mcp_call_count": 0,
-                        }
-                    ),
-                    "analysis_usable": False,
                     "diagnostics": diagnostics,
                     "target": {
                         "selection_basis": "alert_context_and_mcp_discovery",
@@ -2471,41 +2209,7 @@ class ArcherySlowLogEvidenceTool:
                 },
             )
         row_count = self._row_count(result.payload)
-        identity_verification = result.instance_identity_verification or {
-            "status": "NOT_APPLICABLE" if row_count == 0 else "UNVERIFIED",
-            "reason_code": (
-                "no_slow_log_rows" if row_count == 0 else "verification_not_returned"
-            ),
-            "reason": (
-                "慢查询结果为空，无日志端点需要验证。"
-                if row_count == 0
-                else "未取得告警端点与慢日志端点的实例归属验证结果。"
-            ),
-            "same_instance": None,
-            "mcp_call_count": 0,
-        }
-        identity_status = str(identity_verification.get("status") or "UNVERIFIED")
-        analysis_usable = (
-            identity_status == "MATCHED"
-            and identity_verification.get("same_instance") is True
-        )
-        if identity_status == "MATCHED":
-            identity_summary = (
-                "实例归属验证通过：告警端点与慢日志端点对应同一个"
-                f" f_instance_id={identity_verification.get('f_instance_id')}"
-            )
-        elif identity_status == "MISMATCHED":
-            identity_summary = (
-                "实例归属验证不通过：两个端点对应不同的 f_instance_id，"
-                "本次慢查询日志证据不可用于该告警"
-            )
-        elif identity_status == "NOT_APPLICABLE":
-            identity_summary = "慢查询结果为空，无日志端点需要执行实例归属验证"
-        else:
-            identity_summary = (
-                "实例归属无法确认：该结果属于缺失证据，不代表两个端点属于不同实例；"
-                "在确认前慢查询日志不可用于支持该告警"
-            )
+        has_log_content = row_count is None or row_count > 0
         row_summary = (
             f"返回 {row_count} 行"
             if row_count is not None
@@ -2531,15 +2235,16 @@ class ArcherySlowLogEvidenceTool:
             limitations.append("未获得完整的 MCP 目标标识")
         if truncation_possible:
             limitations.append("结果受字符上限约束并可能截断")
-        if not analysis_usable:
-            limitations.append(
-                str(identity_verification.get("reason") or "实例归属未经确认")
-            )
+        evidence_summary = (
+            "慢查询日志已作为本次告警窗口的实时证据进入分析"
+            if has_log_content
+            else "查询成功但未返回慢查询日志，不作为根因支持证据"
+        )
         return (
             f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "
             f"{database_summary}，慢日志表 {table_summary}，{row_summary}；{sql_summary}；"
-            f"{identity_summary}。"
-            "归属一致只证明日志来自告警实例，具体根因仍须结合日志内容和其他实时信号判断。",
+            f"{evidence_summary}。"
+            "具体根因仍须结合日志内容和其他实时信号判断。",
             {
                 "sql": result.requested_sql,
                 "query_completed": True,
@@ -2553,8 +2258,6 @@ class ArcherySlowLogEvidenceTool:
                 "model_tool_calls": list(result.model_tool_calls),
                 "model_request_ids": list(result.model_request_ids),
                 "metadata_resolution_tables": list(result.metadata_resolution_tables),
-                "instance_identity_verification": identity_verification,
-                "analysis_usable": analysis_usable,
                 "diagnostics": result.diagnostics or {},
                 "target": {
                     "selection_basis": "alert_context_and_mcp_discovery",
@@ -2577,9 +2280,12 @@ class ArcherySlowLogEvidenceTool:
                     "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
                     "truncation_possible": truncation_possible,
                 },
-                "root_cause_eligible": analysis_usable,
+                "evidence_limitations": limitations,
+                "root_cause_eligible": has_log_content,
                 "root_cause_ineligible_reason": (
-                    "" if analysis_usable else "；".join(limitations)
+                    ""
+                    if has_log_content
+                    else "慢查询结果为空，未返回可分析的日志内容"
                 ),
                 "result": result.payload,
             },

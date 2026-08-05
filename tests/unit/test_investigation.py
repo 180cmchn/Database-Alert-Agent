@@ -72,17 +72,8 @@ class LargeControlledTool:
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence", {
             "query_completed": True,
-            "instance_identity_verification": {
-                "status": "UNVERIFIED",
-                "reason_code": "member_lookup_failed",
-                "reason": "identity evidence missing",
-                "same_instance": None,
-                "mcp_call_count": 2,
-                "queries": [{"sql": "SELECT " + "x" * 1000}],
-            },
-            "analysis_usable": False,
-            "root_cause_eligible": False,
-            "root_cause_ineligible_reason": "identity evidence missing",
+            "root_cause_eligible": True,
+            "root_cause_ineligible_reason": "",
             "result": {"sample": "x" * 3000},
         }
 
@@ -142,16 +133,11 @@ async def test_tool_executor_preserves_decision_fields_when_result_is_truncated(
 
     assert record.truncated is True
     assert record.structured_data["query_completed"] is True
-    assert record.structured_data["analysis_usable"] is False
-    assert record.structured_data["root_cause_eligible"] is False
-    assert record.structured_data["root_cause_ineligible_reason"] == (
-        "identity evidence missing"
-    )
-    verification = record.structured_data["instance_identity_verification"]
-    assert verification["status"] == "UNVERIFIED"
-    assert verification["reason_code"] == "member_lookup_failed"
-    assert "queries" not in verification
-    assert record.is_root_cause_support_eligible() is False
+    assert record.structured_data["root_cause_eligible"] is True
+    assert record.structured_data["root_cause_ineligible_reason"] == ""
+    assert "instance_identity_verification" not in record.structured_data
+    assert "analysis_usable" not in record.structured_data
+    assert record.is_root_cause_support_eligible() is True
 
 
 @pytest.mark.asyncio

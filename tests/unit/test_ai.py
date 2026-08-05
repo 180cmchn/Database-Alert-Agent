@@ -26,12 +26,17 @@ def make_alert():
     )
 
 
-def test_prompts_preserve_archery_evidence_when_instance_identity_matches() -> None:
-    assert "instance_identity_verification.status=MATCHED" in ai_module.SYSTEM_PROMPT
-    assert "不得仅因两个" in ai_module.SYSTEM_PROMPT
-    assert "analysis_usable=false" in ai_module.SYSTEM_PROMPT
-    assert "instance_identity_verification.status=MATCHED" in ai_module.VALIDATION_PROMPT
-    assert "analysis_usable=false" in ai_module.VALIDATION_PROMPT
+def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> None:
+    assert "直接作为本次告警窗口的实时证据使用" in ai_module.SYSTEM_PROMPT
+    assert "不得再把它与告警标题中的主机或端口作字符串比较" in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert "不得要求或描述额外的 instance_id" in ai_module.SYSTEM_PROMPT
+    assert "instance_identity_verification.status=MATCHED" not in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert "不得比较告警标题" in ai_module.VALIDATION_PROMPT
+    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
 
 
 @pytest.mark.asyncio

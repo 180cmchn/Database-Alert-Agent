@@ -26,24 +26,8 @@ from app.domain.ports import InvestigationTool
 
 _TRUNCATION_CONTROL_KEYS = (
     "query_completed",
-    "analysis_usable",
     "root_cause_eligible",
     "root_cause_ineligible_reason",
-)
-_IDENTITY_VERIFICATION_CONTROL_KEYS = (
-    "comparison_basis",
-    "alert_endpoint",
-    "slow_log_endpoints",
-    "slow_log_endpoint",
-    "slow_log_endpoint_source",
-    "alert_f_instance_ids",
-    "slow_log_f_instance_ids",
-    "same_instance",
-    "status",
-    "reason_code",
-    "reason",
-    "f_instance_id",
-    "mcp_call_count",
 )
 
 
@@ -166,15 +150,6 @@ class ToolExecutor:
                 for key in _TRUNCATION_CONTROL_KEYS
                 if key in safe_data
             )
-            verification = safe_data.get("instance_identity_verification")
-            if isinstance(verification, dict):
-                compact_verification = {
-                    key: verification[key]
-                    for key in _IDENTITY_VERIFICATION_CONTROL_KEYS
-                    if key in verification
-                }
-                if compact_verification:
-                    preserved["instance_identity_verification"] = compact_verification
 
         preserved["original_char_count"] = len(serialized)
         preview_container = {**preserved, "truncated_preview": ""}
