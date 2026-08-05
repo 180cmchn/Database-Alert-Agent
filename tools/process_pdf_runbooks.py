@@ -118,6 +118,30 @@ def _content_sha256(pages: list[str]) -> str:
     return hashlib.sha256("\n\n".join(pages).encode("utf-8")).hexdigest()
 
 
+def _apply_runtime_output_gate(
+    report: dict[str, Any],
+    runtime_pdf_dir: Path,
+    generated_output_dir: Path,
+) -> None:
+    matches_generated_output = (
+        runtime_pdf_dir.resolve() == generated_output_dir.resolve()
+    )
+    report["runtime_configuration"] = {
+        "runbook_pdf_dir": str(runtime_pdf_dir),
+        "generated_output_dir": str(generated_output_dir),
+        "matches_generated_output": matches_generated_output,
+    }
+    if matches_generated_output:
+        return
+
+    gate = report["acceptance"]["production_gate"]
+    gate["passed"] = False
+    gate["failures"].append(
+        f"RUNBOOK_PDF_DIR={runtime_pdf_dir} does not point to generated output: "
+        f"{generated_output_dir}"
+    )
+
+
 def _has_structured_alert_types(annotation: dict[str, Any]) -> bool:
     if "alert_type" in annotation or "alert_types" in annotation:
         return True
@@ -540,6 +564,11 @@ def main() -> int:
                 gates,
             )
             report["acceptance"] = evaluation_report
+            _apply_runtime_output_gate(
+                report,
+                settings.runbook_pdf_dir,
+                args.output_dir,
+            )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if args.enforce_gates and not report["acceptance"]["production_gate"]["passed"]:
         return 1

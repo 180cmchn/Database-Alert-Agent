@@ -782,7 +782,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate deterministic acceptance JSONL from PDF runbooks"
     )
-    parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
+    parser.add_argument(
+        "--pdf-dir", type=Path, default=Path("runbooks/pdfs-typed")
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,

@@ -34,7 +34,7 @@ services:
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
-      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs-typed
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
       MCP_SETTINGS_PATH: /app/config/mcp/settings.json
     volumes:
@@ -53,7 +53,7 @@ services:
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
-      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs-typed
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: "true"
       HTTP_SCHEDULER: kafka
@@ -97,7 +97,7 @@ services:
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
-      RUNBOOK_PDF_DIR: /app/runbooks/pdfs
+      RUNBOOK_PDF_DIR: /app/runbooks/pdfs-typed
       KAFKA_ENABLED: "true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-1}

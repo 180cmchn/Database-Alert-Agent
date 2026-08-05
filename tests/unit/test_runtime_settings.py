@@ -127,6 +127,16 @@ def test_ai_max_tokens_has_reasoning_safe_default_and_bounds() -> None:
         Settings(_env_file=None, ai_provider="fake", ai_max_tokens=131_073)
 
 
+def test_pdf_runbook_default_uses_generated_typed_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RUNBOOK_PDF_DIR", raising=False)
+
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.runbook_pdf_dir == Path("runbooks/pdfs-typed")
+
+
 def test_pdf_runbook_readiness_requires_directory_and_pdf(
     tmp_path: Path,
 ) -> None:

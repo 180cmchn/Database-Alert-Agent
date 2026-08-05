@@ -259,7 +259,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate runbook retrieval and diagnosis coverage"
     )
-    parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
+    parser.add_argument(
+        "--pdf-dir", type=Path, default=Path("runbooks/pdfs-typed")
+    )
     parser.add_argument(
         "--matching-dataset",
         type=Path,

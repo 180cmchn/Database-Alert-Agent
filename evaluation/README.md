@@ -23,12 +23,12 @@ Windows PowerShell：
 .\.venv\Scripts\python.exe tools\generate_evaluation_datasets.py --sync
 ```
 
-默认读取 `runbooks/pdfs`，写入：
+默认读取生成后的 `runbooks/pdfs-typed`，写入：
 
 - `datasets/runbook_matching.jsonl`
 - `datasets/root_cause_diagnosis.jsonl`
 
-输入既可以是 `pdfs/<alert_type>/*.pdf` 的类型目录，也可以是遗留的平铺 PDF。平铺目录有旧全局
+输入既可以是 `pdfs-typed/<alert_type>/*.pdf` 的类型目录，也可以是遗留的平铺 PDF。平铺目录有旧全局
 索引时可显式传入：
 
 ```bash

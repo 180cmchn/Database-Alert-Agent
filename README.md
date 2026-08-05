@@ -68,7 +68,7 @@ LangGraph 调查图：fingerprint → knowledge → runbook → strategy
 
 ## 告警手册
 
-本地手册按规范化告警类型存放：`runbooks/pdfs/<alert_type>/*.pdf` 是不可变的审计原文，
+运行时手册按规范化告警类型存放：`runbooks/pdfs-typed/<alert_type>/*.pdf` 是不可变的审计原文，
 同目录的 `index.json` 是该类型对应的结构化检索和诊断结果。索引记录知识类型、停用标志、
 适用范围、告警别名、真实章节/页码、候选原因、支持证据、反证、只读核查动作、需要审批的
 变更动作，以及图片中红框/高亮的关键报错、代码和界面字段。文件名（不含 `.pdf`）仍是稳定
@@ -92,8 +92,8 @@ PDF 必须未加密且带可提取文字层；纯扫描件需先 OCR。含图页
 PDF 时，就绪检查不会把实例标记为可用。普通自动化测试使用自包含的小型 PDF fixture，不依赖
 生产手册。
 
-旧的平铺 PDF 与全局索引可先处理到一个新的、尚不存在的输出目录，再把
-`RUNBOOK_PDF_DIR` 切换到该目录：
+原始平铺 PDF 存放在 `runbooks/pdfs`；先处理到运行时类型目录
+`runbooks/pdfs-typed`，再让 `RUNBOOK_PDF_DIR` 指向生成目录：
 
 ```bash
 .venv/bin/python tools/process_pdf_runbooks.py \
@@ -130,7 +130,7 @@ python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output
 相关环境变量：
 
 ```dotenv
-RUNBOOK_PDF_DIR=./runbooks/pdfs
+RUNBOOK_PDF_DIR=./runbooks/pdfs-typed
 RUNBOOK_LIMIT=5
 RUNBOOK_PDF_MAX_FILE_BYTES=20000000
 RUNBOOK_PDF_MAX_TEXT_CHARS=200000

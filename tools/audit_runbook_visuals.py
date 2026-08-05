@@ -45,7 +45,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Audit image-page annotation coverage for PDF runbooks"
     )
-    parser.add_argument("--pdf-dir", type=Path, default=Path("runbooks/pdfs"))
+    parser.add_argument(
+        "--pdf-dir", type=Path, default=Path("runbooks/pdfs-typed")
+    )
     args = parser.parse_args()
 
     report = asyncio.run(audit(args))

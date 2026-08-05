@@ -15,6 +15,7 @@ from app.adapters.pdf_runbooks import (
 )
 from app.domain.errors import RunbookError
 from tools.process_pdf_runbooks import (
+    _apply_runtime_output_gate,
     _content_sha256,
     _extract_pages,
     _load_generated_annotation_cache,
@@ -51,6 +52,44 @@ def _write_text_pdf(path: Path, text: str) -> None:
     page[NameObject("/Contents")] = writer._add_object(stream)
     with path.open("wb") as handle:
         writer.write(handle)
+
+
+def test_runtime_output_gate_requires_application_to_use_generated_directory(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "pdfs-typed"
+    report: dict[str, object] = {
+        "acceptance": {
+            "production_gate": {"passed": True, "failures": []}
+        }
+    }
+
+    _apply_runtime_output_gate(report, tmp_path / "pdfs", output)
+
+    assert report["runtime_configuration"] == {
+        "runbook_pdf_dir": str(tmp_path / "pdfs"),
+        "generated_output_dir": str(output),
+        "matches_generated_output": False,
+    }
+    assert report["acceptance"] == {
+        "production_gate": {
+            "passed": False,
+            "failures": [
+                f"RUNBOOK_PDF_DIR={tmp_path / 'pdfs'} does not point to "
+                f"generated output: {output}"
+            ],
+        }
+    }
+
+    matching_report: dict[str, object] = {
+        "acceptance": {
+            "production_gate": {"passed": True, "failures": []}
+        }
+    }
+    _apply_runtime_output_gate(matching_report, output, output)
+    assert matching_report["acceptance"] == {
+        "production_gate": {"passed": True, "failures": []}
+    }
 
 
 @pytest.mark.asyncio

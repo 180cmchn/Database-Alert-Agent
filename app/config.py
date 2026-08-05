@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # deliberately conservative and always forces REVIEW_REQUIRED.
     ai_fallback_enabled: bool = True
 
-    runbook_pdf_dir: Path = Path("./runbooks/pdfs")
+    runbook_pdf_dir: Path = Path("./runbooks/pdfs-typed")
     runbook_limit: int = Field(default=5, ge=1, le=20)
     runbook_pdf_max_file_bytes: int = Field(
         default=20_000_000, ge=100_000, le=200_000_000

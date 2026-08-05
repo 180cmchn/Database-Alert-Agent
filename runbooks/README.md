@@ -1,7 +1,7 @@
 # 本地 PDF 告警处理手册
 
-`pdfs/<alert_type>/` 保存同一种告警的手册审计原文，类型目录内的 `index.json` 保存这些 PDF
-对应的结构化检索与诊断结果。服务同时读取 PDF 文字层、检测含图页面，并把索引中人工识别的红框报错、截图字段
+`pdfs/` 保存待处理的平铺 PDF 原文；`pdfs-typed/<alert_type>/` 是自动生成的运行时目录，
+类型目录内的 `index.json` 保存这些 PDF 对应的结构化检索与诊断结果。服务同时读取 PDF 文字层、检测含图页面，并把索引中识别的红框报错、截图字段
 和关键字作为 `visual_evidence`；它们与告警名、指标名、章节特征、别名、适用范围和正文一起
 参与混合检索。命中的具体章节及其对应原因、动作和视觉证据作为可追溯知识依据。
 
@@ -30,7 +30,7 @@
 默认配置：
 
 ```dotenv
-RUNBOOK_PDF_DIR=./runbooks/pdfs
+RUNBOOK_PDF_DIR=./runbooks/pdfs-typed
 RUNBOOK_LIMIT=5
 RUNBOOK_PDF_MAX_FILE_BYTES=20000000
 RUNBOOK_PDF_MAX_TEXT_CHARS=200000
