@@ -266,6 +266,73 @@ async def test_local_pdf_search_never_falls_back_to_another_alert_type(
     assert await LocalPDFRunbookLibrary(tmp_path).search(alert) == []
 
 
+@pytest.mark.asyncio
+async def test_exact_cause_evidence_outweighs_alert_definition_section(
+    tmp_path: Path,
+) -> None:
+    alert_type = "hostswapisfillingup"
+    directory = tmp_path / alert_type
+    directory.mkdir()
+    runbook_id = "host-swap-guide"
+    _write_text_pdf(
+        directory / f"{runbook_id}.pdf",
+        "HostSwapIsFillingUp warning and swap configuration diagnostic guide.",
+    )
+    hypothesis = "Swap usage is high while RAM is available due to configuration drift."
+    _write_minimal_index(
+        directory,
+        alert_type,
+        runbook_id,
+        annotation_fields={
+            "match": {
+                "alert_names": ["HostSwapIsFillingUp"],
+                "metric_names": [],
+                "aliases": [],
+                "keywords": [],
+            },
+            "sections": [
+                {
+                    "id": "alert-definition",
+                    "title": "Alert definition",
+                    "pages": [1],
+                    "match_terms": ["HostSwapIsFillingUp"],
+                },
+                {
+                    "id": "swap-diagnosis",
+                    "title": "Swap and RAM diagnosis",
+                    "pages": [1],
+                },
+            ],
+            "causes": [
+                {
+                    "cause_id": "swap-config-drift",
+                    "hypothesis": hypothesis,
+                    "section_ids": ["swap-diagnosis"],
+                }
+            ],
+        },
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "HostSwapIsFillingUp",
+            "reason": "HostSwapIsFillingUp",
+            "alert_type": alert_type,
+            "alert_name": "HostSwapIsFillingUp",
+            "error_summary": hypothesis,
+            "description": hypothesis,
+        }
+    )
+
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert matches[0].section == "swap-diagnosis"
+    assert [cause.cause_id for cause in matches[0].causes] == [
+        "swap-config-drift"
+    ]
+    assert "候选原因证据命中" in matches[0].match_reasons
+
+
 def test_alert_type_directory_name_is_shared_and_path_safe() -> None:
     assert alert_type_directory_name(" MySQL/Slow Query 400 ") == (
         "mysql_slow_query_400"

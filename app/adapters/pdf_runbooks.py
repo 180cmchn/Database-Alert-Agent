@@ -545,6 +545,40 @@ def _cause_search_text(items: list[RunbookCause]) -> str:
     )
 
 
+def _cause_evidence_matches_alert(
+    items: list[RunbookCause],
+    alert: NormalizedAlert,
+) -> bool:
+    query = _normalized_match_text(
+        "\n".join(
+            value
+            for value in (
+                alert.error_pattern or "",
+                alert.error_summary or "",
+                alert.description,
+            )
+            if value
+        )
+    )
+    query_signature = _normalized_log_signature(query)
+    if not query:
+        return False
+    for item in items:
+        evidence_values = (
+            item.hypothesis,
+            *item.supporting_evidence,
+            *item.contradicting_evidence,
+        )
+        for value in evidence_values:
+            normalized = _normalized_match_text(value)
+            signature = _normalized_log_signature(normalized)
+            if len(normalized) >= 4 and normalized in query:
+                return True
+            if len(signature) >= 4 and signature in query_signature:
+                return True
+    return False
+
+
 def _bm25_score(
     query_terms: Counter[str],
     document_terms: Counter[str],
@@ -684,6 +718,11 @@ def _score_section(
             reasons.append("手册别名命中")
             direct_match = True
             break
+
+    if _cause_evidence_matches_alert(section_causes, alert):
+        score += 36
+        reasons.append("候选原因证据命中")
+        direct_match = True
 
     for match_term in section.match_terms:
         normalized_term = _normalized_match_text(match_term)
