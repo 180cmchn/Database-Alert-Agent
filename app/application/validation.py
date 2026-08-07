@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from app.domain.models import (
     AnalysisBasisSource,
     EvidenceRecord,
-    ExcludedCauseAssessment,
     ExternalKnowledgeReference,
     InvestigationRun,
     NormalizedAlert,
@@ -44,64 +42,57 @@ _DANGEROUS_ACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 def enforce_post_evidence_root_cause_policy(
     recommendation: Recommendation,
+    evidence: list[EvidenceRecord],
 ) -> Recommendation:
-    """Keep disproved investigation hypotheses out of the final cause list.
+    """Drop disproved investigation hypotheses from the final recommendation.
 
     ``CONTRADICTED`` is retained in the enum so historical recommendations remain
-    readable. New recommendations expose those items separately as excluded
-    hypotheses, while ``root_causes`` contains only causes that remain plausible
-    after all collected evidence has been considered.
+    readable. New recommendations contain only causes that remain plausible after
+    all collected evidence has been considered.
     """
 
+    evidence_by_id = {str(item.id): item for item in evidence}
     plausible_causes: list[RootCauseAssessment] = []
-    excluded_causes = list(recommendation.excluded_causes)
-    excluded_indexes = {
-        item.cause.strip().casefold(): index
-        for index, item in enumerate(excluded_causes)
-        if item.cause.strip()
-    }
-    removed_conflicting_cause = False
+    invalid_contradiction = False
 
     for root_cause in recommendation.root_causes:
-        key = root_cause.cause.strip().casefold()
         if root_cause.status != RootCauseStatus.CONTRADICTED:
-            if key and key in excluded_indexes:
-                removed_conflicting_cause = True
-                continue
             plausible_causes.append(root_cause)
             continue
 
-        converted = ExcludedCauseAssessment(
-            cause=root_cause.cause,
-            cause_id=root_cause.cause_id,
-            evidence_refs=list(dict.fromkeys(root_cause.evidence_refs)),
-            reason="该调查假设与所引用的实时证据冲突，已从可能根因中排除。",
+        has_live_contradiction = any(
+            (record := evidence_by_id.get(evidence_ref)) is not None
+            and record.is_root_cause_support_eligible()
+            for evidence_ref in dict.fromkeys(root_cause.evidence_refs)
         )
-        existing_index = excluded_indexes.get(key)
-        if existing_index is None:
-            excluded_indexes[key] = len(excluded_causes)
-            excluded_causes.append(converted)
+        if has_live_contradiction:
             continue
 
-        existing = excluded_causes[existing_index]
-        excluded_causes[existing_index] = existing.model_copy(
-            update={
-                "cause_id": existing.cause_id or converted.cause_id,
-                "evidence_refs": list(
-                    dict.fromkeys([*existing.evidence_refs, *converted.evidence_refs])
-                ),
-                "reason": existing.reason.strip() or converted.reason,
-            }
+        invalid_contradiction = True
+        plausible_causes.append(
+            root_cause.model_copy(
+                update={
+                    "status": RootCauseStatus.UNKNOWN,
+                    "evidence_refs": [],
+                    "confidence": min(root_cause.confidence, 0.45),
+                    "verified": False,
+                    "next_probe": root_cause.next_probe
+                    or "补充可验证该原因必要预测的实时只读证据。",
+                }
+            )
         )
 
-    update: dict[str, Any] = {
-        "root_causes": plausible_causes,
-        "likely_causes": [item.cause for item in plausible_causes],
-        "excluded_causes": excluded_causes,
-    }
-    if removed_conflicting_cause:
-        update["requires_human"] = True
-    return recommendation.model_copy(update=update)
+    return recommendation.model_copy(
+        update={
+            "root_causes": plausible_causes,
+            "likely_causes": [item.cause for item in plausible_causes],
+            "requires_human": (
+                recommendation.requires_human
+                or not plausible_causes
+                or invalid_contradiction
+            ),
+        }
+    )
 
 
 class RuleConclusionValidator:
@@ -119,8 +110,6 @@ class RuleConclusionValidator:
         evidence_by_id = {str(item.id): item for item in evidence}
         has_supported_cause = False
         all_causes_decisive = bool(recommendation.root_causes)
-        if not recommendation.root_causes and not recommendation.excluded_causes:
-            issues.append("采证后必须至少形成一个可能根因或一个有实时反证的已排除原因")
 
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
@@ -169,7 +158,7 @@ class RuleConclusionValidator:
             elif root_cause.status == RootCauseStatus.CONTRADICTED:
                 issues.append(
                     f"根因 #{index}（{cause_label}）已被实时证据反驳，"
-                    "必须移入 excluded_causes，不能继续列为可能根因"
+                    "必须在最终结果生成前直接移除"
                 )
                 all_causes_decisive = False
             else:
@@ -181,45 +170,6 @@ class RuleConclusionValidator:
             if root_cause.status != RootCauseStatus.SUPPORTED and root_cause.verified:
                 issues.append(
                     f"根因 #{index}（{cause_label}）只有 SUPPORTED 状态才能标记已验证"
-                )
-
-        plausible_labels = {
-            item.cause.strip().casefold()
-            for item in recommendation.root_causes
-            if item.cause.strip()
-        }
-        for index, excluded_cause in enumerate(
-            recommendation.excluded_causes, start=1
-        ):
-            cause_label = excluded_cause.cause.strip() or "未命名排除原因"
-            if not excluded_cause.cause.strip():
-                issues.append(f"已排除原因 #{index} 必须填写原因名称")
-            if not excluded_cause.reason.strip():
-                issues.append(f"已排除原因 #{index}（{cause_label}）必须说明排除依据")
-            if excluded_cause.cause.strip().casefold() in plausible_labels:
-                issues.append(
-                    f"已排除原因 #{index}（{cause_label}）不能同时出现在可能根因中"
-                )
-
-            live_contradicting_refs: set[str] = set()
-            for evidence_ref in dict.fromkeys(excluded_cause.evidence_refs):
-                record = evidence_by_id.get(evidence_ref)
-                if record is None:
-                    issues.append(
-                        f"已排除原因 #{index}（{cause_label}）引用了不存在的证据："
-                        f"{evidence_ref}"
-                    )
-                    continue
-                if not record.is_root_cause_support_eligible():
-                    issues.append(
-                        f"已排除原因 #{index}（{cause_label}）引用的证据不能作为实时反证："
-                        f"{evidence_ref}（{record.status.value}）"
-                    )
-                    continue
-                live_contradicting_refs.add(evidence_ref)
-            if not live_contradicting_refs:
-                issues.append(
-                    f"已排除原因 #{index}（{cause_label}）缺少可用的实时 SUCCESS 反证"
                 )
 
         evidence_sufficient = (
@@ -260,17 +210,6 @@ class RuleConclusionValidator:
                     issues.append(
                         f"根因 #{index} 引用了手册中不存在的 cause_id："
                         f"{root_cause.cause_id}"
-                    )
-            for index, excluded_cause in enumerate(
-                recommendation.excluded_causes, start=1
-            ):
-                if (
-                    excluded_cause.cause_id
-                    and excluded_cause.cause_id not in known_cause_ids
-                ):
-                    issues.append(
-                        f"已排除原因 #{index} 引用了手册中不存在的 cause_id："
-                        f"{excluded_cause.cause_id}"
                     )
         elif recommendation.runbook_references or any(
             basis.source == AnalysisBasisSource.RUNBOOK
@@ -369,7 +308,6 @@ class RuleConclusionValidator:
                 "validator": type(self).__name__,
                 "alert_id": str(alert.id),
                 "checked_root_causes": len(recommendation.root_causes),
-                "checked_excluded_causes": len(recommendation.excluded_causes),
                 "checked_steps": len(recommendation.steps),
                 "evidence_count": len(evidence),
                 "runbook_count": len(runbooks),

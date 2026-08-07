@@ -10,7 +10,6 @@ from app.domain.errors import AdvisorError
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
-    ExcludedCauseAssessment,
     ExternalKnowledgeExcerpt,
     ExternalKnowledgeReference,
     InvestigationRun,
@@ -58,9 +57,10 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
         ai_module.SYSTEM_PROMPT
     )
     assert "不得在这两个字段中输出 CONTRADICTED" in ai_module.SYSTEM_PROMPT
-    assert "被 SUCCESS 实时证据反驳的调查假设必须放入 excluded_causes" in (
+    assert "被 SUCCESS 实时证据反驳的调查假设必须直接从最终结果删除" in (
         ai_module.SYSTEM_PROMPT
     )
+    assert "不得展示已删除假设的名称或排除理由" in ai_module.SYSTEM_PROMPT
     assert "此阶段只决定如何采集实时证据" in ai_module.PLANNER_PROMPT
     assert "不得形成或输出最终根因" in ai_module.PLANNER_PROMPT
     assert "root_causes 中出现 CONTRADICTED 时 analysis_contract_passed 必须为 false" in (
@@ -226,14 +226,6 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
         runbook_references=[
             RunbookReference(runbook_id="unknown-rb", section="PDF")
         ],
-        excluded_causes=[
-            ExcludedCauseAssessment(
-                cause="已排除原因",
-                cause_id="unknown-cause",
-                evidence_refs=["evidence-1"],
-                reason="实时证据不符合该原因的必要预测。",
-            )
-        ],
     )
     runbooks = [
         RunbookExcerpt(
@@ -247,7 +239,6 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
 
     # Invalid runbook reference dropped, valid references kept.
     assert result.runbook_references == []
-    assert result.excluded_causes[0].cause_id is None
 
     # AI basis preserved; no RUNBOOK basis (none were valid), but one AI basis
     # ensures the ordering invariant.

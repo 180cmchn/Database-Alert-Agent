@@ -697,7 +697,6 @@ input:disabled { color: #6d8291; background: #0b1925; cursor: not-allowed; }
 .wecom-simple-list { margin: 13px 0 0; padding-left: 19px; color: #9eb1bc; font-size: 11px; line-height: 1.75; }
 .wecom-simple-list li + li { margin-top: 7px; }
 .wecom-simple-list strong { color: var(--accent); font-size: 9px; }
-.wecom-simple-list small { display: block; margin-top: 3px; color: #718b9a; font-size: 9px; overflow-wrap: anywhere; }
 .wecom-advice-list { margin: 0; padding: 0; display: grid; gap: 0; list-style: none; }
 .wecom-advice-list li { padding: 14px 0; display: grid; grid-template-columns: auto 1fr; gap: 11px; border-bottom: 1px solid var(--line-soft); }
 .wecom-advice-list li:first-child { padding-top: 0; }

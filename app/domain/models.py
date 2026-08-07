@@ -304,15 +304,6 @@ class RootCauseAssessment(BaseModel):
         return self
 
 
-class ExcludedCauseAssessment(BaseModel):
-    """A pre-investigation hypothesis ruled out by successful live evidence."""
-
-    cause: str
-    cause_id: str | None = None
-    evidence_refs: list[str] = Field(default_factory=list)
-    reason: str
-
-
 class Recommendation(BaseModel):
     summary: str
     knowledge_match_summary: str = ""
@@ -328,7 +319,6 @@ class Recommendation(BaseModel):
         default_factory=list
     )
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
-    excluded_causes: list[ExcludedCauseAssessment] = Field(default_factory=list)
     analysis_mode: Literal["assist", "shadow"] = "assist"
 
 

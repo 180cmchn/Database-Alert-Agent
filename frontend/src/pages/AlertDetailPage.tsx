@@ -405,6 +405,17 @@ export function AlertDetailPage() {
   if (!record) return <EmptyState title="告警不存在" description="该记录可能已被删除，或链接中的 ID 不正确。" />;
 
   const { alert, recommendation } = record;
+  const contradictedCauseNames = new Set(
+    recommendation?.root_causes
+      .filter((rootCause) => rootCause.status === "CONTRADICTED")
+      .map((rootCause) => rootCause.cause) || [],
+  );
+  const visibleRootCauses = recommendation?.root_causes.filter(
+    (rootCause) => rootCause.status !== "CONTRADICTED",
+  ) || [];
+  const visibleLikelyCauses = recommendation?.likely_causes.filter(
+    (cause) => !contradictedCauseNames.has(cause),
+  ) || [];
   const isActive = isTracking;
   const currentFeedback = selectedRun
     ? record.feedback.find((item) => item.run_id === selectedRun.id)
@@ -614,10 +625,10 @@ export function AlertDetailPage() {
             </div>
           </div>
 
-          {recommendation.root_causes.length > 0 && (
+          {visibleRootCauses.length > 0 && (
             <SectionCard eyebrow="ROOT CAUSE" title="采证后根因判断">
               <div className="root-causes">
-                {recommendation.root_causes.map((rootCause, index) => (
+                {visibleRootCauses.map((rootCause, index) => (
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
                     <span className="root-index">{String(index + 1).padStart(2, "0")}</span>
                     <div><strong>{rootCause.cause}</strong><p>{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>{rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}</div>
@@ -626,22 +637,6 @@ export function AlertDetailPage() {
                   </article>
                 ))}
               </div>
-            </SectionCard>
-          )}
-
-          {recommendation.excluded_causes.length > 0 && (
-            <SectionCard eyebrow="EXCLUDED" title="已排除原因" description="以下调查假设已被本次实时证据排除，不属于可能根因">
-              <ol className="likely-causes">
-                {recommendation.excluded_causes.map((excludedCause, index) => (
-                  <li key={`${excludedCause.cause}-${index}`}>
-                    <span>{index + 1}</span>
-                    <div>
-                      <strong>{excludedCause.cause}</strong> · {excludedCause.reason}
-                      {excludedCause.evidence_refs.length > 0 && <small className="source-ref">反证：{excludedCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}</small>}
-                    </div>
-                  </li>
-                ))}
-              </ol>
             </SectionCard>
           )}
 
@@ -663,10 +658,10 @@ export function AlertDetailPage() {
             </SectionCard>
 
             <div className="advice-side">
-              {recommendation.likely_causes.length > 0 && (
+              {visibleLikelyCauses.length > 0 && (
                 <SectionCard eyebrow="HYPOTHESES" title="可能原因">
                   <ol className="likely-causes">
-                    {recommendation.likely_causes.map((cause, index) => (
+                    {visibleLikelyCauses.map((cause, index) => (
                       <li key={`${cause}-${index}`}><span>{index + 1}</span>{cause}</li>
                     ))}
                   </ol>

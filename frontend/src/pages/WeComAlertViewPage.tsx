@@ -118,6 +118,17 @@ function OverviewContent({ record }: { record: StoredAlert }) {
 
 function RootCauseContent({ record }: { record: StoredAlert }) {
   const recommendation = record.recommendation!;
+  const contradictedCauseNames = new Set(
+    recommendation.root_causes
+      .filter((rootCause) => rootCause.status === "CONTRADICTED")
+      .map((rootCause) => rootCause.cause),
+  );
+  const visibleRootCauses = recommendation.root_causes.filter(
+    (rootCause) => rootCause.status !== "CONTRADICTED",
+  );
+  const visibleLikelyCauses = recommendation.likely_causes.filter(
+    (cause) => !contradictedCauseNames.has(cause),
+  );
   return (
     <div className="wecom-content-stack">
       <section className="wecom-content-card">
@@ -128,8 +139,8 @@ function RootCauseContent({ record }: { record: StoredAlert }) {
         </div>
       </section>
 
-      {recommendation.root_causes.length > 0 ? (
-        recommendation.root_causes.map((rootCause, index) => (
+      {visibleRootCauses.length > 0 ? (
+        visibleRootCauses.map((rootCause, index) => (
           <article className={`wecom-content-card wecom-root-cause root-${rootCause.status.toLowerCase()}`} key={`${rootCause.cause}-${index}`}>
             <header>
               <span>{String(index + 1).padStart(2, "0")}</span>
@@ -141,29 +152,15 @@ function RootCauseContent({ record }: { record: StoredAlert }) {
             )}
           </article>
         ))
-      ) : recommendation.likely_causes.length > 0 ? (
+      ) : visibleLikelyCauses.length > 0 ? (
         <section className="wecom-content-card">
           <div className="wecom-section-title"><CircleHelp size={20} /><h2>待验证的可能原因</h2></div>
           <ol className="wecom-simple-list">
-            {recommendation.likely_causes.map((cause) => <li key={cause}>{cause}</li>)}
+            {visibleLikelyCauses.map((cause) => <li key={cause}>{cause}</li>)}
           </ol>
         </section>
       ) : (
         <section className="wecom-content-card wecom-empty-content"><CircleHelp size={26} /><p>本次没有形成可展示的根因候选。</p></section>
-      )}
-
-      {recommendation.excluded_causes.length > 0 && (
-        <section className="wecom-content-card">
-          <div className="wecom-section-title"><ShieldAlert size={20} /><h2>实时证据已排除</h2></div>
-          <ol className="wecom-simple-list">
-            {recommendation.excluded_causes.map((excludedCause, index) => (
-              <li key={`${excludedCause.cause}-${index}`}>
-                <strong>{excludedCause.cause}</strong> · {excludedCause.reason}
-                {excludedCause.evidence_refs.length > 0 && <small>反证：{excludedCause.evidence_refs.map((id) => compactId(id, 8)).join("、")}</small>}
-              </li>
-            ))}
-          </ol>
-        </section>
       )}
 
       {recommendation.analysis_bases.length > 0 && (
