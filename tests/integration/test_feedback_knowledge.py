@@ -64,7 +64,10 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         assert feedback.json()["runbook_match_verdict"] == "NOT_APPLICABLE"
         assert feedback.json()["supporting_evidence_ids"] == [evidence_id]
         reviewed_detail = client.get(first["detail_url"]).json()
-        assert reviewed_detail["status"] == "COMPLETED"
+        # The confirmed human feedback is accepted for knowledge reuse, but the
+        # original run still has only alert-context evidence and must retain its
+        # review-required status under the evidence-sufficiency gate.
+        assert reviewed_detail["status"] == "REVIEW_REQUIRED"
         assert len(reviewed_detail["feedback"]) == 1
         assert reviewed_detail["feedback"][0]["created_at"].endswith(("+00:00", "Z"))
         assert reviewed_detail["updated_at"].endswith(("+00:00", "Z"))
@@ -93,7 +96,7 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
         assert conflicting.status_code == 409
         assert conflicting.json()["code"] == "FEEDBACK_ALREADY_SUBMITTED"
         fixed_detail = client.get(first["detail_url"]).json()
-        assert fixed_detail["status"] == "COMPLETED"
+        assert fixed_detail["status"] == "REVIEW_REQUIRED"
         assert len(fixed_detail["feedback"]) == 1
         assert fixed_detail["feedback"][0]["id"] == feedback.json()["id"]
 

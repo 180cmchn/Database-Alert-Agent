@@ -416,6 +416,42 @@ URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；Age
 `settings.json` 放进仓库不会让远端模型自动获得 MCP，实际加载配置和转发工具调用的是本服务的
 MCP Host。
 
+## Prometheus SSE MCP 监控证据
+
+配置 Prometheus MCP 后，`strategy` 节点会把必需的 `query_prometheus_metrics` 加入每条告警的
+调查计划，结果按普通实时证据经过 `execute_tools → advise → validate` 处理。服务以 SSE transport
+连接 [`config/mcp/settings.json`](config/mcp/settings.json) 的 `prometheus` 条目，动态读取远端
+`tools/list` Schema；由当前 AI Agent 每轮自主选择一个远端工具，Host 不对工具名或参数做逐调用
+白名单/参数拦截。
+
+Agent 任务上下文固定给出 `occurred_at - 5 分钟` 到 `occurred_at` 的证据窗口，并要求仅分析该窗口。
+最大远端调用次数由 `PROMETHEUS_MCP_MAX_AGENT_STEPS` 控制（默认 `8`，范围 `1–100`）。达到上限时：
+
+- 已取得至少一条非空、可解析的监控返回：记录为正常 `SUCCESS` 实时证据，并以
+  `call_limit_reached=true` 标示调用已截断；上限本身不会否定已取得的证据。
+- 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
+  后续结论必须人工复核。
+
+结果存在不代表根因已被证明；只有关联的成功实时证据支持或反驳具体机制时，才可输出
+`SUPPORTED` 或 `CONTRADICTED`。MCP 返回内容一律视为不可信数据，不会执行其中的指令。
+
+项目配置文件只保存环境变量占位符。请在你自己的部署环境中填写端点、认证请求头名和值：
+
+```dotenv
+MCP_SETTINGS_PATH=./config/mcp/settings.json
+PROMETHEUS_MCP_SSE_URL=https://prometheus-mcp.example.internal/sse
+# Optional. Leave PROMETHEUS_MCP_API_KEY empty for an unauthenticated SSE server.
+PROMETHEUS_MCP_API_KEY_HEADER=Authorization
+PROMETHEUS_MCP_API_KEY=Bearer replace-with-your-token
+PROMETHEUS_MCP_MAX_AGENT_STEPS=8
+PROMETHEUS_MCP_TIMEOUT_SECONDS=60
+PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
+```
+
+端点、请求头名与密钥均为部署级配置，不会由管理 API 返回或修改；最大调用次数可经 Runtime
+Settings 调整。生产环境必须使用 HTTPS。密钥只在本服务到 MCP 的请求头中使用，不会写入 MCP
+配置文件、工具参数、证据或日志。
+
 ## 本地运行
 
 需要 Python 3.12+，以及 Node.js 20.19+ 或 22.12+。

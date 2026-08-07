@@ -40,6 +40,15 @@ def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> No
     assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
 
 
+def test_system_prompt_requires_chinese_user_facing_recommendations() -> None:
+    assert "最终面向用户的自然语言必须使用简体中文" in ai_module.SYSTEM_PROMPT
+    assert "不得输出英文句子、英文推理过程、计算草稿或未核实的时间推导" in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert '"Let\'s calculate"' in ai_module.SYSTEM_PROMPT
+    assert "指标名、标签名、数据库对象名、原始技术值及必要缩写" in ai_module.SYSTEM_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_no_runbook_forces_low_confidence() -> None:
     recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [])
@@ -81,6 +90,38 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
     )
 
     assert recommendation.knowledge_match_summary == expected
+
+
+@pytest.mark.asyncio
+async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    repair_prompt = ""
+    valid_response = Recommendation(
+        summary="中文分析结果",
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
+        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        requires_human=True,
+        confidence=0.3,
+        manual_matched=False,
+    )
+    calls = 0
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        nonlocal calls, repair_prompt
+        calls += 1
+        if calls == 1:
+            return "not-json", object()
+        repair_prompt = messages[-1]["content"]
+        return valid_response.model_dump_json(), object()
+
+    advisor._complete = complete
+
+    await advisor.advise(make_alert(), [])
+
+    assert "中文最终输出规则" in repair_prompt
+    assert "所有面向用户的自然语言字段使用简体中文" in repair_prompt
 
 
 @pytest.mark.asyncio
@@ -533,6 +574,55 @@ async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
     assert calls[0]["tools"] == tools
     assert calls[0]["tool_choice"] == "required"
     assert "response_format" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_advisor_mcp_tool_error_exposes_safe_upstream_diagnostics() -> None:
+    secret = "provider-secret-that-must-not-appear"
+
+    class APIStatusError(Exception):
+        status_code = 422
+        request_id = "gateway-request-123"
+        code = "unsupported_tools"
+        body = {
+            "error": {
+                "message": f"tools are unsupported; token={secret}",
+                "api_key": secret,
+            }
+        }
+
+    class FailingCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            raise APIStatusError(f"Authorization: Bearer {secret}")
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FailingCompletions())
+    )
+    tool = {
+        "type": "function",
+        "function": {"name": "monitoring_query", "parameters": {"type": "object"}},
+    }
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor.request_mcp_tool_call(
+            messages=[{"role": "user", "content": "never expose this prompt"}],
+            tools=[tool],
+        )
+
+    error = str(caught.value)
+    assert "AI provider MCP tool request failed" in error
+    assert "type=APIStatusError" in error
+    assert "status_code=422" in error
+    assert "request_id=gateway-request-123" in error
+    assert "code=unsupported_tools" in error
+    assert "***REDACTED***" in error
+    assert secret not in error
+    assert "never expose this prompt" not in error
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
         "archery_mcp_max_agent_steps",
+        "prometheus_mcp_max_agent_steps",
         "external_knowledge_api_key",
         "external_knowledge_api_key_base_url",
     }
@@ -160,6 +161,15 @@ class Settings(BaseSettings):
     # outer ToolExecutor deadline above a single MCP read timeout so the detail
     # page reports the actual Archery/agent failure instead of a generic timeout.
     archery_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
+
+    # Prometheus is a deployment-only SSE MCP evidence source. Its endpoint and
+    # authentication material must not be changed through the admin API.
+    prometheus_mcp_sse_url: str = ""
+    prometheus_mcp_api_key: str = Field(default="", repr=False)
+    prometheus_mcp_api_key_header: str = "Authorization"
+    prometheus_mcp_max_agent_steps: int = Field(default=8, ge=1, le=100)
+    prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
+    prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
 
     # External knowledge deployment coordinates are intentionally not runtime
     # editable. External knowledge and local PDFs are peer sources; neither has
@@ -289,6 +299,7 @@ class Settings(BaseSettings):
             ("flashduty_base_url", True),
             ("external_knowledge_base_url", False),
             ("archery_mcp_url", False),
+            ("prometheus_mcp_sse_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -335,6 +346,12 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "archery_mcp_url must be the full MCP endpoint without query or fragment"
+                )
+            if field_name == "prometheus_mcp_sse_url" and (
+                parsed.query or parsed.fragment or parsed.path in {"", "/"}
+            ):
+                raise ValueError(
+                    "prometheus_mcp_sse_url must be the full SSE endpoint without query or fragment"
                 )
             if (
                 field_name != "external_knowledge_base_url"
@@ -387,6 +404,13 @@ class Settings(BaseSettings):
                 self.archery_mcp_token.strip(),
             )
         )
+
+    @computed_field
+    @property
+    def prometheus_mcp_enabled(self) -> bool:
+        """Enable Prometheus evidence when its SSE endpoint is configured."""
+
+        return bool(self.prometheus_mcp_sse_url.strip())
 
     def external_knowledge_api_key_is_current(self) -> bool:
         """Return whether the secret is bound to the active deployment URL."""
@@ -465,6 +489,26 @@ class Settings(BaseSettings):
             elif self.ai_provider != "openai_compatible":
                 issues.append(
                     "Archery MCP requires an openai_compatible model with tool calling"
+                )
+        if self.prometheus_mcp_sse_url.strip() or self.prometheus_mcp_api_key.strip():
+            required_prometheus_settings = {
+                "PROMETHEUS_MCP_SSE_URL": self.prometheus_mcp_sse_url,
+            }
+            missing_prometheus_settings = [
+                name
+                for name, value in required_prometheus_settings.items()
+                if not value.strip()
+            ]
+            if missing_prometheus_settings:
+                issues.append(
+                    "Prometheus MCP configuration is incomplete; missing: "
+                    + ", ".join(missing_prometheus_settings)
+                )
+            elif not self.mcp_settings_path.is_file():
+                issues.append(f"MCP settings file does not exist: {self.mcp_settings_path}")
+            elif self.ai_provider != "openai_compatible":
+                issues.append(
+                    "Prometheus MCP requires an openai_compatible model with tool calling"
                 )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

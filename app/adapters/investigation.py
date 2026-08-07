@@ -11,6 +11,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TOOL_NAME,
     is_slow_query_alert_title,
 )
+from app.adapters.prometheus_mcp import PROMETHEUS_METRICS_TOOL_NAME
 from app.application.sanitization import sanitize
 from app.domain.models import (
     EvidenceRecord,
@@ -28,6 +29,7 @@ _TRUNCATION_CONTROL_KEYS = (
     "query_completed",
     "root_cause_eligible",
     "root_cause_ineligible_reason",
+    "call_limit_reached",
 )
 
 
@@ -262,6 +264,7 @@ class DefaultInvestigationStrategyProvider:
         alert_context_timeout_seconds: float = 15,
         external_tool_timeout_seconds: float = 45,
         archery_tool_timeout_seconds: float = 780,
+        prometheus_tool_timeout_seconds: float = 780,
         available_tools: list[str] | None = None,
         metrics_ds_name: str = "",
         logs_ds_name: str = "",
@@ -271,6 +274,7 @@ class DefaultInvestigationStrategyProvider:
         self.alert_context_timeout_seconds = alert_context_timeout_seconds
         self.external_tool_timeout_seconds = external_tool_timeout_seconds
         self.archery_tool_timeout_seconds = archery_tool_timeout_seconds
+        self.prometheus_tool_timeout_seconds = prometheus_tool_timeout_seconds
         self.available_tools = set(
             ["alert_context"] if available_tools is None else available_tools
         )
@@ -388,6 +392,15 @@ class DefaultInvestigationStrategyProvider:
                     tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
                     required=True,
                     timeout_seconds=self.archery_tool_timeout_seconds,
+                )
+            )
+
+        if PROMETHEUS_METRICS_TOOL_NAME in self.available_tools:
+            requests.append(
+                ToolExecutionRequest(
+                    tool_name=PROMETHEUS_METRICS_TOOL_NAME,
+                    required=True,
+                    timeout_seconds=self.prometheus_tool_timeout_seconds,
                 )
             )
 
@@ -575,6 +588,7 @@ def build_default_tool_registry() -> InvestigationToolRegistry:
             UnavailableExternalTool(
                 ARCHERY_SLOW_LOG_TOOL_NAME, "archery_mcp"
             ),
+            UnavailableExternalTool(PROMETHEUS_METRICS_TOOL_NAME, "prometheus_mcp"),
             UnavailableExternalTool("query_changes", "alert_platform"),
             UnavailableExternalTool("query_similar_incidents", "alert_platform"),
         ]
