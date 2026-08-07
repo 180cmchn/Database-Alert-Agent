@@ -377,6 +377,27 @@ def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> No
     assert alert.features["threshold"] == "90"
 
 
+def test_flashduty_alert_adapter_removes_slow_query_filter_note() -> None:
+    payload = flashduty_alert_payload()
+    signal = "数据库慢查询过多，五分钟内超过500个慢查询，触发阈值告警的值为: 646个"
+    filter_note = "（已排除640个数据库管理平台采集数据用sql）"
+    raw_text = f"{signal}{filter_note}"
+    payload["data"]["title"] = "MySQL slow_query threshold"
+    payload["data"]["description"] = raw_text
+    payload["data"]["labels"].update(
+        {"check": raw_text, "alarm_content": raw_text}
+    )
+
+    alert = FlashDutyAlertSourceAdapter().normalize(payload)
+
+    assert alert.reason == signal
+    assert alert.description == signal
+    assert alert.labels["check"] == signal
+    assert alert.labels["alarm_content"] == signal
+    assert alert.features["alarm_content"] == signal
+    assert alert.raw_payload["data"]["description"] == raw_text
+
+
 def make_context() -> InvestigationContext:
     alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(
         flashduty_alert_payload()

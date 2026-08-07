@@ -20,6 +20,7 @@ from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.graph import InvestigationAgent
 from app.agents.state import create_initial_state
 from app.application.sanitization import sanitize, sanitize_alert
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
@@ -151,7 +152,9 @@ class AlertAnalysisService:
         Returns:
             Tuple of (stored alert, was_created)
         """
-        normalized = self.source_registry.normalize(source, payload)
+        normalized = preprocess_normalized_alert(
+            self.source_registry.normalize(source, payload)
+        )
         alert = self.alert_sanitizer(normalized)
         stored, created = await self.repository.create_or_get(alert)
         if not created:
@@ -231,7 +234,7 @@ class AlertAnalysisService:
         # Create initial state for LangGraph
         initial_state = create_initial_state(
             alert_id=alert_id,
-            alert=stored.alert,
+            alert=preprocess_normalized_alert(stored.alert),
             stored_alert=stored,
             run=run,
             max_dynamic_turns=self.max_dynamic_turns,

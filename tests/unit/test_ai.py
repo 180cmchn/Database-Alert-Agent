@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -10,6 +11,7 @@ from app.domain.errors import AdvisorError
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
+    EvidenceRecord,
     ExternalKnowledgeExcerpt,
     ExternalKnowledgeReference,
     InvestigationRun,
@@ -18,6 +20,7 @@ from app.domain.models import (
     RunbookExcerpt,
     RunbookReference,
     RunbookVisualEvidence,
+    ToolStatus,
 )
 
 
@@ -63,6 +66,18 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
     assert "不得展示已删除假设的名称或排除理由" in ai_module.SYSTEM_PROMPT
     assert "此阶段只决定如何采集实时证据" in ai_module.PLANNER_PROMPT
     assert "不得形成或输出最终根因" in ai_module.PLANNER_PROMPT
+    assert "只是附带的 SQL 过滤说明，不是告警计数口径" in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert "不得把数据库管理平台采集 SQL 作为本次告警的候选原因或根因" in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert "不是告警计数口径" in ai_module.PLANNER_PROMPT
+    assert "不得围绕这些 SQL 规划根因取证" in ai_module.PLANNER_PROMPT
+    assert "若建议据此重新计算触发值，或将这些已过滤 SQL 作为候选原因或根因" in (
+        ai_module.VALIDATION_PROMPT
+    )
+    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
     assert "root_causes 中出现 CONTRADICTED 时 analysis_contract_passed 必须为 false" in (
         ai_module.VALIDATION_PROMPT
     )
@@ -109,6 +124,70 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
     )
 
     assert recommendation.knowledge_match_summary == expected
+
+
+@pytest.mark.asyncio
+async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    captured_payload: dict[str, object] = {}
+    signal = "五分钟内慢查询触发值为646个"
+    raw_text = f"{signal}（已排除640个数据库管理平台采集数据用sql）"
+    alert = make_alert().model_copy(
+        update={
+            "title": "MySQL slow_query threshold",
+            "reason": raw_text,
+            "description": raw_text,
+            "labels": {"check": raw_text},
+            "raw_payload": {"reason": raw_text},
+        }
+    )
+    evidence = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="alert_context",
+        source_system="alert_platform",
+        status=ToolStatus.SUCCESS,
+        summary=raw_text,
+        structured_data={
+            "flashduty": {"alert": {"description": raw_text}}
+        },
+    )
+    model_response = Recommendation(
+        summary="证据不足，需继续核查。",
+        analysis_bases=[
+            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")
+        ],
+        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        requires_human=True,
+        confidence=0.3,
+        manual_matched=False,
+    )
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        captured_payload.update(json.loads(messages[1]["content"]))
+        return model_response.model_dump_json(), object()
+
+    advisor._complete = complete
+
+    await advisor.advise(alert, [], evidence=[evidence])
+
+    serialized = json.dumps(captured_payload, ensure_ascii=False)
+    assert "数据库管理平台采集数据用" not in serialized
+    assert captured_payload["alert"]["reason"] == signal  # type: ignore[index]
+    assert captured_payload["tool_evidence"][0]["summary"] == signal  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_fake_advisor_does_not_copy_slow_query_filter_note_into_cause() -> None:
+    signal = "五分钟内慢查询触发值为646个"
+    raw_text = f"{signal}（已排除640个数据库管理平台采集数据用sql）"
+    alert = make_alert().model_copy(update={"reason": raw_text})
+
+    recommendation, _ = await FakeAIAdvisor().advise(alert, [])
+
+    assert recommendation.root_causes[0].cause == signal
+    assert recommendation.likely_causes == [signal]
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from mcp import types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
 
 from app.application.sanitization import sanitize, sanitize_text
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.models import InvestigationContext, NormalizedAlert, ToolExecutionRequest
 from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 
@@ -2293,6 +2294,7 @@ class ArcherySlowLogEvidenceTool:
 
     @staticmethod
     def _alert_target_context(alert: NormalizedAlert) -> dict[str, Any]:
+        alert = preprocess_normalized_alert(alert)
         database = (
             alert.database.model_dump(mode="json", exclude_none=True)
             if alert.database is not None

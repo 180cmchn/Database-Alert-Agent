@@ -22,6 +22,7 @@ from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 
 from app.application.sanitization import sanitize, sanitize_text
+from app.domain.alert_preprocessing import preprocess_alert_data
 from app.domain.models import (
     InvestigationContext,
     ToolExecutionRequest,
@@ -477,8 +478,10 @@ class PrometheusMCPClient:
                 "content": json.dumps(
                     {
                         "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
-                        "alert": context.alert.model_dump(
-                            mode="json", exclude={"raw_payload"}
+                        "alert": preprocess_alert_data(
+                            context.alert.model_dump(
+                                mode="json", exclude={"raw_payload"}
+                            )
                         ),
                         "required_window": {
                             "start": window_start.isoformat(),

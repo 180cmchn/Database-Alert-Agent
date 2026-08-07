@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import re
 
+from app.domain.alert_preprocessing import (
+    has_management_platform_sql_filter_note,
+    is_management_platform_collection_sql_cause,
+)
 from app.domain.models import (
     AnalysisBasisSource,
     EvidenceRecord,
@@ -43,6 +47,7 @@ _DANGEROUS_ACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 def enforce_post_evidence_root_cause_policy(
     recommendation: Recommendation,
     evidence: list[EvidenceRecord],
+    alert: NormalizedAlert | None = None,
 ) -> Recommendation:
     """Drop disproved investigation hypotheses from the final recommendation.
 
@@ -54,8 +59,18 @@ def enforce_post_evidence_root_cause_policy(
     evidence_by_id = {str(item.id): item for item in evidence}
     plausible_causes: list[RootCauseAssessment] = []
     invalid_contradiction = False
+    filtered_metric_cause = False
+    management_sql_already_filtered = bool(
+        alert
+        and has_management_platform_sql_filter_note(alert.raw_payload)
+    )
 
     for root_cause in recommendation.root_causes:
+        if management_sql_already_filtered and is_management_platform_collection_sql_cause(
+            root_cause.cause
+        ):
+            filtered_metric_cause = True
+            continue
         if root_cause.status != RootCauseStatus.CONTRADICTED:
             plausible_causes.append(root_cause)
             continue
@@ -90,6 +105,7 @@ def enforce_post_evidence_root_cause_policy(
                 recommendation.requires_human
                 or not plausible_causes
                 or invalid_contradiction
+                or filtered_metric_cause
             ),
         }
     )

@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.domain.alert_preprocessing import preprocess_alert_data
 from app.domain.errors import InvalidAlertPayloadError, UnknownAlertSourceError
 from app.domain.models import (
     DatabaseTarget,
@@ -133,8 +134,19 @@ class CanonicalAlertSourceAdapter:
         self._environment_resolver = EnvironmentResolver(environment_aliases or {})
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert:
+        analysis_payload = {
+            key: preprocess_alert_data(value) for key, value in payload.items()
+        }
+        for field in ("title", "reason"):
+            raw_value = payload.get(field)
+            if (
+                isinstance(raw_value, str)
+                and raw_value.strip()
+                and not str(analysis_payload.get(field) or "").strip()
+            ):
+                analysis_payload[field] = "数据库慢查询告警"
         try:
-            parsed = CanonicalAlertPayload.model_validate(payload)
+            parsed = CanonicalAlertPayload.model_validate(analysis_payload)
         except ValidationError as exc:
             raise InvalidAlertPayloadError(str(exc)) from exc
 
@@ -147,7 +159,11 @@ class CanonicalAlertSourceAdapter:
             ) from exc
 
         known_fields = set(CanonicalAlertPayload.model_fields)
-        extension_fields = {key: value for key, value in payload.items() if key not in known_fields}
+        extension_fields = {
+            key: value
+            for key, value in analysis_payload.items()
+            if key not in known_fields
+        }
         attributes = {**parsed.attributes, **extension_fields}
         environment = self._environment_resolver.resolve(
             parsed.environment or parsed.labels.get("environment") or parsed.labels.get("env")

@@ -114,6 +114,42 @@ def test_post_evidence_policy_requires_review_when_all_causes_are_removed() -> N
     assert result.requires_human is True
 
 
+def test_post_evidence_policy_drops_management_sql_cause_filtered_by_alert() -> None:
+    filter_note = "（已排除640个数据库管理平台采集数据用sql）"
+    alert = make_alert().model_copy(
+        update={
+            "raw_payload": {
+                "description": f"五分钟内慢查询触发值为646个{filter_note}"
+            }
+        }
+    )
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="本次告警完全由数据库管理平台采集 SQL 造成",
+                status=RootCauseStatus.UNKNOWN,
+                next_probe="复核 SQL 来源。",
+            ),
+            RootCauseAssessment(
+                cause="业务 SQL 执行频次异常增加",
+                status=RootCauseStatus.UNKNOWN,
+                next_probe="按指纹核对慢查询执行次数。",
+            ),
+        ],
+        requires_human=False,
+    )
+
+    result = enforce_post_evidence_root_cause_policy(
+        recommendation, [], alert
+    )
+
+    assert [item.cause for item in result.root_causes] == [
+        "业务 SQL 执行频次异常增加"
+    ]
+    assert result.likely_causes == ["业务 SQL 执行频次异常增加"]
+    assert result.requires_human is True
+
+
 @pytest.mark.parametrize(
     "status",
     [ToolStatus.FAILED, ToolStatus.TIMEOUT, ToolStatus.NO_DATA, ToolStatus.SKIPPED],

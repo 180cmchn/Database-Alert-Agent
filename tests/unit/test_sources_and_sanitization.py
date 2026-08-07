@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
@@ -75,6 +77,74 @@ def test_incident_fingerprint_ignores_event_identity_and_occurrence_time() -> No
 
     assert first.external_id != second.external_id
     assert first.occurred_at != second.occurred_at
+    assert first.incident_fingerprint == second.incident_fingerprint
+
+
+@pytest.mark.parametrize(
+    "filter_note",
+    [
+        "（已排除640个数据库管理平台采集数据用sql）",
+        "(已排除 640 条 数据库管理平台采集数据用 SQL)",
+    ],
+)
+def test_slow_query_filter_note_is_removed_from_analysis_fields(
+    filter_note: str,
+) -> None:
+    signal = "数据库慢查询过多，五分钟内超过500个慢查询，触发阈值告警的值为: 646个"
+    raw_text = f"{signal}{filter_note}"
+    payload = {
+        "external_id": "slow-query-filter-note",
+        "severity": "WARNING",
+        "title": "MySQL slow_query threshold",
+        "reason": raw_text,
+        "description": raw_text,
+        "labels": {"check": raw_text},
+        "features": {"alarm_content": raw_text},
+        "attributes": {"nested": {"message": raw_text}},
+    }
+
+    alert = CanonicalAlertSourceAdapter().normalize(payload)
+
+    assert alert.reason == signal
+    assert alert.description == signal
+    assert alert.alert_type == signal
+    assert alert.error_summary == signal
+    assert alert.labels["check"] == signal
+    assert alert.features["alarm_content"] == signal
+    assert alert.attributes["nested"]["message"] == signal
+    model_payload = json.dumps(
+        alert.model_dump(mode="json", exclude={"raw_payload"}),
+        ensure_ascii=False,
+    )
+    assert "数据库管理平台采集数据用" not in model_payload
+    assert alert.raw_payload["reason"] == raw_text
+
+
+def test_slow_query_filter_count_does_not_change_incident_fingerprint() -> None:
+    adapter = CanonicalAlertSourceAdapter()
+    signal = "五分钟内慢查询触发值为646个"
+    common = {
+        "severity": "WARNING",
+        "title": "MySQL slow_query threshold",
+        "reason": "mysql_slow_query_400",
+        "metric_name": "mysql_slow_query_total",
+    }
+
+    first = adapter.normalize(
+        {
+            **common,
+            "external_id": "slow-query-filter-640",
+            "description": f"{signal}（已排除640个数据库管理平台采集数据用sql）",
+        }
+    )
+    second = adapter.normalize(
+        {
+            **common,
+            "external_id": "slow-query-filter-900",
+            "description": f"{signal}（已排除900个数据库管理平台采集数据用sql）",
+        }
+    )
+
     assert first.incident_fingerprint == second.incident_fingerprint
 
 

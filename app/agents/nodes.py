@@ -674,7 +674,9 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "requires_human": True,
             }
         )
-    recommendation = enforce_post_evidence_root_cause_policy(recommendation, evidence)
+    recommendation = enforce_post_evidence_root_cause_policy(
+        recommendation, evidence, alert
+    )
 
     return {
         "current_stage": InvestigationStage.ADVISING,
