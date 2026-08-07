@@ -21,7 +21,10 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      # `kafka-topics.sh` starts a JVM on every probe. A TCP connect is enough
+      # to establish that the broker is accepting client connections; aiokafka
+      # still handles the broker's normal metadata/retry sequence on startup.
+      test: ["CMD-SHELL", "bash -c '>/dev/tcp/127.0.0.1/9092'"]
       interval: 3s
       timeout: 5s
       retries: 10
@@ -123,9 +126,9 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:80"
-    depends_on:
-      api:
-        condition: service_healthy
+    # The static application can be served before the API is available. This
+    # removes the Kafka -> migrate -> API critical path from UI startup; API
+    # requests become available once the backend completes its own safeguards.
 
 volumes:
   kafka-data:

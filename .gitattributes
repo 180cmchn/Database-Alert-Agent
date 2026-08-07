@@ -1,0 +1,4 @@
+# Shell entrypoints must retain Unix newlines: their Linux shebang cannot parse
+# a trailing carriage return from Windows CRLF conversion.
+*.sh text eol=lf
+Dockerfile text eol=lf

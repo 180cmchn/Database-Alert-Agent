@@ -24,6 +24,12 @@ COPY alembic.ini ./
 COPY runbooks ./runbooks
 COPY config ./config
 COPY entrypoint.sh ./
+# The repository may be checked out on Windows with CRLF line endings.  A CR in
+# the shebang makes Linux look for `/bin/sh\r`, preventing every container
+# command (including migrations) from starting.  Normalize the copied script
+# within the Linux build environment so the image is independent of checkout
+# settings.
+RUN python -c "from pathlib import Path; path = Path('entrypoint.sh'); path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))"
 
 # Install the project after copying its source without resolving dependencies
 # again: they were installed by the cacheable layer above.
