@@ -13,6 +13,7 @@ from app.adapters.external_knowledge import (
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agents.state import AgentState
 from app.application.sanitization import sanitize
+from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import (
     AdvisorMetadata,
@@ -601,7 +602,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         alert_id,
         run,
         InvestigationStage.ADVISING,
-        "正在结合已命中的知识来源生成结构化处理建议。",
+        "实时证据采集已完成，正在根据告警与实时证据生成可能根因和处理建议。",
         {
             "runbook_matches": len(runbooks),
             "external_knowledge_matches": len(external_knowledge),
@@ -673,6 +674,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "requires_human": True,
             }
         )
+    recommendation = enforce_post_evidence_root_cause_policy(recommendation)
 
     return {
         "current_stage": InvestigationStage.ADVISING,
@@ -686,7 +688,9 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.ADVISING,
-                message="正在结合已命中的知识来源生成结构化处理建议。",
+                message=(
+                    "实时证据采集已完成，正在根据告警与实时证据生成可能根因和处理建议。"
+                ),
                 details={
                     "runbook_matches": len(runbooks),
                     "external_knowledge_matches": len(external_knowledge),

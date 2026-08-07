@@ -32,6 +32,7 @@ class RecordingAdvisor(FakeAIAdvisor):
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.calls = 0
+        self.evidence_tool_names: list[str] = []
 
     async def advise(  # type: ignore[no-untyped-def]
         self,
@@ -45,6 +46,7 @@ class RecordingAdvisor(FakeAIAdvisor):
     ):
         self.events.append("ADVISOR")
         self.calls += 1
+        self.evidence_tool_names = [item.tool_name for item in evidence or []]
         return await super().advise(
             alert,
             runbooks,
@@ -224,6 +226,7 @@ async def test_every_severity_sends_one_final_ai_result(
 
     assert events == ["ADVISOR", f"RESULT:{severity}"]
     assert advisor.calls == 1
+    assert advisor.evidence_tool_names == ["alert_context"]
     assert first.alert.id == second.alert.id
     assert first.status == AlertStatus.REVIEW_REQUIRED
     assert all(item.passed for item in first.validations)

@@ -615,7 +615,7 @@ export function AlertDetailPage() {
           </div>
 
           {recommendation.root_causes.length > 0 && (
-            <SectionCard eyebrow="ROOT CAUSE" title="根因判断">
+            <SectionCard eyebrow="ROOT CAUSE" title="采证后根因判断">
               <div className="root-causes">
                 {recommendation.root_causes.map((rootCause, index) => (
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
@@ -626,6 +626,22 @@ export function AlertDetailPage() {
                   </article>
                 ))}
               </div>
+            </SectionCard>
+          )}
+
+          {recommendation.excluded_causes.length > 0 && (
+            <SectionCard eyebrow="EXCLUDED" title="已排除原因" description="以下调查假设已被本次实时证据排除，不属于可能根因">
+              <ol className="likely-causes">
+                {recommendation.excluded_causes.map((excludedCause, index) => (
+                  <li key={`${excludedCause.cause}-${index}`}>
+                    <span>{index + 1}</span>
+                    <div>
+                      <strong>{excludedCause.cause}</strong> · {excludedCause.reason}
+                      {excludedCause.evidence_refs.length > 0 && <small className="source-ref">反证：{excludedCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}</small>}
+                    </div>
+                  </li>
+                ))}
+              </ol>
             </SectionCard>
           )}
 

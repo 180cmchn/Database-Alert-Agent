@@ -152,6 +152,13 @@ export interface RootCauseAssessment {
   next_probe?: string | null;
 }
 
+export interface ExcludedCauseAssessment {
+  cause: string;
+  cause_id?: string | null;
+  evidence_refs: string[];
+  reason: string;
+}
+
 export interface Recommendation {
   summary: string;
   knowledge_match_summary: string;
@@ -165,6 +172,7 @@ export interface Recommendation {
   runbook_references: RunbookReference[];
   external_knowledge_matches: ExternalKnowledgeExcerpt[];
   root_causes: RootCauseAssessment[];
+  excluded_causes: ExcludedCauseAssessment[];
   analysis_mode: "assist" | "shadow";
 }
 

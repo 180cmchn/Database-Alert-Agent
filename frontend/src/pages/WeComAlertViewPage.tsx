@@ -18,7 +18,7 @@ type WeComView = "overview" | "root-cause" | "recovery-advice";
 
 const rootCauseLabels = {
   SUPPORTED: "已有实时证据支持",
-  CONTRADICTED: "已被实时证据反驳",
+  CONTRADICTED: "历史结果：已被实时证据反驳",
   UNKNOWN: "证据不足",
 } as const;
 
@@ -150,6 +150,20 @@ function RootCauseContent({ record }: { record: StoredAlert }) {
         </section>
       ) : (
         <section className="wecom-content-card wecom-empty-content"><CircleHelp size={26} /><p>本次没有形成可展示的根因候选。</p></section>
+      )}
+
+      {recommendation.excluded_causes.length > 0 && (
+        <section className="wecom-content-card">
+          <div className="wecom-section-title"><ShieldAlert size={20} /><h2>实时证据已排除</h2></div>
+          <ol className="wecom-simple-list">
+            {recommendation.excluded_causes.map((excludedCause, index) => (
+              <li key={`${excludedCause.cause}-${index}`}>
+                <strong>{excludedCause.cause}</strong> · {excludedCause.reason}
+                {excludedCause.evidence_refs.length > 0 && <small>反证：{excludedCause.evidence_refs.map((id) => compactId(id, 8)).join("、")}</small>}
+              </li>
+            ))}
+          </ol>
+        </section>
       )}
 
       {recommendation.analysis_bases.length > 0 && (

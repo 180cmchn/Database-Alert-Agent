@@ -3,11 +3,15 @@ from uuid import uuid4
 import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.application.validation import RuleConclusionValidator
+from app.application.validation import (
+    RuleConclusionValidator,
+    enforce_post_evidence_root_cause_policy,
+)
 from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
+    ExcludedCauseAssessment,
     InvestigationRun,
     Recommendation,
     RecommendationStep,
@@ -48,6 +52,65 @@ def make_recommendation(
         manual_matched=False,
         root_causes=root_causes or [],
     )
+
+
+def test_post_evidence_policy_moves_contradicted_hypotheses_out_of_root_causes() -> None:
+    contradicted_evidence_id = str(uuid4())
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="连接泄漏",
+                status=RootCauseStatus.UNKNOWN,
+                next_probe="查询连接来源分布。",
+            ),
+            RootCauseAssessment(
+                cause="数据库管理平台采集 SQL 导致告警",
+                status=RootCauseStatus.CONTRADICTED,
+                evidence_refs=[contradicted_evidence_id],
+            ),
+        ]
+    ).model_copy(
+        update={
+            "likely_causes": ["连接泄漏", "数据库管理平台采集 SQL 导致告警"]
+        }
+    )
+
+    result = enforce_post_evidence_root_cause_policy(recommendation)
+
+    assert [item.cause for item in result.root_causes] == ["连接泄漏"]
+    assert result.likely_causes == ["连接泄漏"]
+    assert len(result.excluded_causes) == 1
+    assert result.excluded_causes[0].cause == "数据库管理平台采集 SQL 导致告警"
+    assert result.excluded_causes[0].evidence_refs == [contradicted_evidence_id]
+
+
+def test_post_evidence_policy_removes_cause_already_explicitly_excluded() -> None:
+    recommendation = make_recommendation(
+        root_causes=[
+            RootCauseAssessment(
+                cause="数据库管理平台采集 SQL 导致告警",
+                status=RootCauseStatus.UNKNOWN,
+                next_probe="复核 SQL 来源。",
+            )
+        ],
+        requires_human=False,
+    ).model_copy(
+        update={
+            "excluded_causes": [
+                ExcludedCauseAssessment(
+                    cause="数据库管理平台采集 SQL 导致告警",
+                    evidence_refs=[str(uuid4())],
+                    reason="实时证据已排除该来源。",
+                )
+            ]
+        }
+    )
+
+    result = enforce_post_evidence_root_cause_policy(recommendation)
+
+    assert result.root_causes == []
+    assert result.likely_causes == []
+    assert result.requires_human is True
 
 
 @pytest.mark.asyncio
@@ -107,6 +170,88 @@ async def test_rule_validator_accepts_honest_unknown_but_marks_evidence_insuffic
     assert result.passed is True
     assert result.evidence_sufficient is False
     assert result.issues == []
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_rejects_empty_cause_assessment() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    recommendation = make_recommendation(requires_human=True)
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [], []
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("至少形成一个可能根因" in issue for issue in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_accepts_only_excluded_hypotheses_with_human_review() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    live_evidence = EvidenceRecord(
+        run_id=run.id,
+        tool_name="query_connection_sources",
+        source_system="database_diagnostics",
+        status=ToolStatus.SUCCESS,
+        summary="连接来源分布与平台采集 SQL 假设不符",
+    )
+    recommendation = make_recommendation(requires_human=True).model_copy(
+        update={
+            "excluded_causes": [
+                ExcludedCauseAssessment(
+                    cause="数据库管理平台采集 SQL 导致告警",
+                    evidence_refs=[str(live_evidence.id)],
+                    reason="实时连接来源和耗时分布未出现该平台采集 SQL。",
+                )
+            ]
+        }
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [live_evidence], []
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is False
+    assert result.issues == []
+    assert result.metadata["checked_root_causes"] == 0
+    assert result.metadata["checked_excluded_causes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_rejects_exclusion_without_successful_live_evidence() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    failed_evidence = EvidenceRecord(
+        run_id=run.id,
+        tool_name="query_connection_sources",
+        source_system="database_diagnostics",
+        status=ToolStatus.FAILED,
+        summary="实时查询失败",
+    )
+    recommendation = make_recommendation(requires_human=True).model_copy(
+        update={
+            "excluded_causes": [
+                ExcludedCauseAssessment(
+                    cause="数据库管理平台采集 SQL 导致告警",
+                    evidence_refs=[str(failed_evidence.id)],
+                    reason="工具没有返回该 SQL。",
+                )
+            ]
+        }
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run, alert, recommendation, [failed_evidence], []
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("不能作为实时反证" in issue for issue in result.issues)
+    assert any("缺少可用的实时 SUCCESS 反证" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
