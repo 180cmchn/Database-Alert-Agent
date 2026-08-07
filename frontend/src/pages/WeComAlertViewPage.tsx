@@ -2,7 +2,6 @@ import {
   AlertTriangle,
   BrainCircuit,
   CheckCircle2,
-  ChevronRight,
   CircleHelp,
   Database,
   Server,
@@ -10,7 +9,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { compactId, formatDateTime, formatPercent } from "../lib/format";
 import type { StoredAlert } from "../types/api";
@@ -62,7 +61,6 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
 
   const { alert, recommendation } = record;
   const host = alert.database?.host || alert.database?.instance || "未提供";
-  const basePath = `/wecom/alerts/${encodeURIComponent(alert.id)}`;
 
   return (
     <main className={`wecom-page severity-${alert.severity.toLowerCase()}`}>
@@ -84,15 +82,6 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
         <div><span>服务</span><strong>{alert.service_name}</strong></div>
       </section>
 
-      <nav className="wecom-view-tabs" aria-label="告警分析内容">
-        <Link className={view === "root-cause" ? "active" : ""} to={`${basePath}/root-cause`}>
-          根因分析
-        </Link>
-        <Link className={view === "recovery-advice" ? "active" : ""} to={`${basePath}/recovery-advice`}>
-          恢复建议
-        </Link>
-      </nav>
-
       {!recommendation ? (
         <section className="wecom-content-card wecom-empty-content">
           <CircleHelp size={28} />
@@ -104,7 +93,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
       ) : view === "recovery-advice" ? (
         <RecoveryAdviceContent record={record} />
       ) : (
-        <OverviewContent record={record} basePath={basePath} />
+        <OverviewContent record={record} />
       )}
 
       <footer className="wecom-page-footer">
@@ -114,7 +103,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
   );
 }
 
-function OverviewContent({ record, basePath }: { record: StoredAlert; basePath: string }) {
+function OverviewContent({ record }: { record: StoredAlert }) {
   const recommendation = record.recommendation!;
   return (
     <section className="wecom-content-card">
@@ -122,10 +111,6 @@ function OverviewContent({ record, basePath }: { record: StoredAlert; basePath: 
       <p className="wecom-summary">{recommendation.summary}</p>
       <div className="wecom-confidence">
         <span>分析置信度</span><strong>{formatPercent(recommendation.confidence)}</strong>
-      </div>
-      <div className="wecom-overview-links">
-        <Link to={`${basePath}/root-cause`}><span>查看告警根因分析</span><ChevronRight size={18} /></Link>
-        <Link to={`${basePath}/recovery-advice`}><span>查看告警恢复建议</span><ChevronRight size={18} /></Link>
       </div>
     </section>
   );

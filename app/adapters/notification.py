@@ -154,6 +154,9 @@ def build_wecom_template_card(
             },
             {"type": 1, "title": "人工反馈", "url": urls["feedback"]},
         ],
+        # WeCom requires template_card.card_action. The overview page exposes
+        # only the summary, so it cannot be used to switch between the two
+        # dedicated detail actions above.
         "card_action": {"type": 1, "url": urls["overview"]},
     }
 

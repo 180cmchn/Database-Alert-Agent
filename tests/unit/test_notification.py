@@ -115,7 +115,10 @@ def test_wecom_card_contains_alert_facts_and_exactly_three_actions() -> None:
     assert actions[2]["url"] == (
         f"https://alerts.intra.example.com/alerts/{event.alert.id}#feedback"
     )
-    assert card["card_action"]["url"].endswith(f"/wecom/alerts/{event.alert.id}")
+    assert card["card_action"] == {
+        "type": 1,
+        "url": f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}",
+    }
 
 
 def test_wecom_card_sanitizes_and_bounds_text_fields() -> None:
