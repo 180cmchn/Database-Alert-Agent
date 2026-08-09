@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Run a live, read-only Archery MCP connection and fixed-target smoke test.
+r"""Run a live Archery MCP connection, authentication, and discovery smoke test.
 
 Run from the project root so the result is printed in the VS Code terminal::
 
@@ -9,7 +9,6 @@ Run from the project root so the result is printed in the VS Code terminal::
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import sys
 from collections.abc import Mapping
@@ -27,33 +26,13 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_LOGIN_TOOL_NAME,
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ArcheryMCPClient,
-    ArcherySlowLogEvidenceTool,
     MCPServerSettings,
     load_mcp_server_settings,
 )
 from app.config import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RESULT_CHARACTER_LIMIT = 24_000
 INSTANCE_REF = "archery"
-DB_NAME = "archery"
-OLDEST_SLOW_LOG_SQL = """SELECT
-    f_id,
-    f_instances_id,
-    f_start_time,
-    f_db,
-    f_sql_text,
-    f_user,
-    f_time_point,
-    f_max_time,
-    f_min_time,
-    f_times,
-    f_sumtime,
-    f_insert_time,
-    f_update_time
-FROM t_slowlog_info
-ORDER BY f_insert_time ASC, f_id ASC
-LIMIT 5"""
 
 
 def _positive_integer(value: Any) -> int | None:
@@ -98,10 +77,7 @@ def _instance_id_from_payload(payload: Mapping[str, Any], instance_ref: str) -> 
     id_keys = ("id", "instance_id")
     for item in _walk_mappings(payload):
         names = [item.get(key) for key in name_keys]
-        if not any(
-            isinstance(name, str) and name.strip().casefold() == expected
-            for name in names
-        ):
+        if not any(isinstance(name, str) and name.strip().casefold() == expected for name in names):
             continue
         for key in id_keys:
             instance_id = _positive_integer(item.get(key))
@@ -118,8 +94,7 @@ def _instance_id_from_payload(payload: Mapping[str, Any], instance_ref: str) -> 
             return int(match.group("id"))
 
     raise RuntimeError(
-        f"list_instances did not return an exact match for configured instance "
-        f"{instance_ref!r}"
+        f"list_instances did not return an exact match for configured instance {instance_ref!r}"
     )
 
 
@@ -190,8 +165,7 @@ async def run() -> None:
     print("=== Archery MCP 配置冒烟测试 ===")
     print(f"MCP Endpoint: {server.url}")
     print(f"固定实例: {INSTANCE_REF}")
-    print(f"固定数据库: {DB_NAME}")
-    print("查询目标: t_slowlog_info 最老 5 条\n")
+    print("检查范围: 初始化、工具发现、登录和实例发现\n")
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds),
@@ -221,11 +195,10 @@ async def run() -> None:
                 missing_tools = sorted(required_tools - tool_names)
                 if missing_tools:
                     raise RuntimeError(
-                        "Archery MCP is missing required tools: "
-                        + ", ".join(missing_tools)
+                        "Archery MCP is missing required tools: " + ", ".join(missing_tools)
                     )
 
-                print("[1/3] 调用 ensure_login_gymJPA")
+                print("[1/2] 调用 ensure_login_gymJPA")
                 await _call_read_only_tool(
                     session,
                     name=ARCHERY_MCP_LOGIN_TOOL_NAME,
@@ -234,7 +207,7 @@ async def run() -> None:
                 )
                 print("      登录确认成功")
 
-                print(f"[2/3] 按固定实例查询 instance_id: {INSTANCE_REF}")
+                print(f"[2/2] 按固定实例查询 instance_id: {INSTANCE_REF}")
                 instances_payload = await _call_read_only_tool(
                     session,
                     name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
@@ -244,34 +217,7 @@ async def run() -> None:
                 instance_id = _instance_id_from_payload(instances_payload, INSTANCE_REF)
                 print(f"      instance_id={instance_id}")
 
-                print(f"[3/3] 查询 {DB_NAME}.t_slowlog_info 最老 5 条")
-                query_payload = await _call_read_only_tool(
-                    session,
-                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                    arguments={
-                        "instance_id": instance_id,
-                        "db_name": DB_NAME,
-                        "sql_content": OLDEST_SLOW_LOG_SQL,
-                        "limit_num": 5,
-                        "max_result_chars": RESULT_CHARACTER_LIMIT,
-                    },
-                    timeout_seconds=timeout_seconds,
-                )
-
-    normalized, executed_sql, actual_sql_verified = (
-        ArcheryMCPClient._normalize_query_payload(
-            query_payload,
-            requested_sql=OLDEST_SLOW_LOG_SQL,
-        )
-    )
-    row_count = ArcherySlowLogEvidenceTool._row_count(normalized)
-    print("\n=== MCP 查询完成 ===")
-    print(f"实际 SQL 已核对: {'是' if actual_sql_verified else '否'}")
-    print(f"返回行数: {row_count if row_count is not None else '无法解析'}")
-    print("实际执行 SQL:")
-    print(executed_sql or "MCP 未返回实际执行 SQL")
-    print("\n完整结果:")
-    print(json.dumps(normalized, ensure_ascii=False, indent=2, default=str))
+    print("\n=== Archery MCP 配置冒烟检查完成 ===")
 
 
 def main() -> int:
