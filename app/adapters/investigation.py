@@ -30,6 +30,11 @@ _TRUNCATION_CONTROL_KEYS = (
     "root_cause_eligible",
     "root_cause_ineligible_reason",
     "call_limit_reached",
+    "partial",
+    "termination_reason",
+    "termination_error_type",
+    "mcp_session_attempts",
+    "reconnect_error_type",
 )
 
 
@@ -152,6 +157,11 @@ class ToolExecutor:
                 for key in _TRUNCATION_CONTROL_KEYS
                 if key in safe_data
             )
+
+        if preserved.get("root_cause_eligible") is True:
+            preserved["eligible_before_truncation"] = True
+        preserved["root_cause_eligible"] = False
+        preserved["root_cause_ineligible_reason"] = "evidence_payload_truncated"
 
         preserved["original_char_count"] = len(serialized)
         preview_container = {**preserved, "truncated_preview": ""}

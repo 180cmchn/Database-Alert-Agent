@@ -10,7 +10,8 @@
       "url": "${PROMETHEUS_MCP_SSE_URL}",
       "headers": {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
-      }
+      },
+      "toolPolicies": {}
     }
   }
 }

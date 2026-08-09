@@ -515,6 +515,7 @@ class OpenAICompatibleAdvisor:
                 messages=messages,
                 tools=tools,
                 tool_choice="required",
+                parallel_tool_calls=False,
                 temperature=0,
                 max_tokens=self._max_tokens,
             )

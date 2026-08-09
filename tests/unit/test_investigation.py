@@ -74,6 +74,11 @@ class LargeControlledTool:
             "query_completed": True,
             "root_cause_eligible": True,
             "root_cause_ineligible_reason": "",
+            "partial": True,
+            "termination_reason": "sse_error_after_partial_result",
+            "termination_error_type": "ConnectionError",
+            "mcp_session_attempts": 2,
+            "reconnect_error_type": "PrometheusMCPProtocolError",
             "result": {"sample": "x" * 3000},
         }
 
@@ -133,11 +138,26 @@ async def test_tool_executor_preserves_decision_fields_when_result_is_truncated(
 
     assert record.truncated is True
     assert record.structured_data["query_completed"] is True
-    assert record.structured_data["root_cause_eligible"] is True
-    assert record.structured_data["root_cause_ineligible_reason"] == ""
+    assert record.structured_data["root_cause_eligible"] is False
+    assert (
+        record.structured_data["root_cause_ineligible_reason"]
+        == "evidence_payload_truncated"
+    )
+    assert record.structured_data["eligible_before_truncation"] is True
+    assert record.structured_data["partial"] is True
+    assert (
+        record.structured_data["termination_reason"]
+        == "sse_error_after_partial_result"
+    )
+    assert record.structured_data["termination_error_type"] == "ConnectionError"
+    assert record.structured_data["mcp_session_attempts"] == 2
+    assert (
+        record.structured_data["reconnect_error_type"]
+        == "PrometheusMCPProtocolError"
+    )
     assert "instance_identity_verification" not in record.structured_data
     assert "analysis_usable" not in record.structured_data
-    assert record.is_root_cause_support_eligible() is True
+    assert record.is_root_cause_support_eligible() is False
 
 
 @pytest.mark.asyncio
@@ -153,7 +173,11 @@ async def test_truncated_evidence_without_explicit_eligibility_fails_closed() ->
     )
 
     assert record.truncated is True
-    assert "root_cause_eligible" not in record.structured_data
+    assert record.structured_data["root_cause_eligible"] is False
+    assert (
+        record.structured_data["root_cause_ineligible_reason"]
+        == "evidence_payload_truncated"
+    )
     assert record.is_root_cause_support_eligible() is False
 
 

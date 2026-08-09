@@ -9,14 +9,21 @@ from uuid import uuid4
 import pytest
 
 import app.adapters.prometheus_mcp as prometheus_module
+import app.application.factory as factory_module
 from app.adapters.investigation import DefaultInvestigationStrategyProvider
 from app.adapters.prometheus_mcp import (
+    PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS,
     PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS,
     PROMETHEUS_METRICS_TOOL_NAME,
     PrometheusMCPClient,
+    PrometheusMCPConfigurationError,
     PrometheusMCPEvidenceTool,
+    PrometheusMCPModelError,
+    PrometheusMCPProtocolError,
     PrometheusMCPQueryResult,
     PrometheusMCPServerSettings,
+    PrometheusMCPToolError,
+    PrometheusMCPToolPolicy,
     load_prometheus_mcp_server_settings,
 )
 from app.config import RUNTIME_SETTINGS_KEYS, Settings
@@ -31,6 +38,25 @@ from app.domain.models import (
 from app.domain.tool_calling import MCPModelToolCall
 
 ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+_FAKE_RANGE_POLICY = PrometheusMCPToolPolicy(
+    name="arbitrary_monitoring_tool",
+    capability="range_query",
+    start_argument_path=("start",),
+    end_argument_path=("end",),
+    timestamp_encoding="rfc3339",
+)
+
+
+def _server_settings(
+    *,
+    headers: dict[str, str] | None = None,
+    tool_policies: tuple[PrometheusMCPToolPolicy, ...] = (_FAKE_RANGE_POLICY,),
+) -> PrometheusMCPServerSettings:
+    return PrometheusMCPServerSettings(
+        url="https://prometheus.example.test/sse",
+        headers=headers or {},
+        tool_policies=tool_policies,
+    )
 
 
 def _context() -> InvestigationContext:
@@ -68,6 +94,15 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
                                 "${PROMETHEUS_MCP_API_KEY}"
                             )
                         },
+                        "toolPolicies": {
+                            "query_range": {
+                                "capability": "range_query",
+                                "startArgument": "start",
+                                "endArgument": "end",
+                                "timestampEncoding": "rfc3339",
+                                "fixedArguments": {"operation": "query"},
+                            }
+                        },
                     }
                 }
             }
@@ -86,6 +121,16 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
 
     assert resolved.url == "https://prometheus.example.test/sse"
     assert resolved.headers == {"X-API-Key": "test-prometheus-secret"}
+    assert resolved.tool_policies == (
+        PrometheusMCPToolPolicy(
+            name="query_range",
+            capability="range_query",
+            start_argument_path=("start",),
+            end_argument_path=("end",),
+            timestamp_encoding="rfc3339",
+            fixed_arguments={"operation": "query"},
+        ),
+    )
     assert "test-prometheus-secret" not in settings_path.read_text(encoding="utf-8")
 
 
@@ -156,6 +201,105 @@ def test_prometheus_mcp_is_enabled_without_an_api_key() -> None:
     )
 
 
+def test_prometheus_mcp_rejects_business_error_with_successful_protocol_envelope() -> None:
+    raw_result = type(
+        "ToolResult",
+        (),
+        {
+            "model_dump": lambda _self, **_: {
+                "isError": False,
+                "structuredContent": {
+                    "status": "failed",
+                    "message": "invalid PromQL range",
+                },
+            }
+        },
+    )()
+
+    with pytest.raises(PrometheusMCPToolError, match="invalid PromQL range"):
+        PrometheusMCPClient._result_payload(raw_result)
+
+
+def test_prometheus_mcp_rejects_json_business_error_in_text_content() -> None:
+    raw_result = type(
+        "ToolResult",
+        (),
+        {
+            "model_dump": lambda _self, **_: {
+                "isError": False,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "status": "error",
+                                "message": "temporary backend failure",
+                            }
+                        ),
+                    }
+                ],
+            }
+        },
+    )()
+
+    with pytest.raises(PrometheusMCPToolError, match="temporary backend failure"):
+        PrometheusMCPClient._result_payload(raw_result)
+
+
+def test_prometheus_mcp_range_contract_uses_timestamps_only_to_reject_mismatch() -> None:
+    in_window = {
+        "data": {
+            "result": [
+                {
+                    "metric": {"job": "mysql"},
+                    "values": [[1786067700, "1"], [1786068000, "2"]],
+                }
+            ]
+        }
+    }
+    out_of_window = {
+        "data": {
+            "result": [
+                {
+                    "metric": {"job": "mysql"},
+                    "values": [[1786067640, "1"], [1786068000, "2"]],
+                }
+            ]
+        }
+    }
+
+    assert (
+        PrometheusMCPClient._window_verification(
+            policy=_FAKE_RANGE_POLICY,
+            payload=in_window,
+            window_start=datetime(2026, 8, 7, 1, 55, tzinfo=UTC),
+            window_end=ALERT_TIME,
+        )
+        == "exact"
+    )
+    assert (
+        PrometheusMCPClient._window_verification(
+            policy=_FAKE_RANGE_POLICY,
+            payload=out_of_window,
+            window_start=datetime(2026, 8, 7, 1, 55, tzinfo=UTC),
+            window_end=ALERT_TIME,
+        )
+        == "mismatch"
+    )
+    assert (
+        PrometheusMCPClient._window_verification(
+            policy=PrometheusMCPToolPolicy(
+                name="instant_query",
+                capability="catalog",
+            ),
+            payload=in_window,
+            window_start=datetime(2026, 8, 7, 1, 55, tzinfo=UTC),
+            window_end=ALERT_TIME,
+        )
+        == "unknown"
+    )
+
+
 class _AsyncContext:
     def __init__(self, value: Any) -> None:
         self.value = value
@@ -173,7 +317,14 @@ class _FakeTool:
         return {
             "name": "arbitrary_monitoring_tool",
             "description": "Server-defined monitoring query",
-            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                },
+            },
         }
 
 
@@ -202,15 +353,32 @@ class _FakeSession:
         return type("ToolResult", (), {"model_dump": lambda _self, **_: self.result})()
 
 
+class _SequencedSession(_FakeSession):
+    results: list[dict[str, Any] | Exception] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        index = len(self.calls)
+        self.calls.append((name, arguments))
+        result = self.results[index]
+        if isinstance(result, Exception):
+            raise result
+        return type("ToolResult", (), {"model_dump": lambda _self, **_: result})()
+
+
 class _SequenceModel:
-    def __init__(self, names: list[str]) -> None:
+    def __init__(
+        self,
+        names: list[str],
+        arguments: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.names = names
+        self.arguments = arguments
         self.messages: list[list[dict[str, Any]]] = []
 
     async def request_mcp_tool_call(
         self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> MCPModelToolCall:
-        self.messages.append(messages)
+        self.messages.append(json.loads(json.dumps(messages, ensure_ascii=False)))
         index = len(self.messages) - 1
         available = {item["function"]["name"] for item in tools}
         name = self.names[index]
@@ -218,13 +386,91 @@ class _SequenceModel:
         return MCPModelToolCall(
             call_id=f"call-{index}",
             name=name,
-            arguments={"query": "up"},
+            arguments=(
+                self.arguments[index]
+                if self.arguments is not None
+                else {
+                    "query": "up",
+                    "start": "2026-08-07T01:55:00+00:00",
+                    "end": "2026-08-07T02:00:00+00:00",
+                }
+            ),
             request_id=f"request-{index}",
         )
 
 
+def test_prometheus_local_policy_rejects_unknown_and_destructive_tools() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "start": {"type": "string"},
+            "end": {"type": "string"},
+        },
+    }
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(["arbitrary_monitoring_tool"]),
+    )
+
+    with pytest.raises(PrometheusMCPConfigurationError, match="at least one"):
+        PrometheusMCPClient(
+            _server_settings(tool_policies=()),
+            _SequenceModel(["arbitrary_monitoring_tool"]),
+        )
+
+    with pytest.raises(PrometheusMCPConfigurationError, match="no tool authorized"):
+        client._authorized_model_tools(
+            [
+                {
+                    "name": "arbitrary_monitoring_tool",
+                    "inputSchema": schema,
+                    "annotations": {"destructiveHint": True, "readOnlyHint": True},
+                }
+            ]
+        )
+
+
 @pytest.mark.asyncio
-async def test_prometheus_client_allows_server_defined_tools_and_preserves_data_at_budget(
+async def test_prometheus_model_cannot_call_tool_outside_local_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnauthorizedModel:
+        async def request_mcp_tool_call(
+            self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        ) -> MCPModelToolCall:
+            del messages, tools
+            return MCPModelToolCall(
+                call_id=f"unauthorized-{uuid4()}",
+                name="delete_prometheus_data",
+                arguments={"confirm": True},
+            )
+
+    _FakeSession.calls = []
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        UnauthorizedModel(),
+        max_agent_steps=2,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert _FakeSession.calls == []
+    assert result.has_monitoring_data is False
+    assert result.termination_reason == "decision_limit_reached"
+    assert {item["outcome"] for item in result.tool_attempts} == {
+        "host_rejected_unauthorized"
+    }
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_deduplicates_successful_calls_without_remote_roundtrip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeSession.calls = []
@@ -237,28 +483,508 @@ async def test_prometheus_client_allows_server_defined_tools_and_preserves_data_
 
     monkeypatch.setattr(prometheus_module, "sse_client", fake_sse_client)
     monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
-    model = _SequenceModel(["arbitrary_monitoring_tool", "arbitrary_monitoring_tool"])
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ]
+    )
     client = PrometheusMCPClient(
-        PrometheusMCPServerSettings(
-            url="https://prometheus.example.test/sse", headers={"X-API-Key": "test-secret"}
-        ),
+        _server_settings(headers={"X-API-Key": "test-secret"}),
         model,
         max_agent_steps=2,
+        sse_read_timeout_seconds=654,
     )
 
     result = await client.collect_alert_window(_context())
 
     assert captured_sse["headers"] == {"X-API-Key": "test-secret"}
+    assert captured_sse["sse_read_timeout"] == 654
     assert _FakeSession.calls == [
-        ("arbitrary_monitoring_tool", {"query": "up"}),
-        ("arbitrary_monitoring_tool", {"query": "up"}),
+        (
+            "arbitrary_monitoring_tool",
+            {
+                "query": "up",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+        ),
     ]
-    assert result.call_limit_reached is True
+    assert result.model_tool_calls == ("arbitrary_monitoring_tool",)
+    assert len(result.responses) == 1
+    assert result.call_limit_reached is False
+    assert result.finished_by_model is True
     assert result.has_monitoring_data is True
     assert result.window_end == ALERT_TIME
     assert result.window_start.isoformat() == "2026-08-07T01:55:00+00:00"
     first_request = json.loads(model.messages[0][1]["content"])
     assert first_request["required_window"]["duration_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_binds_policy_window_before_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        {"structuredContent": {"series": [{"value": 41}]}},
+        {"structuredContent": {"series": [{"value": 42}]}},
+    ]
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ],
+        arguments=[
+            {"query": "up"},
+            {
+                "query": "up",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            {},
+        ],
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert _SequencedSession.calls == [
+        (
+            "arbitrary_monitoring_tool",
+            {
+                "query": "up",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+        )
+    ]
+    assert result.responses[0]["model_arguments"] == {"query": "up"}
+    assert result.responses[0]["window_verification"] == "exact"
+    assert result.has_monitoring_data is True
+    assert result.tool_attempts[1]["outcome"] == "host_rejected_duplicate"
+
+
+def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "prometheus": {
+                        "url": "${PROMETHEUS_MCP_SSE_URL}",
+                        "headers": {},
+                        "toolPolicies": {
+                            "arbitrary_monitoring_tool": {
+                                "capability": "range_query",
+                                "startArgument": "start",
+                                "endArgument": "end",
+                                "timestampEncoding": "rfc3339",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=None,
+        ai_provider="openai_compatible",
+        ai_api_key="test-key",
+        ai_model="test-model",
+        mcp_settings_path=settings_path,
+        prometheus_mcp_sse_url="https://prometheus.example.test/sse",
+        prometheus_mcp_tool_timeout_seconds=777,
+    )
+
+    tool = factory_module._build_prometheus_mcp_tool(
+        settings,
+        _SequenceModel(["arbitrary_monitoring_tool"]),  # type: ignore[arg-type]
+    )
+
+    assert tool is not None
+    assert tool.client.sse_read_timeout_seconds == 777
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_rejects_finish_until_a_usable_response_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSession.calls = []
+    _FakeSession.result = {"structuredContent": {"series": [{"value": 42}]}}
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    model = _SequenceModel(
+        [
+            "finish_prometheus_investigation",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ]
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert _FakeSession.calls == [
+        (
+            "arbitrary_monitoring_tool",
+            {
+                "query": "up",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+        )
+    ]
+    assert result.finished_by_model is True
+    assert result.termination_reason == "finished_by_model"
+    rejected_feedback = json.loads(model.messages[1][-1]["content"])
+    assert rejected_feedback["monitoring_result"]["host_rejected_finish"] is True
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_retries_model_selection_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlakyModel:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.messages: list[list[dict[str, Any]]] = []
+
+        async def request_mcp_tool_call(
+            self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        ) -> MCPModelToolCall:
+            self.attempts += 1
+            self.messages.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+            if self.attempts == 1:
+                raise RuntimeError("temporary model failure")
+            return MCPModelToolCall(
+                call_id="call-after-retry",
+                name="arbitrary_monitoring_tool",
+                arguments={
+                    "query": "up",
+                    "start": "2026-08-07T01:55:00+00:00",
+                    "end": "2026-08-07T02:00:00+00:00",
+                },
+            )
+
+    _FakeSession.calls = []
+    _FakeSession.result = {"structuredContent": {"series": [{"value": 42}]}}
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    model = FlakyModel()
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=1,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert model.attempts == 2
+    repair = json.loads(model.messages[1][-1]["content"])
+    assert repair["host_event"] == "model_tool_selection_retry"
+    assert repair["previous_error_type"] == "RuntimeError"
+    assert result.has_monitoring_data is True
+    assert _FakeSession.calls == [
+        (
+            "arbitrary_monitoring_tool",
+            {
+                "query": "up",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_bounds_repeated_premature_finish_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSession.calls = []
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(
+            [
+                "finish_prometheus_investigation",
+                "finish_prometheus_investigation",
+                "finish_prometheus_investigation",
+                "finish_prometheus_investigation",
+            ]
+        ),
+        max_agent_steps=2,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert _FakeSession.calls == []
+    assert result.has_monitoring_data is False
+    assert result.finished_by_model is False
+    assert result.call_limit_reached is False
+    assert result.termination_reason == "decision_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_returns_standard_mcp_error_text_to_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        {
+            "isError": True,
+            "content": [{"type": "text", "text": "invalid range selector"}],
+        },
+        {"structuredContent": {"series": [{"value": 7}]}},
+    ]
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ]
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert len(_SequencedSession.calls) == 2
+    assert len(result.responses) == 1
+    assert [item["outcome"] for item in result.tool_attempts] == [
+        "tool_error",
+        "observation",
+    ]
+    error_feedback = json.loads(model.messages[1][-1]["content"])
+    assert error_feedback["monitoring_result"]["tool_error"] == "PrometheusMCPToolError"
+    assert "invalid range selector" in error_feedback["monitoring_result"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_prometheus_evidence_reconnects_after_first_session_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        ConnectionError("stream closed"),
+        {"structuredContent": {"series": [{"value": 7}]}},
+    ]
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ]
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(client).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _context(),
+    )
+
+    assert len(_SequencedSession.calls) == 2
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.structured_data["mcp_session_attempts"] == 2
+    assert (
+        evidence.structured_data["reconnect_error_type"]
+        == PrometheusMCPProtocolError.__name__
+    )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_reconnects_when_only_catalog_precedes_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        {"structuredContent": {"metrics": ["mysql_up"]}},
+        ConnectionError("stream closed"),
+        {"structuredContent": {"series": [{"value": 7}]}},
+    ]
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ],
+        arguments=[
+            {"operation": "list"},
+            {"query": "up", "attempt": 1},
+            {
+                "query": "up",
+                "attempt": 2,
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            {},
+        ],
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(client).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _context(),
+    )
+
+    assert len(_SequencedSession.calls) == 3
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.structured_data["mcp_session_attempts"] == 2
+    assert len(evidence.structured_data["monitoring_results"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_evidence_does_not_reconnect_for_model_failure() -> None:
+    class ModelFailingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def collect_alert_window(
+            self, context: InvestigationContext
+        ) -> PrometheusMCPQueryResult:
+            del context
+            self.calls += 1
+            raise PrometheusMCPModelError("model unavailable")
+
+    client = ModelFailingClient()
+    tool = PrometheusMCPEvidenceTool(client)  # type: ignore[arg-type]
+
+    with pytest.raises(PrometheusMCPModelError, match="model unavailable"):
+        await tool.execute(
+            ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+            _context(),
+        )
+
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_preserves_response_after_later_model_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSession.calls = []
+    _FakeSession.result = {"structuredContent": {"series": [{"value": 42}]}}
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(["arbitrary_monitoring_tool"]),
+        max_agent_steps=2,
+    )
+
+    result = await client.collect_alert_window(_context())
+    evidence = await PrometheusMCPEvidenceTool(
+        _RecordingPrometheusClient(result)
+    ).execute(ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME), _context())
+
+    assert len(result.responses) == 1
+    assert result.partial is True
+    assert result.termination_reason == "model_error_after_partial_result"
+    assert result.termination_error_type == "PrometheusMCPModelError"
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.structured_data["partial"] is True
+    assert (
+        evidence.structured_data["termination_reason"]
+        == "model_error_after_partial_result"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_client_preserves_response_when_sse_exit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingSSEContext(_AsyncContext):
+        async def __aexit__(self, *args: Any) -> None:
+            raise ExceptionGroup("SSE reader failed", [ConnectionError("stream closed")])
+
+    _FakeSession.calls = []
+    _FakeSession.result = {"structuredContent": {"series": [{"value": 42}]}}
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: FailingSSEContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"]
+        ),
+        max_agent_steps=2,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert len(result.responses) == 1
+    assert result.partial is True
+    assert result.termination_reason == "sse_error_after_partial_result"
+    assert result.termination_error_type == "ConnectionError"
 
 
 @pytest.mark.asyncio
@@ -274,23 +1000,73 @@ async def test_prometheus_client_bounds_only_the_model_view_of_a_large_result(
         lambda *_args, **_kwargs: _AsyncContext((object(), object())),
     )
     monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
-    model = _SequenceModel(["arbitrary_monitoring_tool", "finish_prometheus_investigation"])
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+            "finish_prometheus_investigation",
+            "finish_prometheus_investigation",
+        ]
+    )
     client = PrometheusMCPClient(
-        PrometheusMCPServerSettings(url="https://prometheus.example.test/sse", headers={}),
+        _server_settings(),
         model,
         max_agent_steps=2,
     )
 
     result = await client.collect_alert_window(_context())
 
-    # The evidence remains complete, while the follow-up model turn receives a
-    # bounded generic preview rather than a server-specific filtered payload.
-    assert len(result.responses[0]["result"]["metrics"]) == 2_000
+    # Both accumulated evidence and the smaller follow-up model view are bounded
+    # independently before another large response can amplify memory use.
+    evidence_result = result.responses[0]["result"]
+    assert evidence_result["result_truncated_for_evidence"] is True
+    assert len(evidence_result["preview"]) == PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS
     model_result = json.loads(model.messages[1][-1]["content"])["monitoring_result"]
     assert model_result["result_truncated_for_model"] is True
     assert model_result["original_char_count"] > PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS
     assert len(model_result["preview"]) == PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS
     assert "不得重复同一工具" in model.messages[0][0]["content"]
+    assert result.has_monitoring_data is False
+    assert result.termination_reason == "decision_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_large_observation_remains_finishable_after_evidence_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSession.calls = []
+    _FakeSession.result = {
+        "structuredContent": {
+            "series": [
+                {
+                    "values": [
+                        [1786067700, "1"],
+                        [1786068000, "x" * 30_000],
+                    ]
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(
+        prometheus_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"]
+        ),
+        max_agent_steps=2,
+    )
+
+    result = await client.collect_alert_window(_context())
+
+    assert result.finished_by_model is True
+    assert result.has_monitoring_data is True
+    assert result.responses[0]["window_verification"] == "exact"
+    assert result.responses[0]["result"]["result_truncated_for_evidence"] is True
 
 
 class _RecordingPrometheusClient:
@@ -317,8 +1093,15 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
     request = ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME)
     usable_tool = PrometheusMCPEvidenceTool(
         _RecordingPrometheusClient(
-            PrometheusMCPQueryResult(
-                responses=({"tool_name": "query", "result": {"value": 1}},),
+                PrometheusMCPQueryResult(
+                    responses=(
+                        {
+                            "tool_name": "query",
+                            "has_monitoring_observation": True,
+                            "window_verification": "exact",
+                            "result": {"value": 1},
+                        },
+                    ),
                 **base,
             )
         )  # type: ignore[arg-type]
@@ -337,6 +1120,44 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
     assert empty.status == ToolStatus.NO_DATA
     assert empty.structured_data["root_cause_eligible"] is False
     assert empty.summary == "Prometheus MCP 调用次数达到上限，实时证据不足。"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_catalog_and_empty_series_are_not_root_cause_evidence() -> None:
+    base = {
+        "window_start": ALERT_TIME.replace(minute=55),
+        "window_end": ALERT_TIME,
+        "model_tool_calls": ("list_metrics", "query_range"),
+        "model_request_ids": (),
+        "call_limit_reached": False,
+        "finished_by_model": False,
+        "termination_reason": "decision_limit_reached",
+    }
+    result = PrometheusMCPQueryResult(
+        responses=(
+            {"tool_name": "list_metrics", "result": {"metrics": ["mysql_up"]}},
+            {
+                "tool_name": "list_metrics_alternate",
+                "result": {"data": ["mysql_up", "mysql_threads_running"]},
+            },
+            {
+                "tool_name": "query_range",
+                "result": {"series": [{"metric": {"job": "mysql"}, "values": []}]},
+            },
+        ),
+        **base,
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(
+        _RecordingPrometheusClient(result)
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _context(),
+    )
+
+    assert result.has_monitoring_data is False
+    assert evidence.status == ToolStatus.NO_DATA
+    assert evidence.structured_data["root_cause_eligible"] is False
 
 
 @pytest.mark.asyncio

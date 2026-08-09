@@ -178,6 +178,7 @@ def _build_prometheus_mcp_tool(
             },
             max_agent_steps=settings.prometheus_mcp_max_agent_steps,
             timeout_seconds=settings.prometheus_mcp_timeout_seconds,
+            sse_read_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
         )
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -526,11 +527,17 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
             "progress": [progress],
         }
 
-    # Check for duplicate tool calls
-    seen_requests = {(e.tool_name, str(sorted(e.request.items()))) for e in evidence}
-    request_key = (decision.tool_name, str(sorted(decision.parameters.items())))
+    # Successful evidence is reusable within a run. Failed or empty attempts may be
+    # retried while the bounded dynamic-turn budget remains.
+    seen_successful_requests = {
+        _tool_request_fingerprint(e.tool_name, e.request)
+        for e in evidence
+        if e.status == ToolStatus.SUCCESS
+        and e.structured_data.get("partial") is not True
+    }
+    request_key = _tool_request_fingerprint(decision.tool_name, decision.parameters)
     safe_tool_name = str(sanitize(decision.tool_name))[:128]
-    if request_key in seen_requests:
+    if request_key in seen_successful_requests:
         progress = await _record_react_outcome(
             ctx,
             alert_id=state.alert_id,
@@ -549,11 +556,40 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
             "progress": [progress],
         }
 
-    # Queue the new tool request
+    # Reuse the strategy's per-tool execution policy. Prefer an exact request
+    # template when a strategy contains more than one call to the same tool.
+    request_template = next(
+        (
+            request
+            for request in strategy.tool_plan
+            if _tool_request_fingerprint(request.tool_name, request.parameters)
+            == request_key
+        ),
+        None,
+    )
+    if request_template is None:
+        request_template = next(
+            (
+                request
+                for request in strategy.tool_plan
+                if request.tool_name == decision.tool_name
+            ),
+            None,
+        )
+
+    request_policy: dict[str, Any] = {}
+    if request_template is not None:
+        request_policy = {
+            "timeout_seconds": request_template.timeout_seconds,
+            "required": request_template.required,
+        }
+
+    # Queue the new tool request. Tools absent from the deterministic strategy use
+    # the domain model's defaults rather than a node-specific timeout.
     new_request = ToolExecutionRequest(
         tool_name=decision.tool_name,
         parameters=decision.parameters,
-        timeout_seconds=10,
+        **request_policy,
     )
     remaining_after_selection = dynamic_turns_remaining - 1
     progress = await _record_react_outcome(
@@ -576,6 +612,21 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
         "should_continue_investigation": True,
         "progress": [progress],
     }
+
+
+def _tool_request_fingerprint(
+    tool_name: str, parameters: dict[str, Any]
+) -> tuple[str, str]:
+    """Return a stable, sanitized identity for one logical tool request."""
+
+    canonical_parameters = json.dumps(
+        sanitize(parameters),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return tool_name, canonical_parameters
 
 
 async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:

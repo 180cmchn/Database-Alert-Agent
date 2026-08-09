@@ -13,6 +13,7 @@ from app.domain.models import (
     InvestigationDecision,
     InvestigationStrategy,
     ToolExecutionRequest,
+    ToolStatus,
 )
 
 
@@ -149,6 +150,140 @@ class RecordingDynamicTool:
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         self.calls.append(request.parameters)
         return "Found matching database timeout logs.", {"matches": 3}
+
+
+class RetryFailedRequestAdvisor(FakeAIAdvisor):
+    async def choose_next_tool(  # type: ignore[no-untyped-def]
+        self, context, evidence, available_tools
+    ):
+        return InvestigationDecision(
+            action="tool",
+            tool_name="retryable_mcp_probe",
+            parameters={"filters": {"service": "orders", "environment": "test"}},
+            reason="Retry the transiently failed read-only probe",
+        )
+
+
+class RetryPartialRequestAdvisor(FakeAIAdvisor):
+    async def choose_next_tool(  # type: ignore[no-untyped-def]
+        self, context, evidence, available_tools
+    ):
+        return InvestigationDecision(
+            action="tool",
+            tool_name="partial_mcp_probe",
+            parameters={"query": "up"},
+            reason="Complete the partial MCP investigation in a fresh session",
+        )
+
+
+class FollowupMCPAdvisor(FakeAIAdvisor):
+    async def choose_next_tool(  # type: ignore[no-untyped-def]
+        self, context, evidence, available_tools
+    ):
+        return InvestigationDecision(
+            action="tool",
+            tool_name="mcp_style_probe",
+            parameters={"phase": "followup"},
+            reason="Collect a second MCP evidence sample",
+        )
+
+
+class FlakyRetryableMCPTool:
+    name = "retryable_mcp_probe"
+    source_system = "test_mcp"
+
+    def __init__(self) -> None:
+        self.calls: list[ToolExecutionRequest] = []
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        self.calls.append(request)
+        if len(self.calls) == 1:
+            raise RuntimeError("transient MCP transport failure")
+        return "MCP retry returned evidence.", {"matches": 1}
+
+
+class PartialRetryableMCPTool:
+    name = "partial_mcp_probe"
+    source_system = "test_mcp"
+
+    def __init__(self) -> None:
+        self.calls: list[ToolExecutionRequest] = []
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        self.calls.append(request)
+        if len(self.calls) == 1:
+            return "Partial MCP evidence.", {
+                "matches": 1,
+                "partial": True,
+                "termination_reason": "sse_error_after_partial_result",
+            }
+        return "Complete MCP evidence.", {"matches": 2, "partial": False}
+
+
+class RecordingMCPStyleTool:
+    name = "mcp_style_probe"
+    source_system = "test_mcp"
+
+    def __init__(self) -> None:
+        self.calls: list[ToolExecutionRequest] = []
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        self.calls.append(request)
+        return "MCP evidence collected.", {"phase": request.parameters["phase"]}
+
+
+class RetryableMCPStrategy:
+    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+        return InvestigationStrategy(
+            strategy_id="retryable-mcp-strategy",
+            title="Retryable MCP strategy",
+            description="Retry one transiently failed MCP request.",
+            tool_plan=[
+                ToolExecutionRequest(
+                    tool_name="retryable_mcp_probe",
+                    parameters={
+                        "filters": {"environment": "test", "service": "orders"}
+                    },
+                    timeout_seconds=240,
+                )
+            ],
+            max_dynamic_turns=1,
+        )
+
+
+class PartialMCPStrategy:
+    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+        return InvestigationStrategy(
+            strategy_id="partial-mcp-strategy",
+            title="Partial MCP strategy",
+            description="Retry one incomplete MCP result.",
+            tool_plan=[
+                ToolExecutionRequest(
+                    tool_name="partial_mcp_probe",
+                    parameters={"query": "up"},
+                    timeout_seconds=240,
+                )
+            ],
+            max_dynamic_turns=1,
+        )
+
+
+class LongTimeoutMCPStrategy:
+    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+        return InvestigationStrategy(
+            strategy_id="long-timeout-mcp-strategy",
+            title="Long timeout MCP strategy",
+            description="Use the MCP host's bounded multi-step timeout.",
+            tool_plan=[
+                ToolExecutionRequest(
+                    tool_name="mcp_style_probe",
+                    parameters={"phase": "initial"},
+                    timeout_seconds=240,
+                    required=True,
+                )
+            ],
+            max_dynamic_turns=1,
+        )
 
 
 class RequiredToolStrategy:
@@ -406,6 +541,117 @@ async def test_dynamic_investigation_executes_selected_tool_and_preserves_strate
     }
     assert react_progress[1].details["reason"] == "Evidence is sufficient"
     assert all(item.sequence > 0 for item in react_progress)
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_investigation_retries_same_request_after_failure(
+    tmp_path: Path,
+) -> None:
+    tool = FlakyRetryableMCPTool()
+    runtime = build_runtime(
+        settings_for(tmp_path).model_copy(
+            update={"react_enabled": True, "react_max_dynamic_turns": 1}
+        ),
+        advisor=RetryFailedRequestAdvisor(),
+        strategy_provider=RetryableMCPStrategy(),
+        tool_registry=InvestigationToolRegistry([tool]),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "dynamic-investigation-retry-failure",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    assert len(tool.calls) == 2
+    assert [item.status for item in result.evidence_records] == [
+        ToolStatus.FAILED,
+        ToolStatus.SUCCESS,
+    ]
+    assert tool.calls[1].timeout_seconds == 240
+    react_progress = [
+        item
+        for item in result.progress
+        if item.details.get("event") == "react_decision"
+    ]
+    assert [item.details["outcome"] for item in react_progress] == ["tool_selected"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_investigation_retries_same_request_after_partial_success(
+    tmp_path: Path,
+) -> None:
+    tool = PartialRetryableMCPTool()
+    runtime = build_runtime(
+        settings_for(tmp_path).model_copy(
+            update={"react_enabled": True, "react_max_dynamic_turns": 1}
+        ),
+        advisor=RetryPartialRequestAdvisor(),
+        strategy_provider=PartialMCPStrategy(),
+        tool_registry=InvestigationToolRegistry([tool]),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "dynamic-investigation-retry-partial",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    assert len(tool.calls) == 2
+    assert [item.status for item in result.evidence_records] == [
+        ToolStatus.SUCCESS,
+        ToolStatus.SUCCESS,
+    ]
+    assert [item.structured_data["partial"] for item in result.evidence_records] == [
+        True,
+        False,
+    ]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_mcp_request_inherits_strategy_timeout_and_required(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingMCPStyleTool()
+    runtime = build_runtime(
+        settings_for(tmp_path).model_copy(
+            update={"react_enabled": True, "react_max_dynamic_turns": 1}
+        ),
+        advisor=FollowupMCPAdvisor(),
+        strategy_provider=LongTimeoutMCPStrategy(),
+        tool_registry=InvestigationToolRegistry([tool]),
+    )
+    await runtime.repository.initialize()
+
+    await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "dynamic-investigation-mcp-timeout",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    assert [item.parameters for item in tool.calls] == [
+        {"phase": "initial"},
+        {"phase": "followup"},
+    ]
+    assert [item.timeout_seconds for item in tool.calls] == [240, 240]
+    assert [item.required for item in tool.calls] == [True, True]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

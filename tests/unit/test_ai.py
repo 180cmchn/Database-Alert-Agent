@@ -671,6 +671,7 @@ async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
     assert result.request_id == "model-tool-request-1"
     assert calls[0]["tools"] == tools
     assert calls[0]["tool_choice"] == "required"
+    assert calls[0]["parallel_tool_calls"] is False
     assert "response_format" not in calls[0]
 
 
