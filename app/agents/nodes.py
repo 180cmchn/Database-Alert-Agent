@@ -12,6 +12,7 @@ from app.adapters.external_knowledge import (
     format_items_for_advisor,
 )
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.agent_runtime.outer_dispatch import DurableOuterToolDispatcher
 from app.agents.state import AgentState
 from app.application.sanitization import sanitize
 from app.application.validation import enforce_post_evidence_root_cause_policy
@@ -22,10 +23,13 @@ from app.domain.models import (
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     InvestigationContext,
+    InvestigationEvidenceAssessment,
     InvestigationRun,
     InvestigationStage,
+    InvestigationStrategy,
     ProgressRecord,
     Recommendation,
+    RootCauseStatus,
     RunbookExcerpt,
     RunStatus,
     ToolExecutionRequest,
@@ -40,6 +44,15 @@ from app.domain.ports import (
     InvestigationStrategyProvider,
     RunbookProvider,
 )
+from app.investigations.models import (
+    EvidenceAssessment,
+    EvidenceRelation,
+    InvestigationMemory,
+    is_terminal_probe_attempt,
+    update_memory,
+)
+from app.investigations.seeding import seed_investigation_memory
+from app.investigations.stop import StopDecision, StopEvaluator, StopReason
 
 logger = logging.getLogger(__name__)
 
@@ -230,9 +243,7 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     ]:
         if not external_enabled:
             missing_client = (
-                "NotConfigured"
-                if "external_knowledge" in state.knowledge_sources
-                else None
+                "NotConfigured" if "external_knowledge" in state.knowledge_sources else None
             )
             return [], 0, missing_client
         try:
@@ -282,28 +293,25 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
             source_summaries.append("本地 PDF 候选未达到匹配阈值，已拒绝匹配")
     if "external_knowledge" in state.knowledge_sources:
         if external_error:
-            source_summaries.append(
-                f"外部知识库查询失败（{external_error}），未作为分析依据"
-            )
+            source_summaries.append(f"外部知识库查询失败（{external_error}），未作为分析依据")
         elif external_knowledge:
-            source_summaries.append(
-                f"外部知识库命中 {len(external_knowledge)} 条"
-            )
+            source_summaries.append(f"外部知识库命中 {len(external_knowledge)} 条")
             if external_rejected_count:
                 source_summaries.append(
                     f"另有 {external_rejected_count} 条低于相关度阈值，已拒绝匹配"
                 )
         else:
-            source_summaries.append(
-                "外部知识库候选未达到相关度阈值，已拒绝匹配"
-            )
+            source_summaries.append("外部知识库候选未达到相关度阈值，已拒绝匹配")
     knowledge_match_summary = "知识匹配结果：" + "；".join(source_summaries) + "。"
     if not runbooks and not external_knowledge:
-        knowledge_match_summary += (
-            "所选知识来源均未命中，Agent 将仅使用告警、实时证据和通用推理。"
-        )
+        knowledge_match_summary += "所选知识来源均未命中，Agent 将仅使用告警、实时证据和通用推理。"
 
-    await ctx.repository.save_runbooks(alert_id, runbooks, run_id=str(run.id))
+    await ctx.repository.save_runbooks(
+        alert_id,
+        runbooks,
+        run_id=str(run.id),
+        **_lease_fence(run),
+    )
 
     if external_knowledge:
         await _update_progress(
@@ -352,10 +360,42 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
         return {"error": "Missing run or alert in strategy selection node"}
 
     strategy = await ctx.strategy_provider.select(alert, runbooks)
-    await ctx.repository.update_run(str(run.id), strategy_id=strategy.strategy_id)
+    await ctx.repository.update_run(
+        str(run.id),
+        strategy_id=strategy.strategy_id,
+        **_lease_fence(run),
+    )
 
-    # Build tool plan from strategy
+    # Build the explicit Host-owned memory before any live tool may run. Hard stop
+    # conditions therefore gate the deterministic plan as well as later ReAct turns.
+    investigation_memory = seed_investigation_memory(
+        alert,
+        runbooks,
+        strategy,
+        available_tools=set(ctx.tool_registry.available_names()),
+    )
+    stop_decision = StopEvaluator().evaluate(investigation_memory)
     pending_requests = list(strategy.tool_plan)
+    if stop_decision.should_stop and stop_decision.reason in {
+        StopReason.TARGET_AMBIGUOUS,
+        StopReason.WINDOW_AMBIGUOUS,
+        StopReason.HUMAN_REQUIRED,
+        StopReason.BUDGET_EXHAUSTED,
+        StopReason.DEADLINE_EXCEEDED,
+    }:
+        pending_requests = []
+    elif pending_requests and stop_decision.reason == StopReason.NO_SAFE_PROBE:
+        # A deterministic baseline plan may collect safe context even when no
+        # causal probe is yet known. It cannot clear UNKNOWN or human review.
+        stop_decision = StopDecision(
+            should_stop=False,
+            reason=StopReason.CONTINUE,
+            requires_human=False,
+            rationale=(
+                "The approved deterministic baseline plan may collect context; "
+                "causal uncertainty remains unresolved."
+            ),
+        )
 
     await _update_progress(
         ctx.repository,
@@ -363,12 +403,17 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
         run,
         InvestigationStage.INVESTIGATING,
         f"执行调查策略 {strategy.strategy_id}。",
-        {"tool_count": len(strategy.tool_plan)},
+        {
+            "tool_count": len(pending_requests),
+            "stop_reason": stop_decision.reason.value,
+        },
     )
 
     return {
         "current_stage": InvestigationStage.INVESTIGATING,
         "strategy": strategy,
+        "investigation_memory": investigation_memory,
+        "stop_decision": stop_decision,
         "pending_tool_requests": pending_requests,
         "dynamic_turns_remaining": strategy.max_dynamic_turns,
         "max_dynamic_turns": strategy.max_dynamic_turns,
@@ -377,7 +422,10 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
                 run_id=run.id,
                 stage=InvestigationStage.INVESTIGATING,
                 message=f"执行调查策略 {strategy.strategy_id}。",
-                details={"tool_count": len(strategy.tool_plan)},
+                details={
+                    "tool_count": len(pending_requests),
+                    "stop_reason": stop_decision.reason.value,
+                },
             )
         ],
     }
@@ -398,31 +446,44 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         return {"error": "Missing run, alert, or strategy in tool execution node"}
 
     new_evidence: list[EvidenceRecord] = []
+    known_evidence_ids = {item.id for item in state.evidence}
+    investigation_memory = state.investigation_memory
 
-    context = InvestigationContext(run_id=run.id, alert=alert, strategy=strategy)
+    context = InvestigationContext(
+        run_id=run.id,
+        alert=alert,
+        strategy=strategy,
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+        investigation_memory=state.investigation_memory.model_dump(mode="json"),
+    )
+    dispatcher = DurableOuterToolDispatcher(ctx.repository, ctx.tool_executor)
 
     for request in pending_requests:
-        try:
-            result = await ctx.tool_executor.execute(request, context)
+        result = await dispatcher.execute(
+            alert_id=alert_id,
+            request=request,
+            context=context,
+            tool_spec=ctx.tool_registry.spec(request.tool_name),
+            prior_evidence=[*state.evidence, *new_evidence],
+        )
+
+        # Local state application and persistence failures are not provider
+        # failures. Let them escape so checkpoint recovery can preserve the real
+        # remote outcome instead of manufacturing a misleading FAILED record.
+        investigation_memory = update_memory(investigation_memory, result)
+        await ctx.repository.save_evidence(
+            alert_id,
+            result,
+            **_lease_fence(run),
+        )
+        if result.id not in known_evidence_ids:
             new_evidence.append(result)
-            await ctx.repository.save_evidence(alert_id, result)
-        except Exception as exc:
-            logger.exception("tool_execution_failed tool=%s", request.tool_name)
-            # Create a failed evidence record
-            failed_evidence = EvidenceRecord(
-                run_id=run.id,
-                tool_name=request.tool_name,
-                source_system="unknown",
-                status=ToolStatus.FAILED,
-                request=request.parameters,
-                summary=f"工具 {request.tool_name} 执行失败。",
-                error=f"{type(exc).__name__}: {sanitize(str(exc))}",
-            )
-            new_evidence.append(failed_evidence)
-            await ctx.repository.save_evidence(alert_id, failed_evidence)
+            known_evidence_ids.add(result.id)
 
     return {
         "evidence": new_evidence,
+        "investigation_memory": investigation_memory,
         "pending_tool_requests": [],  # Clear pending requests after execution
     }
 
@@ -464,7 +525,15 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
     dynamic turns remain, the AI advisor can choose additional tools to run.
     """
     if state.error:
-        return {"should_continue_investigation": False}
+        return {
+            "should_continue_investigation": False,
+            "stop_decision": StopDecision(
+                should_stop=True,
+                reason=StopReason.HUMAN_REQUIRED,
+                requires_human=True,
+                rationale="The investigation already contains an execution error.",
+            ),
+        }
 
     run = state.run
     alert = state.alert
@@ -473,10 +542,43 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
     dynamic_turns_remaining = state.dynamic_turns_remaining
 
     if not run or not alert or not strategy:
-        return {"should_continue_investigation": False}
+        return {
+            "should_continue_investigation": False,
+            "stop_decision": StopDecision(
+                should_stop=True,
+                reason=StopReason.HUMAN_REQUIRED,
+                requires_human=True,
+                rationale="The investigation state is incomplete.",
+            ),
+        }
 
-    if dynamic_turns_remaining <= 0:
-        return {"should_continue_investigation": False}
+    pre_planning_stop = StopEvaluator().evaluate(state.investigation_memory)
+    if pre_planning_stop.should_stop and pre_planning_stop.reason in {
+        StopReason.SUPPORTED_CAUSE,
+        StopReason.TARGET_AMBIGUOUS,
+        StopReason.WINDOW_AMBIGUOUS,
+        StopReason.HUMAN_REQUIRED,
+        StopReason.BUDGET_EXHAUSTED,
+        StopReason.DEADLINE_EXCEEDED,
+    }:
+        return {
+            "investigation_memory": state.investigation_memory,
+            "should_continue_investigation": False,
+            "stop_decision": pre_planning_stop,
+        }
+
+    # A final assessment turn is still required after the last permitted tool
+    # dispatch. A run configured with zero ReAct turns has no such pending turn.
+    assessment_only = dynamic_turns_remaining <= 0 and state.max_dynamic_turns > 0
+    if dynamic_turns_remaining <= 0 and not assessment_only:
+        return {
+            "investigation_memory": state.investigation_memory,
+            "should_continue_investigation": False,
+            "stop_decision": StopEvaluator().evaluate(
+                state.investigation_memory,
+                budget_exhausted=True,
+            ),
+        }
 
     # Ask the AI advisor to choose the next tool
     try:
@@ -485,30 +587,182 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
                 run_id=run.id,
                 alert=alert,
                 strategy=strategy,
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
+                investigation_memory=state.investigation_memory.model_dump(mode="json"),
             ),
             evidence,
-            ctx.tool_registry.available_names(),
+            ctx.tool_registry.available_specs(),
+        )
+        investigation_memory = _apply_planner_assessments(
+            state.investigation_memory,
+            decision.evidence_assessments,
         )
     except Exception as exc:
         logger.warning("dynamic_tool_selection_failed error=%s", type(exc).__name__)
+        if assessment_only:
+            progress = await _record_react_outcome(
+                ctx,
+                alert_id=state.alert_id,
+                run=run,
+                outcome="assessment_error",
+                message="ReAct 最终证据评估失败，已停止追加工具并转人工复核。",
+                turns_remaining=0,
+                evidence_count=len(evidence),
+                details={"error_type": type(exc).__name__},
+            )
+            return {
+                "investigation_memory": state.investigation_memory,
+                "should_continue_investigation": False,
+                "stop_decision": StopDecision(
+                    should_stop=True,
+                    reason=StopReason.HUMAN_REQUIRED,
+                    requires_human=True,
+                    rationale=(
+                        "The final evidence assessment failed after the tool budget was exhausted."
+                    ),
+                ),
+                "progress": [progress],
+            }
+        fallback_request = _next_safe_probe_request(
+            state.investigation_memory,
+            evidence,
+            strategy,
+            ctx.tool_registry,
+        )
+        if fallback_request is not None:
+            remaining_after_selection = dynamic_turns_remaining - 1
+            progress = await _record_react_outcome(
+                ctx,
+                alert_id=state.alert_id,
+                run=run,
+                outcome="planner_fallback_probe",
+                message="ReAct 规划失败，Host 改用最高优先级的已批准只读探针。",
+                turns_remaining=remaining_after_selection,
+                evidence_count=len(evidence),
+                details={
+                    "error_type": type(exc).__name__,
+                    "tool_name": str(sanitize(fallback_request.tool_name))[:128],
+                    "hypothesis_ids": fallback_request.hypothesis_ids,
+                },
+            )
+            return {
+                "investigation_memory": state.investigation_memory,
+                "pending_tool_requests": [fallback_request],
+                "dynamic_turns_remaining": remaining_after_selection,
+                "should_continue_investigation": True,
+                "stop_decision": StopDecision(
+                    should_stop=False,
+                    reason=StopReason.CONTINUE,
+                    requires_human=False,
+                    rationale=("The planner failed, but an approved discriminating probe remains."),
+                ),
+                "progress": [progress],
+            }
         progress = await _record_react_outcome(
             ctx,
             alert_id=state.alert_id,
             run=run,
             outcome="planner_error",
-            message=(
-                "ReAct 动态调查规划失败，已停止追加工具并基于现有证据继续分析。"
-            ),
+            message=("ReAct 动态调查规划失败，已停止追加工具并基于现有证据继续分析。"),
             turns_remaining=dynamic_turns_remaining,
             evidence_count=len(evidence),
             details={"error_type": type(exc).__name__},
         )
         return {
+            "investigation_memory": state.investigation_memory,
             "should_continue_investigation": False,
+            "stop_decision": StopDecision(
+                should_stop=True,
+                reason=StopReason.HUMAN_REQUIRED,
+                requires_human=True,
+                rationale=("The planner failed and no deterministic approved probe was available."),
+            ),
+            "progress": [progress],
+        }
+
+    if assessment_only:
+        if decision.action == "finish" or not decision.tool_name:
+            investigation_memory = InvestigationMemory.model_validate(
+                {
+                    **investigation_memory.model_dump(mode="python"),
+                    "model_finish_requested": True,
+                }
+            )
+        stop_decision = StopEvaluator().evaluate(
+            investigation_memory,
+            budget_exhausted=True,
+        )
+        progress = await _record_react_outcome(
+            ctx,
+            alert_id=state.alert_id,
+            run=run,
+            outcome="final_assessment",
+            message="ReAct 已评估最后一次工具结果，调用预算已结束。",
+            turns_remaining=0,
+            evidence_count=len(evidence),
+            details={
+                "decision_action": decision.action,
+                "stop_reason": stop_decision.reason.value,
+                "supported_hypothesis_ids": stop_decision.supported_hypothesis_ids,
+            },
+        )
+        return {
+            "investigation_memory": investigation_memory,
+            "should_continue_investigation": False,
+            "stop_decision": stop_decision,
             "progress": [progress],
         }
 
     if decision.action == "finish" or not decision.tool_name:
+        investigation_memory = InvestigationMemory.model_validate(
+            {
+                **investigation_memory.model_dump(mode="python"),
+                "model_finish_requested": True,
+            }
+        )
+        stop_decision = StopEvaluator().evaluate(investigation_memory)
+        if not stop_decision.should_stop:
+            fallback_request = _next_safe_probe_request(
+                investigation_memory,
+                evidence,
+                strategy,
+                ctx.tool_registry,
+            )
+            if fallback_request is not None:
+                remaining_after_selection = dynamic_turns_remaining - 1
+                progress = await _record_react_outcome(
+                    ctx,
+                    alert_id=state.alert_id,
+                    run=run,
+                    outcome="finish_overridden",
+                    message="ReAct 的结束请求未通过 Host 停止条件，继续执行已批准只读探针。",
+                    turns_remaining=remaining_after_selection,
+                    evidence_count=len(evidence),
+                    details={
+                        "tool_name": str(sanitize(fallback_request.tool_name))[:128],
+                        "hypothesis_ids": fallback_request.hypothesis_ids,
+                        "reason": str(sanitize(decision.reason))[:500],
+                    },
+                )
+                return {
+                    "investigation_memory": investigation_memory,
+                    "pending_tool_requests": [fallback_request],
+                    "dynamic_turns_remaining": remaining_after_selection,
+                    "should_continue_investigation": True,
+                    "stop_decision": stop_decision,
+                    "progress": [progress],
+                }
+            stop_decision = StopDecision(
+                should_stop=True,
+                reason=StopReason.NO_SAFE_PROBE,
+                requires_human=True,
+                rationale=(
+                    "The model requested finish and every approved probe was already "
+                    "completed or unavailable."
+                ),
+                model_finish_requested=True,
+            )
         progress = await _record_react_outcome(
             ctx,
             alert_id=state.alert_id,
@@ -520,24 +774,58 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
             details={
                 "decision_action": decision.action,
                 "reason": str(sanitize(decision.reason))[:500],
+                "stop_reason": stop_decision.reason.value,
+                "supported_hypothesis_ids": stop_decision.supported_hypothesis_ids,
             },
         )
         return {
+            "investigation_memory": investigation_memory,
             "should_continue_investigation": False,
+            "stop_decision": stop_decision,
             "progress": [progress],
         }
 
-    # Successful evidence is reusable within a run. Failed or empty attempts may be
-    # retried while the bounded dynamic-turn budget remains.
-    seen_successful_requests = {
+    stop_decision = StopEvaluator().evaluate(investigation_memory)
+    if stop_decision.should_stop and stop_decision.reason != StopReason.NO_SAFE_PROBE:
+        progress = await _record_react_outcome(
+            ctx,
+            alert_id=state.alert_id,
+            run=run,
+            outcome="host_stop",
+            message="Host 停止条件已满足，不再追加只读探针。",
+            turns_remaining=dynamic_turns_remaining,
+            evidence_count=len(evidence),
+            details={
+                "stop_reason": stop_decision.reason.value,
+                "supported_hypothesis_ids": stop_decision.supported_hypothesis_ids,
+            },
+        )
+        return {
+            "investigation_memory": investigation_memory,
+            "should_continue_investigation": False,
+            "stop_decision": stop_decision,
+            "progress": [progress],
+        }
+
+    # A terminal result closes this logical probe for the current outer run.
+    # Missing outcomes affect scheduling only and remain ineligible as causal evidence.
+    attempted_requests = {
         _tool_request_fingerprint(e.tool_name, e.request)
         for e in evidence
-        if e.status == ToolStatus.SUCCESS
-        and e.structured_data.get("partial") is not True
+        if is_terminal_probe_attempt(e)
     }
     request_key = _tool_request_fingerprint(decision.tool_name, decision.parameters)
     safe_tool_name = str(sanitize(decision.tool_name))[:128]
-    if request_key in seen_successful_requests:
+    if request_key in attempted_requests:
+        duplicate_stop = StopDecision(
+            should_stop=True,
+            reason=StopReason.HUMAN_REQUIRED,
+            requires_human=True,
+            rationale=(
+                "The planner repeated a terminal logical probe instead of selecting "
+                "an unattempted discriminating probe."
+            ),
+        )
         progress = await _record_react_outcome(
             ctx,
             alert_id=state.alert_id,
@@ -549,10 +837,13 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
             details={
                 "tool_name": safe_tool_name,
                 "reason": str(sanitize(decision.reason))[:500],
+                "stop_reason": duplicate_stop.reason.value,
             },
         )
         return {
+            "investigation_memory": investigation_memory,
             "should_continue_investigation": False,
+            "stop_decision": duplicate_stop,
             "progress": [progress],
         }
 
@@ -562,18 +853,13 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
         (
             request
             for request in strategy.tool_plan
-            if _tool_request_fingerprint(request.tool_name, request.parameters)
-            == request_key
+            if _tool_request_fingerprint(request.tool_name, request.parameters) == request_key
         ),
         None,
     )
     if request_template is None:
         request_template = next(
-            (
-                request
-                for request in strategy.tool_plan
-                if request.tool_name == decision.tool_name
-            ),
+            (request for request in strategy.tool_plan if request.tool_name == decision.tool_name),
             None,
         )
 
@@ -589,6 +875,8 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
     new_request = ToolExecutionRequest(
         tool_name=decision.tool_name,
         parameters=decision.parameters,
+        objective=decision.objective or decision.reason,
+        hypothesis_ids=decision.hypothesis_ids,
         **request_policy,
     )
     remaining_after_selection = dynamic_turns_remaining - 1
@@ -602,21 +890,109 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
         evidence_count=len(evidence),
         details={
             "tool_name": safe_tool_name,
+            **({"hypothesis_ids": decision.hypothesis_ids} if decision.hypothesis_ids else {}),
             "reason": str(sanitize(decision.reason))[:500],
         },
     )
 
     return {
+        "investigation_memory": investigation_memory,
         "pending_tool_requests": [new_request],
         "dynamic_turns_remaining": remaining_after_selection,
         "should_continue_investigation": True,
+        "stop_decision": StopDecision(
+            should_stop=False,
+            reason=StopReason.CONTINUE,
+            requires_human=False,
+            rationale="The planner selected an approved read-only investigation tool.",
+        ),
         "progress": [progress],
     }
 
 
-def _tool_request_fingerprint(
-    tool_name: str, parameters: dict[str, Any]
-) -> tuple[str, str]:
+def _apply_planner_assessments(
+    memory: InvestigationMemory,
+    proposed: list[InvestigationEvidenceAssessment],
+) -> InvestigationMemory:
+    """Apply model semantics without allowing ineligible evidence to change a cause."""
+
+    if not proposed:
+        return memory
+    evidence_by_id = memory.evidence_by_id()
+    grouped: dict[str, list[EvidenceAssessment]] = {}
+    for item in proposed:
+        evidence = evidence_by_id.get(item.evidence_id)
+        if evidence is None:
+            raise ValueError("planner assessment references unknown evidence")
+        assessment = EvidenceAssessment(
+            hypothesis_id=item.hypothesis_id,
+            evidence_id=item.evidence_id,
+            relation=EvidenceRelation(item.relation),
+            rationale=item.rationale,
+        )
+        grouped.setdefault(item.evidence_id, []).append(assessment)
+    updated = memory
+    for evidence_id, assessments in grouped.items():
+        updated = update_memory(updated, evidence_by_id[evidence_id], assessments)
+    return updated
+
+
+def _next_safe_probe_request(
+    memory: InvestigationMemory,
+    evidence: list[EvidenceRecord],
+    strategy: InvestigationStrategy,
+    registry: InvestigationToolRegistry,
+) -> ToolExecutionRequest | None:
+    """Choose the highest-priority uncompleted probe already approved by the Host."""
+
+    attempted = {
+        _tool_request_fingerprint(item.tool_name, item.request)
+        for item in evidence
+        if is_terminal_probe_attempt(item)
+    }
+    hypothesis_by_need = {
+        item.next_probe.need_id: item.hypothesis_id
+        for item in memory.hypotheses
+        if item.next_probe is not None
+    }
+    for probe in memory.safe_unattempted_probes():
+        if not probe.tool_name:
+            continue
+        spec = registry.spec(probe.tool_name)
+        if spec is None or not spec.read_only:
+            continue
+        parameters = dict(probe.parameters)
+        if _tool_request_fingerprint(probe.tool_name, parameters) in attempted:
+            continue
+        template = next(
+            (
+                item
+                for item in strategy.tool_plan
+                if item.tool_name == probe.tool_name and item.parameters == parameters
+            ),
+            None,
+        ) or next(
+            (item for item in strategy.tool_plan if item.tool_name == probe.tool_name),
+            None,
+        )
+        policy: dict[str, Any] = {}
+        if template is not None:
+            policy = {
+                "timeout_seconds": template.timeout_seconds,
+                "required": template.required,
+            }
+        hypothesis_id = hypothesis_by_need.get(probe.need_id)
+        return ToolExecutionRequest(
+            tool_name=probe.tool_name,
+            parameters=parameters,
+            objective=probe.objective,
+            hypothesis_ids=[hypothesis_id] if hypothesis_id else [],
+            **policy,
+        )
+    return None
+
+
+def _tool_request_fingerprint(tool_name: str, parameters: dict[str, Any]) -> tuple[str, str]:
     """Return a stable, sanitized identity for one logical tool request."""
 
     canonical_parameters = json.dumps(
@@ -675,6 +1051,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
+            investigation_memory=state.investigation_memory,
         )
     except Exception as exc:
         primary_advisor_error = exc
@@ -694,6 +1071,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
+            investigation_memory=state.investigation_memory,
         )
         advisor_metadata = advisor_metadata.model_copy(
             update={"usage": {"fallback_reason": type(exc).__name__}}
@@ -709,6 +1087,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                     "error_detail": sanitize(str(exc)),
                 },
             ),
+            **_lease_fence(run),
         )
 
     recommendation = recommendation.model_copy(
@@ -726,8 +1105,19 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             }
         )
     recommendation = enforce_post_evidence_root_cause_policy(
-        recommendation, evidence, alert
+        recommendation,
+        evidence,
+        alert,
+        state.investigation_memory,
     )
+    host_review_reasons = _host_review_reasons(state)
+    if host_review_reasons:
+        recommendation = recommendation.model_copy(
+            update={
+                "requires_human": True,
+                "confidence": min(recommendation.confidence, 0.5),
+            }
+        )
 
     return {
         "current_stage": InvestigationStage.ADVISING,
@@ -741,9 +1131,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.ADVISING,
-                message=(
-                    "实时证据采集已完成，正在根据告警与实时证据生成可能根因和处理建议。"
-                ),
+                message=("实时证据采集已完成，正在根据告警与实时证据生成可能根因和处理建议。"),
                 details={
                     "runbook_matches": len(runbooks),
                     "external_knowledge_matches": len(external_knowledge),
@@ -783,7 +1171,12 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
     # Rule validation
     rule_validation = await ctx.rule_validator.validate(
-        run, alert, recommendation, evidence, runbooks
+        run,
+        alert,
+        recommendation,
+        evidence,
+        runbooks,
+        state.investigation_memory,
     )
 
     required_failures = _required_tool_failures(strategy.tool_plan, evidence)
@@ -794,13 +1187,26 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "metadata": {
                     **rule_validation.metadata,
                     "required_tool_failures": required_failures,
-                    "evidence_gap": (
-                        f"必需调查工具未成功：{', '.join(required_failures)}"
-                    ),
+                    "evidence_gap": (f"必需调查工具未成功：{', '.join(required_failures)}"),
                 },
             }
         )
-    await ctx.repository.save_validation(alert_id, rule_validation)
+    host_review_reasons = _host_review_reasons(state)
+    if host_review_reasons:
+        rule_validation = rule_validation.model_copy(
+            update={
+                "evidence_sufficient": False,
+                "metadata": {
+                    **rule_validation.metadata,
+                    "host_review_reasons": host_review_reasons,
+                },
+            }
+        )
+    await ctx.repository.save_validation(
+        alert_id,
+        rule_validation,
+        **_lease_fence(run),
+    )
 
     # Agent validation
     agent_validation: ValidationRecord | None = None
@@ -815,11 +1221,20 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "primary_error_type": primary_advisor_error or "Unknown",
             },
         )
-        await ctx.repository.save_validation(alert_id, agent_validation)
+        await ctx.repository.save_validation(
+            alert_id,
+            agent_validation,
+            **_lease_fence(run),
+        )
     elif rule_validation.passed and validation_enabled:
         try:
             agent_validation = await ctx.conclusion_validator.validate(
-                run, alert, recommendation, evidence, runbooks
+                run,
+                alert,
+                recommendation,
+                evidence,
+                runbooks,
+                state.investigation_memory,
             )
         except Exception as exc:
             agent_validation = ValidationRecord(
@@ -839,7 +1254,11 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                     },
                 }
             )
-        await ctx.repository.save_validation(alert_id, agent_validation)
+        await ctx.repository.save_validation(
+            alert_id,
+            agent_validation,
+            **_lease_fence(run),
+        )
 
     # Contract validity and evidence sufficiency are independent. An honest
     # UNKNOWN can pass validation while still requiring human review.
@@ -848,10 +1267,7 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     )
     evidence_sufficient = rule_validation.evidence_sufficient and (
         not validation_enabled
-        or (
-            agent_validation is not None
-            and agent_validation.evidence_sufficient
-        )
+        or (agent_validation is not None and agent_validation.evidence_sufficient)
     )
 
     return {
@@ -875,42 +1291,18 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    runbooks = state.runbooks
     recommendation = state.recommendation
-    advisor_metadata = state.advisor_metadata
     validation_passed = state.validation_passed
     evidence_sufficient = state.evidence_sufficient
     advisor_degraded = state.advisor_degraded
     shadow_enabled = state.shadow_enabled
     error = state.error
+    host_review_reasons = _host_review_reasons(state)
 
     if not run or not alert:
         return {"error": "Missing run or alert in report node"}
 
     if error:
-        # Handle error case
-        await ctx.repository.update_run(
-            str(run.id),
-            status=RunStatus.FAILED.value,
-            stage=InvestigationStage.FAILED,
-            error=error,
-        )
-        await ctx.repository.append_progress(
-            alert_id,
-            ProgressRecord(
-                run_id=run.id,
-                stage=InvestigationStage.FAILED,
-                message="调查执行失败。",
-                details={"error": error},
-            ),
-        )
-        await ctx.repository.save_analysis(
-            alert_id,
-            AlertStatus.FAILED,
-            runbooks=runbooks,
-            error=error,
-            run_id=str(run.id),
-        )
         return {
             "current_stage": InvestigationStage.FAILED,
             "status": AlertStatus.FAILED,
@@ -923,6 +1315,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         and evidence_sufficient
         and not shadow_enabled
         and not advisor_degraded
+        and not host_review_reasons
     )
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
     run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
@@ -947,29 +1340,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         "正在保存建议、依据和审计结果。",
         {"final_status": final_status.value},
     )
-    await ctx.repository.update_run(str(run.id), status=run_status.value, stage=final_stage)
-    await ctx.repository.append_progress(
-        alert_id,
-        ProgressRecord(
-            run_id=run.id,
-            stage=final_stage,
-            message="调查完成。" if passed else "结论需要人工复核。",
-            details={
-                "validation_passed": validation_passed,
-                "evidence_sufficient": evidence_sufficient,
-                "shadow_enabled": shadow_enabled,
-                "advisor_degraded": advisor_degraded,
-            },
-        )
-    )
-    await ctx.repository.save_analysis(
-        alert_id,
-        final_status,
-        runbooks=runbooks,
-        recommendation=recommendation,
-        advisor_metadata=advisor_metadata,
-        run_id=str(run.id),
-    )
 
     return {
         "current_stage": final_stage,
@@ -986,6 +1356,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                     "evidence_sufficient": evidence_sufficient,
                     "shadow_enabled": shadow_enabled,
                     "advisor_degraded": advisor_degraded,
+                    "host_review_reasons": host_review_reasons,
                 },
             )
         ],
@@ -1006,6 +1377,25 @@ def _required_tool_failures(
     ]
 
 
+def _host_review_reasons(state: AgentState) -> list[str]:
+    """Return deterministic reasons that forbid autonomous completion."""
+
+    reasons: list[str] = []
+    decision = state.stop_decision
+    if decision is not None and decision.requires_human:
+        reasons.append(f"stop:{decision.reason.value}")
+
+    unresolved = sorted(
+        hypothesis.hypothesis_id
+        for hypothesis in state.investigation_memory.hypotheses
+        if hypothesis.status == RootCauseStatus.UNKNOWN
+    )
+    reasons.extend(f"unresolved:{hypothesis_id}" for hypothesis_id in unresolved)
+    if not state.investigation_memory.hypotheses:
+        reasons.append("no_hypotheses")
+    return list(dict.fromkeys(reasons))
+
+
 async def _update_progress(
     repository: AlertRepository,
     alert_id: str,
@@ -1015,7 +1405,7 @@ async def _update_progress(
     details: dict[str, Any] | None = None,
 ) -> ProgressRecord:
     """Update run stage and append progress record."""
-    await repository.update_run(str(run.id), stage=stage)
+    await repository.update_run(str(run.id), stage=stage, **_lease_fence(run))
     return await repository.append_progress(
         alert_id,
         ProgressRecord(
@@ -1024,4 +1414,16 @@ async def _update_progress(
             message=message,
             details=details or {},
         ),
+        **_lease_fence(run),
     )
+
+
+def _lease_fence(run: InvestigationRun) -> dict[str, Any]:
+    """Return the ownership identity required for every active-run update."""
+
+    if not run.lease_owner:
+        raise ValueError("active investigation run is missing its lease owner")
+    return {
+        "lease_owner": run.lease_owner,
+        "fencing_token": run.fencing_token,
+    }

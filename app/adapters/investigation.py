@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
 from datetime import UTC, datetime
 from typing import Any
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
+
 from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TOOL_NAME,
     is_slow_query_alert_title,
 )
 from app.adapters.prometheus_mcp import PROMETHEUS_METRICS_TOOL_NAME
+from app.agent_runtime.contracts import RetryPolicy, ToolRisk, ToolSpec
 from app.application.sanitization import sanitize
 from app.domain.models import (
     EvidenceRecord,
@@ -31,6 +36,7 @@ _TRUNCATION_CONTROL_KEYS = (
     "root_cause_ineligible_reason",
     "call_limit_reached",
     "partial",
+    "allow_followup_dispatch",
     "termination_reason",
     "termination_error_type",
     "mcp_session_attempts",
@@ -63,11 +69,104 @@ class InvestigationToolRegistry:
             if getattr(tool, "available", True)
         )
 
+    def specs(self) -> list[ToolSpec]:
+        """Return a stable, policy-bearing catalog for every registered tool."""
+
+        return [self._spec_for(self._tools[name]) for name in sorted(self._tools)]
+
+    def available_specs(self) -> list[ToolSpec]:
+        """Return model-visible contracts for tools available in this runtime."""
+
+        return [
+            self._spec_for(self._tools[name])
+            for name in sorted(self._tools)
+            if getattr(self._tools[name], "available", True)
+        ]
+
+    def spec(self, name: str) -> ToolSpec | None:
+        tool = self._tools.get(name)
+        return self._spec_for(tool) if tool is not None else None
+
+    @staticmethod
+    def _spec_for(tool: InvestigationTool) -> ToolSpec:
+        declared = getattr(tool, "tool_spec", None)
+        if isinstance(declared, ToolSpec):
+            return declared
+
+        schema = getattr(
+            tool,
+            "input_schema",
+            {"type": "object", "additionalProperties": True},
+        )
+        if not isinstance(schema, dict):
+            raise TypeError(f"Tool {tool.name} input_schema must be an object")
+        canonical_schema = json.dumps(
+            schema,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ToolSpec(
+            name=tool.name,
+            provider=tool.source_system,
+            capability=str(getattr(tool, "capability", tool.name)),
+            input_schema=schema,
+            read_only=bool(getattr(tool, "read_only", True)),
+            risk=ToolRisk(str(getattr(tool, "risk", ToolRisk.LOW)).upper()),
+            policy_version=str(getattr(tool, "policy_version", "legacy-read-only-v1")),
+            schema_version=(
+                "sha256:"
+                + hashlib.sha256(canonical_schema.encode("utf-8")).hexdigest()[:16]
+            ),
+            timeout=float(getattr(tool, "default_timeout_seconds", 30)),
+            retry=RetryPolicy(
+                max_attempts=int(getattr(tool, "max_attempts", 1)),
+            ),
+        )
+
+
+class ToolPolicyViolation(ValueError):
+    """Raised before execution when a request violates its advertised contract."""
+
+
+class InvestigationToolPolicy:
+    """Provider-neutral safety and JSON Schema gate for outer investigation tools."""
+
+    def __init__(self, registry: InvestigationToolRegistry) -> None:
+        self.registry = registry
+
+    def authorize(self, request: ToolExecutionRequest) -> ToolSpec:
+        tool = self.registry.get(request.tool_name)
+        spec = self.registry.spec(request.tool_name)
+        if tool is None or spec is None:
+            raise ToolPolicyViolation(f"Tool is not registered: {request.tool_name}")
+        if not getattr(tool, "available", True):
+            raise ToolPolicyViolation(f"Tool is not available: {request.tool_name}")
+        if not spec.read_only:
+            raise ToolPolicyViolation(
+                f"Investigation tool is not declared read-only: {request.tool_name}"
+            )
+        try:
+            Draft202012Validator.check_schema(spec.input_schema)
+            Draft202012Validator(spec.input_schema).validate(request.parameters)
+        except (SchemaError, ValidationError) as exc:
+            raise ToolPolicyViolation(
+                f"Tool arguments do not satisfy the registered schema: {request.tool_name}"
+            ) from exc
+        return spec
+
 
 class ToolExecutor:
-    def __init__(self, registry: InvestigationToolRegistry, max_result_chars: int = 12000) -> None:
+    def __init__(
+        self,
+        registry: InvestigationToolRegistry,
+        max_result_chars: int = 12000,
+        *,
+        policy: InvestigationToolPolicy | None = None,
+    ) -> None:
         self.registry = registry
         self.max_result_chars = max_result_chars
+        self.policy = policy or InvestigationToolPolicy(registry)
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -83,6 +182,23 @@ class ToolExecutor:
                 status=ToolStatus.SKIPPED,
                 summary=f"未执行调查工具 {request.tool_name}：工具未注册或能力未启用。",
                 structured_data={"reason_code": "tool_not_registered"},
+                started_at=started_at,
+                started=started,
+            )
+
+        try:
+            self.policy.authorize(request)
+        except ToolPolicyViolation as exc:
+            return self._record(
+                request,
+                context,
+                source_system=tool.source_system,
+                status=ToolStatus.SKIPPED,
+                summary=f"未执行调查工具 {request.tool_name}：调用未通过只读策略校验。",
+                structured_data={
+                    "reason_code": "tool_policy_rejected",
+                    "policy_error": str(sanitize(exc)),
+                },
                 started_at=started_at,
                 started=started,
             )
@@ -227,6 +343,8 @@ class ToolExecutor:
 class AlertContextTool:
     name = "alert_context"
     source_system = "alert_platform"
+    read_only = True
+    max_attempts = 2
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -251,6 +369,7 @@ class UnavailableExternalTool:
     """Placeholder for a real log/APM/database-management platform adapter."""
 
     available = False
+    read_only = True
 
     def __init__(self, name: str, source_system: str) -> None:
         self.name = name

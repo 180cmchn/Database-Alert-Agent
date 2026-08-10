@@ -17,8 +17,10 @@ from uuid import UUID, uuid4
 from app.adapters.alert_sources import AlertSourceRegistry
 from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.agent_runtime.contracts import RunManifest
+from app.agent_runtime.leases import LeaseLostError, RunLeaseGuard
 from app.agents.graph import InvestigationAgent
-from app.agents.state import create_initial_state
+from app.agents.state import AgentState, create_initial_state
 from app.application.sanitization import sanitize, sanitize_alert
 from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
@@ -51,6 +53,7 @@ from app.domain.ports import (
     InvestigationStrategyProvider,
     ManagementNotifier,
     RunbookProvider,
+    RunLeaseConflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,7 @@ class AlertAnalysisService:
         fallback_advisor: AIAdvisor | None = None,
         runbook_limit: int = 5,
         investigation_lease_seconds: int = 300,
+        lease_heartbeat_interval_seconds: float | None = None,
         react_enabled: bool = False,
         validation_enabled: bool = True,
         shadow_enabled: bool = False,
@@ -91,6 +95,7 @@ class AlertAnalysisService:
         runbook_match_min_score: float = 12,
         runbook_match_min_confidence: float = 0.35,
         knowledge_sources: list[str] | None = None,
+        runtime_manifest_config: dict[str, Any] | None = None,
     ) -> None:
         self.source_registry = source_registry
         self.runbook_provider = runbook_provider
@@ -105,6 +110,7 @@ class AlertAnalysisService:
         self.fallback_advisor = fallback_advisor
         self.runbook_limit = runbook_limit
         self.investigation_lease_seconds = investigation_lease_seconds
+        self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
         self.shadow_enabled = shadow_enabled
@@ -119,6 +125,7 @@ class AlertAnalysisService:
         self.knowledge_sources = (
             knowledge_sources if knowledge_sources is not None else ["local_pdf"]
         )
+        self.runtime_manifest_config = dict(runtime_manifest_config or {})
         self._active_analyses = 0
         self._retired_adapters: list[object] = []
         self._retired_adapter_ids: set[int] = set()
@@ -207,17 +214,36 @@ class AlertAnalysisService:
         if stored.status in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
             return stored
 
-        run = await self.repository.create_run(
-            alert_id,
-            lease_owner=f"direct-{uuid4()}",
-            lease_seconds=self.investigation_lease_seconds,
-        )
-        if run is None:
-            return await self.get(alert_id)
-
         self._active_analyses += 1
         try:
-            return await self._analyze_claimed_alert(stored, alert_id, run)
+            agent = self.agent
+            generation_snapshot = self._create_config_snapshot()
+            lease_owner = f"direct-{uuid4()}"
+            run = await self.repository.reclaim_expired_run(
+                alert_id,
+                lease_owner,
+                self.investigation_lease_seconds,
+            )
+            if run is None:
+                run_id = uuid4()
+                manifest = self._create_run_manifest(run_id, generation_snapshot)
+                run = await self.repository.create_run(
+                    alert_id,
+                    lease_owner=lease_owner,
+                    lease_seconds=self.investigation_lease_seconds,
+                    config_snapshot=generation_snapshot,
+                    manifest=manifest,
+                )
+            if run is None:
+                return await self.get(alert_id)
+
+            return await self._analyze_claimed_alert(
+                stored,
+                alert_id,
+                run,
+                agent=agent,
+                generation_snapshot=generation_snapshot,
+            )
         finally:
             self._active_analyses -= 1
             if self._active_analyses == 0:
@@ -228,8 +254,21 @@ class AlertAnalysisService:
         stored: StoredAlert,
         alert_id: str,
         run: InvestigationRun,
+        *,
+        agent: InvestigationAgent,
+        generation_snapshot: AnalysisConfigSnapshot,
     ) -> StoredAlert:
         """Run a claimed investigation while its adapter generation stays alive."""
+
+        if not run.lease_owner:
+            raise LeaseLostError(
+                run_id=str(run.id),
+                lease_owner="",
+                fencing_token=run.fencing_token,
+                reason="claimed run has no lease owner",
+            )
+
+        run_snapshot = run.config_snapshot or generation_snapshot
 
         # Create initial state for LangGraph
         initial_state = create_initial_state(
@@ -237,75 +276,197 @@ class AlertAnalysisService:
             alert=preprocess_normalized_alert(stored.alert),
             stored_alert=stored,
             run=run,
-            max_dynamic_turns=self.max_dynamic_turns,
-            validation_enabled=self.validation_enabled,
-            shadow_enabled=self.shadow_enabled,
-            ai_fallback_enabled=self.ai_fallback_enabled,
-            knowledge_sources=self.knowledge_sources,
-        )
-
-        # Record initial progress
-        await self.repository.append_progress(
-            alert_id,
-            ProgressRecord(
-                run_id=run.id,
-                stage=InvestigationStage.RECEIVED,
-                message="调查 Worker 已领取任务。",
+            max_dynamic_turns=(
+                run_snapshot.react_max_dynamic_turns
+                if run_snapshot.react_enabled
+                else 0
             ),
+            validation_enabled=run_snapshot.validation_enabled,
+            shadow_enabled=run_snapshot.shadow_enabled,
+            ai_fallback_enabled=run_snapshot.ai_fallback_enabled,
+            knowledge_sources=run_snapshot.knowledge_sources,
         )
 
         try:
-            # Run the LangGraph investigation
-            final_state = await self.agent.run(initial_state)
-
-            # Check if the investigation ended with FAILED status
-            if final_state.status == AlertStatus.FAILED:
-                error = final_state.error or "Investigation failed"
-                raise AnalysisFailedError(alert_id, error)
-
-            # Send notification
-            if final_state.recommendation and final_state.alert:
-                if final_state.status == AlertStatus.COMPLETED:
-                    message = "数据库告警分析已完成。"
-                elif final_state.recommendation.analysis_mode == "shadow":
-                    message = "数据库告警已生成影子分析，请人工复核。"
-                else:
-                    message = "数据库告警已生成候选分析，请人工复核。"
-                await self._send_analysis_result(
-                    final_state.alert,
-                    run_id=run.id,
-                    status=final_state.status,
-                    message=message,
-                    recommendation=final_state.recommendation,
-                )
-
-            return await self.get(alert_id)
-
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {sanitize(str(exc))}"
-            await self.repository.update_run(
-                str(run.id),
-                status=RunStatus.FAILED.value,
-                stage=InvestigationStage.FAILED,
-                error=error,
-            )
+            await self._require_compatible_resume_manifest(run, generation_snapshot)
             await self.repository.append_progress(
                 alert_id,
                 ProgressRecord(
                     run_id=run.id,
-                    stage=InvestigationStage.FAILED,
-                    message="调查执行失败。",
-                    details={"error": error},
+                    stage=InvestigationStage.RECEIVED,
+                    message="调查 Worker 已领取任务。",
                 ),
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
             )
-            await self.repository.save_analysis(
-                alert_id,
-                AlertStatus.FAILED,
-                runbooks=None,
-                error=error,
+            lease_guard = RunLeaseGuard(
+                self.repository,
                 run_id=str(run.id),
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
+                lease_seconds=self.investigation_lease_seconds,
+                heartbeat_interval_seconds=self.lease_heartbeat_interval_seconds,
             )
+            final_state = await lease_guard.run(agent.run(initial_state))
+        except LeaseLostError:
+            logger.warning(
+                "Investigation stopped after losing its run lease alert_id=%s run_id=%s",
+                alert_id,
+                run.id,
+            )
+            raise
+        except RunLeaseConflict as exc:
+            raise LeaseLostError(
+                run_id=str(run.id),
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
+                reason="a fenced run update was rejected",
+            ) from exc
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {sanitize(str(exc))}"
+            try:
+                await self.repository.finalize_run(
+                    alert_id,
+                    str(run.id),
+                    lease_owner=run.lease_owner,
+                    fencing_token=run.fencing_token,
+                    run_status=RunStatus.FAILED,
+                    final_stage=InvestigationStage.FAILED,
+                    alert_status=AlertStatus.FAILED,
+                    progress=ProgressRecord(
+                        run_id=run.id,
+                        stage=InvestigationStage.FAILED,
+                        message="调查执行失败。",
+                        details={"error": error},
+                    ),
+                    error=error,
+                )
+            except RunLeaseConflict as lease_exc:
+                raise LeaseLostError(
+                    run_id=str(run.id),
+                    lease_owner=run.lease_owner,
+                    fencing_token=run.fencing_token,
+                    reason="the lease was lost before failure could be recorded",
+                ) from lease_exc
             raise AnalysisFailedError(alert_id, error) from exc
+
+        try:
+            await self._persist_terminal_state(alert_id, run, final_state)
+        except RunLeaseConflict as exc:
+            raise LeaseLostError(
+                run_id=str(run.id),
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
+                reason="the lease was lost before the final result could be recorded",
+            ) from exc
+
+        if final_state.status == AlertStatus.FAILED:
+            error = final_state.error or "Investigation failed"
+            raise AnalysisFailedError(alert_id, error)
+
+        # Send notification
+        if final_state.recommendation and final_state.alert:
+            if final_state.status == AlertStatus.COMPLETED:
+                message = "数据库告警分析已完成。"
+            elif final_state.recommendation.analysis_mode == "shadow":
+                message = "数据库告警已生成影子分析，请人工复核。"
+            else:
+                message = "数据库告警已生成候选分析，请人工复核。"
+            await self._send_analysis_result(
+                final_state.alert,
+                run_id=run.id,
+                status=final_state.status,
+                message=message,
+                recommendation=final_state.recommendation,
+                lease_owner=run.lease_owner,
+                fencing_token=run.fencing_token,
+            )
+
+        return await self.get(alert_id)
+
+    async def _require_compatible_resume_manifest(
+        self,
+        run: InvestigationRun,
+        generation_snapshot: AnalysisConfigSnapshot,
+    ) -> None:
+        if run.fencing_token <= run.attempt:
+            return
+        frozen = await self.repository.get_run_manifest(str(run.id))
+        if frozen is None:
+            raise RuntimeError("Reclaimed run does not have a frozen manifest")
+        current = self._create_run_manifest(run.id, generation_snapshot)
+        ignored = {"created_at"}
+        frozen_payload = frozen.model_dump(mode="json", exclude=ignored)
+        current_payload = current.model_dump(mode="json", exclude=ignored)
+        incompatible_fields = sorted(
+            key
+            for key in frozen_payload
+            if frozen_payload.get(key) != current_payload.get(key)
+        )
+        if incompatible_fields:
+            fields = ", ".join(incompatible_fields)
+            raise RuntimeError(
+                "Frozen run manifest is incompatible with the current runtime: "
+                f"{fields}"
+            )
+
+    async def _persist_terminal_state(
+        self,
+        alert_id: str,
+        run: InvestigationRun,
+        final_state: AgentState,
+    ) -> None:
+        terminal = {
+            AlertStatus.COMPLETED: (
+                RunStatus.COMPLETED,
+                InvestigationStage.COMPLETED,
+                "调查完成。",
+            ),
+            AlertStatus.REVIEW_REQUIRED: (
+                RunStatus.REVIEW_REQUIRED,
+                InvestigationStage.REVIEW_REQUIRED,
+                "结论需要人工复核。",
+            ),
+            AlertStatus.FAILED: (
+                RunStatus.FAILED,
+                InvestigationStage.FAILED,
+                "调查执行失败。",
+            ),
+        }.get(final_state.status)
+        if terminal is None:
+            raise RuntimeError(
+                f"Investigation returned non-terminal status: {final_state.status.value}"
+            )
+        run_status, final_stage, message = terminal
+        details: dict[str, Any]
+        if final_state.status == AlertStatus.FAILED:
+            details = {"error": final_state.error or "Investigation failed"}
+        else:
+            details = {
+                "validation_passed": final_state.validation_passed,
+                "evidence_sufficient": final_state.evidence_sufficient,
+                "shadow_enabled": final_state.shadow_enabled,
+                "advisor_degraded": final_state.advisor_degraded,
+            }
+        await self.repository.finalize_run(
+            alert_id,
+            str(run.id),
+            lease_owner=run.lease_owner,
+            fencing_token=run.fencing_token,
+            run_status=run_status,
+            final_stage=final_stage,
+            alert_status=final_state.status,
+            progress=ProgressRecord(
+                run_id=run.id,
+                stage=final_stage,
+                message=message,
+                details=details,
+            ),
+            runbooks=final_state.runbooks,
+            recommendation=final_state.recommendation,
+            advisor_metadata=final_state.advisor_metadata,
+            error=final_state.error,
+        )
 
     def retire_adapters(self, *adapters: object) -> None:
         """Defer closing replaced adapters until no investigation still uses them."""
@@ -616,6 +777,7 @@ class AlertAnalysisService:
 
         This captures the key runtime settings for tracking across re-analyses.
         """
+        tool_specs = self.tool_registry.available_specs()
         return AnalysisConfigSnapshot(
             knowledge_sources=list(self.knowledge_sources),
             external_knowledge_enabled=self.external_knowledge_client is not None,
@@ -639,6 +801,53 @@ class AlertAnalysisService:
                 if self.advisor.__class__.__name__ == "FakeAIAdvisor"
                 else "openai_compatible"
             ),
+            ai_timeout_seconds=float(
+                self.runtime_manifest_config.get("ai_timeout_seconds", 300)
+            ),
+            ai_max_retries=int(self.runtime_manifest_config.get("ai_max_retries", 2)),
+            ai_max_tokens=int(self.runtime_manifest_config.get("ai_max_tokens", 16_384)),
+            prompt_version=str(
+                self.runtime_manifest_config.get("prompt_version")
+                or getattr(self.advisor, "prompt_version", "")
+            ),
+            code_version=str(
+                self.runtime_manifest_config.get("code_version", "0.1.0")
+            ),
+            archery_mcp_max_agent_steps=int(
+                self.runtime_manifest_config.get("archery_mcp_max_agent_steps", 0)
+            ),
+            prometheus_mcp_max_agent_steps=int(
+                self.runtime_manifest_config.get("prometheus_mcp_max_agent_steps", 0)
+            ),
+            archery_mcp_use_shared_harness=bool(
+                self.runtime_manifest_config.get(
+                    "archery_mcp_use_shared_harness", True
+                )
+            ),
+            prometheus_mcp_use_shared_harness=bool(
+                self.runtime_manifest_config.get(
+                    "prometheus_mcp_use_shared_harness", False
+                )
+            ),
+            tool_schema_versions={item.name: item.schema_version for item in tool_specs},
+            tool_policy_versions={item.name: item.policy_version for item in tool_specs},
+        )
+
+    @staticmethod
+    def _create_run_manifest(
+        run_id: UUID,
+        config_snapshot: AnalysisConfigSnapshot,
+    ) -> RunManifest:
+        return RunManifest(
+            run_id=run_id,
+            agent_name="database-alert-investigation",
+            code_version=config_snapshot.code_version or "unknown",
+            model_provider=config_snapshot.ai_provider,
+            model_name=config_snapshot.ai_model,
+            prompt_version=config_snapshot.prompt_version or "unknown",
+            tool_schema_versions=dict(config_snapshot.tool_schema_versions),
+            tool_policy_versions=dict(config_snapshot.tool_policy_versions),
+            configuration=config_snapshot.model_dump(mode="json"),
         )
 
     async def reanalyze(
@@ -672,22 +881,30 @@ class AlertAnalysisService:
                     "An analysis is already in progress. Use force=True to override."
                 )
 
-        # Create config snapshot
-        config_snapshot = self._create_config_snapshot()
-
-        # Create a new run for re-analysis
-        run = await self.repository.create_run_for_reanalyze(
-            alert_id,
-            lease_owner=f"reanalyze-{uuid4()}",
-            lease_seconds=self.investigation_lease_seconds,
-            config_snapshot=config_snapshot,
-        )
-        if run is None:
-            raise InvalidAlertPayloadError("Failed to create investigation run")
-
         self._active_analyses += 1
         try:
-            await self._analyze_claimed_alert(stored, alert_id, run)
+            agent = self.agent
+            config_snapshot = self._create_config_snapshot()
+            run_id = uuid4()
+            manifest = self._create_run_manifest(run_id, config_snapshot)
+            run = await self.repository.create_run_for_reanalyze(
+                alert_id,
+                lease_owner=f"reanalyze-{uuid4()}",
+                lease_seconds=self.investigation_lease_seconds,
+                config_snapshot=config_snapshot,
+                manifest=manifest,
+                force=force,
+            )
+            if run is None:
+                raise InvalidAlertPayloadError("Failed to create investigation run")
+
+            await self._analyze_claimed_alert(
+                stored,
+                alert_id,
+                run,
+                agent=agent,
+                generation_snapshot=config_snapshot,
+            )
             return run, config_snapshot
         finally:
             self._active_analyses -= 1
@@ -702,6 +919,8 @@ class AlertAnalysisService:
         status: AlertStatus,
         message: str,
         recommendation: Recommendation,
+        lease_owner: str,
+        fencing_token: int,
     ) -> None:
         """Send analysis result notification and persist delivery status."""
         from app.domain.models import AnalysisResultEvent
@@ -722,7 +941,12 @@ class AlertAnalysisService:
                     stage=InvestigationStage.REPORTING,
                     message="企微机器人通知已发送",
                 ),
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
+                allow_terminal=True,
             )
+        except RunLeaseConflict:
+            raise
         except Exception as exc:
             error_msg = sanitize(f"{type(exc).__name__}: {exc}")
             logger.warning(
@@ -738,4 +962,7 @@ class AlertAnalysisService:
                     message="企微机器人通知失败",
                     details={"error": error_msg},
                 ),
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
+                allow_terminal=True,
             )

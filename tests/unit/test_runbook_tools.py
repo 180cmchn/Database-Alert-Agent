@@ -54,7 +54,8 @@ async def test_evaluation_has_no_handbook_approval_metrics(
     assert "approved_runbook_ratio" not in report["metrics"]
     assert "dataset_reviewed" not in report
     assert report["metrics"]["runbook_case_coverage"] == 1.0
-    assert report["metrics"]["cause_case_coverage"] == 1.0
+    assert report["metrics"]["cause_candidate_recall"] == 0.0
+    assert report["metrics"]["cause_case_coverage"] == 0.0
 
 
 def test_evaluation_gate_uses_automatic_coverage_instead_of_fixed_volume() -> None:
@@ -62,6 +63,7 @@ def test_evaluation_gate_uses_automatic_coverage_instead_of_fixed_volume() -> No
         "counts": {
             "positive_matching_cases": 1,
             "no_match_cases": 1,
+            "diagnosis_cases": 100,
         },
         "metrics": {
             "runbook_case_coverage": 0.5,

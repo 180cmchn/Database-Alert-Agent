@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.adapters.flashduty import FlashDutyResponse
+from app.agent_runtime.leases import LeaseLostError
 from app.application.factory import build_runtime
 from app.application.scheduler import (
     FlashDutyAlertPoller,
@@ -101,6 +102,47 @@ async def test_in_memory_scheduler_retries_job_while_old_lease_is_active() -> No
     await scheduler.start()
     try:
         await scheduler.enqueue("alert-1")
+        await asyncio.wait_for(finished.wait(), timeout=1)
+    finally:
+        await scheduler.stop()
+
+    assert service.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_in_memory_scheduler_retries_after_worker_loses_lease() -> None:
+    finished = asyncio.Event()
+
+    class EmptyRepository:
+        async def list_by_status(self, statuses):  # type: ignore[no-untyped-def]
+            return []
+
+    class LeaseLostService:
+        repository = EmptyRepository()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                raise LeaseLostError(
+                    run_id="run-1",
+                    lease_owner="worker-1",
+                    fencing_token=1,
+                    reason="simulated heartbeat loss",
+                )
+            finished.set()
+            return SimpleNamespace(status=AlertStatus.COMPLETED)
+
+    service = LeaseLostService()
+    scheduler = InMemoryAnalysisScheduler(  # type: ignore[arg-type]
+        service,
+        lease_retry_delay_seconds=0,
+    )
+    await scheduler.start()
+    try:
+        await scheduler.enqueue("alert-lease-lost")
         await asyncio.wait_for(finished.wait(), timeout=1)
     finally:
         await scheduler.stop()

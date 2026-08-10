@@ -5,7 +5,7 @@ import pytest
 from app.adapters.investigation import AlertContextTool, InvestigationToolRegistry
 from app.application.factory import build_runtime
 from app.config import Settings
-from app.domain.models import AlertStatus
+from app.domain.models import AlertStatus, RootCauseStatus
 
 
 class RecordingTool:
@@ -69,7 +69,9 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
         },
     )
 
-    assert result.status == AlertStatus.COMPLETED
+    # The probes succeeded, but ReAct is disabled in this fixture, so no
+    # hypothesis-to-evidence assessment has established a supported cause.
+    assert result.status == AlertStatus.REVIEW_REQUIRED
     assert [name for name, _ in calls] == ["query_metrics"]
     assert all(parameters["environment"] == "production" for _, parameters in calls)
     parameters_by_tool = dict(calls)
@@ -77,9 +79,11 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
     assert parameters_by_tool["query_metrics"]["expr"] == "mysql_threads_connected"
     assert all(item.status.value == "SUCCESS" for item in result.evidence_records)
     assert all(item.passed for item in result.validations)
-    assert all(item.evidence_sufficient for item in result.validations)
+    assert all(not item.evidence_sufficient for item in result.validations)
     assert result.recommendation is not None
-    assert result.recommendation.root_causes[0].verified is True
+    assert result.recommendation.requires_human is True
+    assert result.recommendation.root_causes[0].status == RootCauseStatus.UNKNOWN
+    assert result.recommendation.root_causes[0].verified is False
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

@@ -2412,6 +2412,14 @@ class RecordingArcheryClient:
         )
 
 
+def test_archery_outer_tool_declares_strict_empty_input_schema() -> None:
+    assert ArcherySlowLogEvidenceTool.input_schema == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+
 class FlakyRecordingArcheryClient(RecordingArcheryClient):
     async def execute_slow_log_query(
         self,

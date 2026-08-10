@@ -75,6 +75,7 @@ class LargeControlledTool:
             "root_cause_eligible": True,
             "root_cause_ineligible_reason": "",
             "partial": True,
+            "allow_followup_dispatch": False,
             "termination_reason": "sse_error_after_partial_result",
             "termination_error_type": "ConnectionError",
             "mcp_session_attempts": 2,
@@ -89,6 +90,31 @@ class LargeUnqualifiedTool:
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence without eligibility", {"sample": "x" * 3000}
+
+
+class SchemaBoundTool:
+    name = "schema_bound"
+    source_system = "test_system"
+    capability = "lookup_by_service"
+    policy_version = "test-policy-v2"
+    input_schema = {
+        "type": "object",
+        "properties": {"service": {"type": "string", "minLength": 1}},
+        "required": ["service"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return "matched", {"service": request.parameters["service"]}
+
+
+class WriteCapableTool(SchemaBoundTool):
+    name = "write_capable"
+    read_only = False
 
 
 def make_context() -> InvestigationContext:
@@ -145,6 +171,7 @@ async def test_tool_executor_preserves_decision_fields_when_result_is_truncated(
     )
     assert record.structured_data["eligible_before_truncation"] is True
     assert record.structured_data["partial"] is True
+    assert record.structured_data["allow_followup_dispatch"] is False
     assert (
         record.structured_data["termination_reason"]
         == "sse_error_after_partial_result"
@@ -271,3 +298,42 @@ async def test_tool_executor_records_permission_failures_separately() -> None:
         "http_status": 403,
         "request_id": "req-forbidden",
     }
+
+
+def test_registry_exposes_versioned_tool_contracts() -> None:
+    registry = InvestigationToolRegistry([SchemaBoundTool()])
+
+    spec = registry.available_specs()[0]
+
+    assert spec.name == "schema_bound"
+    assert spec.provider == "test_system"
+    assert spec.capability == "lookup_by_service"
+    assert spec.read_only is True
+    assert spec.policy_version == "test-policy-v2"
+    assert spec.schema_version.startswith("sha256:")
+    assert spec.input_schema["required"] == ["service"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "parameters"),
+    [
+        (SchemaBoundTool(), {"service": 42}),
+        (SchemaBoundTool(), {"service": "orders", "unsafe": True}),
+        (WriteCapableTool(), {"service": "orders"}),
+    ],
+)
+async def test_tool_policy_rejects_invalid_or_non_read_only_calls_before_execution(
+    tool: SchemaBoundTool,
+    parameters: dict[str, object],
+) -> None:
+    executor = ToolExecutor(InvestigationToolRegistry([tool]))
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=tool.name, parameters=parameters),
+        make_context(),
+    )
+
+    assert record.status == ToolStatus.SKIPPED
+    assert record.structured_data["reason_code"] == "tool_policy_rejected"
+    assert tool.calls == 0

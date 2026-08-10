@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
 from mcp import ClientSession
@@ -326,6 +327,9 @@ class ArcheryMCPClient:
         query_tool_name: str = ARCHERY_MCP_QUERY_TOOL_NAME,
         timeout_seconds: float = 60,
         transport: httpx.AsyncBaseTransport | None = None,
+        use_shared_harness: bool = False,
+        harness_connector: Any | None = None,
+        harness_runtime_dependencies: Any | None = None,
     ) -> None:
         parsed = urlsplit(server.url.strip())
         if (
@@ -385,6 +389,9 @@ class ArcheryMCPClient:
         self.model = model
         self._headers = dict(server.headers)
         self._transport = transport
+        self.use_shared_harness = use_shared_harness
+        self._harness_connector = harness_connector
+        self._harness_runtime_dependencies = harness_runtime_dependencies
 
     @classmethod
     def from_settings(
@@ -399,6 +406,8 @@ class ArcheryMCPClient:
         max_agent_steps: int = ARCHERY_MCP_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         transport: httpx.AsyncBaseTransport | None = None,
+        use_shared_harness: bool = True,
+        harness_runtime_dependencies: Any | None = None,
     ) -> ArcheryMCPClient:
         server = load_mcp_server_settings(
             settings_path,
@@ -414,9 +423,42 @@ class ArcheryMCPClient:
             max_agent_steps=max_agent_steps,
             timeout_seconds=timeout_seconds,
             transport=transport,
+            use_shared_harness=use_shared_harness,
+            harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
     async def execute_slow_log_query(
+        self,
+        occurred_at: datetime,
+        *,
+        alert_context: Mapping[str, Any] | None = None,
+        run_id: UUID | None = None,
+        outer_dispatch_id: UUID | None = None,
+        outer_dispatch_attempt: int | None = None,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+    ) -> ArcherySlowLogQueryResult:
+        if self.use_shared_harness:
+            from app.adapters.archery_harness import execute_archery_harness
+
+            return await execute_archery_harness(
+                self,
+                occurred_at,
+                alert_context=alert_context or {},
+                run_id=run_id,
+                outer_dispatch_id=outer_dispatch_id,
+                outer_dispatch_attempt=outer_dispatch_attempt,
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
+                connector=self._harness_connector,
+                runtime_dependencies=self._harness_runtime_dependencies,
+            )
+        return await self._execute_slow_log_query_legacy(
+            occurred_at,
+            alert_context=alert_context,
+        )
+
+    async def _execute_slow_log_query_legacy(
         self,
         occurred_at: datetime,
         *,
@@ -2648,9 +2690,17 @@ class ArcherySlowLogEvidenceTool:
 
     name = ARCHERY_SLOW_LOG_TOOL_NAME
     source_system = "archery_mcp"
+    read_only = True
+    input_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
 
     def __init__(self, client: ArcheryMCPClient) -> None:
         self.client = client
+        # Re-entry is a checkpoint resume only when the shared child harness is active.
+        self.max_attempts = 2 if getattr(client, "use_shared_harness", False) else 1
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -2669,10 +2719,23 @@ class ArcherySlowLogEvidenceTool:
         alert_target_context = self._alert_target_context(context.alert)
         session_attempts = 1
         reconnect_error_type: str | None = None
+        run_arguments = (
+            {
+                "run_id": context.run_id,
+                "outer_dispatch_id": context.outer_dispatch_id,
+                "outer_dispatch_attempt": context.outer_dispatch_attempt,
+                "lease_owner": context.lease_owner,
+                "fencing_token": context.fencing_token,
+            }
+            if isinstance(self.client, ArcheryMCPClient)
+            and self.client.use_shared_harness
+            else {}
+        )
         try:
             result = await self.client.execute_slow_log_query(
                 context.alert.occurred_at,
                 alert_context=alert_target_context,
+                **run_arguments,
             )
         except ArcheryMCPProtocolError as exc:
             reconnect_error_type = type(exc).__name__
@@ -2680,9 +2743,13 @@ class ArcherySlowLogEvidenceTool:
             result = await self.client.execute_slow_log_query(
                 context.alert.occurred_at,
                 alert_context=alert_target_context,
+                **run_arguments,
             )
+        diagnostics = result.diagnostics or {}
+        recorded_session_attempts = diagnostics.get("mcp_session_attempts")
+        if type(recorded_session_attempts) is int and recorded_session_attempts > 0:
+            session_attempts = max(session_attempts, recorded_session_attempts)
         if not result.query_completed:
-            diagnostics = result.diagnostics or {}
             reason = str(diagnostics.get("reason") or "慢查询证据不足")
             next_stage = str(diagnostics.get("next_stage") or "需要人工复核")
             return ToolExecutionResult(
@@ -2700,7 +2767,14 @@ class ArcherySlowLogEvidenceTool:
                     "login_confirmed": True,
                     "login_tool": self.client.login_tool_name,
                     "mcp_tool": self.client.query_tool_name,
-                    "mcp_invocation": "model_tool_calling",
+                    "mcp_invocation": (
+                        "shared_agent_harness"
+                        if getattr(self.client, "use_shared_harness", False)
+                        else "model_tool_calling"
+                    ),
+                    "allow_followup_dispatch": not getattr(
+                        self.client, "use_shared_harness", False
+                    ),
                     "mcp_session_attempts": session_attempts,
                     "reconnect_error_type": reconnect_error_type,
                     "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
@@ -2773,7 +2847,14 @@ class ArcherySlowLogEvidenceTool:
             "login_confirmed": True,
             "login_tool": self.client.login_tool_name,
             "mcp_tool": self.client.query_tool_name,
-            "mcp_invocation": "model_tool_calling",
+            "mcp_invocation": (
+                "shared_agent_harness"
+                if getattr(self.client, "use_shared_harness", False)
+                else "model_tool_calling"
+            ),
+            "allow_followup_dispatch": not getattr(
+                self.client, "use_shared_harness", False
+            ),
             "mcp_session_attempts": session_attempts,
             "reconnect_error_type": reconnect_error_type,
             "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,

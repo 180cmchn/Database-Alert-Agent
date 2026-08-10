@@ -1,7 +1,8 @@
 {
   "dataset_policy": {
     "minimum_positive_matching_cases": 1,
-    "minimum_no_match_cases": 1
+    "minimum_no_match_cases": 1,
+    "minimum_diagnosis_cases": 1
   },
   "metric_thresholds": {
     "runbook_recall_at_5": 0.95,
@@ -17,5 +18,17 @@
     "fabricated_runbook_references",
     "fabricated_evidence",
     "unapproved_change_actions"
-  ]
+  ],
+  "harness_policy": {
+    "enabled": false,
+    "minimum_harness_scenarios": 12,
+    "required_fault_families": [
+      "model_no_tool_call",
+      "mcp_timeout",
+      "mcp_reconnect",
+      "partial_evidence",
+      "budget_exhaustion",
+      "checkpoint_resume"
+    ]
+  }
 }

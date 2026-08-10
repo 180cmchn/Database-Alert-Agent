@@ -34,6 +34,7 @@ def test_confirmed_feedback_becomes_candidate_but_live_check_still_runs(
             "reason": "latency",
             "environment": "prd",
             "service_name": "orders-api",
+            "database": {"engine": "postgresql", "instance": "orders-primary"},
         }
         first = client.post(
             "/api/v1/alerts/canonical/analyze",

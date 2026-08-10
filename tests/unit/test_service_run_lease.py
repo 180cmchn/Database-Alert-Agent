@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+
+from app.adapters.persistence import InvestigationRunRow
+from app.agent_runtime.contracts import RunCheckpoint
+from app.agent_runtime.leases import LeaseLostError
+from app.application.factory import build_runtime
+from app.config import Settings
+from app.domain.errors import AnalysisFailedError
+from app.domain.models import AlertStatus, InvestigationStage, RunStatus
+
+
+def _settings(tmp_path: Path) -> Settings:
+    runbooks = tmp_path / "runbooks"
+    runbooks.mkdir()
+    return Settings(
+        _env_file=None,
+        ai_provider="fake",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
+        runbook_pdf_dir=runbooks,
+    )
+
+
+class BlockingAgent:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def run(self, _: object) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class UnexpectedAgent:
+    def __init__(self) -> None:
+        self.called = False
+
+    async def run(self, _: object) -> None:
+        self.called = True
+        raise AssertionError("incompatible recovery must not execute the graph")
+
+
+def test_run_manifest_freezes_prometheus_harness_canary_mode(tmp_path: Path) -> None:
+    runtime = build_runtime(
+        _settings(tmp_path).model_copy(
+            update={"prometheus_mcp_use_shared_harness": True}
+        )
+    )
+
+    snapshot = runtime.service._create_config_snapshot()
+    manifest = runtime.service._create_run_manifest(uuid4(), snapshot)
+
+    assert snapshot.archery_mcp_use_shared_harness is True
+    assert snapshot.prometheus_mcp_use_shared_harness is True
+    assert manifest.configuration["prometheus_mcp_use_shared_harness"] is True
+
+
+@pytest.mark.asyncio
+async def test_service_force_reanalysis_supersedes_an_active_run(tmp_path: Path) -> None:
+    runtime = build_runtime(_settings(tmp_path))
+    await runtime.repository.initialize()
+    stored, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "force-active-service-run",
+            "severity": "WARNING",
+            "title": "Force active analysis replacement",
+            "reason": "test",
+        },
+    )
+    first = await runtime.repository.create_run(
+        str(stored.alert.id),
+        "first-worker",
+        300,
+    )
+    assert first is not None
+    try:
+        replacement, _ = await runtime.service.reanalyze(
+            str(stored.alert.id),
+            force=True,
+        )
+
+        current = await runtime.repository.get(str(stored.alert.id))
+        assert current is not None and current.latest_run is not None
+        assert current.latest_run.id == replacement.id
+        assert current.latest_run.status == RunStatus.REVIEW_REQUIRED
+        prior = next(item for item in current.all_runs if item.id == first.id)
+        assert prior.status == RunStatus.FAILED
+        assert prior.error == "Superseded by forced re-analysis"
+        assert (
+            await runtime.repository.renew_run_lease(
+                str(first.id),
+                "first-worker",
+                first.fencing_token,
+                300,
+            )
+            is False
+        )
+    finally:
+        await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_service_lost_heartbeat_cancels_agent_without_writing_final_state(
+    tmp_path: Path,
+) -> None:
+    runtime = build_runtime(_settings(tmp_path))
+    await runtime.repository.initialize()
+    blocking_agent = BlockingAgent()
+    runtime.service.agent = blocking_agent  # type: ignore[assignment]
+    runtime.service.lease_heartbeat_interval_seconds = 0.005
+    renew_calls: list[tuple[str, str, int, int]] = []
+
+    async def reject_renewal(
+        run_id: str,
+        lease_owner: str,
+        fencing_token: int,
+        lease_seconds: int,
+    ) -> bool:
+        renew_calls.append((run_id, lease_owner, fencing_token, lease_seconds))
+        return False
+
+    runtime.repository.renew = reject_renewal  # type: ignore[method-assign]
+    stored, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "lost-service-lease",
+            "severity": "WARNING",
+            "title": "Lease lost during investigation",
+            "reason": "test",
+        },
+    )
+    alert_id = str(stored.alert.id)
+    try:
+        with pytest.raises(LeaseLostError):
+            async with asyncio.timeout(1):
+                await runtime.service.analyze_by_id(alert_id)
+
+        current = await runtime.repository.get(alert_id)
+        assert current is not None
+        assert current.status == AlertStatus.ANALYZING
+        assert current.error is None
+        assert current.recommendation is None
+        assert current.latest_run is not None
+        assert current.latest_run.status == RunStatus.RUNNING
+        assert all(item.stage != InvestigationStage.FAILED for item in current.progress)
+        assert blocking_agent.started.is_set()
+        assert blocking_agent.cancelled.is_set()
+        assert renew_calls == [
+            (
+                str(current.latest_run.id),
+                current.latest_run.lease_owner,
+                current.latest_run.fencing_token,
+                runtime.service.investigation_lease_seconds,
+            )
+        ]
+    finally:
+        await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_graph_updates_are_fenced_with_the_claimed_run_identity(tmp_path: Path) -> None:
+    runtime = build_runtime(_settings(tmp_path))
+    await runtime.repository.initialize()
+    update_calls: list[tuple[str, dict[str, Any]]] = []
+    finalize_calls: list[tuple[str, str, dict[str, Any]]] = []
+    original_update_run = runtime.repository.update_run
+    original_finalize_run = runtime.repository.finalize_run
+
+    async def record_update(run_id: str, **changes: Any) -> None:
+        update_calls.append((run_id, dict(changes)))
+        await original_update_run(run_id, **changes)
+
+    async def record_finalize(alert_id: str, run_id: str, **changes: Any) -> Any:
+        finalize_calls.append((alert_id, run_id, dict(changes)))
+        return await original_finalize_run(alert_id, run_id, **changes)
+
+    runtime.repository.update_run = record_update  # type: ignore[method-assign]
+    runtime.repository.finalize_run = record_finalize  # type: ignore[method-assign]
+    try:
+        result = await runtime.service.analyze(
+            "canonical",
+            {
+                "external_id": "fenced-graph-updates",
+                "severity": "WARNING",
+                "title": "Verify graph write fencing",
+                "reason": "test",
+            },
+        )
+
+        assert result.latest_run is not None
+        run = result.latest_run
+        assert update_calls
+        assert all(run_id == str(run.id) for run_id, _ in update_calls)
+        assert all(changes.get("lease_owner") == run.lease_owner for _, changes in update_calls)
+        assert all(
+            changes.get("fencing_token") == run.fencing_token
+            for _, changes in update_calls
+        )
+        assert len(finalize_calls) == 1
+        finalized_alert_id, finalized_run_id, final_changes = finalize_calls[0]
+        assert finalized_alert_id == str(result.alert.id)
+        assert finalized_run_id == str(run.id)
+        assert final_changes["lease_owner"] == run.lease_owner
+        assert final_changes["fencing_token"] == run.fencing_token
+        assert final_changes["run_status"] == RunStatus.REVIEW_REQUIRED
+        assert final_changes["alert_status"] == AlertStatus.REVIEW_REQUIRED
+    finally:
+        await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_run_fails_closed_when_runtime_manifest_changed(
+    tmp_path: Path,
+) -> None:
+    runtime = build_runtime(_settings(tmp_path))
+    await runtime.repository.initialize()
+    stored, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "incompatible-resume",
+            "severity": "WARNING",
+            "title": "Reject mixed runtime recovery",
+            "reason": "test",
+        },
+    )
+    run_id = uuid4()
+    snapshot = runtime.service._create_config_snapshot()
+    manifest = runtime.service._create_run_manifest(run_id, snapshot)
+    run = await runtime.repository.create_run(
+        str(stored.alert.id),
+        "original-worker",
+        300,
+        config_snapshot=snapshot,
+        manifest=manifest,
+    )
+    assert run is not None
+    await runtime.repository.save_checkpoint(
+        RunCheckpoint(
+            run_id=run.id,
+            version=1,
+            sequence=0,
+            state={"stage": "received"},
+            manifest_hash=manifest.digest(),
+        ),
+        expected_version=0,
+        lease_owner="original-worker",
+        fencing_token=run.fencing_token,
+    )
+    async with runtime.repository.session_factory() as session:  # type: ignore[attr-defined]
+        row = await session.get(InvestigationRunRow, str(run.id))
+        assert row is not None
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    unexpected_agent = UnexpectedAgent()
+    runtime.service.agent = unexpected_agent  # type: ignore[assignment]
+    runtime.service.runtime_manifest_config["code_version"] = "incompatible-version"
+    try:
+        with pytest.raises(AnalysisFailedError, match="manifest is incompatible"):
+            await runtime.service.analyze_by_id(str(stored.alert.id))
+
+        current = await runtime.repository.get(str(stored.alert.id))
+        assert current is not None and current.latest_run is not None
+        assert str(current.latest_run.id) == str(run.id)
+        assert current.latest_run.fencing_token == run.fencing_token + 1
+        assert current.latest_run.status == RunStatus.FAILED
+        assert current.status == AlertStatus.FAILED
+        assert unexpected_agent.called is False
+    finally:
+        await runtime.repository.close()  # type: ignore[attr-defined]

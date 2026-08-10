@@ -21,6 +21,7 @@ from app.adapters.prometheus_mcp import (
     PrometheusMCPModelError,
     PrometheusMCPProtocolError,
     PrometheusMCPQueryResult,
+    PrometheusMCPReadOnlyViolation,
     PrometheusMCPServerSettings,
     PrometheusMCPToolError,
     PrometheusMCPToolPolicy,
@@ -1365,6 +1366,37 @@ class _RecordingPrometheusClient:
         return self.result
 
 
+def test_prometheus_outer_tool_declares_strict_empty_input_schema() -> None:
+    assert PrometheusMCPEvidenceTool.input_schema == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_prometheus_outer_tool_rejects_caller_parameters() -> None:
+    result = PrometheusMCPQueryResult(
+        responses=(),
+        window_start=ALERT_TIME.replace(minute=55),
+        window_end=ALERT_TIME,
+        model_tool_calls=(),
+        model_request_ids=(),
+        call_limit_reached=False,
+        finished_by_model=False,
+    )
+    client = _RecordingPrometheusClient(result)
+
+    with pytest.raises(PrometheusMCPReadOnlyViolation, match="alert context"):
+        await PrometheusMCPEvidenceTool(client).execute(  # type: ignore[arg-type]
+            ToolExecutionRequest(
+                tool_name=PROMETHEUS_METRICS_TOOL_NAME,
+                parameters={"start": "caller-controlled"},
+            ),
+            _context(),
+        )
+
+
 @pytest.mark.asyncio
 async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_result_exists(
 ) -> None:
@@ -1407,6 +1439,43 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
     assert empty.status == ToolStatus.NO_DATA
     assert empty.structured_data["root_cause_eligible"] is False
     assert empty.summary == "Prometheus MCP 调用次数达到上限，实时证据不足。"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_partial_result_is_not_root_cause_eligible() -> None:
+    result = PrometheusMCPQueryResult(
+        responses=(
+            {
+                "tool_name": "query",
+                "has_monitoring_observation": True,
+                "window_verification": "exact",
+                "result": {"value": 1},
+            },
+        ),
+        window_start=ALERT_TIME.replace(minute=55),
+        window_end=ALERT_TIME,
+        model_tool_calls=("query",),
+        model_request_ids=(),
+        call_limit_reached=False,
+        finished_by_model=False,
+        partial=True,
+        termination_reason="sse_error_after_partial_result",
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
+        _RecordingPrometheusClient(result)
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _context(),
+    )
+
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.structured_data["partial"] is True
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert (
+        evidence.structured_data["root_cause_ineligible_reason"]
+        == "partial_evidence"
+    )
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,11 @@ from uuid import uuid4
 import pytest
 
 import app.adapters.ai as ai_module
-from app.adapters.ai import FakeAIAdvisor, _validate_manual_policy
+from app.adapters.ai import (
+    ConservativeFallbackAdvisor,
+    FakeAIAdvisor,
+    _validate_manual_policy,
+)
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.domain.errors import AdvisorError
 from app.domain.models import (
@@ -22,6 +26,7 @@ from app.domain.models import (
     RunbookVisualEvidence,
     ToolStatus,
 )
+from app.investigations.models import EvidenceNeed, Hypothesis, InvestigationMemory
 
 
 def make_alert():
@@ -31,47 +36,32 @@ def make_alert():
 
 
 def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> None:
-    assert "直接作为本次告警窗口的实时证据使用" in ai_module.SYSTEM_PROMPT
-    assert "不得再把它与告警标题中的主机或端口作字符串比较" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "才可作为本次告警窗口的因果证据使用" in ai_module.SYSTEM_PROMPT
+    assert "partial 不为 true" in ai_module.SYSTEM_PROMPT
+    assert "不得再把它与告警标题中的主机或端口作字符串比较" in (ai_module.SYSTEM_PROMPT)
     assert "不得要求或描述额外的 instance_id" in ai_module.SYSTEM_PROMPT
-    assert "instance_identity_verification.status=MATCHED" not in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "instance_identity_verification.status=MATCHED" not in (ai_module.SYSTEM_PROMPT)
     assert "不得比较告警标题" in ai_module.VALIDATION_PROMPT
     assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
 
 
 def test_system_prompt_requires_chinese_user_facing_recommendations() -> None:
     assert "最终面向用户的自然语言必须使用简体中文" in ai_module.SYSTEM_PROMPT
-    assert "不得输出英文句子、英文推理过程、计算草稿或未核实的时间推导" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "不得输出英文句子、英文推理过程、计算草稿或未核实的时间推导" in (ai_module.SYSTEM_PROMPT)
     assert '"Let\'s calculate"' in ai_module.SYSTEM_PROMPT
     assert "指标名、标签名、数据库对象名、原始技术值及必要缩写" in ai_module.SYSTEM_PROMPT
 
 
 def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
-    assert "先读取告警信息，再完整审阅本次已采集的 tool_evidence" in (
-        ai_module.SYSTEM_PROMPT
-    )
-    assert "不得先照抄候选原因，再在输出中逐条支持或反驳" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "先读取告警信息，再完整审阅本次已采集的 tool_evidence" in (ai_module.SYSTEM_PROMPT)
+    assert "不得先照抄候选原因，再在输出中逐条支持或反驳" in (ai_module.SYSTEM_PROMPT)
     assert "不得在这两个字段中输出 CONTRADICTED" in ai_module.SYSTEM_PROMPT
-    assert "被 SUCCESS 实时证据反驳的调查假设必须直接从最终结果删除" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "被 SUCCESS 实时证据反驳的调查假设必须直接从最终结果删除" in (ai_module.SYSTEM_PROMPT)
     assert "不得展示已删除假设的名称或排除理由" in ai_module.SYSTEM_PROMPT
     assert "此阶段只决定如何采集实时证据" in ai_module.PLANNER_PROMPT
     assert "不得形成或输出最终根因" in ai_module.PLANNER_PROMPT
-    assert "只是附带的 SQL 过滤说明，不是告警计数口径" in (
-        ai_module.SYSTEM_PROMPT
-    )
-    assert "不得把数据库管理平台采集 SQL 作为本次告警的候选原因或根因" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "只是附带的 SQL 过滤说明，不是告警计数口径" in (ai_module.SYSTEM_PROMPT)
+    assert "不得把数据库管理平台采集 SQL 作为本次告警的候选原因或根因" in (ai_module.SYSTEM_PROMPT)
     assert "不是告警计数口径" in ai_module.PLANNER_PROMPT
     assert "不得围绕这些 SQL 规划根因取证" in ai_module.PLANNER_PROMPT
     assert "若建议据此重新计算触发值，或将这些已过滤 SQL 作为候选原因或根因" in (
@@ -81,6 +71,81 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
     assert "root_causes 中出现 CONTRADICTED 时 analysis_contract_passed 必须为 false" in (
         ai_module.VALIDATION_PROMPT
     )
+    assert "cause 必须逐字复用该假设的 mechanism" in ai_module.SYSTEM_PROMPT
+    assert "使用假设 A 的证据包装原因 B" in ai_module.VALIDATION_PROMPT
+    assert "causal_candidate=false" in ai_module.PLANNER_PROMPT
+
+
+def test_prompts_treat_partial_success_as_descriptive_missing_evidence() -> None:
+    assert "structured_data.partial=true 表示采集不完整" in ai_module.SYSTEM_PROMPT
+    assert "allow_followup_dispatch=false 只表示" in ai_module.SYSTEM_PROMPT
+    assert "本轮不再派发相同 MCP 调查，不代表证据充分" in ai_module.SYSTEM_PROMPT
+    assert "structured_data.partial=true 的部分结果" in ai_module.PLANNER_PROMPT
+    assert "一律只能标为 INCONCLUSIVE" in ai_module.PLANNER_PROMPT
+    assert "即使部分结果同时标记 root_cause_eligible=true" in (ai_module.PLANNER_PROMPT)
+    assert "partial=true 的记录即使" in ai_module.VALIDATION_PROMPT
+    assert "不代表证据充分" in ai_module.VALIDATION_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_fake_advisor_keeps_partial_success_as_descriptive_unknown_context() -> None:
+    evidence = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_archery_slow_logs",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="已返回部分慢日志，可用于描述当前监控上下文。",
+        structured_data={
+            "partial": True,
+            "query_completed": True,
+            "root_cause_eligible": True,
+            "allow_followup_dispatch": False,
+        },
+    )
+
+    recommendation, _ = await FakeAIAdvisor().advise(
+        make_alert(),
+        [],
+        evidence=[evidence],
+    )
+
+    assert recommendation.root_causes[0].status.value == "UNKNOWN"
+    assert recommendation.root_causes[0].verified is False
+    assert recommendation.root_causes[0].evidence_refs == [str(evidence.id)]
+    assert recommendation.requires_human is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advisor", [FakeAIAdvisor(), ConservativeFallbackAdvisor()])
+async def test_deterministic_advisors_bind_causes_to_investigation_memory(
+    advisor: FakeAIAdvisor,
+) -> None:
+    hypothesis = Hypothesis(
+        hypothesis_id="pool-leak",
+        mechanism="连接池泄漏导致连接槽位持续占用。",
+        expected_observations=["长连接集中在单一应用。"],
+        contradicting_observations=["连接均匀且生命周期较短。"],
+        next_probe=EvidenceNeed(
+            need_id="pool-leak:probe",
+            objective="按应用只读核对连接年龄分布。",
+            expected_observation="长连接集中。",
+            contradicting_observation="连接分布均匀。",
+            tool_name="query_connection_sources",
+        ),
+    )
+    memory = InvestigationMemory(hypotheses=[hypothesis])
+
+    recommendation, _ = await advisor.advise(
+        make_alert(),
+        [],
+        investigation_memory=memory,
+    )
+
+    assert len(recommendation.root_causes) == 1
+    assert recommendation.root_causes[0].hypothesis_id == hypothesis.hypothesis_id
+    assert recommendation.root_causes[0].cause == hypothesis.mechanism
+    assert recommendation.root_causes[0].status.value == "UNKNOWN"
+    assert recommendation.root_causes[0].next_probe == hypothesis.next_probe.objective
 
 
 @pytest.mark.asyncio
@@ -89,9 +154,7 @@ async def test_no_runbook_forces_low_confidence() -> None:
     assert recommendation.manual_matched is False
     assert recommendation.confidence <= 0.45
     assert recommendation.runbook_references == []
-    assert [item.source for item in recommendation.analysis_bases] == [
-        AnalysisBasisSource.AI
-    ]
+    assert [item.source for item in recommendation.analysis_bases] == [AnalysisBasisSource.AI]
 
 
 @pytest.mark.asyncio
@@ -102,9 +165,7 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
     model_response = Recommendation(
         summary="Model analysis",
         knowledge_match_summary="model-overwritten-value",
-        analysis_bases=[
-            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")
-        ],
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
         requires_human=True,
         confidence=0.3,
@@ -149,15 +210,11 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
         source_system="alert_platform",
         status=ToolStatus.SUCCESS,
         summary=raw_text,
-        structured_data={
-            "flashduty": {"alert": {"description": raw_text}}
-        },
+        structured_data={"flashduty": {"alert": {"description": raw_text}}},
     )
     model_response = Recommendation(
         summary="证据不足，需继续核查。",
-        analysis_bases=[
-            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")
-        ],
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
         requires_human=True,
         confidence=0.3,
@@ -230,9 +287,7 @@ async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None
     captured_payload: dict[str, object] = {}
     model_response = Recommendation(
         summary="No semantic match",
-        analysis_bases=[
-            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")
-        ],
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
         requires_human=True,
         confidence=0.3,
@@ -302,9 +357,7 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
         requires_human=True,
         confidence=0.9,
         manual_matched=True,
-        runbook_references=[
-            RunbookReference(runbook_id="unknown-rb", section="PDF")
-        ],
+        runbook_references=[RunbookReference(runbook_id="unknown-rb", section="PDF")],
     )
     runbooks = [
         RunbookExcerpt(
@@ -321,9 +374,7 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
 
     # AI basis preserved; no RUNBOOK basis (none were valid), but one AI basis
     # ensures the ordering invariant.
-    assert [basis.source for basis in result.analysis_bases] == [
-        AnalysisBasisSource.AI
-    ]
+    assert [basis.source for basis in result.analysis_bases] == [AnalysisBasisSource.AI]
 
     # Step without valid source_ref dropped.
     assert result.steps == []
@@ -578,9 +629,7 @@ async def test_advisor_empty_content_error_contains_only_safe_response_metadata(
     advisor._model = "shared-analysis-model"
     advisor._max_tokens = 16_384
     advisor._json_mode = False
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=EmptyCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=EmptyCompletions()))
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": prompt_secret},
@@ -635,9 +684,7 @@ async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=ToolCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ToolCompletions()))
     tool = {
         "type": "function",
         "function": {
@@ -699,9 +746,7 @@ async def test_advisor_mcp_tool_error_exposes_safe_upstream_diagnostics() -> Non
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=FailingCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
     tool = {
         "type": "function",
         "function": {"name": "monitoring_query", "parameters": {"type": "object"}},
@@ -749,9 +794,7 @@ async def test_advisor_mcp_missing_tool_call_preserves_safe_response_shape() -> 
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=TextOnlyCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=TextOnlyCompletions()))
 
     with pytest.raises(AdvisorError) as caught:
         await advisor.request_mcp_tool_call(
@@ -788,9 +831,7 @@ async def test_advisor_no_choices_error_contains_request_shape() -> None:
     advisor._model = "shared-analysis-model"
     advisor._max_tokens = 16_384
     advisor._json_mode = True
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=NoChoiceCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=NoChoiceCompletions()))
 
     with pytest.raises(AdvisorError) as caught:
         await advisor._complete([{"role": "user", "content": "hello"}])
@@ -818,9 +859,7 @@ async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -
             )
             return SimpleNamespace(
                 id="validation-request-1",
-                choices=[
-                    SimpleNamespace(message=SimpleNamespace(content=content))
-                ],
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
                 usage=None,
             )
 
@@ -828,9 +867,7 @@ async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -
     validator._model = "shared-analysis-model"
     validator._max_tokens = 16_384
     validator._json_mode = True
-    validator._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=CapturingCompletions())
-    )
+    validator._client = SimpleNamespace(chat=SimpleNamespace(completions=CapturingCompletions()))
     alert = make_alert()
     recommendation, _ = await FakeAIAdvisor().advise(alert, [])
     run = InvestigationRun(alert_id=alert.id)

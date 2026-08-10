@@ -24,6 +24,8 @@ from app.domain.models import (
     ToolExecutionRequest,
     ValidationRecord,
 )
+from app.investigations.models import InvestigationMemory
+from app.investigations.stop import StopDecision
 
 
 def merge_evidence(left: list[EvidenceRecord], right: list[EvidenceRecord]) -> list[EvidenceRecord]:
@@ -65,6 +67,8 @@ class AgentState(BaseModel):
     knowledge_match_summary: str = ""
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)
     strategy: InvestigationStrategy | None = None
+    investigation_memory: InvestigationMemory = Field(default_factory=InvestigationMemory)
+    stop_decision: StopDecision | None = None
 
     # Tool execution for dynamic investigation
     pending_tool_requests: list[ToolExecutionRequest] = Field(default_factory=list)

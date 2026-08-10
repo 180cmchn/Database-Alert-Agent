@@ -105,6 +105,10 @@ class PrometheusMCPModelError(PrometheusMCPError):
         self.diagnostic_data = diagnostic_data or {}
 
 
+class PrometheusMCPReadOnlyViolation(PrometheusMCPError):
+    """A caller attempted to override Host-owned Prometheus query inputs."""
+
+
 @dataclass(frozen=True, slots=True)
 class PrometheusMCPToolPolicy:
     """Deployment-owned authorization and execution contract for one MCP tool."""
@@ -370,6 +374,8 @@ class PrometheusMCPClient:
         max_agent_steps: int = PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         sse_read_timeout_seconds: float | None = None,
+        use_shared_harness: bool = False,
+        harness_runtime_dependencies: Any | None = None,
     ) -> None:
         parsed = urlsplit(server.url.strip())
         if (
@@ -398,6 +404,10 @@ class PrometheusMCPClient:
             raise PrometheusMCPConfigurationError(
                 "Prometheus MCP SSE read timeout must be positive"
             )
+        if not isinstance(use_shared_harness, bool):
+            raise PrometheusMCPConfigurationError(
+                "Prometheus MCP use_shared_harness must be a boolean"
+            )
         self.mcp_url = server.url.strip()
         self._headers = dict(server.headers)
         self._tool_policies = {policy.name: policy for policy in server.tool_policies}
@@ -417,6 +427,8 @@ class PrometheusMCPClient:
             if sse_read_timeout_seconds is not None
             else timeout_seconds
         )
+        self.use_shared_harness = use_shared_harness
+        self.harness_runtime_dependencies = harness_runtime_dependencies
 
     @classmethod
     def from_settings(
@@ -428,6 +440,8 @@ class PrometheusMCPClient:
         max_agent_steps: int = PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         sse_read_timeout_seconds: float | None = None,
+        use_shared_harness: bool = False,
+        harness_runtime_dependencies: Any | None = None,
     ) -> PrometheusMCPClient:
         return cls(
             load_prometheus_mcp_server_settings(
@@ -437,9 +451,22 @@ class PrometheusMCPClient:
             max_agent_steps=max_agent_steps,
             timeout_seconds=timeout_seconds,
             sse_read_timeout_seconds=sse_read_timeout_seconds,
+            use_shared_harness=use_shared_harness,
+            harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
     async def collect_alert_window(
+        self, context: InvestigationContext
+    ) -> PrometheusMCPQueryResult:
+        if self.use_shared_harness:
+            from app.adapters.prometheus_harness import (
+                collect_prometheus_with_harness,
+            )
+
+            return await collect_prometheus_with_harness(self, context)
+        return await self._collect_alert_window_legacy(context)
+
+    async def _collect_alert_window_legacy(
         self, context: InvestigationContext
     ) -> PrometheusMCPQueryResult:
         occurred_at = context.alert.occurred_at
@@ -1644,16 +1671,28 @@ class PrometheusMCPEvidenceTool:
 
     name = PROMETHEUS_METRICS_TOOL_NAME
     source_system = "prometheus_mcp"
+    read_only = True
+    input_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
 
     def __init__(self, client: PrometheusMCPClient) -> None:
         self.client = client
+        # Legacy collection has no durable child checkpoint and must not be replayed.
+        self.max_attempts = 2 if getattr(client, "use_shared_harness", False) else 1
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
     ) -> ToolExecutionResult:
-        # Outer tool parameters are ignored. The embedded Agent receives the
-        # normalized alert and selects only locally authorized MCP tools; the Host
-        # binds trusted range arguments before each remote call.
+        # The embedded Agent receives only the normalized alert. The Host binds
+        # trusted range arguments before each remote call, so callers cannot
+        # override its query scope through the outer tool contract.
+        if request.parameters:
+            raise PrometheusMCPReadOnlyViolation(
+                "Prometheus evidence parameters are derived only from the alert context"
+            )
         session_attempts = 1
         reconnect_error_type: str | None = None
         try:
@@ -1666,7 +1705,14 @@ class PrometheusMCPEvidenceTool:
             "window_start": result.window_start.isoformat(),
             "window_end": result.window_end.isoformat(),
             "window_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
-            "mcp_invocation": "model_tool_calling",
+            "mcp_invocation": (
+                "shared_agent_harness"
+                if getattr(self.client, "use_shared_harness", False)
+                else "model_tool_calling"
+            ),
+            "allow_followup_dispatch": not getattr(
+                self.client, "use_shared_harness", False
+            ),
             "model_tool_calls": list(result.model_tool_calls),
             "model_request_ids": list(result.model_request_ids),
             "tool_attempts": list(result.tool_attempts),
@@ -1680,8 +1726,10 @@ class PrometheusMCPEvidenceTool:
             "reconnect_error_type": reconnect_error_type,
             "monitoring_results": list(result.responses),
             "query_completed": result.has_monitoring_data,
-            "root_cause_eligible": result.has_monitoring_data,
+            "root_cause_eligible": result.has_monitoring_data and not result.partial,
         }
+        if result.partial:
+            structured_data["root_cause_ineligible_reason"] = "partial_evidence"
         if result.has_monitoring_data:
             if result.partial:
                 suffix = "；后续调查未完整结束，已保留此前取得的可用监控返回"

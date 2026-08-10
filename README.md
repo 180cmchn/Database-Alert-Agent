@@ -45,10 +45,47 @@ START → fingerprint → knowledge → runbook → strategy
 验证等中间节点发现上游错误后会立即短路，不再继续发起后续调查或 AI 调用；`report` 节点统一将
 运行和告警分析落为 `FAILED` 并保存失败进度，避免失败链路继续产生无效结果。
 
-动态调查按工具名和规范化 JSON 参数识别同一逻辑请求。只有完整的 `SUCCESS` 才会阻止重复调用；
-`FAILED`、`TIMEOUT`、`NO_DATA` 以及标记为 `partial=true` 的成功结果，可在剩余 ReAct 轮次内重新
-采集。动态调用沿用策略中该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host 重新压缩
-到固定 10 秒。每次重新分析仍创建独立运行；上一运行的证据用于历史审计，不冒充本次实时证据。
+**持久化 Agent harness：**
+
+- `RunManifest` 在创建运行时冻结代码、模型、提示词、工具 Schema、工具策略和有效配置；其摘要同时
+  写入 checkpoint，恢复时若摘要不一致会拒绝加载，避免用另一套运行契约续跑旧状态。Manifest 已预留
+  `knowledge_versions` 字段，但当前创建运行时尚未采集知识源版本，该字段保持空对象，因此当前恢复
+  校验不承诺检测 PDF、外部知识库或历史案例内容漂移。
+- LangGraph 主图使用 `agent` checkpoint namespace；外层每次逻辑派发的 MCP 子运行使用
+  `mcp:<provider>:<dispatch_id>`。同一逻辑派发的首次执行与恢复尝试复用该 namespace，不同派发则相互
+  隔离，避免串用 Archery、Prometheus 等 provider 的状态和预算快照。
+- event 是按运行追加、带顺序号和版本的审计流；invocation 持久化工具名、有效参数指纹、尝试次数、
+  生命周期、错误详情和 artifact 引用；artifact 保存经过脱敏的大结果，并记录大小和 SHA-256 摘要。
+- 同一运行被重新领取后会从 checkpoint 恢复图状态、成功观测、预算、重试状态和已完成 invocation，
+  不重新执行已经完成的节点或远程调用。显式“重新分析”仍创建新的运行，不复用旧运行的实时证据。
+- 恢复前还会比较当前代码、模型、提示词、工具 Schema、工具策略和有效配置与 frozen manifest；如果
+  这些已填充的运行契约发生漂移，则 fail closed 为失败终态，不加载旧图或调用 MCP，需要用当前配置
+  创建新运行。
+- 所有运行期持久化写都携带当前 `lease_owner` 和单调递增的 `fencing_token`。heartbeat 无法续租或
+  owner/token 已变化时，旧 worker 会取消长操作并 fail closed；过期 worker 不能再写 event、
+  checkpoint、invocation、artifact 或最终运行状态。
+
+动态调查按工具名和规范化 JSON 参数识别同一逻辑请求。完整的 `SUCCESS` 以及 `FAILED`、
+`TIMEOUT`、`SKIPPED`、`NO_DATA` 都会关闭当前外层 ReAct 运行中的同一探针，避免重复消耗动态轮次；
+MCP 子 harness 会在返回这些终态前按只读与重试策略完成受控重试。通用工具的 `partial=true` 结果只有
+在 `allow_followup_dispatch` 未设置为 `false` 时才能分配新的外层逻辑派发；Archery shared harness 和
+Prometheus shared harness 均设置 `allow_followup_dispatch=false`，不会由外层 Agent 再次派发同一
+MCP 调查。下表同时列出对外证据状态和 durable invocation 的保守终态语义：
+
+| 状态 | 语义 | 根因判定用途 |
+| --- | --- | --- |
+| `SUCCESS` | 调用完成并返回可用的本次实时观测 | 只有与候选机制相关时才可支持或反驳根因 |
+| `NO_DATA` | 调用成功，但没有返回可用观测 | `MISSING`，不能支持或反驳根因 |
+| `FAILED` | 调用执行失败 | `MISSING`，不能支持或反驳根因 |
+| `TIMEOUT` | 调用未在截止期内完成 | `MISSING`，不能支持或反驳根因 |
+| `SKIPPED` | 工具未注册、不可用或被 Host 策略拒绝，未发起远程调用 | `MISSING`，不能支持或反驳根因 |
+| `UNKNOWN_OUTCOME` | 调用已越过远程边界，但恢复时无法确认是否完成 | `MISSING`，不能支持或反驳根因，也不能当作查询已执行或未执行的证明 |
+| `CANCELLED` | 调用因租约丢失、运行终止或取消信号而停止 | `MISSING`，不能支持或反驳根因 |
+
+`partial=true` 表示本次调查未完整结束；即使其中保留了部分成功观测，整条 partial 证据也不能支持
+或反驳根因，只能用于审计、人工复核和规划后续独立探针。未返回、被截断或失败的部分保持未知，
+不得被当作反证。动态调用沿用策略中该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host
+重新压缩到固定 10 秒。
 
 ## 数据流
 
@@ -352,9 +389,10 @@ Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名�
 以 Host 控制事件而不是伪造的 `assistant tool_call` 写入上下文，因此不占远端 MCP 调用预算。每轮
 结果会分别明确远端调用和模型决策的已用、剩余数。模型选择失败时 Host 会把脱敏错误、剩余预算和
 严格单工具调用要求作为 repair feedback，再做一次有限重试。若兼容 API 仍返回纯文本而非工具
-调用，诊断会保留脱敏后的 `finish_reason`、文本长度和截断预览。每个会话最多向 MCP 发送
-`ARCHERY_MCP_MAX_AGENT_STEPS` 个模型选择的工具调用，
-默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP 返回的工具中可能包含
+调用，诊断会保留脱敏后的 `finish_reason`、文本长度和截断预览。每条告警的一次分析运行最多向
+Archery MCP 发送 `ARCHERY_MCP_MAX_AGENT_STEPS` 个模型选择的工具调用；首次会话、重连、checkpoint
+恢复和受控重试共享该总预算。默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP
+返回的工具中可能包含
 `apply_query_permission_gymJPA` 等会产生外部状态变更的
 工具；这些工具不会进入模型可见的工具列表。
 
@@ -404,11 +442,13 @@ history 字段已经发现但查询未完成时，诊断返回“等待 history 
 传输失败、登录确认失败、鉴权失败、超时、MCP 标准错误或不可恢复的 Archery 业务错误形成失败
 证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。SQL
 工具错误的脱敏类型和详情会写入对应 `query_trace`，便于区分字段错误、语法错误和权限错误。首次
-协议或传输失败时 EvidenceTool 会新建会话重试一次，每个新会话都重新登录。远端调用预算按会话
-计算，只有实际发送至 MCP 的模型工具调用才占用 `ARCHERY_MCP_MAX_AGENT_STEPS`；Host 登录和未通过
-只读校验的调用不占用该预算。另设最多两倍于远端预算的模型决策保护上限，防止模型持续生成无效
-调用。因此最坏远端调查调用数仍约为 `2 * ARCHERY_MCP_MAX_AGENT_STEPS`，另加每次会话的确定性登录；
-跨会话共享预算和完整轨迹是后续状态机改造项。
+协议或传输失败时，shared harness 可在策略允许时新建会话并重新登录。所有重连会话共享同一个
+运行状态、成功观测、调用轨迹、checkpoint、重试状态和远端调用预算；实际发送到 MCP 的调查调用
+总数不会超过 `ARCHERY_MCP_MAX_AGENT_STEPS`。若结束时只有 partial 结果，证据会设置
+`allow_followup_dispatch=false`，外层 Agent 不会再创建一个满额预算的 Archery 调查。Host bootstrap
+与被 Host 拒绝的调用会单独记账，但不占用远端工具调用预算。传输中断导致调用结果未知时，只有
+Host 仍能证明工具只读且 `RetryPolicy` 明确允许时才会重试；否则保留
+`UNKNOWN_OUTCOME`/缺失证据并停止自动重放。显式重新分析会创建新 run，并按新 run 重新分配预算。
 
 项目级 MCP 配置只保存环境变量引用，不保存秘密：
 
@@ -477,23 +517,26 @@ SSE 空闲读取期限使用外层 Prometheus 工具期限，避免模型规划�
 最多允许重试一次。工具错误、空结果和目录结果会分别给出下一步提示，避免模型反复枚举或原样重试。
 工具选择失败时，第二次模型请求会带上脱敏的错误类型、错误详情、可用工具及剩余预算；连续两次
 仍未形成工具调用时返回带两次安全诊断的 `NO_DATA`，而不是丢失调查轨迹。
-最大远端调用次数由 `PROMETHEUS_MCP_MAX_AGENT_STEPS` 控制（默认 `8`，范围 `1–100`），模型决策
-另有有限上限以避免反复提前结束或重复选择。达到远端调用上限时：
+shared harness 中每条告警的一次分析运行，其远端调用总数由
+`PROMETHEUS_MCP_MAX_AGENT_STEPS` 控制（默认 `8`，范围 `1–100`）；首次会话、重连、checkpoint 恢复
+和受控重试共享该总预算。模型决策另有有限上限以避免反复提前结束或重复选择。达到远端调用上限时：
 
-- 已取得至少一条包含样本、序列或数值的可解析监控返回：记录为正常 `SUCCESS` 实时证据，并以
-  `call_limit_reached=true` 标示调用已截断；上限本身不会否定已取得的证据。
+- 已取得至少一条包含样本、序列或数值的可解析监控返回：保留为 `SUCCESS` 观测并以
+  `call_limit_reached=true` 标示调用已截断；shared harness 同时将未正常结束的调查标记为
+  `partial=true`，该条 partial 记录不能支持或反驳根因。
 - 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
   后续结论必须人工复核。
 
 指标目录、状态对象和空序列会保留给后续模型调用及审计，但不会被标为根因支持证据。若已取得
 可用观测后模型、MCP 调用或 SSE 会话发生错误，当前运行保留已有结果并记录 `partial`、
-`termination_reason` 和错误类型，不再因后续单点故障丢弃整轮证据。普通、可修正的工具业务错误
-只记录在 `tool_attempts`，不会把已成功结束的调查标为 `partial`。标准 MCP `content[].text` 中完整的
+`termination_reason` 和错误类型，不再因后续单点故障丢弃整轮审计信息；该 partial 记录不能支持或
+反驳根因。普通、可修正的工具业务错误只记录在 `tool_attempts`，不会把已成功结束的调查标为
+`partial`。标准 MCP `content[].text` 中完整的
 JSON 或 JSON 代码块会先解包再识别观测与样本时间戳，避免已经返回的 Prometheus 数据被文本外壳
 误判为空。每条审计响应最多保留 24,000 字符，回传模型的视图最多 8,000 字符；若聚合证据仍触发
 通用截断，则取消根因支持资格。
 
-结果存在不代表根因已被证明；只有关联的成功实时证据支持具体机制时，才可把原因标为
+结果存在不代表根因已被证明；只有关联的完整、非 partial 成功实时证据支持具体机制时，才可把原因标为
 `SUPPORTED`。被成功实时证据反驳的调查假设直接从最终结果删除，不向用户展示。MCP 返回内容
 一律视为不可信数据，不会执行其中的指令。
 
@@ -535,15 +578,28 @@ PROMETHEUS_MCP_SSE_URL=https://prometheus-mcp.example.internal/sse
 PROMETHEUS_MCP_API_KEY_HEADER=Authorization
 PROMETHEUS_MCP_API_KEY=Bearer replace-with-your-token
 PROMETHEUS_MCP_MAX_AGENT_STEPS=8
+PROMETHEUS_MCP_USE_SHARED_HARNESS=false
 PROMETHEUS_MCP_TIMEOUT_SECONDS=60
 PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
 端点、请求头名与密钥均为部署级配置，不会由管理 API 返回或修改；最大调用次数可经 Runtime
 Settings 调整。生产环境必须使用 HTTPS。密钥只在本服务到 MCP 的请求头中使用，不会写入 MCP
-配置文件、工具参数、证据或日志。首次协议或传输失败且尚无合格观测时会新建 SSE 会话重试一次；
-当前预算按会话计算，最坏远端调用数约为 `2 * PROMETHEUS_MCP_MAX_AGENT_STEPS`，跨会话共享预算和
-首会话完整轨迹仍需在内网兼容性验证后完成状态机收敛。
+配置文件、工具参数、证据或日志。`PROMETHEUS_MCP_USE_SHARED_HARNESS=false`（默认）使用 legacy
+执行路径；设为 `true` 才启用持久化 shared harness canary。共享 harness 在所有重连和恢复尝试之间
+保留成功观测、调用轨迹、checkpoint 与同一个远端调用预算，因此每条告警的一次分析运行总调用数
+不会超过 `PROMETHEUS_MCP_MAX_AGENT_STEPS`。shared harness 返回 partial 结果时会设置
+`allow_followup_dispatch=false`，外层 Agent 不会通过新的逻辑派发重置预算。传输中断造成结果未知时，
+只有本地策略仍确认工具只读、场景显式授权且 `RetryPolicy` 尚有额度，才会在新会话中重试原查询；
+写工具和未授权工具不会使用该例外。默认 legacy 路径没有 durable child checkpoint，上述跨重连恢复
+和 per-alert 总预算保证仅适用于 shared harness canary。
+
+当前开发机未连接公司内网，Archery MCP 和 Prometheus MCP 均未做真实 Host 连通、鉴权、Schema 或
+超时行为测试。发布时应先审核 Prometheus 的真实 `tools/list` 与本地 `toolPolicies` 是否一致，再仅对
+少量 worker 设置 `PROMETHEUS_MCP_USE_SHARED_HARNESS=true`。观察 timeout、reconnect、no-data、预算
+消耗和 checkpoint 恢复事件后再逐步扩大部署范围；Archery shared harness 也应先在受控 worker 验证
+真实 Host 行为。Prometheus 布尔开关不负责自动流量分配；回滚时将对应 worker 的值恢复为 `false`
+并重启即可。已产生的 run、checkpoint 和审计事件继续保留，但不会被 legacy 路径当作新的实时证据。
 
 ## 本地运行
 
@@ -658,6 +714,11 @@ Agent 必须先完成实时证据采集，再形成最终可能根因：
 - `SUPPORTED`：存在非告警平台的实时 `SUCCESS` 证据；
 - `UNKNOWN`：证据不足，同时给出 `next_probe`。
 
+新运行中的每个最终根因必须通过 `hypothesis_id` 绑定显式调查内存中的同一假设。模型输出仅是
+提议；Host 会根据该假设的合格 evidence assessments 重新派生 `cause`、`status`、
+`evidence_refs` 和 `verified`，跨假设借用证据、未知或重复 ID 都会触发人工复核。没有具体候选
+机制时使用的 `unresolved-cause` 只是规划占位符，始终保持 `UNKNOWN`，不能被升级为已支持根因。
+
 `root_causes` 与 `likely_causes` 只包含采证后仍成立或尚未排除的原因。被实时证据反驳的调查
 假设直接从最终结果删除，不展示其名称、状态或排除理由。若现有假设全部被删除且证据不足以
 形成新原因，允许根因列表为空并转人工复核。只有
@@ -730,6 +791,31 @@ pytest -m "not live"
 ruff check app tests migrations
 cd frontend && npm run build
 ```
+
+Agent/MCP harness 的核心 replay 与故障注入测试可单独运行：
+
+```bash
+.venv/bin/pytest -q \
+  tests/unit/test_mcp_runtime.py \
+  tests/unit/test_archery_harness.py \
+  tests/unit/test_prometheus_harness.py
+
+.venv/bin/pytest -q \
+  tests/unit/test_langgraph_checkpoint.py \
+  tests/unit/test_persistence_harness.py \
+  tests/unit/test_run_lease_guard.py \
+  tests/unit/test_service_run_lease.py
+```
+
+这些用例使用 `ReplayMCPConnector`、fake client 和临时 SQLite，不访问 Archery 或 Prometheus 内网
+Host。覆盖模型未生成 tool call 后的一次 repair、Host 拒绝、timeout/disconnect/unknown outcome、
+重连后保留部分结果与预算、预算耗尽、checkpoint resume、终态 artifact 回填、过期 fencing 拒写，
+以及已完成运行恢复时不重放远程调用。它们验证本地状态机与持久化契约，不能替代公司内网中的真实
+MCP Schema、鉴权、SSE 行为和超时兼容性验证。
+
+生产部署还必须把 `APP_CODE_VERSION` 设置为不可变镜像摘要或 Git revision，并确保同一批 API 与
+worker 使用相同值。该值写入每次运行的 frozen manifest；恢复时不一致会 fail closed，避免新代码
+继续执行旧 checkpoint。开发环境可使用默认值或 `.env.example` 中的 `dev`。
 
 普通测试使用临时数据库、Fake AI 和模拟 FlashDuty 响应，不读取工作区 `.env`，用于稳定验证
 状态机、鉴权、重试、只读边界和数据转换。真实部署配置由显式启用的 `live` 测试验证；它会产生

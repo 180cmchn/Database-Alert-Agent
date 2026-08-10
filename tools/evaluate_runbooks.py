@@ -12,6 +12,12 @@ from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import RunbookKnowledgeType
 
+_ZERO_TOLERANCE_VIOLATIONS = (
+    "fabricated_runbook_references",
+    "fabricated_evidence",
+    "unapproved_change_actions",
+)
+
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -206,14 +212,19 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "runbook_precision_at_1": _ratio(top_one_hits, match_total),
         "no_match_accuracy": _ratio(no_match_hits, no_match_total),
         "section_hit_rate": _ratio(section_hits, match_total),
-        "cause_candidate_recall": _coverage_ratio(cause_found, cause_expected),
+        # An empty diagnosis set is not evidence of perfect diagnosis recall.
+        "cause_candidate_recall": _ratio(cause_found, cause_expected),
         "runbook_case_coverage": _coverage_ratio(
             len(eligible_runbook_types & evaluated_runbook_types),
             len(eligible_runbook_types),
         ),
-        "cause_case_coverage": _coverage_ratio(
-            len(eligible_causes & evaluated_causes),
-            len(eligible_causes),
+        "cause_case_coverage": (
+            _coverage_ratio(
+                len(eligible_causes & evaluated_causes),
+                len(eligible_causes),
+            )
+            if diagnosis_cases
+            else 0.0
         ),
         "generated_case_freshness": _coverage_ratio(
             fresh_generated_case_count,
@@ -232,6 +243,10 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "annotated_cause_targets": len(eligible_causes),
             "generated_cases": generated_case_count,
         },
+        # This evaluator does not execute model or tool scenarios. Explicit
+        # zeroes mean no violation was observed in this report's scope; an
+        # independent harness report can add its own counts before gating.
+        "violations": {name: 0 for name in _ZERO_TOLERANCE_VIOLATIONS},
         "failures": failures,
     }
 
@@ -243,6 +258,7 @@ def _gate_report(report: dict[str, Any], gates: dict[str, Any]) -> dict[str, Any
     for count_key, policy_key in (
         ("positive_matching_cases", "minimum_positive_matching_cases"),
         ("no_match_cases", "minimum_no_match_cases"),
+        ("diagnosis_cases", "minimum_diagnosis_cases"),
     ):
         minimum = int(dataset_policy.get(policy_key, 0))
         actual_count = int(counts.get(count_key, 0))
@@ -252,7 +268,97 @@ def _gate_report(report: dict[str, Any], gates: dict[str, Any]) -> dict[str, Any
         actual = float(report["metrics"].get(metric, 0))
         if actual < float(threshold):
             failures.append(f"{metric}={actual:.4f} is below {float(threshold):.4f}")
+
+    violations = report.get("violations")
+    for violation_name in gates.get("zero_tolerance") or []:
+        if not isinstance(violations, dict) or violation_name not in violations:
+            failures.append(f"violations.{violation_name} is missing")
+            continue
+        count = violations[violation_name]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            failures.append(
+                f"violations.{violation_name} must be a non-negative integer"
+            )
+            continue
+        if count:
+            failures.append(
+                f"violations.{violation_name}={count} violates zero tolerance"
+            )
+
+    harness_policy = gates.get("harness_policy") or {}
+    if harness_policy.get("enabled") is True:
+        harness = report.get("harness")
+        if not isinstance(harness, dict):
+            failures.append("harness report is required when harness_policy is enabled")
+        else:
+            minimum_scenarios = int(
+                harness_policy.get("minimum_harness_scenarios", 0)
+            )
+            scenario_count = harness.get("scenario_count")
+            if (
+                isinstance(scenario_count, bool)
+                or not isinstance(scenario_count, int)
+                or scenario_count < 0
+            ):
+                failures.append("harness.scenario_count must be a non-negative integer")
+            elif scenario_count < minimum_scenarios:
+                failures.append(
+                    f"harness.scenario_count={scenario_count} is below {minimum_scenarios}"
+                )
+
+            fault_families = harness.get("fault_families")
+            for family in harness_policy.get("required_fault_families") or []:
+                if not isinstance(fault_families, dict) or family not in fault_families:
+                    failures.append(f"harness.fault_families.{family} is missing")
+                    continue
+                family_count = fault_families[family]
+                if (
+                    isinstance(family_count, bool)
+                    or not isinstance(family_count, int)
+                    or family_count < 1
+                ):
+                    failures.append(
+                        f"harness.fault_families.{family} must contain at least one scenario"
+                    )
+
+            harness_violations = harness.get("violations")
+            for violation_name in gates.get("zero_tolerance") or []:
+                if (
+                    not isinstance(harness_violations, dict)
+                    or violation_name not in harness_violations
+                ):
+                    failures.append(
+                        f"harness.violations.{violation_name} is missing"
+                    )
     return {"passed": not failures, "failures": failures}
+
+
+def _attach_harness_report(
+    report: dict[str, Any],
+    harness_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach an independent scenario report and merge its violation counts."""
+
+    result = dict(report)
+    result["harness"] = harness_report
+    violations = dict(report.get("violations") or {})
+    harness_violations = harness_report.get("violations")
+    if isinstance(harness_violations, dict):
+        for name, count in harness_violations.items():
+            existing = violations.get(name, 0)
+            if (
+                isinstance(existing, int)
+                and not isinstance(existing, bool)
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+            ):
+                violations[name] = existing + count
+            else:
+                # Preserve invalid input so the gate reports it instead of
+                # silently coercing or discarding the value.
+                violations[name] = count
+    result["violations"] = violations
+    return result
 
 
 def main() -> int:
@@ -275,10 +381,20 @@ def main() -> int:
     parser.add_argument("--gates", type=Path, default=Path("policies/production-gates.json"))
     parser.add_argument("--min-score", type=float, default=12.0)
     parser.add_argument("--min-confidence", type=float, default=0.35)
+    parser.add_argument(
+        "--harness-report",
+        type=Path,
+        help="Optional independent Agent harness scenario report in JSON format",
+    )
     parser.add_argument("--enforce-gates", action="store_true")
     args = parser.parse_args()
 
     report = asyncio.run(evaluate(args))
+    if args.harness_report is not None:
+        harness_report = json.loads(args.harness_report.read_text(encoding="utf-8"))
+        if not isinstance(harness_report, dict):
+            parser.error("--harness-report must contain a JSON object")
+        report = _attach_harness_report(report, harness_report)
     gates = json.loads(args.gates.read_text(encoding="utf-8"))
     report["production_gate"] = _gate_report(report, gates)
     print(json.dumps(report, ensure_ascii=False, indent=2))

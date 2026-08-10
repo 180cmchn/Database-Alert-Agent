@@ -130,6 +130,7 @@ class NormalizedAlert(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
+
 class RunbookProbe(BaseModel):
     tool_name: str
     objective: str
@@ -266,9 +267,7 @@ class AnalysisBasis(BaseModel):
         if self.source == AnalysisBasisSource.EXTERNAL_KNOWLEDGE and not isinstance(
             self.source_ref, ExternalKnowledgeReference
         ):
-            raise ValueError(
-                "EXTERNAL_KNOWLEDGE analysis basis requires an external source_ref"
-            )
+            raise ValueError("EXTERNAL_KNOWLEDGE analysis basis requires an external source_ref")
         if self.source == AnalysisBasisSource.AI and self.source_ref is not None:
             raise ValueError("AI analysis basis must not contain source_ref")
         return self
@@ -284,6 +283,9 @@ class RecommendationStep(BaseModel):
 
 class RootCauseAssessment(BaseModel):
     cause: str
+    # Optional so recommendations persisted before the Agent harness remain
+    # readable. New harness runs bind every final cause to Host-owned memory.
+    hypothesis_id: str | None = Field(default=None, min_length=1, max_length=200)
     cause_id: str | None = None
     status: RootCauseStatus = RootCauseStatus.UNKNOWN
     evidence_refs: list[str] = Field(default_factory=list)
@@ -315,9 +317,7 @@ class Recommendation(BaseModel):
     confidence: float = Field(ge=0, le=1)
     manual_matched: bool
     runbook_references: list[RunbookReference] = Field(default_factory=list)
-    external_knowledge_matches: list[ExternalKnowledgeExcerpt] = Field(
-        default_factory=list
-    )
+    external_knowledge_matches: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
     analysis_mode: Literal["assist", "shadow"] = "assist"
 
@@ -325,6 +325,8 @@ class Recommendation(BaseModel):
 class ToolExecutionRequest(BaseModel):
     tool_name: str
     parameters: dict[str, Any] = Field(default_factory=dict)
+    objective: str = ""
+    hypothesis_ids: list[str] = Field(default_factory=list)
     # A bounded multi-step MCP investigation can legitimately outlive the
     # former single-request ceiling. This remains an internal strategy value;
     # API callers cannot supply tool plans directly.
@@ -352,6 +354,25 @@ class InvestigationContext(BaseModel):
     run_id: UUID
     alert: NormalizedAlert
     strategy: InvestigationStrategy
+    lease_owner: str | None = None
+    fencing_token: int | None = Field(default=None, ge=1)
+    # The outer dispatcher scopes durable child checkpoints to one logical tool
+    # dispatch. Attempt 2 may only resume that same child run.
+    outer_dispatch_id: UUID | None = None
+    outer_dispatch_attempt: int | None = Field(default=None, ge=1, le=2)
+    # Kept as a JSON-compatible projection so domain tool adapters do not depend
+    # on the harness' richer checkpoint model.
+    investigation_memory: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def require_complete_lease_identity(self) -> InvestigationContext:
+        if (self.lease_owner is None) != (self.fencing_token is None):
+            raise ValueError("lease_owner and fencing_token must be provided together")
+        if (self.outer_dispatch_id is None) != (self.outer_dispatch_attempt is None):
+            raise ValueError(
+                "outer_dispatch_id and outer_dispatch_attempt must be provided together"
+            )
+        return self
 
 
 class EvidenceRecord(BaseModel):
@@ -370,15 +391,19 @@ class EvidenceRecord(BaseModel):
     truncated: bool = False
 
     def is_root_cause_support_eligible(self) -> bool:
-        """Return whether this successful live record may support a root cause."""
+        """Return whether this complete live record may decide a root cause.
+
+        A partial result remains useful as collected monitoring context, but it
+        cannot support or contradict a causal mechanism. Dispatch completion
+        (for example ``allow_followup_dispatch=false``) is deliberately not an
+        evidence-quality override.
+        """
 
         return (
             self.status == ToolStatus.SUCCESS
             and self.source_system != "alert_platform"
-            and (
-                not self.truncated
-                or self.structured_data.get("root_cause_eligible") is True
-            )
+            and self.structured_data.get("partial") is not True
+            and (not self.truncated or self.structured_data.get("root_cause_eligible") is True)
             and self.structured_data.get("root_cause_eligible") is not False
         )
 
@@ -450,12 +475,24 @@ class AnalysisConfigSnapshot(BaseModel):
     ai_fallback_enabled: bool = True
     ai_model: str = ""
     ai_provider: str = "openai_compatible"
+    ai_timeout_seconds: float = 300
+    ai_max_retries: int = 2
+    ai_max_tokens: int = 16_384
+    prompt_version: str = ""
+    code_version: str = ""
+    archery_mcp_max_agent_steps: int = 0
+    prometheus_mcp_max_agent_steps: int = 0
+    archery_mcp_use_shared_harness: bool = True
+    prometheus_mcp_use_shared_harness: bool = False
+    tool_schema_versions: dict[str, str] = Field(default_factory=dict)
+    tool_policy_versions: dict[str, str] = Field(default_factory=dict)
 
 
 class InvestigationRun(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     alert_id: UUID
     attempt: int = Field(default=1, ge=1)
+    fencing_token: int = Field(default=1, ge=1)
     status: RunStatus = RunStatus.RUNNING
     current_stage: InvestigationStage = InvestigationStage.RECEIVED
     strategy_id: str | None = None
@@ -508,11 +545,39 @@ class FeedbackRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class InvestigationEvidenceAssessment(BaseModel):
+    """Model-proposed semantic relation, enforced later by the evidence policy."""
+
+    hypothesis_id: str = Field(min_length=1, max_length=200)
+    evidence_id: str = Field(min_length=1, max_length=200)
+    relation: Literal["SUPPORTS", "CONTRADICTS", "INCONCLUSIVE"]
+    rationale: str = Field(default="", max_length=2_000)
+
+
 class InvestigationDecision(BaseModel):
     action: Literal["tool", "finish"]
     tool_name: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
+    objective: str = ""
+    hypothesis_ids: list[str] = Field(default_factory=list)
+    evidence_assessments: list[InvestigationEvidenceAssessment] = Field(
+        default_factory=list,
+        max_length=200,
+    )
     reason: str = ""
+
+    @model_validator(mode="after")
+    def validate_tool_decision(self) -> InvestigationDecision:
+        if self.action == "tool" and not self.tool_name:
+            raise ValueError("tool action requires tool_name")
+        if self.action == "finish" and (self.tool_name or self.parameters):
+            raise ValueError("finish action cannot contain a tool call")
+        assessment_keys = [
+            (item.hypothesis_id, item.evidence_id) for item in self.evidence_assessments
+        ]
+        if len(assessment_keys) != len(set(assessment_keys)):
+            raise ValueError("evidence may be assessed only once per hypothesis")
+        return self
 
 
 class AdvisorMetadata(BaseModel):

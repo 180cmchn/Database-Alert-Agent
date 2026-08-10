@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Literal
+from typing import Any, Literal
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
 from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.agent_runtime.langgraph_checkpoint import RepositoryLangGraphCheckpointer
 from app.agents.nodes import (
     NodeContext,
     advise_node,
@@ -56,7 +59,19 @@ def should_continue_dynamic_investigation(state: AgentState) -> Literal["execute
     return "advise"
 
 
-def build_investigation_graph(ctx: NodeContext) -> StateGraph:
+def should_start_tool_investigation(state: AgentState) -> Literal["execute_tools", "advise"]:
+    """Apply Host stop conditions before the first live tool dispatch."""
+
+    if state.stop_decision is not None and state.stop_decision.should_stop:
+        return "advise"
+    return "execute_tools"
+
+
+def build_investigation_graph(
+    ctx: NodeContext,
+    *,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+) -> StateGraph:
     """Build the LangGraph investigation graph.
 
     The graph implements the following flow:
@@ -98,7 +113,14 @@ def build_investigation_graph(ctx: NodeContext) -> StateGraph:
     graph.add_edge(NODE_FINGERPRINT, NODE_KNOWLEDGE)
     graph.add_edge(NODE_KNOWLEDGE, NODE_RUNBOOK)
     graph.add_edge(NODE_RUNBOOK, NODE_STRATEGY)
-    graph.add_edge(NODE_STRATEGY, NODE_EXECUTE_TOOLS)
+    graph.add_conditional_edges(
+        NODE_STRATEGY,
+        should_start_tool_investigation,
+        {
+            "execute_tools": NODE_EXECUTE_TOOLS,
+            "advise": NODE_ADVISE,
+        },
+    )
 
     # The deterministic plan always runs first. Dynamic investigation then decides
     # whether to queue one additional tool call or finish with the gathered evidence.
@@ -117,7 +139,7 @@ def build_investigation_graph(ctx: NodeContext) -> StateGraph:
     graph.add_edge(NODE_VALIDATE, NODE_REPORT)
     graph.add_edge(NODE_REPORT, END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 class InvestigationAgent:
@@ -191,5 +213,39 @@ class InvestigationAgent:
         Returns:
             The final state after investigation completes
         """
-        result = await self.graph.ainvoke(initial_state)
+        run = initial_state.run
+        if run is None or not run.lease_owner:
+            result = await self.graph.ainvoke(initial_state)
+            return AgentState.model_validate(result)
+
+        manifest = await self.ctx.repository.get_run_manifest(str(run.id))
+        if manifest is None:
+            result = await self.graph.ainvoke(initial_state)
+            return AgentState.model_validate(result)
+        if manifest.run_id != run.id:
+            raise RuntimeError("Run manifest identity does not match the investigation run")
+
+        checkpointer = RepositoryLangGraphCheckpointer(
+            self.ctx.repository,
+            run_id=run.id,
+            manifest_hash=manifest.digest(),
+            lease_owner=run.lease_owner,
+            fencing_token=run.fencing_token,
+        )
+        graph = build_investigation_graph(self.ctx, checkpointer=checkpointer)
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": str(run.id),
+            }
+        }
+        saved = await checkpointer.aget_tuple(config)
+        if saved is None:
+            result = await graph.ainvoke(initial_state, config)
+            return AgentState.model_validate(result)
+
+        resume_config = await graph.aupdate_state(
+            saved.config,
+            {"run": run},
+        )
+        result = await graph.ainvoke(None, resume_config)
         return AgentState.model_validate(result)

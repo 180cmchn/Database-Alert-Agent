@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.adapters.ai import (
+    PROMPT_VERSION,
     ConservativeFallbackAdvisor,
     FakeAIAdvisor,
     FakeConclusionValidator,
@@ -10,6 +11,7 @@ from app.adapters.ai import (
     OpenAICompatibleConclusionValidator,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
+from app.adapters.archery_harness import ArcheryHarnessRuntimeDependencies
 from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcheryMCPClient,
@@ -33,6 +35,7 @@ from app.adapters.notification import (
 )
 from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.adapters.persistence import SQLAlchemyAlertRepository
+from app.adapters.prometheus_harness import PrometheusHarnessRuntimeDependencies
 from app.adapters.prometheus_mcp import (
     PROMETHEUS_METRICS_TOOL_NAME,
     PrometheusMCPClient,
@@ -70,6 +73,24 @@ def _flashduty_tool_timeout(settings: Settings) -> float:
         120,
         settings.flashduty_timeout_seconds * (settings.flashduty_max_retries + 1) + retry_backoff,
     )
+
+
+def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
+    """Return non-secret runtime values that must be frozen per investigation."""
+
+    return {
+        "code_version": settings.app_code_version,
+        "prompt_version": PROMPT_VERSION,
+        "ai_timeout_seconds": settings.ai_timeout_seconds,
+        "ai_max_retries": settings.ai_max_retries,
+        "ai_max_tokens": settings.ai_max_tokens,
+        "archery_mcp_max_agent_steps": settings.archery_mcp_max_agent_steps,
+        "prometheus_mcp_max_agent_steps": settings.prometheus_mcp_max_agent_steps,
+        "archery_mcp_use_shared_harness": True,
+        "prometheus_mcp_use_shared_harness": (
+            settings.prometheus_mcp_use_shared_harness
+        ),
+    }
 
 
 def _build_advisor(settings: Settings) -> AIAdvisor:
@@ -141,6 +162,7 @@ def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeCli
 def _build_archery_mcp_tool(
     settings: Settings,
     model: AIAdvisor,
+    repository: AlertRepository | None = None,
 ) -> ArcherySlowLogEvidenceTool | None:
     if not settings.archery_mcp_enabled or not isinstance(model, MCPToolCallingModel):
         return None
@@ -155,6 +177,11 @@ def _build_archery_mcp_tool(
             window_seconds=settings.archery_slow_log_window_seconds,
             max_agent_steps=settings.archery_mcp_max_agent_steps,
             timeout_seconds=settings.archery_mcp_timeout_seconds,
+            harness_runtime_dependencies=(
+                ArcheryHarnessRuntimeDependencies(repository)
+                if repository is not None
+                else None
+            ),
         )
     )
 
@@ -162,6 +189,7 @@ def _build_archery_mcp_tool(
 def _build_prometheus_mcp_tool(
     settings: Settings,
     model: AIAdvisor,
+    repository: AlertRepository | None = None,
 ) -> PrometheusMCPEvidenceTool | None:
     """Build the optional SSE monitoring evidence tool without loading ``.env``."""
 
@@ -179,6 +207,12 @@ def _build_prometheus_mcp_tool(
             max_agent_steps=settings.prometheus_mcp_max_agent_steps,
             timeout_seconds=settings.prometheus_mcp_timeout_seconds,
             sse_read_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
+            use_shared_harness=settings.prometheus_mcp_use_shared_harness,
+            harness_runtime_dependencies=(
+                PrometheusHarnessRuntimeDependencies(repository)
+                if repository is not None
+                else None
+            ),
         )
     )
 
@@ -187,6 +221,7 @@ def _build_tool_registry(
     settings: Settings,
     advisor: AIAdvisor,
     client: FlashDutyClient | None = None,
+    repository: AlertRepository | None = None,
 ) -> InvestigationToolRegistry:
     registry = build_default_tool_registry()
     if client is not None:
@@ -201,10 +236,10 @@ def _build_tool_registry(
             channel_ids=settings.flashduty_poll_channel_ids,
         ):
             registry.register(tool)
-    archery_tool = _build_archery_mcp_tool(settings, advisor)
+    archery_tool = _build_archery_mcp_tool(settings, advisor, repository)
     if archery_tool is not None:
         registry.register(archery_tool)
-    prometheus_tool = _build_prometheus_mcp_tool(settings, advisor)
+    prometheus_tool = _build_prometheus_mcp_tool(settings, advisor, repository)
     if prometheus_tool is not None:
         registry.register(prometheus_tool)
     return registry
@@ -245,34 +280,32 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     advisor = _build_advisor(settings)
     conclusion_validator = _build_conclusion_validator(settings)
     notifier = _build_notifier(settings)
-    archery_tool = _build_archery_mcp_tool(settings, advisor)
-    prometheus_tool = _build_prometheus_mcp_tool(settings, advisor)
-    available_tools = set(service.tool_registry.available_names())
-    if archery_tool is None:
-        available_tools.discard(ARCHERY_SLOW_LOG_TOOL_NAME)
-    else:
-        available_tools.add(ARCHERY_SLOW_LOG_TOOL_NAME)
-    if prometheus_tool is None:
-        available_tools.discard(PROMETHEUS_METRICS_TOOL_NAME)
-    else:
-        available_tools.add(PROMETHEUS_METRICS_TOOL_NAME)
+    replaced_names = {ARCHERY_SLOW_LOG_TOOL_NAME, PROMETHEUS_METRICS_TOOL_NAME}
+    retained_tools = [
+        tool
+        for name in service.tool_registry.names()
+        if name not in replaced_names
+        if (tool := service.tool_registry.get(name)) is not None
+    ]
+    tool_registry = InvestigationToolRegistry(retained_tools)
+    archery_tool = _build_archery_mcp_tool(settings, advisor, service.repository)
+    prometheus_tool = _build_prometheus_mcp_tool(settings, advisor, service.repository)
+    if archery_tool is not None:
+        tool_registry.register(archery_tool)
+    if prometheus_tool is not None:
+        tool_registry.register(prometheus_tool)
+    tool_executor = ToolExecutor(tool_registry, settings.tool_max_result_chars)
     strategy_provider = DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
         archery_tool_timeout_seconds=settings.archery_mcp_tool_timeout_seconds,
         prometheus_tool_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
-        available_tools=sorted(available_tools),
+        available_tools=tool_registry.available_names(),
         metrics_ds_name=settings.flashduty_metrics_ds_name,
         logs_ds_name=settings.flashduty_logs_ds_name,
         logs_ds_type=settings.flashduty_logs_ds_type,
     )
     external_knowledge_client = _build_external_knowledge_client(settings)
-    service.tool_registry.unregister(ARCHERY_SLOW_LOG_TOOL_NAME)
-    service.tool_registry.unregister(PROMETHEUS_METRICS_TOOL_NAME)
-    if archery_tool is not None:
-        service.tool_registry.register(archery_tool)
-    if prometheus_tool is not None:
-        service.tool_registry.register(prometheus_tool)
     agent = InvestigationAgent(
         repository=service.repository,
         runbook_provider=service.runbook_provider,
@@ -280,8 +313,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         fallback_advisor=service.fallback_advisor,
         rule_validator=service.rule_validator,
         conclusion_validator=conclusion_validator,
-        tool_registry=service.tool_registry,
-        tool_executor=service.tool_executor,
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
         strategy_provider=strategy_provider,
         runbook_limit=settings.runbook_limit,
         external_knowledge_client=external_knowledge_client,
@@ -294,6 +327,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.conclusion_validator = conclusion_validator
     service.notifier = notifier
     service.strategy_provider = strategy_provider
+    service.tool_registry = tool_registry
+    service.tool_executor = tool_executor
     service.runbook_limit = settings.runbook_limit
     service.react_enabled = settings.react_enabled
     service.max_dynamic_turns = settings.react_max_dynamic_turns if settings.react_enabled else 0
@@ -306,6 +341,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.runbook_match_min_score = settings.runbook_match_min_score
     service.runbook_match_min_confidence = settings.runbook_match_min_confidence
     service.knowledge_sources = settings.knowledge_sources
+    service.runtime_manifest_config = _runtime_manifest_config(settings)
     service.agent = agent
     runtime.settings = settings
     service.retire_adapters(old_advisor, old_conclusion_validator)
@@ -346,7 +382,12 @@ def build_runtime(
 
     flashduty_client = _build_flashduty_client(settings)
     external_knowledge_client = _build_external_knowledge_client(settings)
-    tool_registry = tool_registry or _build_tool_registry(settings, advisor, flashduty_client)
+    tool_registry = tool_registry or _build_tool_registry(
+        settings,
+        advisor,
+        flashduty_client,
+        repository,
+    )
     strategy_provider = strategy_provider or DefaultInvestigationStrategyProvider(
         settings.react_max_dynamic_turns if settings.react_enabled else 0,
         external_tool_timeout_seconds=_flashduty_tool_timeout(settings),
@@ -385,6 +426,7 @@ def build_runtime(
         runbook_match_min_score=settings.runbook_match_min_score,
         runbook_match_min_confidence=settings.runbook_match_min_confidence,
         knowledge_sources=settings.knowledge_sources,
+        runtime_manifest_config=_runtime_manifest_config(settings),
     )
     return Runtime(
         settings=settings,

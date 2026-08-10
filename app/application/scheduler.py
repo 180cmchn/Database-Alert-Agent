@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer
 
 from app.adapters.flashduty import FlashDutyClient
+from app.agent_runtime.leases import LeaseLostError
 from app.application.service import AlertAnalysisService
 from app.config import Settings
 from app.domain.models import AlertStatus, StoredAlert
@@ -456,21 +457,30 @@ class InMemoryAnalysisScheduler:
     async def _worker(self) -> None:
         while True:
             alert_id = await self.queue.get()
+            retry_after_lease = False
             try:
                 await self._limiter.acquire()
                 try:
                     result = await self.service.analyze_by_id(alert_id)
                     if result.status in {AlertStatus.QUEUED, AlertStatus.ANALYZING}:
-                        self._schedule_lease_retry(alert_id)
+                        retry_after_lease = True
                 finally:
                     await self._limiter.release()
             except asyncio.CancelledError:
                 raise
+            except LeaseLostError:
+                retry_after_lease = True
+                logger.warning(
+                    "Investigation lease was lost; scheduling recovery alert_id=%s",
+                    alert_id,
+                )
             except Exception:
                 logger.exception("Asynchronous investigation failed alert_id=%s", alert_id)
             finally:
                 self._queued.discard(alert_id)
                 self.queue.task_done()
+            if retry_after_lease:
+                self._schedule_lease_retry(alert_id)
 
     def _schedule_lease_retry(self, alert_id: str) -> None:
         async def retry_later() -> None:

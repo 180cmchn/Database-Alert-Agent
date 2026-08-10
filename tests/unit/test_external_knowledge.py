@@ -142,6 +142,7 @@ class CapturingAdvisor(FakeAIAdvisor):
         external_knowledge=None,
         knowledge_match_summary="",
         strategy=None,
+        investigation_memory=None,
     ):
         self.external_knowledge = list(external_knowledge or [])
         self.knowledge_match_summary = knowledge_match_summary
@@ -153,6 +154,7 @@ class CapturingAdvisor(FakeAIAdvisor):
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
+            investigation_memory=investigation_memory,
         )
 
 
