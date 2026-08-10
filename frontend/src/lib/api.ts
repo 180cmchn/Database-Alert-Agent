@@ -7,8 +7,6 @@ import type {
   ApiProblem,
   CanonicalAlertPayload,
   DashboardSummary,
-  FeedbackRecord,
-  FeedbackRequest,
   ReanalyzeRequest,
   ReanalyzeResponse,
   RunbookRecord,
@@ -111,13 +109,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-
-  submitFeedback: (alertId: string, payload: FeedbackRequest, token: string) =>
-    request<FeedbackRecord>(
-      `/api/v1/alerts/${encodeURIComponent(alertId)}/feedback`,
-      { method: "POST", body: JSON.stringify(payload) },
-      token,
-    ),
 
   reanalyzeAlert: (alertId: string, payload: ReanalyzeRequest, token: string) =>
     request<ReanalyzeResponse>(

@@ -11,7 +11,7 @@ export const statusLabel: Record<AlertStatus, string> = {
   QUEUED: "排队中",
   ANALYZING: "分析中",
   COMPLETED: "已完成",
-  REVIEW_REQUIRED: "待人工复核",
+  INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",
 };
 
@@ -25,7 +25,7 @@ export const stageLabel: Record<InvestigationStage, string> = {
   VALIDATING: "校验分析结论",
   REPORTING: "归档建议与依据",
   COMPLETED: "分析完成",
-  REVIEW_REQUIRED: "等待人工复核",
+  INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",
 };
 

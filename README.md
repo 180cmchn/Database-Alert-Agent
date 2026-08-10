@@ -14,7 +14,7 @@
 项目采用 **LangGraph** 框架构建告警调查工作流。调查图定义了清晰的节点和边，实现可观测、可调试的分析链路：
 
 ```text
-START → fingerprint → knowledge → runbook → strategy
+START → fingerprint → runbook → strategy
      → execute_tools → dynamic_investigation ──(循环)──→ execute_tools
                             ↓
                           advise → validate → report → END
@@ -24,8 +24,7 @@ START → fingerprint → knowledge → runbook → strategy
 
 | 节点 | 功能 |
 | --- | --- |
-| `fingerprint` | 生成告警指纹，用于历史案例匹配 |
-| `knowledge` | 匹配已确认的历史案例 |
+| `fingerprint` | 生成稳定告警指纹，用于去重和调查关联 |
 | `runbook` | 并行检索所选本地 PDF 与外部知识来源，并执行阈值拒识 |
 | `strategy` | 选择调查策略，生成工具执行计划 |
 | `execute_tools` | 执行调查工具，收集证据 |
@@ -50,7 +49,7 @@ START → fingerprint → knowledge → runbook → strategy
 - `RunManifest` 在创建运行时冻结代码、模型、提示词、工具 Schema、工具策略和有效配置；其摘要同时
   写入 checkpoint，恢复时若摘要不一致会拒绝加载，避免用另一套运行契约续跑旧状态。Manifest 已预留
   `knowledge_versions` 字段，但当前创建运行时尚未采集知识源版本，该字段保持空对象，因此当前恢复
-  校验不承诺检测 PDF、外部知识库或历史案例内容漂移。
+  校验不承诺检测 PDF 或外部知识库内容漂移。
 - LangGraph 主图使用 `agent` checkpoint namespace；外层每次逻辑派发的 MCP 子运行使用
   `mcp:<provider>:<dispatch_id>`。同一逻辑派发的首次执行与恢复尝试复用该 namespace，不同派发则相互
   隔离，避免串用 Archery、Prometheus 等 provider 的状态和预算快照。
@@ -83,7 +82,7 @@ MCP 调查。下表同时列出对外证据状态和 durable invocation 的保�
 | `CANCELLED` | 调用因租约丢失、运行终止或取消信号而停止 | `MISSING`，不能支持或反驳根因 |
 
 `partial=true` 表示本次调查未完整结束；即使其中保留了部分成功观测，整条 partial 证据也不能支持
-或反驳根因，只能用于审计、人工复核和规划后续独立探针。未返回、被截断或失败的部分保持未知，
+或反驳根因，只能用于审计和规划后续独立探针。未返回、被截断或失败的部分保持未知，
 不得被当作反证。动态调用沿用策略中该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host
 重新压缩到固定 10 秒。
 
@@ -98,7 +97,7 @@ FlashDuty /alert/list（定时轮询）
           ↓
 所选知识来源并行检索：本地 PDF 结构化匹配 + 外部 KnowledgePack 向量检索
           ↓
-LangGraph 调查图：fingerprint → knowledge → runbook → strategy
+LangGraph 调查图：fingerprint → runbook → strategy
           → execute_tools → dynamic_investigation → advise → validate → report
           ↓
 结构化原因与有序依据
@@ -124,6 +123,8 @@ LangGraph 调查图：fingerprint → knowledge → runbook → strategy
 每份 PDF 只返回得分最高的章节；低于分数或置信度阈值时明确返回“未命中”。投入运行的
 PDF 和视觉证据不维护质量等级或审核状态，所有可检索手册按相同规则参与匹配。
 `knowledge_type=incomplete` 或 `deprecated=true` 的资料不参与检索；`deprecated` 仅表示资料已停用。
+`knowledge_type=incident_case` 表示手册内容本身是历史事故案例，仍属于部署提供的本地 PDF 知识，
+与已删除的人工反馈衍生 `knowledge_cases` 数据库表无关。
 
 PDF 必须未加密且带可提取文字层；纯扫描件需先 OCR。含图页面还必须在索引中记录带页码的
 `visual_evidence`，避免只提取文字层而遗漏图片中的诊断信息。手册目录为只读运行数据，更新方式
@@ -250,8 +251,6 @@ PRODUCTION_GATE_APPROVED=false
 WECOM_ENABLED=true
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 WECOM_PAGE_BASE_URL=https://alerts.intra.example.com
-# Optional; leave empty to use /alerts/{alert_id}#feedback in this frontend.
-WECOM_FEEDBACK_FORM_URL=
 ```
 
 `AI_MAX_TOKENS` 会显式传给主分析、动态规划和独立结论验收。对于默认启用 Thinking 的推理模型，
@@ -266,7 +265,7 @@ Kafka Worker 在下一批消息开始前读取并应用新值。
 启用企微通知时还必须配置 `WECOM_PAGE_BASE_URL`，它应是企微客户端可访问的前端 HTTPS 地址；
 开发环境未启用企微时仅写本地日志，便于测试。
 
-当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成严格受限的保守候选建议，继续走完 `VALIDATING → REPORTING → REVIEW_REQUIRED`，不会在建议阶段直接跳到 `FAILED`。该候选结果会降低置信度、标记必须人工复核，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
+当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成严格受限的保守候选建议，继续走完 `VALIDATING → REPORTING → INCONCLUSIVE`，不会在建议阶段直接跳到 `FAILED`。该候选结果会降低置信度，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
 
 如果 `AI_FALLBACK_ENABLED=false` 或没有可用的降级 Advisor，建议生成失败会写入 `state.error`，
 后续中间节点短路并由 `report` 统一结束失败链路。服务同时记录包含异常类型和脱敏错误摘要的
@@ -337,21 +336,19 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次 `SUCCESS` 证据，才能把候选原因提升为 `SUPPORTED`。
 
-影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `REVIEW_REQUIRED`，建议
-标记为 `analysis_mode=shadow`。收集到足够专家反馈且生产门槛通过前，建议保持开启。
+影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `INCONCLUSIVE`，建议
+标记为 `analysis_mode=shadow`。生产准入验证完成前，建议保持开启。
 生产环境只有在部署侧显式设置 `PRODUCTION_GATE_APPROVED=true` 后才允许关闭影子模式；该开关
 不属于管理 API 可在线修改的配置。
 
 企微消息使用 `template_card`，主体展示告警标题、级别、主机、数据库、环境、服务和外部 ID，
-底部固定三项操作：
+底部固定两项操作：
 
 - “告警根因分析”：在企微客户端内打开 `/wecom/alerts/{id}/root-cause` 轻量页面，只展示已封装的
   摘要、采证后仍可能的根因、证据引用和置信度；`next_probe` 保留在结构化结果中，不在该页重复
   展示；
 - “告警恢复建议”：在企微客户端内打开 `/wecom/alerts/{id}/recovery-advice` 轻量页面，只展示已
-  封装的建议步骤、预期结果、注意事项和风险；
-- “人工反馈”：默认打开本系统详情页的反馈表；配置 `WECOM_FEEDBACK_FORM_URL` 后改为外部问卷，
-  并自动附加 `alert_id`、`run_id`、`source=wecom` 查询参数。
+  封装的建议步骤、预期结果、注意事项和风险。
 
 群机器人 Webhook 只负责出站通知，不具备按钮事件回调和原卡片更新能力。若需要完全原生的卡片
 内联交互，需切换到企业自建应用消息并增加回调验签与卡片更新接口。
@@ -525,7 +522,7 @@ shared harness 中每条告警的一次分析运行，其远端调用总数由
   `call_limit_reached=true` 标示调用已截断；shared harness 同时将未正常结束的调查标记为
   `partial=true`，该条 partial 记录不能支持或反驳根因。
 - 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
-  后续结论必须人工复核。
+  后续分析以 `INCONCLUSIVE` 结束。
 
 指标目录、状态对象和空序列会保留给后续模型调用及审计，但不会被标为根因支持证据。若已取得
 可用观测后模型、MCP 调用或 SSE 会话发生错误，当前运行保留已有结果并记录 `partial`、
@@ -716,43 +713,20 @@ Agent 必须先完成实时证据采集，再形成最终可能根因：
 
 新运行中的每个最终根因必须通过 `hypothesis_id` 绑定显式调查内存中的同一假设。模型输出仅是
 提议；Host 会根据该假设的合格 evidence assessments 重新派生 `cause`、`status`、
-`evidence_refs` 和 `verified`，跨假设借用证据、未知或重复 ID 都会触发人工复核。没有具体候选
+`evidence_refs` 和 `verified`，跨假设借用证据、未知或重复 ID 都会使结论判为不充分。没有具体候选
 机制时使用的 `unresolved-cause` 只是规划占位符，始终保持 `UNKNOWN`，不能被升级为已支持根因。
 
 `root_causes` 与 `likely_causes` 只包含采证后仍成立或尚未排除的原因。被实时证据反驳的调查
 假设直接从最终结果删除，不展示其名称、状态或排除理由。若现有假设全部被删除且证据不足以
-形成新原因，允许根因列表为空并转人工复核。只有
-`SUPPORTED` 可以设置 `verified=true`。手册诊断图中的候选原因不是本次事故已经成立的事实，
-历史确认案例也只能作为采证线索。
+形成新原因，允许根因列表为空并以 `INCONCLUSIVE` 结束。只有
+`SUPPORTED` 可以设置 `verified=true`。手册诊断图中的候选原因，以及本地 PDF 或外部知识中的
+历史案例内容，都不是本次事故已经成立的事实，只能作为采证线索。
 
 校验记录把两个维度分开保存：`passed` 只表示分析契约诚实、可追溯且安全，
 `evidence_sufficient` 表示实时证据是否足以完成根因判断。一个正确声明为 `UNKNOWN`、
-设置 `verified=false`、提供具体 `next_probe` 且要求人工复核的结论可以通过分析契约，
-但 `evidence_sufficient=false`，最终状态仍为 `REVIEW_REQUIRED`。只有规则校验和 Agent
+设置 `verified=false` 并提供具体 `next_probe` 的结论可以通过分析契约，
+但 `evidence_sufficient=false`，最终状态仍为 `INCONCLUSIVE`。只有规则校验和 Agent
 校验的契约均通过且证据充分时，才允许进入 `COMPLETED`。
-
-## 人工反馈与训练闭环
-
-`POST /api/v1/alerts/{id}/feedback` 除最终根因和实际恢复动作外，还支持：
-
-- `runbook_match_verdict`：`CORRECT`、`INCORRECT`、`MISSED`、`NOT_APPLICABLE`；
-- 正确手册 ID/章节和漏召回手册列表；
-- 支持结论的本次调查证据 ID；
-- Agent 的错误声明和被采纳步骤。
-
-确认或纠正且恢复成功的反馈会成为同问题指纹的候选历史案例，但新事件仍必须重新采集实时证据。
-
-内置反馈页会直接调用该接口。使用外部问卷时，应由问卷平台的服务端 Webhook 或受控内网中转服务
-读取卡片链接携带的 `alert_id`/`run_id`，把字段映射为上述请求结构后提交：
-
-```http
-POST /api/v1/alerts/{alert_id}/feedback
-Authorization: Bearer ${ADMIN_API_TOKEN}
-Content-Type: application/json
-```
-
-不要把 `ADMIN_API_TOKEN` 放入问卷链接或浏览器端脚本。接口会校验反馈所引用的 run、成功证据和
-建议步骤，并以 `idempotency_key` 防止问卷平台重试造成重复记录。
 
 ## 离线评测与生产准入
 
@@ -782,7 +756,7 @@ Content-Type: application/json
 数据集位于 `evaluation/datasets/`，门槛位于 `policies/production-gates.json`。准入不再要求两个
 数据集各凑 100 条或逐条修改审核状态，而是要求当前所有有效“手册 × 告警类型”、所有已抽取原因
 都被最新自动样本覆盖，且召回、拒识、章节和原因指标达到阈值。自动样本只证明摄取与检索回归，
-不会被描述成独立的真实效果验证；真实准确率仍通过影子运行、事故反馈和按时间隔离的历史样本统计。
+不会被描述成独立的真实效果验证；真实准确率仍通过影子运行和按时间隔离的历史样本统计。
 
 ## 验证
 
@@ -838,8 +812,12 @@ Remove-Item Env:FLASHDUTY_TEST_CHANNEL_IDS
 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 等进程环境变量。
 
 数据库升级使用 Alembic。服务会在启动和就绪检查中核对 Alembic 版本及关键列，不再用
-`create_all` 静默修补已有数据库。`0006_training_feedback` 增加手册匹配、证据引用和步骤采纳等
-训练反馈字段；`0009_validation_evidence_sufficiency` 为校验记录增加独立的证据充分度字段。
+`create_all` 静默修补已有数据库。`0009_validation_evidence_sufficiency` 为校验记录增加独立的
+证据充分度字段。`0013_remove_feedback_review_status` 将历史 `REVIEW_REQUIRED` 状态迁移为
+`INCONCLUSIVE`，并删除 `alert_feedback` 及其衍生的 `knowledge_cases` 表。升级会永久删除原始反馈
+记录和已生成的数据库案例；降级只能重建两张空表，不能恢复已删除的数据。仓储使用 MySQL 时要求
+8.0.13 或更高版本，以支持 JSON 表达式默认值；
+MySQL 的 DDL 非事务性，生产升级前必须停服并完成数据库备份。
 
 早期版本可能留下“已有业务表但 `alembic_version` 为空”的 SQLite。不要直接或盲目 stamp：
 先停止进程并备份数据库，核对其表结构确实对应 `0002`，再执行

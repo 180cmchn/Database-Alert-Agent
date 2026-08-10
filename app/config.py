@@ -32,7 +32,6 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "runbook_limit",
         "wecom_webhook_url",
         "wecom_page_base_url",
-        "wecom_feedback_form_url",
         "wecom_enabled",
         "react_enabled",
         "react_max_dynamic_turns",
@@ -85,7 +84,7 @@ class Settings(BaseSettings):
     ai_json_mode: bool = True
     # Keep the investigation auditable when an OpenAI-compatible gateway is
     # temporarily unavailable or returns an invalid structure.  The fallback is
-    # deliberately conservative and always forces REVIEW_REQUIRED.
+    # deliberately conservative and always produces an INCONCLUSIVE result.
     ai_fallback_enabled: bool = True
 
     runbook_pdf_dir: Path = Path("./runbooks/pdfs-typed")
@@ -105,9 +104,6 @@ class Settings(BaseSettings):
     # Public/intranet frontend origin used by WeCom's in-app browser. Root-cause
     # and recovery actions open dedicated lightweight pages under this origin.
     wecom_page_base_url: str = ""
-    # Optional external questionnaire. When empty, the card opens the built-in
-    # alert feedback form; correlation parameters are appended when configured.
-    wecom_feedback_form_url: str = ""
     # Master switch for WeCom group robot notifications. When false, no messages
     # are sent even if a webhook URL is configured; when true, a valid URL is
     # required before notifications can be delivered.
@@ -187,8 +183,7 @@ class Settings(BaseSettings):
     external_knowledge_min_relevance: float = Field(default=0.60, ge=0, le=1)
 
     # Selectable knowledge sources for alert matching. At least one source
-    # should be enabled; historical cases (DB) are always used and not
-    # controlled by this setting.  Values: "local_pdf", "external_knowledge".
+    # should be enabled. Values: "local_pdf", "external_knowledge".
     knowledge_sources: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["local_pdf"]
     )
@@ -207,8 +202,7 @@ class Settings(BaseSettings):
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
     tool_max_result_chars: int = Field(default=12000, ge=1000, le=100000)
     # Retention runs only at the configured weekly calendar slot; startup never
-    # triggers an immediate cleanup. Human-reviewed alerts are always excluded
-    # by the repository-level retention query.
+    # triggers an immediate cleanup.
     alert_retention_enabled: bool = True
     alert_retention_days: int = Field(default=7, ge=7, le=3650)
     react_enabled: bool = False
@@ -299,7 +293,6 @@ class Settings(BaseSettings):
             ("ai_base_url", True),
             ("wecom_webhook_url", False),
             ("wecom_page_base_url", False),
-            ("wecom_feedback_form_url", False),
             ("flashduty_base_url", True),
             ("external_knowledge_base_url", False),
             ("archery_mcp_url", False),

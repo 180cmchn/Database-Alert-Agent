@@ -131,9 +131,6 @@ export function SettingsPage() {
       const wecomWebhookUrl = String(form.get("wecom_webhook_url") || "").trim();
       if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
       patch.wecom_page_base_url = String(form.get("wecom_page_base_url") || "").trim();
-      patch.wecom_feedback_form_url = String(
-        form.get("wecom_feedback_form_url") || "",
-      ).trim();
       patch.wecom_enabled = wecomEnabled;
       const knowledgeApiKey = String(form.get("external_knowledge_api_key") || "").trim();
       if (knowledgeApiKey) patch.external_knowledge_api_key = knowledgeApiKey;
@@ -228,8 +225,8 @@ export function SettingsPage() {
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>启用有界 ReAct</strong><small>允许模型在已注册工具内追加有限次数的证据采集</small></span></span><input name="react_enabled" type="checkbox" defaultChecked={settings.react_enabled} /><i /></label>
             <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则校验与同一配置模型的独立验收轮次</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
-            <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，但强制进入人工复核</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并强制进入人工复核，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
+            <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，并以结论不充分结束</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并以结论不充分结束，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>
@@ -242,7 +239,7 @@ export function SettingsPage() {
         <SectionCard
           eyebrow="WECOM OUTPUT"
           title="企微机器人"
-          description="发送告警信息卡片；根因与恢复建议在企微内嵌专用页面展示，人工反馈可使用内置表单或外部问卷。"
+          description="发送告警信息卡片；根因与恢复建议在企微内嵌专用页面展示。"
           action={<span className={`configured-chip ${settings.wecom_webhook_url_configured ? "yes" : "no"}`}><Webhook size={13} />{settings.wecom_webhook_url_configured ? "企业微信地址已配置" : "企业微信地址未配置"}</span>}
         >
           <div className="switch-stack">
@@ -260,16 +257,6 @@ export function SettingsPage() {
                 placeholder="https://alerts.intra.example.com"
               />
               <small>卡片前两项会在企微客户端内打开此地址下的专用根因/恢复页面。</small>
-            </label>
-            <label className="field span-2">
-              <span>外部人工反馈问卷 URL（可选）</span>
-              <input
-                name="wecom_feedback_form_url"
-                type="url"
-                defaultValue={settings.wecom_feedback_form_url}
-                placeholder="留空则使用系统内置反馈表单"
-              />
-              <small>配置后自动附加 alert_id、run_id 与 source=wecom 查询参数。</small>
             </label>
           </div>
         </SectionCard>

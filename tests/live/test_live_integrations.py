@@ -248,7 +248,7 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
         await runtime.repository.close()  # type: ignore[attr-defined]
 
     assert isinstance(runtime.service.notifier, LogManagementNotifier)
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert result.error is None
     assert result.advisor_metadata is not None
     assert result.advisor_metadata.request_id

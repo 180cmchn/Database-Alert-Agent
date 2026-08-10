@@ -82,9 +82,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
 def test_cors_origins_accept_csv_and_production_urls_require_https(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "CORS_ALLOWED_ORIGINS", "http://localhost:5173,https://console.example.test"
-    )
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173,https://console.example.test")
     settings = Settings(_env_file=None, ai_provider="fake")
     assert settings.cors_allowed_origins == [
         "http://localhost:5173",
@@ -218,9 +216,7 @@ def test_wecom_url_requires_official_https_group_robot_endpoint(url: str) -> Non
     valid = Settings(
         _env_file=None,
         ai_provider="fake",
-        wecom_webhook_url=(
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
-        ),
+        wecom_webhook_url=("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"),
     )
     assert valid.wecom_webhook_url.endswith("key=test-key")
 
@@ -237,12 +233,11 @@ def test_settings_validation_error_hides_invalid_wecom_url_secret() -> None:
     assert secret not in str(caught.value)
 
 
-def test_wecom_page_and_feedback_urls_are_validated() -> None:
+def test_wecom_page_url_is_validated() -> None:
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         wecom_page_base_url="http://alerts.intra.example.com",
-        wecom_feedback_form_url="https://survey.example.com/form?campaign=dba#questions",
     )
     assert settings.wecom_page_base_url == "http://alerts.intra.example.com"
 
@@ -257,14 +252,9 @@ def test_wecom_page_and_feedback_urls_are_validated() -> None:
         _env_file=None,
         ai_provider="fake",
         wecom_enabled=True,
-        wecom_webhook_url=(
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
-        ),
+        wecom_webhook_url=("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"),
     )
-    assert any(
-        "WECOM_PAGE_BASE_URL" in issue
-        for issue in enabled_without_page.readiness_issues()
-    )
+    assert any("WECOM_PAGE_BASE_URL" in issue for issue in enabled_without_page.readiness_issues())
 
 
 def test_flashduty_polling_interval_and_scope_configuration(
@@ -355,9 +345,7 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
         archery_mcp_token="test-token",
     )
     assert configured.archery_mcp_enabled is True
-    assert any(
-        "model with tool calling" in issue for issue in configured.readiness_issues()
-    )
+    assert any("model with tool calling" in issue for issue in configured.readiness_issues())
     assert "archery_mcp_url" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
@@ -540,9 +528,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
     configured, _, changed = await manager.patch(
         settings,
         {
-            "wecom_webhook_url": (
-                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
-            ),
+            "wecom_webhook_url": ("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"),
         },
         expected_revision=manager.revision,
     )
@@ -562,7 +548,6 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["issues"] == []
     assert body["wecom_webhook_url_configured"] is False
     assert body["wecom_page_base_url"] == ""
-    assert body["wecom_feedback_form_url"] == ""
     assert body["ai_fallback_enabled"] is True
     assert body["scheduler_workers"] == 1
     assert body["flashduty_polling_enabled"] is False
@@ -571,7 +556,6 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["prometheus_mcp_use_shared_harness"] is False
     assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
-    assert "wecom_feedback_form_url" in RUNTIME_SETTINGS_KEYS
     assert "ai_api_key" not in body
     assert "wecom_webhook_url" not in body
 
@@ -582,9 +566,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
             )
         }
     )
-    safe_response = RuntimeSettingsResponse.from_settings(
-        configured_wecom, revision="1" * 16
-    )
+    safe_response = RuntimeSettingsResponse.from_settings(configured_wecom, revision="1" * 16)
     safe_body = safe_response.model_dump(mode="json")
     assert safe_body["wecom_webhook_url_configured"] is True
     assert "must-not-leak" not in safe_response.model_dump_json()
@@ -592,9 +574,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     incomplete = settings.model_copy(
         update={"ai_provider": "openai_compatible", "ai_api_key": "", "ai_model": ""}
     )
-    incomplete_response = RuntimeSettingsResponse.from_settings(
-        incomplete, revision="0" * 16
-    )
+    incomplete_response = RuntimeSettingsResponse.from_settings(incomplete, revision="0" * 16)
     assert incomplete_response.ready is False
     assert any("AI_API_KEY" in issue for issue in incomplete_response.issues)
 
@@ -635,10 +615,7 @@ async def test_external_base_url_is_deployment_only_and_runtime_key_is_url_bound
     assert "external_knowledge_enabled" not in persisted
     assert "external_knowledge_base_url" not in persisted
     assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
-    assert (
-        persisted["external_knowledge_api_key_base_url"]
-        == "http://127.0.0.1:8001"
-    )
+    assert persisted["external_knowledge_api_key_base_url"] == "http://127.0.0.1:8001"
 
 
 @pytest.mark.asyncio
@@ -692,9 +669,7 @@ def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
     changed_url = with_secret.model_copy(
         update={"external_knowledge_base_url": "http://localhost:9001"}
     )
-    changed_response = RuntimeSettingsResponse.from_settings(
-        changed_url, revision="1" * 16
-    )
+    changed_response = RuntimeSettingsResponse.from_settings(changed_url, revision="1" * 16)
     assert changed_response.external_knowledge_api_key_configured is False
     assert any("must be re-entered" in issue for issue in changed_response.issues)
 
@@ -712,9 +687,7 @@ def test_production_requires_gate_approval_before_shadow_mode_is_disabled(
         "ai_model": "configured-test-model",
         "ai_base_url": "https://models.example.test/v1",
         "admin_api_token": "configured-admin-token",
-        "wecom_webhook_url": (
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"
-        ),
+        "wecom_webhook_url": ("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"),
         "runbook_pdf_dir": runbooks,
     }
 
@@ -722,6 +695,4 @@ def test_production_requires_gate_approval_before_shadow_mode_is_disabled(
     shadow = Settings(**base, shadow_enabled=True, production_gate_approved=False)
 
     assert any("PRODUCTION_GATE_APPROVED" in issue for issue in blocked.readiness_issues())
-    assert not any(
-        "PRODUCTION_GATE_APPROVED" in issue for issue in shadow.readiness_issues()
-    )
+    assert not any("PRODUCTION_GATE_APPROVED" in issue for issue in shadow.readiness_issues())

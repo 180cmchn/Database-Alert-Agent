@@ -11,7 +11,7 @@ import {
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api } from "../lib/api";
-import { compactId, formatDateTime, formatPercent } from "../lib/format";
+import { compactId, formatDateTime, formatPercent, statusLabel } from "../lib/format";
 import type { StoredAlert } from "../types/api";
 
 type WeComView = "overview" | "root-cause" | "recovery-advice";
@@ -70,7 +70,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
         <p>{alert.reason}</p>
         <div className="wecom-meta-row">
           <span className="wecom-severity">{alert.severity}</span>
-          <span>{record.status}</span>
+          <span>{statusLabel[record.status]}</span>
           <time dateTime={alert.occurred_at}>{formatDateTime(alert.occurred_at)}</time>
         </div>
       </header>
@@ -97,7 +97,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
       )}
 
       <footer className="wecom-page-footer">
-        历史案例与知识资料仅作为线索；本次根因结论以当前事件的实时证据为准。
+        手册与外部知识资料仅作为线索；本次根因结论以当前事件的实时证据为准。
       </footer>
     </main>
   );

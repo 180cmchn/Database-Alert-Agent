@@ -53,9 +53,7 @@ class UnexpectedAgent:
 
 def test_run_manifest_freezes_prometheus_harness_canary_mode(tmp_path: Path) -> None:
     runtime = build_runtime(
-        _settings(tmp_path).model_copy(
-            update={"prometheus_mcp_use_shared_harness": True}
-        )
+        _settings(tmp_path).model_copy(update={"prometheus_mcp_use_shared_harness": True})
     )
 
     snapshot = runtime.service._create_config_snapshot()
@@ -94,7 +92,7 @@ async def test_service_force_reanalysis_supersedes_an_active_run(tmp_path: Path)
         current = await runtime.repository.get(str(stored.alert.id))
         assert current is not None and current.latest_run is not None
         assert current.latest_run.id == replacement.id
-        assert current.latest_run.status == RunStatus.REVIEW_REQUIRED
+        assert current.latest_run.status == RunStatus.INCONCLUSIVE
         prior = next(item for item in current.all_runs if item.id == first.id)
         assert prior.status == RunStatus.FAILED
         assert prior.error == "Superseded by forced re-analysis"
@@ -204,18 +202,15 @@ async def test_graph_updates_are_fenced_with_the_claimed_run_identity(tmp_path: 
         assert update_calls
         assert all(run_id == str(run.id) for run_id, _ in update_calls)
         assert all(changes.get("lease_owner") == run.lease_owner for _, changes in update_calls)
-        assert all(
-            changes.get("fencing_token") == run.fencing_token
-            for _, changes in update_calls
-        )
+        assert all(changes.get("fencing_token") == run.fencing_token for _, changes in update_calls)
         assert len(finalize_calls) == 1
         finalized_alert_id, finalized_run_id, final_changes = finalize_calls[0]
         assert finalized_alert_id == str(result.alert.id)
         assert finalized_run_id == str(run.id)
         assert final_changes["lease_owner"] == run.lease_owner
         assert final_changes["fencing_token"] == run.fencing_token
-        assert final_changes["run_status"] == RunStatus.REVIEW_REQUIRED
-        assert final_changes["alert_status"] == AlertStatus.REVIEW_REQUIRED
+        assert final_changes["run_status"] == RunStatus.INCONCLUSIVE
+        assert final_changes["alert_status"] == AlertStatus.INCONCLUSIVE
     finally:
         await runtime.repository.close()  # type: ignore[attr-defined]
 

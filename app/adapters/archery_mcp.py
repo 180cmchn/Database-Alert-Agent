@@ -2751,13 +2751,13 @@ class ArcherySlowLogEvidenceTool:
             session_attempts = max(session_attempts, recorded_session_attempts)
         if not result.query_completed:
             reason = str(diagnostics.get("reason") or "慢查询证据不足")
-            next_stage = str(diagnostics.get("next_stage") or "需要人工复核")
+            next_stage = str(diagnostics.get("next_stage") or "等待补充可用证据")
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
                 summary=(
                     f"Archery 慢查询未执行最终 history 查询：{reason}；"
                     f"下一阶段：{next_stage}。"
-                    "已保留只读 MCP 调用轨迹，告警分析可继续但需要人工复核。"
+                    "已保留只读 MCP 调用轨迹，告警分析可继续但当前结论不充分。"
                 ),
                 structured_data={
                     "query_completed": False,
@@ -2800,7 +2800,7 @@ class ArcherySlowLogEvidenceTool:
                     "scope": "alert_target_slow_log_incomplete",
                     "root_cause_eligible": False,
                     "root_cause_ineligible_reason": (
-                        "未执行最终慢查询 SQL；证据不足，需要人工复核"
+                        "未执行最终慢查询 SQL；当前证据不足"
                     ),
                     "result": result.payload,
                 },

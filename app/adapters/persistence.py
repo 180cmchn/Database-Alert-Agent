@@ -23,7 +23,6 @@ from sqlalchemy import (
     delete,
     desc,
     event,
-    exists,
     inspect,
     select,
     text,
@@ -43,11 +42,8 @@ from app.domain.models import (
     AnalysisConfigSnapshot,
     DashboardSummary,
     EvidenceRecord,
-    FeedbackRecord,
-    FeedbackVerdict,
     InvestigationRun,
     InvestigationStage,
-    KnowledgeCase,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -103,7 +99,7 @@ async def _require_active_run_lease(
                 InvestigationRunRow.status.in_(
                     {
                         RunStatus.COMPLETED.value,
-                        RunStatus.REVIEW_REQUIRED.value,
+                        RunStatus.INCONCLUSIVE.value,
                         RunStatus.FAILED.value,
                     }
                 )
@@ -319,7 +315,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0012"
+DATABASE_SCHEMA_REVISION = "0013"
 AGENT_EVENT_PAYLOAD_MAX_CHARS = 12_000
 INVOCATION_RESULT_MAX_CHARS = 12_000
 _INVOCATION_RESULT_CONTROL_KEYS = (
@@ -463,61 +459,6 @@ class ValidationRow(Base):
     evidence_sufficient: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     issues_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-
-
-class FeedbackRow(Base):
-    __tablename__ = "alert_feedback"
-    __table_args__ = (
-        UniqueConstraint("alert_id", "idempotency_key", name="uq_feedback_idempotency"),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    alert_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("alerts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("investigation_runs.id", ondelete="CASCADE"), nullable=False
-    )
-    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    verdict: Mapped[str] = mapped_column(String(32), nullable=False)
-    final_root_cause: Mapped[str | None] = mapped_column(Text)
-    actual_resolution: Mapped[str | None] = mapped_column(Text)
-    recovered: Mapped[int | None] = mapped_column(Integer)
-    runbook_match_verdict: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="UNKNOWN"
-    )
-    correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
-    correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
-    missed_runbook_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    supporting_evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    wrong_agent_claims_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    accepted_step_orders_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    reviewer: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-
-
-class KnowledgeCaseRow(Base):
-    __tablename__ = "knowledge_cases"
-    __table_args__ = (UniqueConstraint("source_run_id", name="uq_case_source_run"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    source_alert_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    source_run_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    incident_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
-    fingerprint_version: Mapped[str] = mapped_column(String(20), nullable=False)
-    environment: Mapped[str] = mapped_column(String(100), nullable=False)
-    service_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    alert_type: Mapped[str] = mapped_column(String(255), nullable=False)
-    database_engine: Mapped[str | None] = mapped_column(String(100))
-    correct_runbook_id: Mapped[str | None] = mapped_column(String(128))
-    correct_runbook_section: Mapped[str | None] = mapped_column(String(200))
-    supporting_evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    final_root_cause: Mapped[str] = mapped_column(Text, nullable=False)
-    actual_resolution: Mapped[str] = mapped_column(Text, nullable=False)
-    recommendation_json: Mapped[dict | None] = mapped_column(JSON)
-    confirmed_by: Mapped[str] = mapped_column(String(255), nullable=False)
-    confirmed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
@@ -776,25 +717,20 @@ class SQLAlchemyAlertRepository:
             await self._assert_schema_current(connection)
 
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int:
-        """Delete expired terminal alerts that have never received human feedback.
-
-        The ``NOT EXISTS`` predicate is intentionally part of the delete itself,
-        rather than a preceding lookup, so a concurrent feedback submission cannot
-        cause its alert (and the feedback row through FK cascade) to be removed.
-        """
+        """Delete expired terminal alerts."""
 
         if cutoff.tzinfo is None:
             raise ValueError("cleanup cutoff must be timezone-aware")
         async with self.session_factory() as session:
-            feedback_exists = exists(
-                select(FeedbackRow.id).where(FeedbackRow.alert_id == AlertRow.id)
-            )
             statement = delete(AlertRow).where(
                 AlertRow.created_at < cutoff.astimezone(UTC),
                 AlertRow.status.in_(
-                    [AlertStatus.COMPLETED.value, AlertStatus.FAILED.value]
+                    [
+                        AlertStatus.COMPLETED.value,
+                        AlertStatus.INCONCLUSIVE.value,
+                        AlertStatus.FAILED.value,
+                    ]
                 ),
-                ~feedback_exists,
             )
             result = await session.execute(statement)
             await session.commit()
@@ -1046,7 +982,6 @@ class SQLAlchemyAlertRepository:
                     manual_matched=bool(
                         recommendation.get("manual_matched", bool(row.runbooks_json))
                     ),
-                    requires_human=recommendation.get("requires_human"),
                     confidence=recommendation.get("confidence"),
                 )
             )
@@ -1095,7 +1030,7 @@ class SQLAlchemyAlertRepository:
             alert_row = await _lock_alert_row(session, alert_id)
             if not alert_row or alert_row.status in {
                 AlertStatus.COMPLETED.value,
-                AlertStatus.REVIEW_REQUIRED.value,
+                AlertStatus.INCONCLUSIVE.value,
             }:
                 return None
             latest_query = (
@@ -1179,7 +1114,7 @@ class SQLAlchemyAlertRepository:
     ) -> InvestigationRun | None:
         """Create a new investigation run for re-analysis with config snapshot.
 
-        Unlike create_run, this method allows re-analyzing completed/review_required alerts
+        Unlike create_run, this method allows re-analyzing completed/inconclusive alerts
         and saves the configuration snapshot for tracking.
         """
         if not isinstance(force, bool):
@@ -2284,7 +2219,7 @@ class SQLAlchemyAlertRepository:
             raise ValueError("fencing_token must be a positive integer")
         if stage in {
             InvestigationStage.COMPLETED,
-            InvestigationStage.REVIEW_REQUIRED,
+            InvestigationStage.INCONCLUSIVE,
             InvestigationStage.FAILED,
         }:
             raise ValueError("terminal run stages must be persisted with finalize_run")
@@ -2340,9 +2275,9 @@ class SQLAlchemyAlertRepository:
                 InvestigationStage.COMPLETED,
                 AlertStatus.COMPLETED,
             ),
-            RunStatus.REVIEW_REQUIRED: (
-                InvestigationStage.REVIEW_REQUIRED,
-                AlertStatus.REVIEW_REQUIRED,
+            RunStatus.INCONCLUSIVE: (
+                InvestigationStage.INCONCLUSIVE,
+                AlertStatus.INCONCLUSIVE,
             ),
             RunStatus.FAILED: (
                 InvestigationStage.FAILED,
@@ -2578,120 +2513,6 @@ class SQLAlchemyAlertRepository:
             )
             await session.commit()
 
-    async def find_knowledge_cases(
-        self, fingerprint: str, fingerprint_version: str, limit: int = 3
-    ) -> list[KnowledgeCase]:
-        async with self.session_factory() as session:
-            query = (
-                select(KnowledgeCaseRow)
-                .where(
-                    KnowledgeCaseRow.incident_fingerprint == fingerprint,
-                    KnowledgeCaseRow.fingerprint_version == fingerprint_version,
-                )
-                .order_by(desc(KnowledgeCaseRow.confirmed_at))
-                .limit(limit)
-            )
-            rows = (await session.execute(query)).scalars().all()
-            return [self._knowledge_case(row) for row in rows]
-
-    async def save_feedback(
-        self, feedback: FeedbackRecord, knowledge_case: KnowledgeCase | None = None
-    ) -> FeedbackRecord:
-        async with self.session_factory() as session:
-            alert_row = (
-                await session.execute(
-                    select(AlertRow)
-                    .where(AlertRow.id == str(feedback.alert_id))
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            run_query = (
-                select(FeedbackRow)
-                .where(FeedbackRow.run_id == str(feedback.run_id))
-                .order_by(FeedbackRow.created_at, FeedbackRow.id)
-            )
-            existing = (await session.execute(run_query)).scalars().first()
-            if existing:
-                return self._feedback(existing)
-            session.add(
-                FeedbackRow(
-                    id=str(feedback.id),
-                    alert_id=str(feedback.alert_id),
-                    run_id=str(feedback.run_id),
-                    idempotency_key=feedback.idempotency_key,
-                    verdict=feedback.verdict.value,
-                    final_root_cause=feedback.final_root_cause,
-                    actual_resolution=feedback.actual_resolution,
-                    recovered=(
-                        1
-                        if feedback.recovered is True
-                        else 0
-                        if feedback.recovered is False
-                        else None
-                    ),
-                    runbook_match_verdict=feedback.runbook_match_verdict.value,
-                    correct_runbook_id=feedback.correct_runbook_id,
-                    correct_runbook_section=feedback.correct_runbook_section,
-                    missed_runbook_ids_json=feedback.missed_runbook_ids,
-                    supporting_evidence_ids_json=feedback.supporting_evidence_ids,
-                    wrong_agent_claims_json=feedback.wrong_agent_claims,
-                    accepted_step_orders_json=feedback.accepted_step_orders,
-                    reviewer=feedback.reviewer,
-                    created_at=feedback.created_at,
-                )
-            )
-            if alert_row is not None:
-                alert_row.status = AlertStatus.COMPLETED.value
-                alert_row.updated_at = _utc_now()
-            if knowledge_case:
-                existing_case = (
-                    await session.execute(
-                        select(KnowledgeCaseRow).where(
-                            KnowledgeCaseRow.source_run_id == str(knowledge_case.source_run_id)
-                        )
-                    )
-                ).scalar_one_or_none()
-                if existing_case is None:
-                    session.add(
-                        KnowledgeCaseRow(
-                            id=str(knowledge_case.id),
-                            source_alert_id=str(knowledge_case.source_alert_id),
-                            source_run_id=str(knowledge_case.source_run_id),
-                            incident_fingerprint=knowledge_case.incident_fingerprint,
-                            fingerprint_version=knowledge_case.fingerprint_version,
-                            environment=knowledge_case.environment,
-                            service_name=knowledge_case.service_name,
-                            alert_type=knowledge_case.alert_type,
-                            database_engine=knowledge_case.database_engine,
-                            correct_runbook_id=knowledge_case.correct_runbook_id,
-                            correct_runbook_section=knowledge_case.correct_runbook_section,
-                            supporting_evidence_ids_json=(knowledge_case.supporting_evidence_ids),
-                            final_root_cause=knowledge_case.final_root_cause,
-                            actual_resolution=knowledge_case.actual_resolution,
-                            recommendation_json=(
-                                knowledge_case.recommendation.model_dump(mode="json")
-                                if knowledge_case.recommendation
-                                else None
-                            ),
-                            confirmed_by=knowledge_case.confirmed_by,
-                            confirmed_at=knowledge_case.confirmed_at,
-                            created_at=knowledge_case.created_at,
-                        )
-                    )
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-                existing = (await session.execute(run_query)).scalars().first()
-                if existing is None:
-                    idempotency_query = select(FeedbackRow).where(
-                        FeedbackRow.alert_id == str(feedback.alert_id),
-                        FeedbackRow.idempotency_key == feedback.idempotency_key,
-                    )
-                    existing = (await session.execute(idempotency_query)).scalar_one()
-                return self._feedback(existing)
-            return feedback
-
     async def set_status(self, alert_id: str, status: AlertStatus) -> None:
         async with self.session_factory() as session:
             row = await session.get(AlertRow, alert_id)
@@ -2911,25 +2732,7 @@ class SQLAlchemyAlertRepository:
                 )
                 for item in validation_rows
             ]
-        feedback_rows = (
-            (
-                await session.execute(
-                    select(FeedbackRow)
-                    .where(FeedbackRow.alert_id == row.id)
-                    .order_by(FeedbackRow.created_at)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        feedback = [self._feedback(item) for item in feedback_rows]
         normalized_alert = NormalizedAlert.model_validate(row.alert_json)
-        knowledge_matches = await self._find_cases_in_session(
-            session,
-            normalized_alert.incident_fingerprint,
-            normalized_alert.fingerprint_version,
-            limit=3,
-        )
 
         selected_result_available = False
         selected_status = AlertStatus(row.status)
@@ -2941,7 +2744,7 @@ class SQLAlchemyAlertRepository:
             selected_status = {
                 RunStatus.RUNNING.value: AlertStatus.ANALYZING,
                 RunStatus.COMPLETED.value: AlertStatus.COMPLETED,
-                RunStatus.REVIEW_REQUIRED.value: AlertStatus.REVIEW_REQUIRED,
+                RunStatus.INCONCLUSIVE.value: AlertStatus.INCONCLUSIVE,
                 RunStatus.FAILED.value: AlertStatus.FAILED,
             }[run_row.status]
             selected_error = run_row.error
@@ -2997,32 +2800,9 @@ class SQLAlchemyAlertRepository:
             progress=progress,
             evidence_records=evidence_records,
             validations=validations,
-            feedback=feedback,
-            knowledge_matches=knowledge_matches,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
-
-    async def _find_cases_in_session(
-        self,
-        session: AsyncSession,
-        fingerprint: str,
-        fingerprint_version: str,
-        limit: int,
-    ) -> list[KnowledgeCase]:
-        if not fingerprint:
-            return []
-        query = (
-            select(KnowledgeCaseRow)
-            .where(
-                KnowledgeCaseRow.incident_fingerprint == fingerprint,
-                KnowledgeCaseRow.fingerprint_version == fingerprint_version,
-            )
-            .order_by(desc(KnowledgeCaseRow.confirmed_at))
-            .limit(limit)
-        )
-        rows = (await session.execute(query)).scalars().all()
-        return [self._knowledge_case(item) for item in rows]
 
     @staticmethod
     def _run(row: InvestigationRunRow) -> InvestigationRun:
@@ -3043,53 +2823,4 @@ class SQLAlchemyAlertRepository:
             config_snapshot=config_snapshot,
             created_at=row.created_at,
             updated_at=row.updated_at,
-        )
-
-    @staticmethod
-    def _feedback(row: FeedbackRow) -> FeedbackRecord:
-        return FeedbackRecord(
-            id=row.id,
-            alert_id=row.alert_id,
-            run_id=row.run_id,
-            idempotency_key=row.idempotency_key,
-            verdict=FeedbackVerdict(row.verdict),
-            final_root_cause=row.final_root_cause,
-            actual_resolution=row.actual_resolution,
-            recovered=bool(row.recovered) if row.recovered is not None else None,
-            runbook_match_verdict=row.runbook_match_verdict,
-            correct_runbook_id=row.correct_runbook_id,
-            correct_runbook_section=row.correct_runbook_section,
-            missed_runbook_ids=row.missed_runbook_ids_json or [],
-            supporting_evidence_ids=row.supporting_evidence_ids_json or [],
-            wrong_agent_claims=row.wrong_agent_claims_json or [],
-            accepted_step_orders=row.accepted_step_orders_json or [],
-            reviewer=row.reviewer,
-            created_at=row.created_at,
-        )
-
-    @staticmethod
-    def _knowledge_case(row: KnowledgeCaseRow) -> KnowledgeCase:
-        return KnowledgeCase(
-            id=row.id,
-            source_alert_id=row.source_alert_id,
-            source_run_id=row.source_run_id,
-            incident_fingerprint=row.incident_fingerprint,
-            fingerprint_version=row.fingerprint_version,
-            environment=row.environment,
-            service_name=row.service_name,
-            alert_type=row.alert_type,
-            database_engine=row.database_engine,
-            correct_runbook_id=row.correct_runbook_id,
-            correct_runbook_section=row.correct_runbook_section,
-            supporting_evidence_ids=row.supporting_evidence_ids_json or [],
-            final_root_cause=row.final_root_cause,
-            actual_resolution=row.actual_resolution,
-            recommendation=(
-                Recommendation.model_validate(row.recommendation_json)
-                if row.recommendation_json
-                else None
-            ),
-            confirmed_by=row.confirmed_by,
-            confirmed_at=row.confirmed_at,
-            created_at=row.created_at,
         )

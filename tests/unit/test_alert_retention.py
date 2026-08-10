@@ -1,7 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -9,8 +8,6 @@ from sqlalchemy import select
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.persistence import (
     AlertRow,
-    FeedbackRow,
-    InvestigationRunRow,
     SQLAlchemyAlertRepository,
 )
 from app.application.scheduler import (
@@ -19,7 +16,7 @@ from app.application.scheduler import (
     next_weekly_retention_run,
 )
 from app.config import Settings
-from app.domain.models import AlertStatus, InvestigationStage, RunStatus
+from app.domain.models import AlertStatus
 
 
 def sqlite_url(path: Path) -> str:
@@ -41,16 +38,16 @@ async def _create_alert(repository: SQLAlchemyAlertRepository, external_id: str)
 
 
 @pytest.mark.asyncio
-async def test_cleanup_removes_only_expired_terminal_alerts_without_feedback(
+async def test_cleanup_removes_all_expired_terminal_alerts(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "retention.db"))
     await repository.initialize()
     old_completed = await _create_alert(repository, "old-completed")
     old_failed = await _create_alert(repository, "old-failed")
-    old_reviewed = await _create_alert(repository, "old-reviewed")
+    old_active = await _create_alert(repository, "old-active")
     recent_completed = await _create_alert(repository, "recent-completed")
-    old_review_required = await _create_alert(repository, "old-review-required")
+    old_inconclusive = await _create_alert(repository, "old-inconclusive")
     cutoff = datetime.now(UTC) - timedelta(days=7)
     old_time = cutoff - timedelta(seconds=1)
 
@@ -58,65 +55,31 @@ async def test_cleanup_removes_only_expired_terminal_alerts_without_feedback(
         alert_ids = [
             old_completed,
             old_failed,
-            old_reviewed,
+            old_active,
             recent_completed,
-            old_review_required,
+            old_inconclusive,
         ]
         rows = {
             row.id: row
-            for row in (
-                await session.execute(select(AlertRow).where(AlertRow.id.in_(alert_ids)))
-            )
+            for row in (await session.execute(select(AlertRow).where(AlertRow.id.in_(alert_ids))))
             .scalars()
             .all()
         }
-        for alert_id in (old_completed, old_reviewed, old_review_required, old_failed):
+        for alert_id in (old_completed, old_active, old_inconclusive, old_failed):
             rows[alert_id].created_at = old_time
         rows[old_completed].status = AlertStatus.COMPLETED.value
         rows[old_failed].status = AlertStatus.FAILED.value
-        rows[old_reviewed].status = AlertStatus.COMPLETED.value
+        rows[old_active].status = AlertStatus.QUEUED.value
         rows[recent_completed].status = AlertStatus.COMPLETED.value
-        rows[old_review_required].status = AlertStatus.REVIEW_REQUIRED.value
-
-        reviewed_run_id = str(uuid4())
-        session.add(
-            InvestigationRunRow(
-                id=reviewed_run_id,
-                alert_id=old_reviewed,
-                attempt=1,
-                status=RunStatus.COMPLETED.value,
-                current_stage=InvestigationStage.COMPLETED.value,
-                created_at=old_time,
-                updated_at=old_time,
-            )
-        )
-        await session.flush()
-        session.add(
-            FeedbackRow(
-                id=str(uuid4()),
-                alert_id=old_reviewed,
-                run_id=reviewed_run_id,
-                idempotency_key="retain-human-feedback",
-                verdict="CONFIRMED",
-                reviewer="operator",
-                created_at=old_time,
-            )
-        )
+        rows[old_inconclusive].status = AlertStatus.INCONCLUSIVE.value
         await session.commit()
 
-    reviewed_before_cleanup = await repository.get(old_reviewed)
-    assert reviewed_before_cleanup is not None
-    assert len(reviewed_before_cleanup.feedback) == 1
-    assert await repository.cleanup_expired_alerts(cutoff) == 2
+    assert await repository.cleanup_expired_alerts(cutoff) == 3
     assert await repository.get(old_completed) is None
     assert await repository.get(old_failed) is None
+    assert await repository.get(old_inconclusive) is None
     assert await repository.get(recent_completed) is not None
-    assert await repository.get(old_review_required) is not None
-
-    retained = await repository.get(old_reviewed)
-    assert retained is not None
-    assert len(retained.feedback) == 1
-    assert retained.feedback[0].idempotency_key == "retain-human-feedback"
+    assert await repository.get(old_active) is not None
     await repository.close()
 
 

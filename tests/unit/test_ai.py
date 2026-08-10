@@ -112,7 +112,6 @@ async def test_fake_advisor_keeps_partial_success_as_descriptive_unknown_context
     assert recommendation.root_causes[0].status.value == "UNKNOWN"
     assert recommendation.root_causes[0].verified is False
     assert recommendation.root_causes[0].evidence_refs == [str(evidence.id)]
-    assert recommendation.requires_human is True
 
 
 @pytest.mark.asyncio
@@ -167,7 +166,6 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
         knowledge_match_summary="model-overwritten-value",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
-        requires_human=True,
         confidence=0.3,
         manual_matched=False,
     )
@@ -216,7 +214,6 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
         summary="证据不足，需继续核查。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
-        requires_human=True,
         confidence=0.3,
         manual_matched=False,
     )
@@ -257,7 +254,6 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
         summary="中文分析结果",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
-        requires_human=True,
         confidence=0.3,
         manual_matched=False,
     )
@@ -289,7 +285,6 @@ async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None
         summary="No semantic match",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
-        requires_human=True,
         confidence=0.3,
         manual_matched=False,
     )
@@ -343,8 +338,8 @@ async def test_matched_runbook_bases_are_ordered_before_ai() -> None:
 def test_matched_runbook_auto_repairs_invalid_citations() -> None:
     """manual_matched=True with invalid/missing citations must auto-repair:
     drop invalid RUNBOOK bases, keep AI bases, drop steps without valid source_ref,
-    clear invalid runbook_references, and force requires_human=True rather than
-    raising AdvisorError."""
+    clear invalid runbook_references, and lower confidence rather than raising
+    AdvisorError."""
     recommendation = Recommendation(
         summary="test",
         analysis_bases=[
@@ -354,7 +349,6 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
             )
         ],
         steps=[RecommendationStep(order=1, action="check")],
-        requires_human=True,
         confidence=0.9,
         manual_matched=True,
         runbook_references=[RunbookReference(runbook_id="unknown-rb", section="PDF")],
@@ -379,16 +373,13 @@ def test_matched_runbook_auto_repairs_invalid_citations() -> None:
     # Step without valid source_ref dropped.
     assert result.steps == []
 
-    # Repair triggered human review.
-    assert result.requires_human is True
-
     # No AdvisorError raised — that is the new behavior.
 
 
 def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None:
     """When retrieval returns candidates but the model judges them irrelevant
     (manual_matched=False), policy should NOT raise; it should clear citations,
-    force human review, and cap confidence."""
+    and cap confidence."""
     reference = RunbookReference(runbook_id="rb-1", section="triage")
     recommendation = Recommendation(
         summary="候选手册与本次告警无关",
@@ -410,7 +401,6 @@ def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None
                 source_ref=reference,
             )
         ],
-        requires_human=False,
         confidence=0.9,
         manual_matched=False,
         runbook_references=[reference],
@@ -426,7 +416,6 @@ def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None
     result = _validate_manual_policy(recommendation, runbooks)
     assert result.manual_matched is False
     assert result.runbook_references == []
-    assert result.requires_human is True
     assert result.confidence <= 0.45
     assert all(step.source_ref is None for step in result.steps)
     runbook_bases = [b for b in result.analysis_bases if b.source == AnalysisBasisSource.RUNBOOK]
@@ -467,7 +456,6 @@ def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> N
                 ),
             )
         ],
-        requires_human=False,
         confidence=0.8,
         manual_matched=False,
     )
@@ -481,7 +469,6 @@ def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> N
     )
     assert result.analysis_bases[0].source_ref == exact
     assert result.steps[0].source_ref == exact
-    assert result.requires_human is True
     assert result.confidence == 0.8
 
 

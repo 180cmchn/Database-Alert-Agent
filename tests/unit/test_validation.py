@@ -43,7 +43,6 @@ def make_recommendation(
     *,
     root_causes: list[RootCauseAssessment] | None = None,
     action: str = "只读核对指标",
-    requires_human: bool = True,
 ) -> Recommendation:
     return Recommendation(
         summary="candidate conclusion",
@@ -54,7 +53,6 @@ def make_recommendation(
             )
         ],
         steps=[RecommendationStep(order=1, action=action)],
-        requires_human=requires_human,
         confidence=0.5,
         manual_matched=False,
         root_causes=root_causes or [],
@@ -135,7 +133,7 @@ def test_post_evidence_policy_drops_contradicted_hypotheses() -> None:
     assert not hasattr(result, "excluded_causes")
 
 
-def test_post_evidence_policy_requires_review_when_all_causes_are_removed() -> None:
+def test_post_evidence_policy_keeps_no_causes_when_all_are_removed() -> None:
     live_evidence = EvidenceRecord(
         run_id=uuid4(),
         tool_name="query_connection_sources",
@@ -151,14 +149,12 @@ def test_post_evidence_policy_requires_review_when_all_causes_are_removed() -> N
                 evidence_refs=[str(live_evidence.id)],
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(recommendation, [live_evidence])
 
     assert result.root_causes == []
     assert result.likely_causes == []
-    assert result.requires_human is True
 
 
 def test_post_evidence_policy_drops_management_sql_cause_filtered_by_alert() -> None:
@@ -179,14 +175,12 @@ def test_post_evidence_policy_drops_management_sql_cause_filtered_by_alert() -> 
                 next_probe="按指纹核对慢查询执行次数。",
             ),
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(recommendation, [], alert)
 
     assert [item.cause for item in result.root_causes] == ["业务 SQL 执行频次异常增加"]
     assert result.likely_causes == ["业务 SQL 执行频次异常增加"]
-    assert result.requires_human is True
 
 
 @pytest.mark.parametrize(
@@ -212,7 +206,6 @@ def test_post_evidence_policy_keeps_cause_unknown_without_live_success(
                 confidence=0.9,
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(recommendation, [unavailable_evidence])
@@ -223,7 +216,6 @@ def test_post_evidence_policy_keeps_cause_unknown_without_live_success(
     assert result.root_causes[0].confidence == 0.45
     assert result.root_causes[0].next_probe
     assert result.likely_causes == ["数据库管理平台采集 SQL 导致告警"]
-    assert result.requires_human is True
 
 
 @pytest.mark.parametrize(
@@ -260,7 +252,6 @@ def test_post_evidence_policy_treats_partial_success_as_unknown(
                 verified=verified,
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(
@@ -272,7 +263,6 @@ def test_post_evidence_policy_treats_partial_success_as_unknown(
     assert result.root_causes[0].verified is False
     assert result.root_causes[0].evidence_refs == []
     assert result.root_causes[0].next_probe
-    assert result.requires_human is True
 
 
 def test_post_evidence_policy_canonicalizes_cause_to_bound_hypothesis() -> None:
@@ -304,7 +294,6 @@ def test_post_evidence_policy_canonicalizes_cause_to_bound_hypothesis() -> None:
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(
@@ -319,7 +308,6 @@ def test_post_evidence_policy_canonicalizes_cause_to_bound_hypothesis() -> None:
     assert result.root_causes[0].status == RootCauseStatus.SUPPORTED
     assert result.root_causes[0].evidence_refs == [str(evidence.id)]
     assert result.root_causes[0].verified is True
-    assert result.requires_human is True
 
 
 def test_post_evidence_policy_replaces_cross_hypothesis_evidence_refs() -> None:
@@ -368,7 +356,6 @@ def test_post_evidence_policy_replaces_cross_hypothesis_evidence_refs() -> None:
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(
@@ -378,7 +365,6 @@ def test_post_evidence_policy_replaces_cross_hypothesis_evidence_refs() -> None:
     )
 
     assert result.root_causes[0].evidence_refs == [str(evidence_a.id)]
-    assert result.requires_human is True
 
 
 def test_post_evidence_policy_drops_unbound_new_model_cause() -> None:
@@ -391,7 +377,6 @@ def test_post_evidence_policy_drops_unbound_new_model_cause() -> None:
                 next_probe="执行只读核验。",
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(
@@ -402,7 +387,6 @@ def test_post_evidence_policy_drops_unbound_new_model_cause() -> None:
 
     assert result.root_causes == []
     assert result.likely_causes == []
-    assert result.requires_human is True
 
 
 def test_post_evidence_policy_cannot_promote_partial_memory_assessment() -> None:
@@ -432,7 +416,6 @@ def test_post_evidence_policy_cannot_promote_partial_memory_assessment() -> None
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = enforce_post_evidence_root_cause_policy(
@@ -445,7 +428,6 @@ def test_post_evidence_policy_cannot_promote_partial_memory_assessment() -> None
     assert result.root_causes[0].status == RootCauseStatus.UNKNOWN
     assert result.root_causes[0].verified is False
     assert result.root_causes[0].next_probe == hypothesis.next_probe.objective
-    assert result.requires_human is True
 
 
 def test_legacy_root_cause_json_without_hypothesis_id_remains_readable() -> None:
@@ -520,10 +502,10 @@ async def test_rule_validator_accepts_honest_unknown_but_marks_evidence_insuffic
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_accepts_empty_cause_assessment_with_human_review() -> None:
+async def test_rule_validator_accepts_empty_cause_as_evidence_insufficient() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    recommendation = make_recommendation(requires_human=True)
+    recommendation = make_recommendation()
 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
 
@@ -553,7 +535,6 @@ async def test_rule_validator_marks_supported_live_evidence_sufficient() -> None
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = await RuleConclusionValidator().validate(
@@ -594,7 +575,6 @@ async def test_rule_validator_rejects_cross_hypothesis_cause_binding() -> None:
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = await RuleConclusionValidator().validate(
@@ -633,7 +613,6 @@ async def test_rule_validator_rejects_live_evidence_marked_root_cause_ineligible
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = await RuleConclusionValidator().validate(
@@ -672,7 +651,6 @@ async def test_rule_validator_rejects_partial_success_as_causal_evidence() -> No
                 verified=True,
             )
         ],
-        requires_human=False,
     )
 
     result = await RuleConclusionValidator().validate(

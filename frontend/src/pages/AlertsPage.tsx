@@ -7,14 +7,18 @@ import { api } from "../lib/api";
 import { severityLabel, statusLabel } from "../lib/format";
 import type { AlertListResponse, AlertStatus, Severity } from "../types/api";
 
-const statuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING", "COMPLETED", "REVIEW_REQUIRED", "FAILED"];
+const statuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING", "COMPLETED", "INCONCLUSIVE", "FAILED"];
 const severities: Severity[] = ["CRITICAL", "WARNING", "INFO"];
 const PAGE_SIZE = 20;
+
+function alertStatusParam(value: string | null): AlertStatus | "" {
+  return statuses.includes(value as AlertStatus) ? value as AlertStatus : "";
+}
 
 export function AlertsPage() {
   const [params, setParams] = useSearchParams();
   const page = Math.max(1, Number(params.get("page")) || 1);
-  const status = (params.get("status") || "") as AlertStatus | "";
+  const status = alertStatusParam(params.get("status"));
   const severity = (params.get("severity") || "") as Severity | "";
   const source = params.get("source") || "";
   const environment = params.get("environment") || "";

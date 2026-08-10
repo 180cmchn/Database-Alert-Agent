@@ -138,9 +138,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
             json={"expected_revision": "0" * 16, "runbook_limit": 8},
         )
         assert conflict.status_code == 409
-        assert conflict.json()["detail"]["code"] == (
-            "RUNTIME_SETTINGS_REVISION_CONFLICT"
-        )
+        assert conflict.json()["detail"]["code"] == ("RUNTIME_SETTINGS_REVISION_CONFLICT")
 
         removed_notifier_fields = client.patch(
             "/api/v1/admin/settings",
@@ -152,9 +150,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
             },
         )
         assert removed_notifier_fields.status_code == 422
-        assert removed_notifier_fields.json()["code"] == (
-            "INVALID_RUNTIME_SETTINGS"
-        )
+        assert removed_notifier_fields.json()["code"] == ("INVALID_RUNTIME_SETTINGS")
 
         assert isinstance(runtime.service.advisor, OpenAICompatibleAdvisor)
         assert runtime.service.advisor._model == "example-model-v2"
@@ -203,8 +199,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
 def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> None:
     client, runtime = create_admin_client(tmp_path)
     wecom_url = (
-        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
-        "wecom-key-that-must-never-be-returned"
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=wecom-key-that-must-never-be-returned"
     )
     with client:
         initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
@@ -217,7 +212,6 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
                 "wecom_enabled": True,
                 "wecom_webhook_url": wecom_url,
                 "wecom_page_base_url": "https://alerts.intra.example.com",
-                "wecom_feedback_form_url": "https://survey.example.com/db-alert",
             },
         )
         assert response.status_code == 200
@@ -225,7 +219,6 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
         assert body["wecom_enabled"] is True
         assert body["wecom_webhook_url_configured"] is True
         assert body["wecom_page_base_url"] == "https://alerts.intra.example.com"
-        assert body["wecom_feedback_form_url"] == "https://survey.example.com/db-alert"
         assert "wecom_webhook_url" not in body
         assert wecom_url not in response.text
         assert isinstance(runtime.service.notifier, WeComManagementNotifier)
@@ -238,7 +231,6 @@ def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> Non
     persisted = (tmp_path / "runtime-settings.json").read_text(encoding="utf-8")
     assert wecom_url in persisted
     assert "https://alerts.intra.example.com" in persisted
-    assert "https://survey.example.com/db-alert" in persisted
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert wecom_url not in audit
 
@@ -295,10 +287,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert "external_knowledge_enabled" not in persisted
     assert "external_knowledge_base_url" not in persisted
     assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
-    assert (
-        persisted["external_knowledge_api_key_base_url"]
-        == "http://127.0.0.1:8001"
-    )
+    assert persisted["external_knowledge_api_key_base_url"] == "http://127.0.0.1:8001"
     assert persisted["knowledge_sources"] == ["local_pdf", "external_knowledge"]
 
 
@@ -397,25 +386,29 @@ def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
         assert item["metadata"]["source_type"] == "local_pdf"
         assert item["metadata"]["file_name"] == TIKV_RUNBOOK_PDF_NAME
 
-        detail = client.get(
-            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
-        )
+        detail = client.get(f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS)
         assert detail.status_code == 200
         assert TIKV_METRIC_NAME in detail.json()["content"]
         assert client.get(
             "/api/v1/admin/runbooks/../escape", headers=ADMIN_HEADERS
         ).status_code in {404, 422}
-        assert client.post(
-            "/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json={}
-        ).status_code == 405
-        assert client.put(
-            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
-            headers=ADMIN_HEADERS,
-            json={},
-        ).status_code == 405
-        assert client.delete(
-            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
-        ).status_code == 405
+        assert (
+            client.post("/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json={}).status_code == 405
+        )
+        assert (
+            client.put(
+                f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
+                headers=ADMIN_HEADERS,
+                json={},
+            ).status_code
+            == 405
+        )
+        assert (
+            client.delete(
+                f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
+            ).status_code
+            == 405
+        )
 
 
 def test_runbook_api_deduplicates_one_pdf_used_by_multiple_alert_types(
@@ -431,9 +424,7 @@ def test_runbook_api_deduplicates_one_pdf_used_by_multiple_alert_types(
         source_directory / TIKV_RUNBOOK_PDF_NAME,
         second_directory / TIKV_RUNBOOK_PDF_NAME,
     )
-    payload = json.loads(
-        (source_directory / "index.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((source_directory / "index.json").read_text(encoding="utf-8"))
     payload["alert_type"] = second_alert_type
     payload["runbooks"][0]["alert_type"] = second_alert_type
     (second_directory / "index.json").write_text(
@@ -512,44 +503,16 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
         assert filtered["total"] == 1
         assert filtered["items"][0]["external_id"] == "list-warning"
 
-        review_required = client.get(
-            "/api/v1/alerts", params={"status": "REVIEW_REQUIRED"}
-        ).json()
-        assert review_required["total"] == 1
-        assert review_required["items"][0]["external_id"] == "list-info"
+        inconclusive = client.get("/api/v1/alerts", params={"status": "INCONCLUSIVE"}).json()
+        assert inconclusive["total"] == 1
+        assert inconclusive["items"][0]["external_id"] == "list-info"
 
         dashboard = client.get("/api/v1/dashboard/summary").json()
         assert dashboard["total"] == 3
         assert dashboard["active"] == 2
         assert dashboard["critical_open"] == 1
         assert dashboard["by_status"]["QUEUED"] == 2
-        assert dashboard["by_status"]["REVIEW_REQUIRED"] == 1
-
-
-def test_feedback_requires_admin_and_uses_authenticated_actor(tmp_path: Path) -> None:
-    client, runtime = create_admin_client(tmp_path)
-    with client:
-        accepted = client.post(
-            "/api/v1/alerts/canonical/analyze",
-            json={
-                "external_id": "feedback-auth",
-                "severity": "INFO",
-                "title": "Latency",
-                "reason": "latency",
-            },
-        ).json()
-        assert client.portal is not None
-        client.portal.call(runtime.service.analyze_by_id, accepted["alert_id"])
-        payload = {
-            "idempotency_key": "feedback-auth-1",
-            "verdict": "REJECTED",
-            "reviewer": "forged-reviewer",
-        }
-        endpoint = f"/api/v1/alerts/{accepted['alert_id']}/feedback"
-        assert client.post(endpoint, json=payload).status_code == 401
-        saved = client.post(endpoint, headers=ADMIN_HEADERS, json=payload)
-        assert saved.status_code == 201
-        assert saved.json()["reviewer"] == "admin"
+        assert dashboard["by_status"]["INCONCLUSIVE"] == 1
 
 
 def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
@@ -577,7 +540,7 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
         detail = client.get(f"/api/v1/alerts/{alert_id}")
         assert detail.status_code == 200
         body = detail.json()
-        assert body["status"] == "REVIEW_REQUIRED"
+        assert body["status"] == "INCONCLUSIVE"
         assert body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
         assert body["recommendation"]["manual_matched"] is True
         assert body["recommendation"]["steps"][0]["source_ref"] == {
@@ -587,13 +550,12 @@ def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
         assert [item["stage"] for item in body["progress"]] == [
             "RECEIVED",
             "FINGERPRINTING",
-            "KNOWLEDGE_MATCHING",
             "RUNBOOK_MATCHING",
             "INVESTIGATING",
             "ADVISING",
             "VALIDATING",
             "REPORTING",
-            "REVIEW_REQUIRED",
+            "INCONCLUSIVE",
             "REPORTING",
         ]
 
@@ -649,9 +611,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         assert history_body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
         assert history_body["recommendation"]["manual_matched"] is True
         assert all(item["run_id"] == first_run_id for item in history_body["progress"])
-        assert all(
-            item["run_id"] == first_run_id for item in history_body["evidence_records"]
-        )
+        assert all(item["run_id"] == first_run_id for item in history_body["evidence_records"])
         assert all(item["run_id"] == first_run_id for item in history_body["validations"])
 
         missing_run = client.get(

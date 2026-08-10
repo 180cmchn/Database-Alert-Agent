@@ -126,7 +126,6 @@ def _build_notifier(settings: Settings) -> ManagementNotifier:
         return WeComManagementNotifier(
             settings.wecom_webhook_url,
             settings.wecom_page_base_url,
-            settings.wecom_feedback_form_url,
         )
     return LogManagementNotifier()
 

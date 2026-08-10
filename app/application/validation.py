@@ -279,20 +279,18 @@ def enforce_post_evidence_root_cause_policy(
     ``CONTRADICTED`` is retained in the enum so historical recommendations remain
     readable. New recommendations contain only causes that remain plausible after
     all collected evidence has been considered, and unsupported decisive states
-    are downgraded to ``UNKNOWN`` for human review.
+    are downgraded to ``UNKNOWN`` so the result remains inconclusive.
     """
 
     evidence_by_id = {str(item.id): item for item in evidence}
     plausible_causes: list[RootCauseAssessment] = []
     root_causes = recommendation.root_causes
-    invalid_causal_assessment = False
     if investigation_memory is not None:
-        root_causes, invalid_causal_assessment = _bind_root_causes_to_memory(
+        root_causes, _ = _bind_root_causes_to_memory(
             root_causes,
             investigation_memory,
             evidence,
         )
-    filtered_metric_cause = False
     management_sql_already_filtered = bool(
         alert and has_management_platform_sql_filter_note(alert.raw_payload)
     )
@@ -301,7 +299,6 @@ def enforce_post_evidence_root_cause_policy(
         if management_sql_already_filtered and is_management_platform_collection_sql_cause(
             root_cause.cause
         ):
-            filtered_metric_cause = True
             continue
         if root_cause.status == RootCauseStatus.UNKNOWN:
             plausible_causes.append(root_cause)
@@ -318,7 +315,6 @@ def enforce_post_evidence_root_cause_policy(
             plausible_causes.append(root_cause)
             continue
 
-        invalid_causal_assessment = True
         plausible_causes.append(
             root_cause.model_copy(
                 update={
@@ -336,13 +332,6 @@ def enforce_post_evidence_root_cause_policy(
         update={
             "root_causes": plausible_causes,
             "likely_causes": [item.cause for item in plausible_causes],
-            "requires_human": (
-                recommendation.requires_human
-                or not plausible_causes
-                or invalid_causal_assessment
-                or filtered_metric_cause
-                or any(item.status == RootCauseStatus.UNKNOWN for item in plausible_causes)
-            ),
         }
     )
 
@@ -438,9 +427,6 @@ class RuleConclusionValidator:
             and bool(recommendation.root_causes)
             and not binding_issues
         )
-        if not evidence_sufficient and not recommendation.requires_human:
-            issues.append("实时证据不足时 recommendation.requires_human 必须为 true")
-
         manual_matched = recommendation.manual_matched
         sources = [item.source for item in recommendation.analysis_bases]
         valid_runbook_refs = {(excerpt.runbook_id, excerpt.section) for excerpt in runbooks}

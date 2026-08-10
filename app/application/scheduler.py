@@ -339,7 +339,7 @@ class FlashDutyAlertPoller:
 
 
 class WeeklyAlertRetentionCleaner:
-    """Delete only unreviewed expired terminal alerts each Friday at 12:00 CST.
+    """Delete expired terminal alerts each Friday at 12:00 CST.
 
     The loop deliberately waits for the next calendar slot before its first run;
     unlike polling, service startup must never perform retention cleanup.

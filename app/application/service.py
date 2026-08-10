@@ -1,8 +1,7 @@
 """Alert analysis service using LangGraph for investigation.
 
-This service provides the public API for alert ingestion, analysis,
-and feedback submission. It delegates investigation to the LangGraph
-InvestigationAgent.
+This service provides the public API for alert ingestion and analysis. It
+delegates investigation to the LangGraph InvestigationAgent.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
-    FeedbackAlreadySubmittedError,
     InvalidAlertPayloadError,
 )
 from app.domain.models import (
@@ -34,15 +32,11 @@ from app.domain.models import (
     AlertStatus,
     AnalysisConfigSnapshot,
     DashboardSummary,
-    FeedbackRecord,
-    FeedbackVerdict,
     InvestigationRun,
     InvestigationStage,
-    KnowledgeCase,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
-    RunbookMatchVerdict,
     RunStatus,
     StoredAlert,
 )
@@ -192,7 +186,7 @@ class AlertAnalysisService:
         stored, created = await self.ingest(source, payload)
         if not created and stored.status in {
             AlertStatus.COMPLETED,
-            AlertStatus.REVIEW_REQUIRED,
+            AlertStatus.INCONCLUSIVE,
         }:
             return stored
         if not created and stored.status == AlertStatus.FAILED and not retry_failed:
@@ -211,7 +205,7 @@ class AlertAnalysisService:
             The stored alert after analysis
         """
         stored = await self.get(alert_id)
-        if stored.status in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
+        if stored.status in {AlertStatus.COMPLETED, AlertStatus.INCONCLUSIVE}:
             return stored
 
         self._active_analyses += 1
@@ -369,9 +363,9 @@ class AlertAnalysisService:
             if final_state.status == AlertStatus.COMPLETED:
                 message = "数据库告警分析已完成。"
             elif final_state.recommendation.analysis_mode == "shadow":
-                message = "数据库告警已生成影子分析，请人工复核。"
+                message = "数据库告警影子分析已结束，结论不充分。"
             else:
-                message = "数据库告警已生成候选分析，请人工复核。"
+                message = "数据库告警分析已结束，结论不充分。"
             await self._send_analysis_result(
                 final_state.alert,
                 run_id=run.id,
@@ -422,10 +416,10 @@ class AlertAnalysisService:
                 InvestigationStage.COMPLETED,
                 "调查完成。",
             ),
-            AlertStatus.REVIEW_REQUIRED: (
-                RunStatus.REVIEW_REQUIRED,
-                InvestigationStage.REVIEW_REQUIRED,
-                "结论需要人工复核。",
+            AlertStatus.INCONCLUSIVE: (
+                RunStatus.INCONCLUSIVE,
+                InvestigationStage.INCONCLUSIVE,
+                "调查结束，结论不充分。",
             ),
             AlertStatus.FAILED: (
                 RunStatus.FAILED,
@@ -531,181 +525,6 @@ class AlertAnalysisService:
         self._retired_adapters = []
         self._retired_adapter_ids.clear()
         await self._close_adapters(adapters)
-
-    async def submit_feedback(
-        self,
-        alert_id: str,
-        *,
-        idempotency_key: str,
-        verdict: FeedbackVerdict,
-        reviewer: str,
-        final_root_cause: str | None = None,
-        actual_resolution: str | None = None,
-        recovered: bool | None = None,
-        runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN,
-        correct_runbook_id: str | None = None,
-        correct_runbook_section: str | None = None,
-        missed_runbook_ids: list[str] | None = None,
-        supporting_evidence_ids: list[str] | None = None,
-        wrong_agent_claims: list[str] | None = None,
-        accepted_step_orders: list[int] | None = None,
-    ) -> FeedbackRecord:
-        """Submit feedback for a completed investigation.
-
-        Args:
-            alert_id: The alert ID
-            idempotency_key: Unique key for idempotency
-            verdict: The feedback verdict
-            reviewer: The reviewer name
-            final_root_cause: Confirmed root cause (required for CONFIRMED/CORRECTED)
-            actual_resolution: Actual resolution taken (required for CONFIRMED/CORRECTED)
-            recovered: Whether the issue was recovered
-            runbook_match_verdict: Verdict on runbook match quality
-            correct_runbook_id: ID of the correct runbook
-            correct_runbook_section: Section of the correct runbook
-            missed_runbook_ids: IDs of runbooks that should have been matched
-            supporting_evidence_ids: IDs of supporting evidence
-            wrong_agent_claims: Claims made by the agent that were wrong
-            accepted_step_orders: Orders of accepted recommendation steps
-
-        Returns:
-            The saved feedback record
-        """
-        stored = await self.get(alert_id)
-        if stored.status not in {AlertStatus.COMPLETED, AlertStatus.REVIEW_REQUIRED}:
-            raise InvalidAlertPayloadError("Only completed investigations can receive feedback")
-        if not stored.latest_run:
-            raise InvalidAlertPayloadError("Investigation run is missing")
-        existing_feedback = next(
-            (
-                item
-                for item in stored.feedback
-                if item.run_id == stored.latest_run.id
-            ),
-            None,
-        )
-        if existing_feedback:
-            if existing_feedback.idempotency_key == idempotency_key:
-                return existing_feedback
-            raise FeedbackAlreadySubmittedError(alert_id, str(stored.latest_run.id))
-        if verdict in {FeedbackVerdict.CONFIRMED, FeedbackVerdict.CORRECTED} and (
-            not final_root_cause or not actual_resolution
-        ):
-            raise InvalidAlertPayloadError(
-                "Confirmed or corrected feedback requires final_root_cause and actual_resolution"
-            )
-        if runbook_match_verdict == RunbookMatchVerdict.CORRECT and not correct_runbook_id:
-            if len(stored.manual_matches) == 1:
-                correct_runbook_id = stored.manual_matches[0].runbook_id
-                correct_runbook_section = (
-                    correct_runbook_section or stored.manual_matches[0].section
-                )
-            else:
-                raise InvalidAlertPayloadError(
-                    "CORRECT runbook feedback requires correct_runbook_id "
-                    "when matches are ambiguous"
-                )
-        retrieved_runbook_ids = {item.runbook_id for item in stored.manual_matches}
-        if (
-            runbook_match_verdict == RunbookMatchVerdict.CORRECT
-            and correct_runbook_id not in retrieved_runbook_ids
-        ):
-            raise InvalidAlertPayloadError(
-                "CORRECT runbook feedback must reference a retrieved runbook"
-            )
-        if (
-            runbook_match_verdict
-            in {
-                RunbookMatchVerdict.INCORRECT,
-                RunbookMatchVerdict.MISSED,
-            }
-            and not correct_runbook_id
-        ):
-            raise InvalidAlertPayloadError(
-                "INCORRECT or MISSED runbook feedback requires correct_runbook_id"
-            )
-        if (
-            runbook_match_verdict == RunbookMatchVerdict.MISSED
-            and correct_runbook_id in retrieved_runbook_ids
-        ):
-            raise InvalidAlertPayloadError(
-                "MISSED runbook feedback must reference a runbook that was not retrieved"
-            )
-        if runbook_match_verdict == RunbookMatchVerdict.NOT_APPLICABLE and correct_runbook_id:
-            raise InvalidAlertPayloadError(
-                "NOT_APPLICABLE runbook feedback cannot provide correct_runbook_id"
-            )
-
-        from app.domain.models import ToolStatus
-
-        evidence_ids = list(dict.fromkeys(supporting_evidence_ids or []))
-        evidence_by_id = {str(item.id): item for item in stored.evidence_records}
-        invalid_evidence = [
-            evidence_id
-            for evidence_id in evidence_ids
-            if evidence_id not in evidence_by_id
-            or evidence_by_id[evidence_id].status != ToolStatus.SUCCESS
-        ]
-        if invalid_evidence:
-            raise InvalidAlertPayloadError(
-                "supporting_evidence_ids must reference SUCCESS evidence from this investigation"
-            )
-
-        accepted_orders = sorted(set(accepted_step_orders or []))
-        valid_orders = {
-            step.order for step in (stored.recommendation.steps if stored.recommendation else [])
-        }
-        if not set(accepted_orders).issubset(valid_orders):
-            raise InvalidAlertPayloadError(
-                "accepted_step_orders must reference recommendation steps from this investigation"
-            )
-
-        feedback = FeedbackRecord(
-            alert_id=stored.alert.id,
-            run_id=stored.latest_run.id,
-            idempotency_key=idempotency_key,
-            verdict=verdict,
-            final_root_cause=sanitize(final_root_cause),
-            actual_resolution=sanitize(actual_resolution),
-            recovered=recovered,
-            runbook_match_verdict=runbook_match_verdict,
-            correct_runbook_id=sanitize(correct_runbook_id),
-            correct_runbook_section=sanitize(correct_runbook_section),
-            missed_runbook_ids=sanitize(list(dict.fromkeys(missed_runbook_ids or []))),
-            supporting_evidence_ids=evidence_ids,
-            wrong_agent_claims=sanitize(wrong_agent_claims or []),
-            accepted_step_orders=accepted_orders,
-            reviewer=sanitize(reviewer),
-        )
-
-        knowledge_case = None
-        if (
-            verdict in {FeedbackVerdict.CONFIRMED, FeedbackVerdict.CORRECTED}
-            and recovered is True
-            and final_root_cause
-            and actual_resolution
-        ):
-            knowledge_case = KnowledgeCase(
-                source_alert_id=stored.alert.id,
-                source_run_id=stored.latest_run.id,
-                incident_fingerprint=stored.alert.incident_fingerprint,
-                fingerprint_version=stored.alert.fingerprint_version,
-                environment=stored.alert.environment,
-                service_name=stored.alert.service_name,
-                alert_type=stored.alert.alert_type,
-                database_engine=(stored.alert.database.engine if stored.alert.database else None),
-                correct_runbook_id=sanitize(correct_runbook_id),
-                correct_runbook_section=sanitize(correct_runbook_section),
-                supporting_evidence_ids=evidence_ids,
-                final_root_cause=sanitize(final_root_cause),
-                actual_resolution=sanitize(actual_resolution),
-                recommendation=stored.recommendation,
-                confirmed_by=sanitize(reviewer),
-            )
-        saved = await self.repository.save_feedback(feedback, knowledge_case)
-        if saved.id != feedback.id and saved.idempotency_key != feedback.idempotency_key:
-            raise FeedbackAlreadySubmittedError(alert_id, str(stored.latest_run.id))
-        return saved
 
     async def get(self, alert_id: str, run_id: str | None = None) -> StoredAlert:
         """Get an alert by ID.
@@ -858,7 +677,7 @@ class AlertAnalysisService:
     ) -> tuple[InvestigationRun, AnalysisConfigSnapshot]:
         """Re-analyze an alert with current runtime settings.
 
-        This method allows re-running analysis on completed/review_required alerts
+        This method allows re-running analysis on completed/inconclusive alerts
         for debugging purposes. The configuration snapshot is saved for tracking.
 
         Args:

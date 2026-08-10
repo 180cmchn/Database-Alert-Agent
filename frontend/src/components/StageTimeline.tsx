@@ -5,7 +5,6 @@ import type { InvestigationStage, ProgressRecord } from "../types/api";
 const CORE_STAGES: InvestigationStage[] = [
   "RECEIVED",
   "FINGERPRINTING",
-  "KNOWLEDGE_MATCHING",
   "RUNBOOK_MATCHING",
   "INVESTIGATING",
   "ADVISING",
@@ -13,7 +12,7 @@ const CORE_STAGES: InvestigationStage[] = [
   "REPORTING",
 ];
 
-const finalStages: InvestigationStage[] = ["COMPLETED", "REVIEW_REQUIRED", "FAILED"];
+const finalStages: InvestigationStage[] = ["COMPLETED", "INCONCLUSIVE", "FAILED"];
 
 export function StageTimeline({
   currentStage,
@@ -36,10 +35,11 @@ export function StageTimeline({
       {stages.map((stage, index) => {
         const record = progressByStage.get(stage);
         const isTerminal = finalStages.includes(stage);
-        const isFailed = stage === "FAILED" || stage === "REVIEW_REQUIRED";
+        const isFailed = stage === "FAILED";
+        const isInconclusive = stage === "INCONCLUSIVE";
         const isCurrent = stage === currentStage;
         const isDone = Boolean(record) || isTerminal || (currentIndex >= 0 && index < currentIndex);
-        const Icon = isFailed
+        const Icon = isFailed || isInconclusive
           ? CircleAlert
           : isCurrent && !isTerminal
             ? LoaderCircle
@@ -50,7 +50,7 @@ export function StageTimeline({
         return (
           <li
             key={`${stage}-${index}`}
-            className={`${isDone ? "done" : "pending"} ${isCurrent ? "current" : ""} ${isFailed ? "failed" : ""}`}
+            className={`${isDone ? "done" : "pending"} ${isCurrent ? "current" : ""} ${isFailed ? "failed" : ""} ${isInconclusive ? "inconclusive" : ""}`}
           >
             <span className="stage-rail" aria-hidden="true" />
             <span className="stage-icon">

@@ -851,7 +851,10 @@ class ArcheryHarnessScenario:
         return HostRejection(
             code="archery_final_evidence_not_collected",
             message="The final bounded Archery history query has not completed.",
-            repair_hint="Continue with an approved read-only probe or request human review.",
+            repair_hint=(
+                "Continue with an approved read-only probe or finish with an "
+                "evidence-insufficient reason."
+            ),
         )
 
     def _successful_transition(

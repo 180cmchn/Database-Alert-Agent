@@ -23,7 +23,7 @@ class AlertStatus(StrEnum):
     QUEUED = "QUEUED"
     ANALYZING = "ANALYZING"
     COMPLETED = "COMPLETED"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
 
 
@@ -37,14 +37,14 @@ class InvestigationStage(StrEnum):
     VALIDATING = "VALIDATING"
     REPORTING = "REPORTING"
     COMPLETED = "COMPLETED"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
 
 
 class RunStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
 
 
@@ -59,12 +59,6 @@ class ToolStatus(StrEnum):
 class ValidationKind(StrEnum):
     RULE = "RULE"
     AGENT = "AGENT"
-
-
-class FeedbackVerdict(StrEnum):
-    CONFIRMED = "CONFIRMED"
-    CORRECTED = "CORRECTED"
-    REJECTED = "REJECTED"
 
 
 class RunbookKnowledgeType(StrEnum):
@@ -82,14 +76,6 @@ class ExecutionClass(StrEnum):
 class RootCauseStatus(StrEnum):
     SUPPORTED = "SUPPORTED"
     CONTRADICTED = "CONTRADICTED"
-    UNKNOWN = "UNKNOWN"
-
-
-class RunbookMatchVerdict(StrEnum):
-    CORRECT = "CORRECT"
-    INCORRECT = "INCORRECT"
-    MISSED = "MISSED"
-    NOT_APPLICABLE = "NOT_APPLICABLE"
     UNKNOWN = "UNKNOWN"
 
 
@@ -313,7 +299,6 @@ class Recommendation(BaseModel):
     analysis_bases: list[AnalysisBasis] = Field(default_factory=list)
     steps: list[RecommendationStep]
     risks: list[str] = Field(default_factory=list)
-    requires_human: bool = True
     confidence: float = Field(ge=0, le=1)
     manual_matched: bool
     runbook_references: list[RunbookReference] = Field(default_factory=list)
@@ -423,7 +408,7 @@ class ConclusionValidationDecision(BaseModel):
 
     ``analysis_contract_passed`` answers whether the recommendation is honest,
     traceable, and safe. ``evidence_sufficient`` separately answers whether the
-    live evidence is strong enough to complete the RCA without human review.
+    live evidence is strong enough to complete the RCA conclusively.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -504,47 +489,6 @@ class InvestigationRun(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class KnowledgeCase(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    source_alert_id: UUID
-    source_run_id: UUID
-    incident_fingerprint: str
-    fingerprint_version: str
-    environment: str
-    service_name: str
-    alert_type: str
-    database_engine: str | None = None
-    correct_runbook_id: str | None = None
-    correct_runbook_section: str | None = None
-    supporting_evidence_ids: list[str] = Field(default_factory=list)
-    final_root_cause: str
-    actual_resolution: str
-    recommendation: Recommendation | None = None
-    confirmed_by: str
-    confirmed_at: datetime = Field(default_factory=utc_now)
-    created_at: datetime = Field(default_factory=utc_now)
-
-
-class FeedbackRecord(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    alert_id: UUID
-    run_id: UUID
-    idempotency_key: str
-    verdict: FeedbackVerdict
-    final_root_cause: str | None = None
-    actual_resolution: str | None = None
-    recovered: bool | None = None
-    runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN
-    correct_runbook_id: str | None = None
-    correct_runbook_section: str | None = None
-    missed_runbook_ids: list[str] = Field(default_factory=list)
-    supporting_evidence_ids: list[str] = Field(default_factory=list)
-    wrong_agent_claims: list[str] = Field(default_factory=list)
-    accepted_step_orders: list[int] = Field(default_factory=list)
-    reviewer: str
-    created_at: datetime = Field(default_factory=utc_now)
-
-
 class InvestigationEvidenceAssessment(BaseModel):
     """Model-proposed semantic relation, enforced later by the evidence policy."""
 
@@ -610,8 +554,6 @@ class StoredAlert(BaseModel):
     progress: list[ProgressRecord] = Field(default_factory=list)
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)
     validations: list[ValidationRecord] = Field(default_factory=list)
-    feedback: list[FeedbackRecord] = Field(default_factory=list)
-    knowledge_matches: list[KnowledgeCase] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -631,7 +573,6 @@ class AlertSummary(BaseModel):
     updated_at: datetime
     current_stage: InvestigationStage | None = None
     manual_matched: bool = False
-    requires_human: bool | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 

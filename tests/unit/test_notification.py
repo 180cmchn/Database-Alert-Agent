@@ -28,9 +28,7 @@ from app.logging_config import configure_logging
 
 
 def analysis_result_event(*, title: str = "数据库连接数接近上限") -> AnalysisResultEvent:
-    reference = RunbookReference(
-        runbook_id="connection-limit", section="initial-triage"
-    )
+    reference = RunbookReference(runbook_id="connection-limit", section="initial-triage")
     return AnalysisResultEvent(
         alert=NormalizedAlert(
             id=uuid4(),
@@ -72,7 +70,6 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
                 )
             ],
             risks=["不要未经审批终止会话"],
-            requires_human=True,
             confidence=0.86,
             manual_matched=True,
             runbook_references=[reference],
@@ -83,7 +80,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
     )
 
 
-def test_wecom_card_contains_alert_facts_and_exactly_three_actions() -> None:
+def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
     event = analysis_result_event()
     card = build_wecom_template_card(
         event,
@@ -92,10 +89,7 @@ def test_wecom_card_contains_alert_facts_and_exactly_three_actions() -> None:
 
     assert card["card_type"] == "text_notice"
     assert card["main_title"]["title"] == "数据库连接数接近上限"
-    facts = {
-        item["keyname"]: item["value"]
-        for item in card["horizontal_content_list"]
-    }
+    facts = {item["keyname"]: item["value"] for item in card["horizontal_content_list"]}
     assert facts["告警级别"] == "严重 / CRITICAL"
     assert facts["告警主机"] == "db-orders.internal"
     assert facts["数据库"] == "postgresql"
@@ -104,16 +98,12 @@ def test_wecom_card_contains_alert_facts_and_exactly_three_actions() -> None:
     assert [item["title"] for item in actions] == [
         "告警根因分析",
         "告警恢复建议",
-        "人工反馈",
     ]
     assert actions[0]["url"] == (
         f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/root-cause"
     )
     assert actions[1]["url"] == (
         f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/recovery-advice"
-    )
-    assert actions[2]["url"] == (
-        f"https://alerts.intra.example.com/alerts/{event.alert.id}#feedback"
     )
     assert card["card_action"] == {
         "type": 1,
@@ -133,29 +123,7 @@ def test_wecom_card_sanitizes_and_bounds_text_fields() -> None:
     assert "***REDACTED***" in serialized
     assert len(card["main_title"]["title"]) <= 26
     assert len(card["sub_title_text"]) <= 112
-    assert all(
-        len(item["value"]) <= 26 for item in card["horizontal_content_list"]
-    )
-
-
-def test_wecom_card_external_feedback_url_gets_correlation_parameters() -> None:
-    event = analysis_result_event()
-    card = build_wecom_template_card(
-        event,
-        page_base_url="https://alerts.intra.example.com/base",
-        feedback_form_url=(
-            "https://survey.example.com/form?campaign=dba&alert_id=stale#questions"
-        ),
-    )
-
-    feedback_url = card["jump_list"][2]["url"]
-    assert feedback_url.startswith("https://survey.example.com/form?")
-    assert "campaign=dba" in feedback_url
-    assert "alert_id=stale" not in feedback_url
-    assert f"alert_id={event.alert.id}" in feedback_url
-    assert f"run_id={event.run_id}" in feedback_url
-    assert "source=wecom" in feedback_url
-    assert feedback_url.endswith("#questions")
+    assert all(len(item["value"]) <= 26 for item in card["horizontal_content_list"])
 
 
 @pytest.mark.asyncio
@@ -203,7 +171,7 @@ async def test_wecom_notifier_sends_one_template_card() -> None:
     assert request.headers["idempotency-key"] == f"{event.alert.id}:analysis-result"
     assert b'"msgtype":"template_card"' in request.content
     assert b'"card_type":"text_notice"' in request.content
-    assert request.content.count(b'"title":"') >= 4
+    assert request.content.count(b'"title":"') >= 3
 
 
 @pytest.mark.asyncio

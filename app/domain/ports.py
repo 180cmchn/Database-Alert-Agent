@@ -12,13 +12,11 @@ from app.domain.models import (
     DashboardSummary,
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
-    FeedbackRecord,
     InvestigationContext,
     InvestigationDecision,
     InvestigationRun,
     InvestigationStage,
     InvestigationStrategy,
-    KnowledgeCase,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -121,7 +119,6 @@ class AIAdvisor(Protocol):
         alert: NormalizedAlert,
         runbooks: list[RunbookExcerpt],
         evidence: list[EvidenceRecord] | None = None,
-        knowledge_cases: list[KnowledgeCase] | None = None,
         external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
         strategy: InvestigationStrategy | None = None,
@@ -436,11 +433,3 @@ class AlertRepository(Protocol):
         lease_owner: str,
         fencing_token: int,
     ) -> None: ...
-
-    async def find_knowledge_cases(
-        self, fingerprint: str, fingerprint_version: str, limit: int = 3
-    ) -> list[KnowledgeCase]: ...
-
-    async def save_feedback(
-        self, feedback: FeedbackRecord, knowledge_case: KnowledgeCase | None = None
-    ) -> FeedbackRecord: ...

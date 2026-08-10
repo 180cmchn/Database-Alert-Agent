@@ -14,7 +14,6 @@ from app.domain.models import (
     InvestigationRun,
     InvestigationStage,
     InvestigationStrategy,
-    KnowledgeCase,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -62,7 +61,6 @@ class AgentState(BaseModel):
 
     # Investigation data
     runbooks: Annotated[list[RunbookExcerpt], merge_runbooks] = Field(default_factory=list)
-    knowledge_cases: list[KnowledgeCase] = Field(default_factory=list)
     external_knowledge: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
     knowledge_match_summary: str = ""
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)

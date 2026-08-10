@@ -5,7 +5,7 @@ import logging
 import re
 from collections import deque
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -27,46 +27,17 @@ def _safe_text(value: Any, *, limit: int, fallback: str = "未提供") -> str:
     return cleaned[:limit] or fallback
 
 
-def _append_query_parameters(url: str, **parameters: str) -> str:
-    """Append authoritative correlation fields while preserving form options."""
-
-    parsed = urlsplit(url)
-    reserved_names = set(parameters)
-    query = [
-        (name, value)
-        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if name not in reserved_names
-    ]
-    query.extend(
-        (name, value)
-        for name, value in parameters.items()
-        if value
-    )
-    return urlunsplit(parsed._replace(query=urlencode(query)))
-
-
 def _action_urls(
     event: AnalysisResultEvent,
     *,
     page_base_url: str,
-    feedback_form_url: str = "",
 ) -> dict[str, str]:
     alert_id = quote(str(event.alert.id), safe="")
     wecom_url = f"{page_base_url.rstrip('/')}/wecom/alerts/{alert_id}"
-    if feedback_form_url:
-        feedback_url = _append_query_parameters(
-            feedback_form_url,
-            alert_id=str(event.alert.id),
-            run_id=str(event.run_id) if event.run_id else "",
-            source="wecom",
-        )
-    else:
-        feedback_url = f"{page_base_url.rstrip('/')}/alerts/{alert_id}#feedback"
     return {
         "overview": wecom_url,
         "root_cause": f"{wecom_url}/root-cause",
         "recovery_advice": f"{wecom_url}/recovery-advice",
-        "feedback": feedback_url,
     }
 
 
@@ -74,20 +45,15 @@ def build_wecom_template_card(
     event: AnalysisResultEvent,
     *,
     page_base_url: str,
-    feedback_form_url: str = "",
 ) -> dict[str, Any]:
-    """Build a bounded WeCom text-notice card with three bottom actions."""
+    """Build a bounded WeCom text-notice card with analysis detail actions."""
 
     if not page_base_url:
         raise NotificationError("WeCom page base URL is not configured")
 
     alert = event.alert
     database = alert.database
-    urls = _action_urls(
-        event,
-        page_base_url=page_base_url,
-        feedback_form_url=feedback_form_url,
-    )
+    urls = _action_urls(event, page_base_url=page_base_url)
     severity_labels = {
         "CRITICAL": "严重",
         "WARNING": "警告",
@@ -95,7 +61,7 @@ def build_wecom_template_card(
     }
     status_labels = {
         "COMPLETED": "分析完成",
-        "REVIEW_REQUIRED": "待人工复核",
+        "INCONCLUSIVE": "结论不充分",
         "FAILED": "分析失败",
     }
     severity = alert.severity.value
@@ -152,7 +118,6 @@ def build_wecom_template_card(
                 "title": "告警恢复建议",
                 "url": urls["recovery_advice"],
             },
-            {"type": 1, "title": "人工反馈", "url": urls["feedback"]},
         ],
         # WeCom requires template_card.card_action. The overview page exposes
         # only the summary, so it cannot be used to switch between the two
@@ -200,13 +165,11 @@ class LogManagementNotifier:
     async def send(self, event: AnalysisResultEvent) -> str:
         delivery_id = f"log-{uuid4()}"
         logger.warning(
-            "analysis_result delivery_id=%s alert_id=%s status=%s "
-            "manual_matched=%s requires_human=%s",
+            "analysis_result delivery_id=%s alert_id=%s status=%s manual_matched=%s",
             delivery_id,
             event.alert.id,
             event.status.value,
             event.recommendation.manual_matched,
-            event.recommendation.requires_human,
         )
         return delivery_id
 
@@ -216,7 +179,6 @@ class WeComManagementNotifier:
         self,
         url: str,
         page_base_url: str,
-        feedback_form_url: str = "",
         timeout_seconds: float = 10,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -226,7 +188,6 @@ class WeComManagementNotifier:
     ) -> None:
         self._url = url
         self._page_base_url = page_base_url
-        self._feedback_form_url = feedback_form_url
         self._timeout = timeout_seconds
         self._transport = transport
         self._max_retries = max_retries
@@ -247,7 +208,6 @@ class WeComManagementNotifier:
             "template_card": build_wecom_template_card(
                 event,
                 page_base_url=self._page_base_url,
-                feedback_form_url=self._feedback_form_url,
             ),
         }
 

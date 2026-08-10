@@ -131,49 +131,6 @@ async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any
     }
 
 
-async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Match against confirmed historical cases.
-
-    Historical cases are always queried and not controlled by ``knowledge_sources``.
-    External knowledge and local PDF runbook matching happen in the subsequent
-    ``runbook_match_node`` where they run in parallel.
-    """
-    if state.error:
-        return {}
-
-    alert_id = state.alert_id
-    run = state.run
-    alert = state.alert
-
-    if not run or not alert:
-        return {"error": "Missing run or alert in knowledge match node"}
-
-    await _update_progress(
-        ctx.repository,
-        alert_id,
-        run,
-        InvestigationStage.KNOWLEDGE_MATCHING,
-        "正在匹配人工确认的历史案例。",
-    )
-
-    knowledge_cases = await ctx.repository.find_knowledge_cases(
-        alert.incident_fingerprint, alert.fingerprint_version, limit=3
-    )
-
-    return {
-        "current_stage": InvestigationStage.KNOWLEDGE_MATCHING,
-        "knowledge_cases": knowledge_cases,
-        "progress": [
-            ProgressRecord(
-                run_id=run.id,
-                stage=InvestigationStage.KNOWLEDGE_MATCHING,
-                message="正在匹配人工确认的历史案例。",
-                details={"knowledge_cases_count": len(knowledge_cases)},
-            )
-        ],
-    }
-
-
 async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     """Search local PDF runbooks and external knowledge in parallel.
 
@@ -188,8 +145,8 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     diagnostic signal. Candidates below the configured relevance threshold are
     explicitly rejected and never reach the advisor.
 
-    Historical cases are handled in the preceding ``knowledge_match_node`` and
-    are not touched here.
+    External knowledge results may include incident cases; they remain ordinary
+    knowledge clues and do not replace live evidence for the current alert.
     """
     if state.error:
         return {}
@@ -207,7 +164,6 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         run,
         InvestigationStage.RUNBOOK_MATCHING,
         "正在检索已选择的知识来源。",
-        {"knowledge_matches": len(state.knowledge_cases)},
     )
 
     local_pdf_enabled = "local_pdf" in state.knowledge_sources
@@ -334,7 +290,6 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
                 stage=InvestigationStage.RUNBOOK_MATCHING,
                 message="正在检索已选择的知识来源。",
                 details={
-                    "knowledge_matches": len(state.knowledge_cases),
                     "local_pdf_enabled": local_pdf_enabled,
                     "external_knowledge_enabled": external_enabled,
                     "external_knowledge_count": len(external_knowledge),
@@ -386,7 +341,7 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
         pending_requests = []
     elif pending_requests and stop_decision.reason == StopReason.NO_SAFE_PROBE:
         # A deterministic baseline plan may collect safe context even when no
-        # causal probe is yet known. It cannot clear UNKNOWN or human review.
+        # causal probe is yet known. It cannot clear UNKNOWN or make the result conclusive.
         stop_decision = StopDecision(
             should_stop=False,
             reason=StopReason.CONTINUE,
@@ -606,7 +561,7 @@ async def dynamic_investigation_node(state: AgentState, ctx: NodeContext) -> dic
                 alert_id=state.alert_id,
                 run=run,
                 outcome="assessment_error",
-                message="ReAct 最终证据评估失败，已停止追加工具并转人工复核。",
+                message="ReAct 最终证据评估失败，已停止追加工具，结论不充分。",
                 turns_remaining=0,
                 evidence_count=len(evidence),
                 details={"error_type": type(exc).__name__},
@@ -1015,7 +970,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     alert = state.alert
     runbooks = state.runbooks
     evidence = state.evidence
-    knowledge_cases = state.knowledge_cases
     external_knowledge = state.external_knowledge
     knowledge_match_summary = state.knowledge_match_summary
     strategy = state.strategy
@@ -1047,7 +1001,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             alert,
             runbooks,
             evidence=evidence,
-            knowledge_cases=knowledge_cases,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
@@ -1067,7 +1020,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             alert,
             runbooks,
             evidence=evidence,
-            knowledge_cases=knowledge_cases,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
@@ -1081,7 +1033,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.ADVISING,
-                message="AI 主分析未返回合规结果，已生成保守候选建议并转人工复核。",
+                message="AI 主分析未返回合规结果，已生成结论不充分的保守候选建议。",
                 details={
                     "error_type": type(exc).__name__,
                     "error_detail": sanitize(str(exc)),
@@ -1101,7 +1053,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             update={
                 "summary": f"{knowledge_match_summary} {recommendation.summary}".strip(),
                 "confidence": min(recommendation.confidence, 0.45),
-                "requires_human": True,
             }
         )
     recommendation = enforce_post_evidence_root_cause_policy(
@@ -1110,11 +1061,10 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         alert,
         state.investigation_memory,
     )
-    host_review_reasons = _host_review_reasons(state)
-    if host_review_reasons:
+    host_inconclusive_reasons = _host_inconclusive_reasons(state)
+    if host_inconclusive_reasons:
         recommendation = recommendation.model_copy(
             update={
-                "requires_human": True,
                 "confidence": min(recommendation.confidence, 0.5),
             }
         )
@@ -1191,14 +1141,14 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 },
             }
         )
-    host_review_reasons = _host_review_reasons(state)
-    if host_review_reasons:
+    host_inconclusive_reasons = _host_inconclusive_reasons(state)
+    if host_inconclusive_reasons:
         rule_validation = rule_validation.model_copy(
             update={
                 "evidence_sufficient": False,
                 "metadata": {
                     **rule_validation.metadata,
-                    "host_review_reasons": host_review_reasons,
+                    "host_inconclusive_reasons": host_inconclusive_reasons,
                 },
             }
         )
@@ -1215,7 +1165,7 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             run_id=run.id,
             kind=ValidationKind.AGENT,
             passed=False,
-            issues=["AI 主分析不可用，保守候选建议必须由人工复核"],
+            issues=["AI 主分析不可用，保守候选建议不能形成充分结论"],
             metadata={
                 "fallback": True,
                 "primary_error_type": primary_advisor_error or "Unknown",
@@ -1261,7 +1211,7 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         )
 
     # Contract validity and evidence sufficiency are independent. An honest
-    # UNKNOWN can pass validation while still requiring human review.
+    # An honest UNKNOWN can pass the contract while remaining evidence-insufficient.
     validation_passed = rule_validation.passed and (
         not validation_enabled or (agent_validation is not None and agent_validation.passed)
     )
@@ -1297,7 +1247,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     advisor_degraded = state.advisor_degraded
     shadow_enabled = state.shadow_enabled
     error = state.error
-    host_review_reasons = _host_review_reasons(state)
+    host_inconclusive_reasons = _host_inconclusive_reasons(state)
 
     if not run or not alert:
         return {"error": "Missing run or alert in report node"}
@@ -1315,16 +1265,15 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         and evidence_sufficient
         and not shadow_enabled
         and not advisor_degraded
-        and not host_review_reasons
+        and not host_inconclusive_reasons
     )
-    final_status = AlertStatus.COMPLETED if passed else AlertStatus.REVIEW_REQUIRED
-    run_status = RunStatus.COMPLETED if passed else RunStatus.REVIEW_REQUIRED
-    final_stage = InvestigationStage.COMPLETED if passed else InvestigationStage.REVIEW_REQUIRED
+    final_status = AlertStatus.COMPLETED if passed else AlertStatus.INCONCLUSIVE
+    run_status = RunStatus.COMPLETED if passed else RunStatus.INCONCLUSIVE
+    final_stage = InvestigationStage.COMPLETED if passed else InvestigationStage.INCONCLUSIVE
 
     if not passed and recommendation:
         recommendation = recommendation.model_copy(
             update={
-                "requires_human": True,
                 "confidence": min(recommendation.confidence, 0.5),
                 "analysis_mode": "shadow" if shadow_enabled else "assist",
             }
@@ -1350,13 +1299,13 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             ProgressRecord(
                 run_id=run.id,
                 stage=final_stage,
-                message="调查完成。" if passed else "结论需要人工复核。",
+                message="调查完成。" if passed else "调查结束，结论不充分。",
                 details={
                     "validation_passed": validation_passed,
                     "evidence_sufficient": evidence_sufficient,
                     "shadow_enabled": shadow_enabled,
                     "advisor_degraded": advisor_degraded,
-                    "host_review_reasons": host_review_reasons,
+                    "host_inconclusive_reasons": host_inconclusive_reasons,
                 },
             )
         ],
@@ -1377,7 +1326,7 @@ def _required_tool_failures(
     ]
 
 
-def _host_review_reasons(state: AgentState) -> list[str]:
+def _host_inconclusive_reasons(state: AgentState) -> list[str]:
     """Return deterministic reasons that forbid autonomous completion."""
 
     reasons: list[str] = []

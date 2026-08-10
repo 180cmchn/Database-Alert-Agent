@@ -19,7 +19,6 @@ from app.agents.nodes import (
     dynamic_investigation_node,
     execute_tools_node,
     fingerprint_node,
-    knowledge_match_node,
     report_node,
     runbook_match_node,
     select_strategy_node,
@@ -39,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 # Node names for the graph
 NODE_FINGERPRINT = "fingerprint"
-NODE_KNOWLEDGE = "knowledge"
 NODE_RUNBOOK = "runbook"
 NODE_STRATEGY = "strategy"
 NODE_EXECUTE_TOOLS = "execute_tools"
@@ -76,7 +74,7 @@ def build_investigation_graph(
 
     The graph implements the following flow:
 
-    START -> fingerprint -> knowledge -> runbook -> strategy
+    START -> fingerprint -> runbook -> strategy
          -> execute_tools -> dynamic_investigation --(loop)--> execute_tools
                                 |
                                 v
@@ -97,7 +95,6 @@ def build_investigation_graph(
     # Add nodes - use partial to bind context while preserving async function signature
     # partial keeps the async nature intact, unlike lambda which returns a coroutine object
     graph.add_node(NODE_FINGERPRINT, partial(fingerprint_node, ctx=ctx))
-    graph.add_node(NODE_KNOWLEDGE, partial(knowledge_match_node, ctx=ctx))
     graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
     graph.add_node(NODE_STRATEGY, partial(select_strategy_node, ctx=ctx))
     graph.add_node(NODE_EXECUTE_TOOLS, partial(execute_tools_node, ctx=ctx))
@@ -110,8 +107,7 @@ def build_investigation_graph(
     graph.set_entry_point(NODE_FINGERPRINT)
 
     # Add linear edges
-    graph.add_edge(NODE_FINGERPRINT, NODE_KNOWLEDGE)
-    graph.add_edge(NODE_KNOWLEDGE, NODE_RUNBOOK)
+    graph.add_edge(NODE_FINGERPRINT, NODE_RUNBOOK)
     graph.add_edge(NODE_RUNBOOK, NODE_STRATEGY)
     graph.add_conditional_edges(
         NODE_STRATEGY,

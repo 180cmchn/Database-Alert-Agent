@@ -164,15 +164,11 @@ async def test_run_lease_renewal_requires_current_owner_and_fencing_token(
     assert second.fencing_token == second.attempt == 2
 
     assert (
-        await repository.renew_run_lease(
-            str(second.id), "worker-b", first.fencing_token, 60
-        )
+        await repository.renew_run_lease(str(second.id), "worker-b", first.fencing_token, 60)
         is False
     )
     assert (
-        await repository.renew_run_lease(
-            str(second.id), "worker-a", second.fencing_token, 60
-        )
+        await repository.renew_run_lease(str(second.id), "worker-a", second.fencing_token, 60)
         is False
     )
     with pytest.raises(RunLeaseConflict):
@@ -182,12 +178,7 @@ async def test_run_lease_renewal_requires_current_owner_and_fencing_token(
             lease_owner="worker-b",
             fencing_token=first.fencing_token,
         )
-    assert (
-        await repository.renew(
-            str(second.id), "worker-b", second.fencing_token, 60
-        )
-        is True
-    )
+    assert await repository.renew(str(second.id), "worker-b", second.fencing_token, 60) is True
     await repository.update_run(
         str(second.id),
         stage=InvestigationStage.INVESTIGATING,
@@ -206,9 +197,7 @@ async def test_run_lease_renewal_requires_current_owner_and_fencing_token(
         second_row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
     assert (
-        await repository.renew_run_lease(
-            str(second.id), "worker-b", second.fencing_token, 60
-        )
+        await repository.renew_run_lease(str(second.id), "worker-b", second.fencing_token, 60)
         is False
     )
     with pytest.raises(RunLeaseConflict):
@@ -312,8 +301,8 @@ async def test_finalize_run_commits_terminal_projection_and_progress_together(
     assert run is not None
     progress = ProgressRecord(
         run_id=run.id,
-        stage=InvestigationStage.REVIEW_REQUIRED,
-        message="结论需要人工复核。",
+        stage=InvestigationStage.INCONCLUSIVE,
+        message="调查结束，但结论不充分。",
         details={"evidence_sufficient": False},
     )
 
@@ -322,18 +311,18 @@ async def test_finalize_run_commits_terminal_projection_and_progress_together(
         str(run.id),
         lease_owner="test-worker",
         fencing_token=run.fencing_token,
-        run_status=RunStatus.REVIEW_REQUIRED,
-        final_stage=InvestigationStage.REVIEW_REQUIRED,
-        alert_status=AlertStatus.REVIEW_REQUIRED,
+        run_status=RunStatus.INCONCLUSIVE,
+        final_stage=InvestigationStage.INCONCLUSIVE,
+        alert_status=AlertStatus.INCONCLUSIVE,
         progress=progress,
         runbooks=[],
     )
 
     current = await repository.get(str(stored.alert.id))
     assert current is not None and current.latest_run is not None
-    assert current.status == AlertStatus.REVIEW_REQUIRED
-    assert current.latest_run.status == RunStatus.REVIEW_REQUIRED
-    assert current.latest_run.current_stage == InvestigationStage.REVIEW_REQUIRED
+    assert current.status == AlertStatus.INCONCLUSIVE
+    assert current.latest_run.status == RunStatus.INCONCLUSIVE
+    assert current.latest_run.current_stage == InvestigationStage.INCONCLUSIVE
     assert current.progress == [saved]
     assert saved.sequence == 1
     await repository.close()
@@ -434,12 +423,7 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
         payload={"worker": "one"},
     )
 
-    assert (
-        await repository.append_agent_events(
-            str(run_id), [first], expected_sequence=0
-        )
-        == 1
-    )
+    assert await repository.append_agent_events(str(run_id), [first], expected_sequence=0) == 1
     with pytest.raises(AgentEventSequenceConflict) as stale:
         await repository.append_agent_events(
             str(run_id),
@@ -470,10 +454,7 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
         payload={"tool_calls": 1},
     )
     assert (
-        await repository.append_agent_events(
-            str(run_id), [second, third], expected_sequence=1
-        )
-        == 3
+        await repository.append_agent_events(str(run_id), [second, third], expected_sequence=1) == 3
     )
     restored = await repository.list_agent_events(str(run_id), after_sequence=1)
     assert restored == [second, third]
@@ -485,9 +466,7 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
         kind=AgentEventKind.ARTIFACT_CREATED,
         payload={"artifact_id": str(uuid4()), "token": "event-secret"},
     )
-    await repository.append_agent_events(
-        str(run_id), [secret_event], expected_sequence=3
-    )
+    await repository.append_agent_events(str(run_id), [secret_event], expected_sequence=3)
     sanitized_event = (await repository.list_agent_events(str(run_id), after_sequence=3))[0]
     assert sanitized_event.payload["token"] == REDACTED
     with pytest.raises(ValueError, match="AgentArtifact"):
@@ -518,9 +497,7 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
     ]
     outcomes = await asyncio.gather(
         *(
-            repository.append_agent_events(
-                str(concurrent_run_id), [candidate], expected_sequence=0
-            )
+            repository.append_agent_events(str(concurrent_run_id), [candidate], expected_sequence=0)
             for candidate in candidates
         ),
         return_exceptions=True,
@@ -581,9 +558,7 @@ async def test_checkpoint_save_uses_optimistic_version_and_restores_latest(
         manifest_hash=manifest.digest(),
     )
 
-    mismatched = first.model_copy(
-        update={"checkpoint_id": uuid4(), "manifest_hash": "f" * 64}
-    )
+    mismatched = first.model_copy(update={"checkpoint_id": uuid4(), "manifest_hash": "f" * 64})
     with pytest.raises(RuntimeError, match="manifest mismatch"):
         await repository.save_checkpoint(mismatched, expected_version=0)
     assert await repository.save_checkpoint(first, expected_version=0) == first
@@ -616,8 +591,7 @@ async def test_checkpoint_save_uses_optimistic_version_and_restores_latest(
         manifest_hash=manifest.digest(),
     )
     assert (
-        await repository.save_checkpoint(provider_snapshot, expected_version=0)
-        == provider_snapshot
+        await repository.save_checkpoint(provider_snapshot, expected_version=0) == provider_snapshot
     )
     assert (
         await repository.load_checkpoint(
@@ -678,12 +652,10 @@ async def test_checkpoint_writes_are_isolated_by_run_before_checkpoint_exists(
         fencing_token=1,
     )
 
-    assert await repository.list_checkpoint_writes(
-        str(run_a), str(checkpoint.checkpoint_id)
-    ) == [write_a]
-    assert await repository.list_checkpoint_writes(
-        str(run_b), str(checkpoint.checkpoint_id)
-    ) == []
+    assert await repository.list_checkpoint_writes(str(run_a), str(checkpoint.checkpoint_id)) == [
+        write_a
+    ]
+    assert await repository.list_checkpoint_writes(str(run_b), str(checkpoint.checkpoint_id)) == []
     await repository.close()
 
 
@@ -718,9 +690,7 @@ async def test_reclaim_rejects_corrupt_latest_checkpoint_without_fallback(
     await repository.save_checkpoint(second, expected_version=1)
     async with repository.session_factory() as session:
         run_row = await session.get(InvestigationRunRow, str(run_id))
-        checkpoint_row = await session.get(
-            AgentCheckpointRow, str(second.checkpoint_id)
-        )
+        checkpoint_row = await session.get(AgentCheckpointRow, str(second.checkpoint_id))
         assert run_row is not None and checkpoint_row is not None
         alert_id = run_row.alert_id
         run_row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -752,9 +722,7 @@ async def test_reclaim_skips_legacy_run_without_checkpoint_and_allows_new_attemp
         }
     )
     stored, _ = await repository.create_or_get(alert)
-    legacy = await repository.create_run(
-        str(stored.alert.id), "legacy-worker", 300
-    )
+    legacy = await repository.create_run(str(stored.alert.id), "legacy-worker", 300)
     assert legacy is not None
     async with repository.session_factory() as session:
         row = await session.get(InvestigationRunRow, str(legacy.id))
@@ -763,14 +731,9 @@ async def test_reclaim_skips_legacy_run_without_checkpoint_and_allows_new_attemp
         await session.commit()
 
     assert (
-        await repository.reclaim_expired_run(
-            str(stored.alert.id), "recovery-worker", 300
-        )
-        is None
+        await repository.reclaim_expired_run(str(stored.alert.id), "recovery-worker", 300) is None
     )
-    replacement = await repository.create_run(
-        str(stored.alert.id), "new-worker", 300
-    )
+    replacement = await repository.create_run(str(stored.alert.id), "new-worker", 300)
 
     assert replacement is not None
     assert replacement.attempt == legacy.attempt + 1
@@ -920,9 +883,7 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
         },
     )
     assert await reopened.get_tool_invocation(str(invocation.invocation_id)) == failed
-    result_summary = await reopened.get_tool_invocation_result(
-        str(invocation.invocation_id)
-    )
+    result_summary = await reopened.get_tool_invocation_result(str(invocation.invocation_id))
     assert result_summary is not None
     assert result_summary["result_truncated"] is True
     assert "result-secret" not in str(result_summary)
@@ -946,9 +907,7 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
     assert stored_artifact.sha256 is not None
     assert stored_artifact.size_bytes is not None
     assert stored_artifact.metadata["token"] == REDACTED
-    restored_artifact = await reopened.get_agent_artifact(
-        str(stored_artifact.artifact_id)
-    )
+    restored_artifact = await reopened.get_agent_artifact(str(stored_artifact.artifact_id))
     assert restored_artifact == (
         stored_artifact,
         {"status": "failed", "token": REDACTED},
@@ -960,10 +919,14 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
         assert artifact_row.content_encoding == "json"
         assert "artifact-secret" not in artifact_row.sanitized_content
         invocation_rows = (
-            await session.execute(
-                select(ToolInvocationRow).where(ToolInvocationRow.run_id == str(run_id))
+            (
+                await session.execute(
+                    select(ToolInvocationRow).where(ToolInvocationRow.run_id == str(run_id))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert [row.status for row in invocation_rows] == [ToolInvocationStatus.FAILED.value]
     await reopened.close()
 
@@ -1205,9 +1168,7 @@ async def test_repository_harness_adapters_reject_stale_fencing_token(
 
     assert await repository.get_agent_event_sequence(str(run_id)) == 0
     assert await repository.get_tool_invocation(str(invocation.invocation_id)) is None
-    assert await repository.load_checkpoint(
-        str(run_id), namespace="mcp:prometheus_mcp"
-    ) is None
+    assert await repository.load_checkpoint(str(run_id), namespace="mcp:prometheus_mcp") is None
     assert await repository.get_agent_artifact(str(artifact.artifact_id)) is None
     await repository.close()
 
@@ -1341,9 +1302,7 @@ async def test_reclaim_and_new_run_creation_serialize_on_alert_row(
 
     replacement_run_id = uuid4()
     replacement_snapshot = AnalysisConfigSnapshot(code_version="test")
-    replacement_manifest = original_manifest.model_copy(
-        update={"run_id": replacement_run_id}
-    )
+    replacement_manifest = original_manifest.model_copy(update={"run_id": replacement_run_id})
 
     async def create_replacement():
         if reanalyze:
@@ -1363,9 +1322,7 @@ async def test_reclaim_and_new_run_creation_serialize_on_alert_row(
         )
 
     reclaimed, created = await asyncio.gather(
-        reclaim_repository.reclaim_expired_run(
-            str(stored.alert.id), "recovery-worker", 300
-        ),
+        reclaim_repository.reclaim_expired_run(str(stored.alert.id), "recovery-worker", 300),
         create_replacement(),
     )
 

@@ -60,14 +60,14 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         detail = client.get(body["detail_url"])
         assert detail.status_code == 200
         detail_body = detail.json()
-        assert detail_body["status"] == "REVIEW_REQUIRED"
+        assert detail_body["status"] == "INCONCLUSIVE"
         assert detail_body["alert"]["external_id"] == "api-1"
         assert detail_body["recommendation"]["manual_matched"] is False
+        assert "requires_human" not in detail_body["recommendation"]
+        assert "feedback" not in detail_body
+        assert "knowledge_matches" not in detail_body
         assert all(item["passed"] for item in detail_body["validations"])
-        assert all(
-            not item["evidence_sufficient"]
-            for item in detail_body["validations"]
-        )
+        assert all(not item["evidence_sufficient"] for item in detail_body["validations"])
 
 
 def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:
@@ -77,12 +77,22 @@ def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:
         assert unknown.status_code == 404
         assert unknown.json()["code"] == "UNKNOWN_ALERT_SOURCE"
 
-        invalid = client.post(
-            "/api/v1/alerts/canonical/analyze", json={"severity": "WARNING"}
-        )
+        invalid = client.post("/api/v1/alerts/canonical/analyze", json={"severity": "WARNING"})
         assert invalid.status_code == 422
         assert invalid.json()["code"] == "INVALID_ALERT_PAYLOAD"
         assert scheduler.jobs == []
+
+
+def test_feedback_api_is_not_exposed(tmp_path: Path) -> None:
+    client, _, _ = create_test_client(tmp_path)
+    with client:
+        response = client.post(
+            "/api/v1/alerts/00000000-0000-0000-0000-000000000000/feedback",
+            json={},
+        )
+        assert response.status_code == 404
+        paths = client.get("/openapi.json").json()["paths"]
+        assert not any(path.endswith("/feedback") for path in paths)
 
 
 def test_flashduty_is_ingested_only_by_the_api_poller(tmp_path: Path) -> None:

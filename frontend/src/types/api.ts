@@ -5,7 +5,7 @@ export type AlertStatus =
   | "QUEUED"
   | "ANALYZING"
   | "COMPLETED"
-  | "REVIEW_REQUIRED"
+  | "INCONCLUSIVE"
   | "FAILED";
 
 export type InvestigationStage =
@@ -18,7 +18,7 @@ export type InvestigationStage =
   | "VALIDATING"
   | "REPORTING"
   | "COMPLETED"
-  | "REVIEW_REQUIRED"
+  | "INCONCLUSIVE"
   | "FAILED";
 
 export interface AlertListItem {
@@ -36,7 +36,6 @@ export interface AlertListItem {
   updated_at: string;
   current_stage: InvestigationStage | null;
   manual_matched: boolean;
-  requires_human: boolean | null;
   confidence: number | null;
 }
 
@@ -159,7 +158,6 @@ export interface Recommendation {
   analysis_bases: AnalysisBasis[];
   steps: RecommendationStep[];
   risks: string[];
-  requires_human: boolean;
   confidence: number;
   manual_matched: boolean;
   runbook_references: RunbookReference[];
@@ -228,65 +226,13 @@ export interface InvestigationRun {
   id: string;
   alert_id: string;
   attempt: number;
-  status: "RUNNING" | "COMPLETED" | "REVIEW_REQUIRED" | "FAILED";
+  status: "RUNNING" | "COMPLETED" | "INCONCLUSIVE" | "FAILED";
   current_stage: InvestigationStage;
   strategy_id?: string | null;
   error?: string | null;
   config_snapshot?: AnalysisConfigSnapshot | null;
   created_at: string;
   updated_at: string;
-}
-
-export interface KnowledgeCase {
-  id: string;
-  final_root_cause: string;
-  actual_resolution: string;
-  confirmed_by: string;
-  confirmed_at: string;
-}
-
-export type FeedbackVerdict = "CONFIRMED" | "CORRECTED" | "REJECTED";
-
-export type RunbookMatchVerdict =
-  | "CORRECT"
-  | "INCORRECT"
-  | "MISSED"
-  | "NOT_APPLICABLE"
-  | "UNKNOWN";
-
-export interface FeedbackRecord {
-  id: string;
-  alert_id: string;
-  run_id: string;
-  idempotency_key: string;
-  verdict: FeedbackVerdict;
-  final_root_cause: string | null;
-  actual_resolution: string | null;
-  recovered: boolean | null;
-  runbook_match_verdict: RunbookMatchVerdict;
-  correct_runbook_id: string | null;
-  correct_runbook_section: string | null;
-  missed_runbook_ids: string[];
-  supporting_evidence_ids: string[];
-  wrong_agent_claims: string[];
-  accepted_step_orders: number[];
-  reviewer: string;
-  created_at: string;
-}
-
-export interface FeedbackRequest {
-  idempotency_key: string;
-  verdict: FeedbackVerdict;
-  final_root_cause?: string;
-  actual_resolution?: string;
-  recovered?: boolean;
-  runbook_match_verdict?: RunbookMatchVerdict;
-  correct_runbook_id?: string;
-  correct_runbook_section?: string;
-  missed_runbook_ids?: string[];
-  supporting_evidence_ids?: string[];
-  wrong_agent_claims?: string[];
-  accepted_step_orders?: number[];
 }
 
 export interface StoredAlert {
@@ -309,8 +255,6 @@ export interface StoredAlert {
   progress: ProgressRecord[];
   evidence_records: EvidenceRecord[];
   validations: ValidationRecord[];
-  feedback: FeedbackRecord[];
-  knowledge_matches: KnowledgeCase[];
   created_at: string;
   updated_at: string;
 }
@@ -408,7 +352,6 @@ export interface AdminSettings {
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
   wecom_page_base_url: string;
-  wecom_feedback_form_url: string;
   flashduty_enabled: boolean;
   flashduty_base_url: string;
   flashduty_app_key_configured: boolean;
@@ -443,7 +386,6 @@ export interface AdminSettingsPatch {
   scheduler_workers?: number;
   wecom_webhook_url?: string;
   wecom_page_base_url?: string;
-  wecom_feedback_form_url?: string;
   wecom_enabled?: boolean;
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;

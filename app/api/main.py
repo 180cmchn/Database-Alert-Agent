@@ -17,7 +17,6 @@ from pydantic import ValidationError
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.api.schemas import (
     AlertAccepted,
-    FeedbackRequest,
     FlashDutyPollAlertItem,
     FlashDutyPollResponse,
     ReanalyzeRequest,
@@ -43,7 +42,6 @@ from app.config import Settings, get_settings
 from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
-    FeedbackAlreadySubmittedError,
     InvalidAlertPayloadError,
     InvalidRunbookIdError,
     RunbookNotFoundError,
@@ -53,7 +51,6 @@ from app.domain.models import (
     AlertListResult,
     AlertStatus,
     DashboardSummary,
-    FeedbackRecord,
     RunbookDocument,
     Severity,
     StoredAlert,
@@ -184,20 +181,6 @@ def create_app(
             content={"code": "INVALID_ALERT_PAYLOAD", "message": str(exc)},
         )
 
-    @app.exception_handler(FeedbackAlreadySubmittedError)
-    async def feedback_already_submitted_handler(
-        _request: Request, exc: FeedbackAlreadySubmittedError
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "code": "FEEDBACK_ALREADY_SUBMITTED",
-                "message": str(exc),
-                "alert_id": exc.alert_id,
-                "run_id": exc.run_id,
-            },
-        )
-
     @app.exception_handler(AlertNotFoundError)
     async def not_found_handler(_request: Request, exc: AlertNotFoundError) -> JSONResponse:
         return JSONResponse(
@@ -316,53 +299,6 @@ def create_app(
         run_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     ) -> StoredAlert:
         return await runtime.service.get(alert_id, run_id=run_id)
-
-    @app.post(
-        "/api/v1/alerts/{alert_id}/feedback",
-        response_model=FeedbackRecord,
-        status_code=201,
-        tags=["alerts"],
-    )
-    async def submit_feedback(
-        alert_id: str,
-        feedback: FeedbackRequest,
-        actor: str = Depends(require_admin),  # noqa: B008
-    ) -> FeedbackRecord:
-        saved = await runtime.service.submit_feedback(
-            alert_id,
-            idempotency_key=feedback.idempotency_key,
-            verdict=feedback.verdict,
-            reviewer=actor,
-            final_root_cause=feedback.final_root_cause,
-            actual_resolution=feedback.actual_resolution,
-            recovered=feedback.recovered,
-            runbook_match_verdict=feedback.runbook_match_verdict,
-            correct_runbook_id=feedback.correct_runbook_id,
-            correct_runbook_section=feedback.correct_runbook_section,
-            missed_runbook_ids=feedback.missed_runbook_ids,
-            supporting_evidence_ids=feedback.supporting_evidence_ids,
-            wrong_agent_claims=feedback.wrong_agent_claims,
-            accepted_step_orders=feedback.accepted_step_orders,
-        )
-        await audit_logger.record(
-            action="feedback",
-            target=f"alert:{alert_id}",
-            fields=[
-                "verdict",
-                "final_root_cause",
-                "actual_resolution",
-                "recovered",
-                "runbook_match_verdict",
-                "correct_runbook_id",
-                "correct_runbook_section",
-                "missed_runbook_ids",
-                "supporting_evidence_ids",
-                "wrong_agent_claims",
-                "accepted_step_orders",
-            ],
-            actor=actor,
-        )
-        return saved
 
     @app.get(
         "/api/v1/admin/runbooks",

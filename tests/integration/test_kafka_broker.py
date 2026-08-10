@@ -49,7 +49,7 @@ async def test_kafka_broker_message_uses_shared_pipeline(tmp_path: Path) -> None
         await producer.send_and_wait(topic, json.dumps(envelope).encode())
         record = await consumer.getone()
         result = await process_envelope(runtime.service, json.loads(record.value))
-        assert result.status == AlertStatus.REVIEW_REQUIRED
+        assert result.status == AlertStatus.INCONCLUSIVE
     finally:
         await producer.stop()
         await consumer.stop()

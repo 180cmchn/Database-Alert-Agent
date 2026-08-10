@@ -1,4 +1,4 @@
-import { ArrowRight, BookCheck, UserRoundCheck } from "lucide-react";
+import { ArrowRight, BookCheck } from "lucide-react";
 import { Link } from "react-router-dom";
 import { formatDateTime, relativeTime } from "../lib/format";
 import type { AlertListItem } from "../types/api";
@@ -29,9 +29,6 @@ export function AlertTable({ alerts, compact = false }: { alerts: AlertListItem[
                 <div className="row-flags">
                   {alert.manual_matched && (
                     <span title="已命中告警手册"><BookCheck size={13} /> 手册命中</span>
-                  )}
-                  {alert.requires_human && (
-                    <span className="human-flag"><UserRoundCheck size={13} /> 需人工</span>
                   )}
                 </div>
               </td>

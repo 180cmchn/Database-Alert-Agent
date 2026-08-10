@@ -44,7 +44,6 @@ class RecordingAdvisor(FakeAIAdvisor):
         alert,
         runbooks,
         evidence=None,
-        knowledge_cases=None,
         external_knowledge=None,
         knowledge_match_summary="",
         strategy=None,
@@ -57,7 +56,6 @@ class RecordingAdvisor(FakeAIAdvisor):
             alert,
             runbooks,
             evidence=evidence,
-            knowledge_cases=knowledge_cases,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
@@ -71,7 +69,6 @@ class FailingAdvisor:
         alert,
         runbooks,
         evidence=None,
-        knowledge_cases=None,
         external_knowledge=None,
         knowledge_match_summary="",
         strategy=None,
@@ -89,7 +86,6 @@ class FlakyAdvisor(FakeAIAdvisor):
         alert,
         runbooks,
         evidence=None,
-        knowledge_cases=None,
         external_knowledge=None,
         knowledge_match_summary="",
         strategy=None,
@@ -102,7 +98,6 @@ class FlakyAdvisor(FakeAIAdvisor):
             alert,
             runbooks,
             evidence=evidence,
-            knowledge_cases=knowledge_cases,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
@@ -447,14 +442,14 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
     assert advisor.calls == 1
     assert advisor.evidence_tool_names == ["alert_context"]
     assert first.alert.id == second.alert.id
-    assert first.status == AlertStatus.REVIEW_REQUIRED
+    assert first.status == AlertStatus.INCONCLUSIVE
     assert all(item.passed for item in first.validations)
     assert all(not item.evidence_sufficient for item in first.validations)
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_ai_failure_finishes_with_review_required_fallback(tmp_path: Path) -> None:
+async def test_ai_failure_finishes_with_inconclusive_fallback(tmp_path: Path) -> None:
     events: list[str] = []
     runtime = build_runtime(
         settings_for(tmp_path), advisor=FailingAdvisor(), notifier=RecordingNotifier(events)
@@ -471,10 +466,9 @@ async def test_ai_failure_finishes_with_review_required_fallback(tmp_path: Path)
         },
     )
 
-    assert stored.status == AlertStatus.REVIEW_REQUIRED
+    assert stored.status == AlertStatus.INCONCLUSIVE
     assert stored.error is None
     assert stored.recommendation is not None
-    assert stored.recommendation.requires_human is True
     assert stored.advisor_metadata is not None
     assert stored.advisor_metadata.provider == "conservative_fallback"
     assert any(item.metadata.get("fallback") is True for item in stored.validations)
@@ -498,7 +492,7 @@ async def test_wecom_send_failure_does_not_change_analysis_status(tmp_path: Path
         },
     )
 
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert events == ["RESULT:WARNING"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
@@ -530,14 +524,14 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
 
     result = await runtime.service.analyze("canonical", payload, retry_failed=True)
 
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert advisor.calls == 2
     assert events == ["RESULT:CRITICAL"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_shadow_mode_always_requires_review(tmp_path: Path) -> None:
+async def test_shadow_mode_is_always_inconclusive(tmp_path: Path) -> None:
     settings = settings_for(tmp_path).model_copy(update={"shadow_enabled": True})
     runtime = build_runtime(settings)
     await runtime.repository.initialize()
@@ -552,12 +546,11 @@ async def test_shadow_mode_always_requires_review(tmp_path: Path) -> None:
         },
     )
 
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert result.recommendation is not None
     assert result.recommendation.analysis_mode == "shadow"
-    assert result.recommendation.requires_human is True
     # The notification step appends a REPORTING progress record after the
-    # REVIEW_REQUIRED record. Find the shadow progress record explicitly.
+    # INCONCLUSIVE record. Find the shadow progress record explicitly.
     shadow_records = [
         record for record in result.progress if record.details.get("shadow_enabled") is True
     ]
@@ -797,8 +790,11 @@ async def test_dynamic_finish_cannot_promote_placeholder_hypothesis(
     assert finish.details["outcome"] == "finish"
     assert finish.details["stop_reason"] == "NO_SAFE_PROBE"
     assert finish.details["supported_hypothesis_ids"] == []
-    assert result.status == AlertStatus.REVIEW_REQUIRED
-    assert "unresolved:unresolved-cause" in result.validations[0].metadata["host_review_reasons"]
+    assert result.status == AlertStatus.INCONCLUSIVE
+    assert (
+        "unresolved:unresolved-cause"
+        in result.validations[0].metadata["host_inconclusive_reasons"]
+    )
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -824,13 +820,16 @@ async def test_ambiguous_target_stops_before_first_tool_call(tmp_path: Path) -> 
 
     assert tool.calls == []
     assert result.evidence_records == []
-    assert result.status == AlertStatus.REVIEW_REQUIRED
-    assert "stop:TARGET_AMBIGUOUS" in result.validations[0].metadata["host_review_reasons"]
+    assert result.status == AlertStatus.INCONCLUSIVE
+    assert (
+        "stop:TARGET_AMBIGUOUS"
+        in result.validations[0].metadata["host_inconclusive_reasons"]
+    )
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_explicit_target_runs_baseline_but_keeps_unknown_cause_for_review(
+async def test_explicit_target_runs_baseline_but_keeps_unknown_cause_inconclusive(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(settings_for(tmp_path))
@@ -854,10 +853,12 @@ async def test_explicit_target_runs_baseline_but_keeps_unknown_cause_for_review(
     )
     assert strategy_progress.details == {"tool_count": 1, "stop_reason": "CONTINUE"}
     assert [item.tool_name for item in result.evidence_records] == ["alert_context"]
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert result.recommendation is not None
-    assert result.recommendation.requires_human is True
-    assert "unresolved:unresolved-cause" in result.validations[0].metadata["host_review_reasons"]
+    assert (
+        "unresolved:unresolved-cause"
+        in result.validations[0].metadata["host_inconclusive_reasons"]
+    )
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -903,8 +904,11 @@ async def test_last_budgeted_tool_result_receives_final_assessment(
         item for item in result.progress if item.details.get("outcome") == "final_assessment"
     )
     assert final_assessment.details["stop_reason"] == "BUDGET_EXHAUSTED"
-    assert result.status == AlertStatus.REVIEW_REQUIRED
-    assert "unresolved:unresolved-cause" in result.validations[0].metadata["host_review_reasons"]
+    assert result.status == AlertStatus.INCONCLUSIVE
+    assert (
+        "unresolved:unresolved-cause"
+        in result.validations[0].metadata["host_inconclusive_reasons"]
+    )
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -974,14 +978,14 @@ async def test_duplicate_rejection_preserves_planner_assessment(tmp_path: Path) 
         item for item in result.progress if item.details.get("outcome") == "duplicate_rejected"
     )
     assert duplicate.details["stop_reason"] == "HUMAN_REQUIRED"
-    host_review_reasons = result.validations[0].metadata["host_review_reasons"]
-    assert "stop:HUMAN_REQUIRED" in host_review_reasons
-    assert "unresolved:unresolved-cause" in host_review_reasons
+    inconclusive_reasons = result.validations[0].metadata["host_inconclusive_reasons"]
+    assert "stop:HUMAN_REQUIRED" in inconclusive_reasons
+    assert "unresolved:unresolved-cause" in inconclusive_reasons
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_zero_dynamic_budget_keeps_unresolved_memory_for_review(
+async def test_zero_dynamic_budget_keeps_unresolved_memory_inconclusive(
     tmp_path: Path,
 ) -> None:
     tool = RecordingMCPStyleTool()
@@ -1004,12 +1008,11 @@ async def test_zero_dynamic_budget_keeps_unresolved_memory_for_review(
     )
 
     assert len(tool.calls) == 1
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert result.recommendation is not None
-    assert result.recommendation.requires_human is True
-    host_review_reasons = result.validations[0].metadata["host_review_reasons"]
-    assert "stop:BUDGET_EXHAUSTED" in host_review_reasons
-    assert "unresolved:unresolved-cause" in host_review_reasons
+    inconclusive_reasons = result.validations[0].metadata["host_inconclusive_reasons"]
+    assert "stop:BUDGET_EXHAUSTED" in inconclusive_reasons
+    assert "unresolved:unresolved-cause" in inconclusive_reasons
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1100,7 +1103,7 @@ async def test_required_tool_failure_comes_from_selected_strategy(tmp_path: Path
         },
     )
 
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     assert result.validations[0].passed is True
     assert result.validations[0].evidence_sufficient is False
     assert result.validations[0].metadata["required_tool_failures"] == ["custom_required_probe"]
@@ -1157,7 +1160,7 @@ async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Pa
     assert runtime.service.agent.ctx.runbook_limit == 9
     assert runtime.service.max_dynamic_turns == 3
     assert provider.limits == [9]
-    assert result.status == AlertStatus.REVIEW_REQUIRED
+    assert result.status == AlertStatus.INCONCLUSIVE
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1173,9 +1176,9 @@ async def test_runtime_refresh_does_not_change_claimed_analysis_generation(
             self.called = True
             return state.model_copy(
                 update={
-                    "status": AlertStatus.REVIEW_REQUIRED,
-                    "run_status": RunStatus.REVIEW_REQUIRED,
-                    "current_stage": InvestigationStage.REVIEW_REQUIRED,
+                    "status": AlertStatus.INCONCLUSIVE,
+                    "run_status": RunStatus.INCONCLUSIVE,
+                    "current_stage": InvestigationStage.INCONCLUSIVE,
                 }
             )
 

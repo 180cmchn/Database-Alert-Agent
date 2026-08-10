@@ -28,7 +28,6 @@ from app.domain.models import (
     InvestigationDecision,
     InvestigationRun,
     InvestigationStrategy,
-    KnowledgeCase,
     NormalizedAlert,
     Recommendation,
     RecommendationStep,
@@ -42,7 +41,7 @@ from app.domain.models import (
 from app.domain.tool_calling import MCPModelToolCall
 from app.investigations.models import EvidenceRelation, InvestigationMemory
 
-PROMPT_VERSION = "database-alert-advisor-v14"
+PROMPT_VERSION = "database-alert-advisor-v16"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 
 
@@ -142,10 +141,11 @@ EXTERNAL_KNOWLEDGE 依据必须引用实际返回的 knowledge_id/title/source_u
 无论是否命中知识，都至少输出一条 AI 依据；命中某类知识时至少输出一条对应来源依据。
 命中知识时，每个 steps 项必须通过 source_ref 引用实际命中的本地 PDF 或外部知识条目。
 只有 status=SUCCESS、来自实时系统、structured_data.partial 不为 true 且未标记
-root_cause_eligible=false 的完整工具证据才能支持或反驳根因；失败、超时、历史案例、部分结果或
-明确不具备根因支持资格的证据只能作为描述性线索。structured_data.partial=true 表示采集不完整，
+root_cause_eligible=false 的完整工具证据才能支持或反驳根因；失败、超时、本地 PDF 或外部知识中的
+历史案例内容、部分结果或明确不具备根因支持资格的证据只能作为描述性线索。
+structured_data.partial=true 表示采集不完整，
 即使 root_cause_eligible=true、query_completed=true 或 allow_followup_dispatch=false，也必须作为
-缺失因果证据处理，不得改变根因三态，并且必须要求人工复核。allow_followup_dispatch=false 只表示
+缺失因果证据处理，不得改变根因三态。allow_followup_dispatch=false 只表示
 本轮不再派发相同 MCP 调查，不代表证据充分。
 对于 archery_mcp 慢查询证据，只有 status=SUCCESS、partial 不为 true、query_completed=true、
 查询结果包含慢日志且 root_cause_eligible 未标记为 false，才可作为本次告警窗口的因果证据使用。
@@ -169,11 +169,10 @@ hypothesis 的证据。若不能绑定已有假设，应省略该根因，不得
 被 SUCCESS 实时证据反驳的调查假设必须直接从最终结果删除，不得出现在 root_causes、
 likely_causes、summary、analysis_bases、steps 或 risks 等任何用户可见字段。失败、超时、SKIPPED、
 NO_DATA 或缺失证据不是反证，不能据此删除原因。若删除后现有证据无法形成合理根因，允许
-root_causes 和 likely_causes 为空，只说明当前证据不足并设置 requires_human=true。
+root_causes 和 likely_causes 为空，只说明当前证据不足。
 不得展示已删除假设的名称或排除理由。
 只有 SUPPORTED 才允许 verified=true；UNKNOWN 必须 verified=false。存在 UNKNOWN、没有
-SUPPORTED 根因或结论仍需人工判断时 requires_human 必须为 true；只有采证后保留的根因全部为
-SUPPORTED 时，才允许 requires_human=false。
+SUPPORTED 根因或仍有关键证据缺口时，结论必须保持证据不充分，不得伪装成已验证结论。
 若 cause_id 来自手册，必须使用实际候选 cause_id；AI 补充原因的 cause_id 必须为 null。
 手册 actions 中 execution_class=change 的动作只能作为需要审批的风险说明，
 不能放入可直接执行的 steps；steps 仅允许只读核查。
@@ -190,7 +189,7 @@ structured_data.partial=true 的部分结果，一律只能标为 INCONCLUSIVE�
 CONTRADICTS；即使部分结果同时标记 root_cause_eligible=true、query_completed=true 或
 allow_followup_dispatch=false 也不得例外。相关性不等于因果性；只有成功、完整、来自受影响系统
 且能验证机制必要预测的实时证据，才能支持或反驳假设。部分结果仍可作为已采集的描述性上下文，
-但不能据此 finish 为证据充分；没有后续安全探针时应 finish 并说明需要人工复核。
+但不能据此 finish 为证据充分；没有后续安全探针时应 finish 并说明证据仍不充分。
 causal_candidate=false 的 hypothesis 只是“尚未建立机制”的调度占位符，对它的任何证据关系都
 必须标为 INCONCLUSIVE，不得将其升级为 SUPPORTED 或 CONTRADICTED。
 慢查询告警中已排除数据库管理平台采集 SQL 的文字只是附带的 SQL 过滤说明，不是告警计数口径。
@@ -201,22 +200,22 @@ causal_candidate=false 的 hypothesis 只是“尚未建立机制”的调度占
 VALIDATION_PROMPT = """你是独立的告警结论验收员，不负责重新生成建议。
 分别判断两个维度：
 1. analysis_contract_passed：结论是否诚实、可追溯、安全，并只展示采证后仍可能成立的根因。
-2. evidence_sufficient：实时证据是否足以在无需人工复核的情况下完成根因分析。
+2. evidence_sufficient：实时证据是否足以完成根因分析。
 
 证据不足本身不是 analysis_contract_passed=false 的理由。若采证后仍合理的候选根因正确标记为
-UNKNOWN、verified=false、没有把猜测写成事实、提供了具体 next_probe，并要求人工复核，
+UNKNOWN、verified=false、没有把猜测写成事实并提供了具体 next_probe，
 则分析契约可以通过，但 evidence_sufficient 必须为 false。
 
 SUPPORTED 必须引用非 alert_platform、structured_data.partial 不为 true、未标记
 root_cause_eligible=false 的完整 SUCCESS 实时证据并设置 verified=true。partial=true 的记录即使
 同时标记 root_cause_eligible=true、query_completed=true 或 allow_followup_dispatch=false，也只能
 作为缺失因果证据和描述性上下文，不能用于 SUPPORTS、CONTRADICTS 或删除候选机制；此时
-evidence_sufficient 必须为 false 且必须要求人工复核。allow_followup_dispatch=false 仅代表调度终态，
+evidence_sufficient 必须为 false。allow_followup_dispatch=false 仅代表调度终态，
 不代表证据充分。root_causes 和 likely_causes 只能包含完整审阅实时证据后仍成立或尚未排除
 的原因，root_causes 中出现 CONTRADICTED 时 analysis_contract_passed 必须为 false。被反驳假设
 必须从所有用户可见字段直接删除，不得展示其名称、反证状态或排除理由。若删除后没有形成新的
 合理原因，root_causes 为空是诚实结果，不应仅因此判定契约失败，但 evidence_sufficient 必须为
-false 且必须要求人工复核。只要存在 UNKNOWN、没有 SUPPORTED 根因、工具失败/超时导致关键证据
+false。只要存在 UNKNOWN、没有 SUPPORTED 根因、工具失败/超时导致关键证据
 缺失，或仍有未排除的候选机制，evidence_sufficient 必须为 false。
 每个最终 root_cause 必须用 hypothesis_id 绑定 investigation_memory 中同一假设，cause 必须与
 该假设的 mechanism 完全一致，status、verified 和 evidence_refs 必须来自该假设自己的
@@ -264,15 +263,12 @@ def _validate_manual_policy(
     """Repair citations using only retrieved identifiers and exact source metadata.
 
     Structural citation mistakes are repaired deterministically instead of
-    discarding the whole model response. A repair always forces human review;
-    no new diagnostic claim is invented.
+    discarding the whole model response. No new diagnostic claim is invented.
     """
 
     external_knowledge = external_knowledge or []
     valid_runbooks = {(item.runbook_id, item.section) for item in runbooks}
     valid_external = {item.knowledge_id: item for item in external_knowledge}
-    repaired = False
-
     # The legacy manual_matched field describes local PDF matches only. Retrieval
     # may return a PDF candidate that the advisor rejects after semantic review.
     manual_matched = bool(runbooks) and recommendation.manual_matched
@@ -281,12 +277,6 @@ def _validate_manual_policy(
         for ref in recommendation.runbook_references
         if manual_matched and (ref.runbook_id, ref.section) in valid_runbooks
     ]
-    if (
-        len(valid_refs) != len(recommendation.runbook_references)
-        or recommendation.manual_matched != manual_matched
-    ):
-        repaired = True
-
     # Keep only exact knowledge citations. For an external reference with a valid
     # ID, restore the trusted title/URI from the retrieved item.
     kept_runbook_bases: list[AnalysisBasis] = []
@@ -303,32 +293,22 @@ def _validate_manual_policy(
                 )
                 not in valid_runbooks
             ):
-                repaired = True
                 continue
             kept_runbook_bases.append(basis)
         elif basis.source == AnalysisBasisSource.EXTERNAL_KNOWLEDGE:
             if not isinstance(basis.source_ref, ExternalKnowledgeReference):
-                repaired = True
                 continue
             matched = valid_external.get(basis.source_ref.knowledge_id)
             if matched is None:
-                repaired = True
                 continue
             exact_ref = ExternalKnowledgeReference(
                 knowledge_id=matched.knowledge_id,
                 title=matched.title,
                 source_uri=matched.source_uri,
             )
-            if basis.source_ref != exact_ref:
-                repaired = True
             kept_external_bases.append(basis.model_copy(update={"source_ref": exact_ref}))
         elif basis.source == AnalysisBasisSource.AI:
             kept_ai_bases.append(basis)
-        else:
-            repaired = True
-
-    if manual_matched and not kept_runbook_bases:
-        repaired = True
     cited_external_ids = {
         basis.source_ref.knowledge_id
         for basis in kept_external_bases
@@ -337,7 +317,6 @@ def _validate_manual_policy(
     for item in external_knowledge:
         if item.knowledge_id in cited_external_ids:
             continue
-        repaired = True
         kept_external_bases.append(
             AnalysisBasis(
                 source=AnalysisBasisSource.EXTERNAL_KNOWLEDGE,
@@ -351,7 +330,6 @@ def _validate_manual_policy(
         )
 
     if not kept_ai_bases:
-        repaired = True
         kept_ai_bases = [
             AnalysisBasis(
                 source=AnalysisBasisSource.AI,
@@ -374,14 +352,12 @@ def _validate_manual_policy(
             ):
                 valid_steps.append(step)
             elif not manual_matched and not external_knowledge:
-                repaired = True
                 valid_steps.append(step.model_copy(update={"source_ref": None}))
             else:
-                repaired = True
+                continue
         elif isinstance(step.source_ref, ExternalKnowledgeReference):
             matched = valid_external.get(step.source_ref.knowledge_id)
             if matched is None:
-                repaired = True
                 if not manual_matched and not external_knowledge:
                     valid_steps.append(step.model_copy(update={"source_ref": None}))
                 continue
@@ -390,11 +366,9 @@ def _validate_manual_policy(
                 title=matched.title,
                 source_uri=matched.source_uri,
             )
-            if step.source_ref != exact_ref:
-                repaired = True
             valid_steps.append(step.model_copy(update={"source_ref": exact_ref}))
         elif manual_matched or external_knowledge:
-            repaired = True
+            continue
         else:
             valid_steps.append(step.model_copy(update={"source_ref": None}))
 
@@ -402,7 +376,6 @@ def _validate_manual_policy(
     new_root_causes: list[RootCauseAssessment] = []
     for root_cause in recommendation.root_causes:
         if root_cause.cause_id and root_cause.cause_id not in known_cause_ids:
-            repaired = True
             new_root_causes.append(root_cause.model_copy(update={"cause_id": None}))
         else:
             new_root_causes.append(root_cause)
@@ -413,11 +386,8 @@ def _validate_manual_policy(
         "steps": valid_steps,
         "root_causes": new_root_causes,
     }
-    if repaired:
-        update["requires_human"] = True
     if not manual_matched and not external_knowledge:
         update["confidence"] = min(recommendation.confidence, 0.45)
-        update["requires_human"] = True
     return recommendation.model_copy(update=update)
 
 
@@ -527,7 +497,6 @@ class OpenAICompatibleAdvisor:
         alert: NormalizedAlert,
         runbooks: list[RunbookExcerpt],
         evidence: list[EvidenceRecord] | None = None,
-        knowledge_cases: list[KnowledgeCase] | None = None,
         external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
         strategy: InvestigationStrategy | None = None,
@@ -549,9 +518,6 @@ class OpenAICompatibleAdvisor:
             ),
             "tool_evidence": [
                 preprocess_alert_data(item.model_dump(mode="json")) for item in evidence or []
-            ],
-            "confirmed_case_candidates": [
-                item.model_dump(mode="json") for item in knowledge_cases or []
             ],
             "external_knowledge_excerpts": [
                 item.model_dump(mode="json") for item in external_knowledge or []
@@ -850,7 +816,6 @@ class FakeAIAdvisor:
         alert: NormalizedAlert,
         runbooks: list[RunbookExcerpt],
         evidence: list[EvidenceRecord] | None = None,
-        knowledge_cases: list[KnowledgeCase] | None = None,
         external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
         strategy: InvestigationStrategy | None = None,
@@ -984,7 +949,6 @@ class FakeAIAdvisor:
                 ],
                 knowledge_match_summary=knowledge_match_summary,
                 risks=["在未确认影响范围前不要执行写操作或重启实例。"],
-                requires_human=not has_live_diagnostics,
                 confidence=0.85,
                 manual_matched=True,
                 runbook_references=[reference],
@@ -1023,7 +987,6 @@ class FakeAIAdvisor:
                     )
                 ],
                 risks=["知识依据不能单独证明本次事故根因。"],
-                requires_human=not has_live_diagnostics,
                 confidence=0.75,
                 manual_matched=False,
                 external_knowledge_matches=external_knowledge,
@@ -1051,8 +1014,7 @@ class FakeAIAdvisor:
                         caution="不要据此直接执行变更。",
                     )
                 ],
-                risks=["缺少匹配的知识依据，建议必须由人工复核。"],
-                requires_human=not has_live_diagnostics,
+                risks=["缺少匹配的知识依据，当前结论不充分。"],
                 confidence=0.35,
                 manual_matched=False,
                 root_causes=root_causes,
@@ -1075,7 +1037,7 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
     """Produce a bounded candidate when the configured model cannot finish.
 
     This is a continuity guard, not a replacement for the model.  The service
-    records why it was used and forces the final result to human review.
+    records why it was used and forces the final result to remain inconclusive.
     """
 
     async def advise(
@@ -1083,7 +1045,6 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
         alert: NormalizedAlert,
         runbooks: list[RunbookExcerpt],
         evidence: list[EvidenceRecord] | None = None,
-        knowledge_cases: list[KnowledgeCase] | None = None,
         external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
         strategy: InvestigationStrategy | None = None,
@@ -1093,22 +1054,20 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
             alert,
             runbooks,
             evidence=evidence,
-            knowledge_cases=knowledge_cases,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             strategy=strategy,
             investigation_memory=investigation_memory,
         )
         if recommendation.manual_matched or external_knowledge:
-            fallback_summary = "AI 主分析暂不可用；已依据命中知识生成保守候选建议，需人工复核。"
+            fallback_summary = "AI 主分析暂不可用；已依据命中知识生成保守候选建议，结论不充分。"
             fallback_confidence = min(recommendation.confidence, 0.55)
         else:
-            fallback_summary = "AI 主分析暂不可用；未命中处理手册，已生成保守候选建议，需人工复核。"
+            fallback_summary = "AI 主分析暂不可用；未命中处理手册，已生成保守候选建议，结论不充分。"
             fallback_confidence = min(recommendation.confidence, 0.35)
         recommendation = recommendation.model_copy(
             update={
                 "summary": fallback_summary,
-                "requires_human": True,
                 "confidence": fallback_confidence,
             }
         )

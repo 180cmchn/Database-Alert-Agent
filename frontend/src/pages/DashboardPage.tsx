@@ -19,7 +19,7 @@ import type { AlertStatus, DashboardSummary, Severity } from "../types/api";
 const statusOrder: AlertStatus[] = [
   "ANALYZING",
   "QUEUED",
-  "REVIEW_REQUIRED",
+  "INCONCLUSIVE",
   "COMPLETED",
   "FAILED",
   "RECEIVED",
@@ -102,7 +102,7 @@ export function DashboardPage() {
         <article className="metric-card critical-card">
           <span className="metric-icon"><ShieldAlert size={20} /></span>
           <div><p>待处理紧急告警</p><strong>{summary?.critical_open ?? 0}</strong></div>
-          <span className="metric-foot">未完成分析或需要人工复核</span>
+          <span className="metric-foot">未完成分析或结论不充分</span>
         </article>
         <article className="metric-card completed-card">
           <span className="metric-icon"><CheckCircle2 size={20} /></span>

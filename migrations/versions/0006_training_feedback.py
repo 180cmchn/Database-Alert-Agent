@@ -13,7 +13,16 @@ branch_labels = None
 depends_on = None
 
 
+def _json_array_server_default() -> str | sa.TextClause:
+    # MySQL 8.0.13+ accepts JSON defaults only as expressions. Other supported
+    # dialects keep the original literal default emitted by this migration.
+    if op.get_bind().dialect.name == "mysql":
+        return sa.text("('[]')")
+    return "[]"
+
+
 def upgrade() -> None:
+    json_array_default = _json_array_server_default()
     op.add_column(
         "alert_feedback",
         sa.Column(
@@ -29,19 +38,39 @@ def upgrade() -> None:
     )
     op.add_column(
         "alert_feedback",
-        sa.Column("missed_runbook_ids_json", sa.JSON(), nullable=False, server_default="[]"),
+        sa.Column(
+            "missed_runbook_ids_json",
+            sa.JSON(),
+            nullable=False,
+            server_default=json_array_default,
+        ),
     )
     op.add_column(
         "alert_feedback",
-        sa.Column("supporting_evidence_ids_json", sa.JSON(), nullable=False, server_default="[]"),
+        sa.Column(
+            "supporting_evidence_ids_json",
+            sa.JSON(),
+            nullable=False,
+            server_default=json_array_default,
+        ),
     )
     op.add_column(
         "alert_feedback",
-        sa.Column("wrong_agent_claims_json", sa.JSON(), nullable=False, server_default="[]"),
+        sa.Column(
+            "wrong_agent_claims_json",
+            sa.JSON(),
+            nullable=False,
+            server_default=json_array_default,
+        ),
     )
     op.add_column(
         "alert_feedback",
-        sa.Column("accepted_step_orders_json", sa.JSON(), nullable=False, server_default="[]"),
+        sa.Column(
+            "accepted_step_orders_json",
+            sa.JSON(),
+            nullable=False,
+            server_default=json_array_default,
+        ),
     )
     op.add_column("knowledge_cases", sa.Column("correct_runbook_id", sa.String(length=128)))
     op.add_column(
@@ -49,7 +78,12 @@ def upgrade() -> None:
     )
     op.add_column(
         "knowledge_cases",
-        sa.Column("supporting_evidence_ids_json", sa.JSON(), nullable=False, server_default="[]"),
+        sa.Column(
+            "supporting_evidence_ids_json",
+            sa.JSON(),
+            nullable=False,
+            server_default=json_array_default,
+        ),
     )
 
 

@@ -10,10 +10,8 @@ from app.config import Settings
 from app.domain.models import (
     AlertStatus,
     AnalysisConfigSnapshot,
-    FeedbackVerdict,
     NormalizedAlert,
     RunbookDocument,
-    RunbookMatchVerdict,
 )
 
 
@@ -23,24 +21,6 @@ class AlertAccepted(BaseModel):
     status: AlertStatus
     detail_url: str
     deduplicated: bool
-
-
-class FeedbackRequest(BaseModel):
-    idempotency_key: str = Field(min_length=1, max_length=255)
-    verdict: FeedbackVerdict
-    # Kept as an optional compatibility field; the authenticated admin identity is
-    # authoritative and the server never trusts this value.
-    reviewer: str | None = Field(default=None, min_length=1, max_length=255)
-    final_root_cause: str | None = None
-    actual_resolution: str | None = None
-    recovered: bool | None = None
-    runbook_match_verdict: RunbookMatchVerdict = RunbookMatchVerdict.UNKNOWN
-    correct_runbook_id: str | None = Field(default=None, min_length=1, max_length=128)
-    correct_runbook_section: str | None = Field(default=None, min_length=1, max_length=200)
-    missed_runbook_ids: list[str] = Field(default_factory=list, max_length=20)
-    supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=50)
-    wrong_agent_claims: list[str] = Field(default_factory=list, max_length=20)
-    accepted_step_orders: list[int] = Field(default_factory=list, max_length=50)
 
 
 class RunbookListResponse(BaseModel):
@@ -139,7 +119,6 @@ class RuntimeSettingsPatch(BaseModel):
     scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     wecom_page_base_url: str | None = Field(default=None, max_length=2048)
-    wecom_feedback_form_url: str | None = Field(default=None, max_length=2048)
     wecom_enabled: bool | None = None
     knowledge_sources: list[str] | None = None
     flashduty_polling_enabled: bool | None = None
@@ -178,7 +157,6 @@ class RuntimeSettingsResponse(BaseModel):
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
     wecom_page_base_url: str
-    wecom_feedback_form_url: str
     flashduty_enabled: bool
     flashduty_base_url: str
     flashduty_app_key_configured: bool
@@ -233,7 +211,6 @@ class RuntimeSettingsResponse(BaseModel):
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             wecom_page_base_url=settings.wecom_page_base_url,
-            wecom_feedback_form_url=settings.wecom_feedback_form_url,
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,
             flashduty_app_key_configured=bool(settings.flashduty_app_key),
