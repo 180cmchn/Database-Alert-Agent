@@ -333,9 +333,8 @@ SQL 过滤说明，不是计数口径或候选根因，也不用于把观测值�
 [`config/mcp/settings.json`](config/mcp/settings.json) 中的 Archery 连接配置，在同一个
 Streamable HTTP 会话中完成初始化、工具发现和确定性登录，再把项目批准的只读工具及其 MCP
 Schema 以 function tools 交给当前 AI 模型。模型每轮自主选择一个下一步只读探针。慢查询取证
-使用的受控工具集为：
+由 Host 独占调用 `ensure_login_gymJPA`；模型可见的受控工具集为：
 
-- `ensure_login_gymJPA`；
 - `list_resource_groups_gymJPA`；
 - `list_instances_gymJPA`；
 - `list_instance_databases_gymJPA`；
@@ -349,8 +348,11 @@ Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名�
 表和字段。
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法和只读元数据探针等非鉴权错误
 也会以脱敏、截断后的诊断回填，模型可据此调整参数或改走其它只读路径。认证、权限和安全错误仍
-立即终止。模型选择失败时 Host 会把脱敏错误和严格单工具调用要求作为 repair feedback，再做一次
-有限重试。模型最多执行
+立即终止。Archery 登录由 Host 在模型调查前确定性执行，登录工具不进入模型可见工具集，登录结果
+以 Host 控制事件而不是伪造的 `assistant tool_call` 写入上下文，因此不占模型调用预算。每轮结果会
+明确已用和剩余预算。模型选择失败时 Host 会把脱敏错误、剩余预算和严格单工具调用要求作为 repair
+feedback，再做一次有限重试。若兼容 API 仍返回纯文本而非工具调用，诊断会保留脱敏后的
+`finish_reason`、文本长度和截断预览。模型最多执行
 `ARCHERY_MCP_MAX_AGENT_STEPS` 个工具调用步骤，
 默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP 返回的工具中可能包含
 `apply_query_permission_gymJPA` 等会产生外部状态变更的
@@ -361,7 +363,8 @@ MCP 服务端仍是工具 Schema 和业务错误的来源；Host 只额外负责
 被拒绝并回填模型；其它只读参数由 MCP 服务端验证，真实错误会回填模型以便修正。成功执行慢日志
 表查询后，Host 判断它是否已形成告警窗口证据：最终查询必须精确使用 Host 给出的两个时间边界，
 支持 Unix 秒/毫秒、UTC ISO、`FROM_UNIXTIME` 和 `to_timestamp` 等受控表达形式，并显式包含不超过
-20 的 `LIMIT`；对于 `mysql_slow_query_review_history`，还必须包含 `hostname_max` 等值条件。
+20 的 `LIMIT`；对于 `mysql_slow_query_review_history`，还必须包含 `hostname_max` 等值条件，并允许
+用 `ts_min < window_end AND ts_max >= window_start` 表达聚合慢查询记录与告警窗口重叠。
 无 `WHERE` 的 `LIMIT 1` 样例、仅字段探测、仅端点条件或仅时间条件都作为成功的辅助探针回传模型，
 不会被提前当成最终证据。完成判断发生在只读 MCP 调用返回之后；模型仍可在剩余预算内基于真实
 结果继续调用或重试。提示词要求模型仅使用本次
@@ -390,7 +393,8 @@ Archery 回显 SQL 与请求完全一致时，才会从已核对 SQL 投影恢�
 提示词要求最终查询和 `sql_query` 的 `limit_num` 都不得超过 20；即使 MCP 返回更多已解析行，
 Host 也只保留前 20 行。回传给模型的单次结果文本最多保留 24,000 字符。
 传输失败、登录确认失败、鉴权失败、超时、MCP 标准错误或不可恢复的 Archery 业务错误形成失败
-证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。首次
+证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。SQL
+工具错误的脱敏类型和详情会写入对应 `query_trace`，便于区分字段错误、语法错误和权限错误。首次
 协议或传输失败时 EvidenceTool 会新建会话重试一次，每个新会话都重新登录。当前调用预算按会话
 计算，因此最坏远端调查调用数约为 `2 * ARCHERY_MCP_MAX_AGENT_STEPS`，另加每次会话的确定性登录；
 跨会话共享预算和完整轨迹是后续状态机改造项。

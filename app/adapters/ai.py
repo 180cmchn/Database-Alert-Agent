@@ -72,6 +72,52 @@ def _provider_error_diagnostic(error: Exception) -> str:
     return ", ".join(details)
 
 
+def _mcp_response_diagnostic(choice: Any, message: Any) -> str:
+    """Describe a malformed tool-selection response without retaining it verbatim."""
+
+    details = [f"finish_reason={getattr(choice, 'finish_reason', None)}"]
+    message_extra = getattr(message, "model_extra", None) or {}
+    for label, value in (
+        ("content", getattr(message, "content", None)),
+        (
+            "refusal",
+            getattr(message, "refusal", None)
+            or (
+                message_extra.get("refusal")
+                if isinstance(message_extra, dict)
+                else None
+            ),
+        ),
+    ):
+        if not isinstance(value, str) or not value:
+            details.append(f"{label}_chars=0")
+            continue
+        preview = re.sub(r"\s+", " ", sanitize_text(value)).strip()[:500]
+        details.extend(
+            (
+                f"{label}_chars={len(value)}",
+                f"{label}_preview={json.dumps(preview, ensure_ascii=False)}",
+            )
+        )
+    reasoning = (
+        getattr(message, "reasoning_content", None)
+        or (
+            message_extra.get("reasoning_content")
+            if isinstance(message_extra, dict)
+            else None
+        )
+        or (
+            message_extra.get("reasoning")
+            if isinstance(message_extra, dict)
+            else None
+        )
+    )
+    details.append(
+        f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0}"
+    )
+    return ", ".join(details)
+
+
 def _system_trust_http_client(timeout_seconds: float) -> httpx.AsyncClient:
     """Build an HTTPX client that keeps TLS verification and trusts the OS CA store."""
 
@@ -535,7 +581,8 @@ class OpenAICompatibleAdvisor:
         if len(tool_calls) != 1:
             raise AdvisorError(
                 "AI provider must return exactly one MCP tool call "
-                f"(request_id={request_id}, count={len(tool_calls)})"
+                f"(request_id={request_id}, count={len(tool_calls)}, "
+                f"{_mcp_response_diagnostic(response.choices[0], message)})"
             )
 
         raw_call = tool_calls[0]

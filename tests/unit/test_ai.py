@@ -725,6 +725,60 @@ async def test_advisor_mcp_tool_error_exposes_safe_upstream_diagnostics() -> Non
 
 
 @pytest.mark.asyncio
+async def test_advisor_mcp_missing_tool_call_preserves_safe_response_shape() -> None:
+    secret = "provider-response-secret"
+
+    class TextOnlyCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="text-only-tool-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content=f"工具预算已经用完。token={secret}",
+                            tool_calls=[],
+                            model_extra={"reasoning_content": "internal reasoning"},
+                        ),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=TextOnlyCompletions())
+    )
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor.request_mcp_tool_call(
+            messages=[{"role": "user", "content": "select one tool"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "monitoring_query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+    error = str(caught.value)
+    assert "request_id=text-only-tool-request" in error
+    assert "count=0" in error
+    assert "finish_reason=stop" in error
+    assert "content_chars=" in error
+    assert "工具预算已经用完" in error
+    assert "reasoning_chars=18" in error
+    assert "***REDACTED***" in error
+    assert secret not in error
+
+
+@pytest.mark.asyncio
 async def test_advisor_no_choices_error_contains_request_shape() -> None:
     class NoChoiceCompletions:
         async def create(self, **kwargs: object) -> SimpleNamespace:
