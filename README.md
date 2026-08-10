@@ -349,11 +349,11 @@ Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名�
 每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法和只读元数据探针等非鉴权错误
 也会以脱敏、截断后的诊断回填，模型可据此调整参数或改走其它只读路径。认证、权限和安全错误仍
 立即终止。Archery 登录由 Host 在模型调查前确定性执行，登录工具不进入模型可见工具集，登录结果
-以 Host 控制事件而不是伪造的 `assistant tool_call` 写入上下文，因此不占模型调用预算。每轮结果会
-明确已用和剩余预算。模型选择失败时 Host 会把脱敏错误、剩余预算和严格单工具调用要求作为 repair
-feedback，再做一次有限重试。若兼容 API 仍返回纯文本而非工具调用，诊断会保留脱敏后的
-`finish_reason`、文本长度和截断预览。模型最多执行
-`ARCHERY_MCP_MAX_AGENT_STEPS` 个工具调用步骤，
+以 Host 控制事件而不是伪造的 `assistant tool_call` 写入上下文，因此不占远端 MCP 调用预算。每轮
+结果会分别明确远端调用和模型决策的已用、剩余数。模型选择失败时 Host 会把脱敏错误、剩余预算和
+严格单工具调用要求作为 repair feedback，再做一次有限重试。若兼容 API 仍返回纯文本而非工具
+调用，诊断会保留脱敏后的 `finish_reason`、文本长度和截断预览。每个会话最多向 MCP 发送
+`ARCHERY_MCP_MAX_AGENT_STEPS` 个模型选择的工具调用，
 默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP 返回的工具中可能包含
 `apply_query_permission_gymJPA` 等会产生外部状态变更的
 工具；这些工具不会进入模型可见的工具列表。
@@ -392,11 +392,22 @@ Archery 回显 SQL 与请求完全一致时，才会从已核对 SQL 投影恢�
 确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
 提示词要求最终查询和 `sql_query` 的 `limit_num` 都不得超过 20；即使 MCP 返回更多已解析行，
 Host 也只保留前 20 行。回传给模型的单次结果文本最多保留 24,000 字符。
+若 `mysql_slow_query_review_history` 查询被 Archery 超时 KILL，Host 将其作为缺失证据回传模型，
+明确禁止原样重试或盲目添加 `FORCE INDEX`。模型可通过只读 `SELECT` 查询
+`information_schema.statistics`；`SHOW INDEX` 仍不在 Host 的 `SELECT/WITH` 安全边界内。若真实
+联合索引以 `hostname_max, ts_min` 开头，恢复查询优先同时使用 `hostname_max = ...`、
+`ts_min >= window_start` 和 `ts_min < window_end` 的半开窗口，并减少投影字段。Host 不会自动改写
+模型 SQL。
+history 字段已经发现但查询未完成时，诊断返回“等待 history 查询成功”；若轨迹中存在 history
+超时，则返回更具体的“等待优化后的 history 查询”，不再误报“等待 history 表字段”。
+
 传输失败、登录确认失败、鉴权失败、超时、MCP 标准错误或不可恢复的 Archery 业务错误形成失败
 证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。SQL
 工具错误的脱敏类型和详情会写入对应 `query_trace`，便于区分字段错误、语法错误和权限错误。首次
-协议或传输失败时 EvidenceTool 会新建会话重试一次，每个新会话都重新登录。当前调用预算按会话
-计算，因此最坏远端调查调用数约为 `2 * ARCHERY_MCP_MAX_AGENT_STEPS`，另加每次会话的确定性登录；
+协议或传输失败时 EvidenceTool 会新建会话重试一次，每个新会话都重新登录。远端调用预算按会话
+计算，只有实际发送至 MCP 的模型工具调用才占用 `ARCHERY_MCP_MAX_AGENT_STEPS`；Host 登录和未通过
+只读校验的调用不占用该预算。另设最多两倍于远端预算的模型决策保护上限，防止模型持续生成无效
+调用。因此最坏远端调查调用数仍约为 `2 * ARCHERY_MCP_MAX_AGENT_STEPS`，另加每次会话的确定性登录；
 跨会话共享预算和完整轨迹是后续状态机改造项。
 
 项目级 MCP 配置只保存环境变量引用，不保存秘密：

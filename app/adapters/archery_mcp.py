@@ -49,11 +49,12 @@ ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # Backward-compatible constant: this is the default; deployments may override it.
 ARCHERY_MCP_MAX_AGENT_STEPS: Final = 12
+ARCHERY_MCP_MODEL_DECISION_MULTIPLIER: Final = 2
 ARCHERY_MCP_MAX_SESSION_ATTEMPTS: Final = 2
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v23"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v24"
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -71,6 +72,10 @@ _BUSINESS_ERROR_TEXT: Final = re.compile(
     |请先调用\s*ensure_login(?:_gymJPA)?\s*\(\s*\)
     """,
     re.IGNORECASE | re.VERBOSE,
+)
+_QUERY_TIMEOUT_TEXT: Final = re.compile(
+    r"查询超时(?:被\s*)?kill|执行超时|query\s+timeout|timed?\s+out|\btimeout\b",
+    re.IGNORECASE,
 )
 _FAILURE_STATUSES: Final = {
     "error",
@@ -499,7 +504,15 @@ class ArcheryMCPClient:
                         last_query_target: tuple[int, str] | None = None
                         last_slow_log_probe_issue: str | None = None
 
-                        for _step in range(self.max_agent_steps):
+                        model_decision_count = 0
+                        max_model_decisions = (
+                            self.max_agent_steps * ARCHERY_MCP_MODEL_DECISION_MULTIPLIER
+                        )
+
+                        while (
+                            len(model_calls) < self.max_agent_steps
+                            and model_decision_count < max_model_decisions
+                        ):
                             try:
                                 call = await self._request_model_tool_call(
                                     messages=messages,
@@ -550,6 +563,9 @@ class ArcheryMCPClient:
                                         metadata_resolution_steps=(metadata_resolution_steps),
                                         member_instance_ids=(metadata_member_instance_ids),
                                         resolved_endpoints=metadata_resolved_endpoints,
+                                        table_columns=metadata_table_columns,
+                                        model_decision_limit=max_model_decisions,
+                                        mcp_tool_call_limit=self.max_agent_steps,
                                         reason=(
                                             "模型连续两次未能选择有效的 Archery MCP "
                                             "工具：第一次="
@@ -564,6 +580,7 @@ class ArcheryMCPClient:
                                         ),
                                     )
                             attempted_model_calls.append(call.name)
+                            model_decision_count += 1
                             selected_table: str | None = None
                             trace_entry: dict[str, Any] | None = None
                             if call.name == self.query_tool_name:
@@ -590,7 +607,6 @@ class ArcheryMCPClient:
                                     call.arguments
                                 )
                                 if last_host_rejection is not None:
-                                    model_calls.append(call)
                                     if trace_entry is not None:
                                         trace_entry["outcome"] = "host_rejected"
                                         trace_entry["continuation_reason"] = last_host_rejection
@@ -602,6 +618,8 @@ class ArcheryMCPClient:
                                                     last_host_rejection
                                                 ),
                                                 model_calls_used=len(model_calls),
+                                                model_decisions_used=model_decision_count,
+                                                max_model_decisions=max_model_decisions,
                                             ),
                                         )
                                     )
@@ -646,8 +664,19 @@ class ArcheryMCPClient:
                                     self._completed_tool_messages(
                                         call,
                                         self._with_model_budget_status(
-                                            self._model_tool_error_result(exc),
+                                            self._model_tool_error_result(
+                                                exc,
+                                                requested_sql=(
+                                                    call.arguments.get("sql_content")
+                                                    if call.name == self.query_tool_name
+                                                    else None
+                                                ),
+                                                window_start=window_start,
+                                                window_end=window_end,
+                                            ),
                                             model_calls_used=len(model_calls),
+                                            model_decisions_used=model_decision_count,
+                                            max_model_decisions=max_model_decisions,
                                         ),
                                     )
                                 )
@@ -704,6 +733,8 @@ class ArcheryMCPClient:
                                             self._with_model_budget_status(
                                                 self._model_tool_result(payload),
                                                 model_calls_used=len(model_calls),
+                                                model_decisions_used=model_decision_count,
+                                                max_model_decisions=max_model_decisions,
                                             ),
                                         )
                                     )
@@ -744,6 +775,8 @@ class ArcheryMCPClient:
                                                     completion_issue=completion_issue,
                                                 ),
                                                 model_calls_used=len(model_calls),
+                                                model_decisions_used=model_decision_count,
+                                                max_model_decisions=max_model_decisions,
                                             ),
                                         )
                                     )
@@ -781,6 +814,10 @@ class ArcheryMCPClient:
                                         "model_executed_tool_calls": [
                                             item.name for item in model_calls
                                         ],
+                                        "model_decision_count": model_decision_count,
+                                        "model_decision_limit": max_model_decisions,
+                                        "mcp_tool_call_count": len(model_calls),
+                                        "mcp_tool_call_limit": self.max_agent_steps,
                                         "mcp_roundtrip_count": mcp_roundtrip_count,
                                         "alert_endpoint": alert_endpoint,
                                         "query_trace": query_trace,
@@ -790,6 +827,9 @@ class ArcheryMCPClient:
                                                 alert_endpoint=alert_endpoint,
                                                 member_instance_ids=(metadata_member_instance_ids),
                                                 resolved_endpoints=(metadata_resolved_endpoints),
+                                                table_columns=metadata_table_columns,
+                                                query_trace=query_trace,
+                                                history_query_completed=True,
                                             )
                                         ),
                                     },
@@ -801,6 +841,8 @@ class ArcheryMCPClient:
                                     self._with_model_budget_status(
                                         self._model_tool_result(payload),
                                         model_calls_used=len(model_calls),
+                                        model_decisions_used=model_decision_count,
+                                        max_model_decisions=max_model_decisions,
                                     ),
                                 )
                             )
@@ -832,9 +874,16 @@ class ArcheryMCPClient:
                             metadata_resolution_steps=metadata_resolution_steps,
                             member_instance_ids=metadata_member_instance_ids,
                             resolved_endpoints=metadata_resolved_endpoints,
+                            table_columns=metadata_table_columns,
+                            model_decision_limit=max_model_decisions,
+                            mcp_tool_call_limit=self.max_agent_steps,
                             reason=(
-                                "模型未在允许的调用预算内完成慢查询取证"
-                                f"{error_suffix}{rejection_suffix}{probe_suffix}"
+                                (
+                                    "模型未在允许的 MCP 调用预算内完成慢查询取证"
+                                    if len(model_calls) >= self.max_agent_steps
+                                    else "模型未在有限决策次数内形成可发送的慢查询取证调用"
+                                )
+                                + f"{error_suffix}{rejection_suffix}{probe_suffix}"
                             ),
                         )
         except ArcheryMCPError:
@@ -894,7 +943,11 @@ class ArcheryMCPClient:
             "必须依据list_table_columns返回的真实字段名和类型选择慢查询时间字段，不要猜测。"
             "若mysql_slow_query_review_history的真实字段包含ts_min和ts_max，二者表示聚合记录的"
             "首次和末次发生时间；可用ts_min < 窗口结束且ts_max >= 窗口开始表达与告警窗口重叠，"
-            "不要强行把两个边界都套在同一个聚合时间字段上。"
+            "不要强行把两个边界都套在同一个聚合时间字段上。但若这种重叠查询被Archery超时"
+            "终止，不得原样重试或只加FORCE INDEX；应使用SELECT查询"
+            "information_schema.statistics确认真实索引。若联合索引以前导列hostname_max、"
+            "ts_min开头，恢复查询优先把ts_min同时限定在Host给出的窗口起止范围内，使索引"
+            "同时获得等值列和有界范围；SHOW INDEX不符合Host的SELECT/WITH安全边界。"
             "对于DATETIME或TIMESTAMP字段，可直接使用Host给出的Unix秒配合FROM_UNIXTIME；"
             "若真实字段中同时存在f_insert_time、f_start_time和f_time_point，分钟级窗口优先使用"
             "f_insert_time，不要把只有日期或格式未知的varchar字段与完整时间戳比较。"
@@ -907,8 +960,9 @@ class ArcheryMCPClient:
             "只读SELECT；若 history 表的必经解析链路走不通，不得直接查询该表，可根据"
             "MCP返回的错误在其它慢日志表或只读探针中选择合理替代路径。每轮只能调用一个工具，"
             "Archery 登录已由 Host 在模型调用前完成，既不需要也不允许模型再次调用登录工具，"
-            "该 Host 登录不计入以下预算。模型自主发起的辅助查询和重试"
-            f"总数不得超过{self.max_agent_steps}；以 Host 返回的剩余预算为准，达到上限才停止。"
+            "该 Host 登录不计入以下预算。只有实际发送至MCP的辅助查询和重试才消耗"
+            f"{self.max_agent_steps}次远端调用预算；被Host拒绝的调用不消耗远端预算，但所有"
+            "模型工具选择仍受独立的有限决策上限约束。以Host反馈的两个剩余数为准。"
         )
         return [
             {
@@ -1288,7 +1342,7 @@ class ArcheryMCPClient:
         upper_columns = {
             cls._normalized_column_name(match.group("column"))
             for match in re.finditer(
-                column + rf"\s*<=\s*{end_expression}",
+                column + rf"\s*(?:<=|<)\s*{end_expression}",
                 where_body,
                 re.IGNORECASE,
             )
@@ -1544,15 +1598,33 @@ class ArcheryMCPClient:
         alert_endpoint: str | None,
         member_instance_ids: Mapping[tuple[int, str], set[int]],
         resolved_endpoints: Mapping[tuple[int, str], set[str]],
+        table_columns: Mapping[tuple[int, str], Mapping[str, set[str]]],
+        query_trace: list[dict[str, Any]],
+        history_query_completed: bool = False,
     ) -> str:
         """Return the next safe metadata hop; this is diagnostic, never authority."""
 
+        if history_query_completed:
+            return "history 查询已完成"
         if alert_endpoint is None:
             return "缺少告警端点"
         if target is None or not member_instance_ids.get(target):
             return "等待 t_instance_member"
         if not resolved_endpoints.get(target):
             return "等待 sql_instance"
+        if any(
+            entry.get("chain_stage") == "history"
+            and entry.get("outcome") == "tool_error"
+            and cls._is_query_timeout_detail(entry.get("error_detail"))
+            for entry in query_trace
+        ):
+            return "等待优化后的 history 查询"
+        history_columns = table_columns.get(target, {}).get(
+            ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold(),
+            set(),
+        )
+        if history_columns:
+            return "等待 history 查询成功"
         return "等待 history 表字段"
 
     @classmethod
@@ -1608,6 +1680,9 @@ class ArcheryMCPClient:
         metadata_resolution_steps: Mapping[tuple[int, str], list[str]],
         member_instance_ids: Mapping[tuple[int, str], set[int]],
         resolved_endpoints: Mapping[tuple[int, str], set[str]],
+        table_columns: Mapping[tuple[int, str], Mapping[str, set[str]]],
+        model_decision_limit: int,
+        mcp_tool_call_limit: int,
         reason: str,
     ) -> ArcherySlowLogQueryResult:
         """Preserve an auditable partial investigation instead of raising model failure."""
@@ -1617,6 +1692,8 @@ class ArcheryMCPClient:
             alert_endpoint=alert_endpoint,
             member_instance_ids=member_instance_ids,
             resolved_endpoints=resolved_endpoints,
+            table_columns=table_columns,
+            query_trace=query_trace,
         )
         return ArcherySlowLogQueryResult(
             payload={"status": "evidence_insufficient", "reason": reason},
@@ -1637,6 +1714,10 @@ class ArcheryMCPClient:
                 "alert_endpoint": alert_endpoint,
                 "model_attempted_tool_calls": attempted_model_calls,
                 "model_executed_tool_calls": [item.name for item in model_calls],
+                "model_decision_count": len(attempted_model_calls),
+                "model_decision_limit": model_decision_limit,
+                "mcp_tool_call_count": len(model_calls),
+                "mcp_tool_call_limit": mcp_tool_call_limit,
                 "mcp_roundtrip_count": mcp_roundtrip_count,
                 "query_trace": query_trace,
             },
@@ -2007,10 +2088,44 @@ class ArcheryMCPClient:
         return not any(marker in detail for marker in non_retryable_markers)
 
     @staticmethod
-    def _model_tool_error_result(error: ArcheryMCPToolError) -> str:
+    def _is_query_timeout_detail(value: Any) -> bool:
+        return _QUERY_TIMEOUT_TEXT.search(str(value)) is not None
+
+    @classmethod
+    def _model_tool_error_result(
+        cls,
+        error: ArcheryMCPToolError,
+        *,
+        requested_sql: Any = None,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+    ) -> str:
+        detail = _safe_error_detail(error)
+        if (
+            not isinstance(requested_sql, str)
+            or not cls._is_slow_query_review_history_select(requested_sql)
+            or not cls._is_query_timeout_detail(error)
+            or window_start is None
+            or window_end is None
+        ):
+            return (
+                "上一 MCP 工具调用失败。以下是 MCP 返回的实际错误，请据此调整参数或只读 SQL "
+                "后继续：\n" + detail
+            )
+
+        window_start_epoch = int(window_start.timestamp())
+        window_end_epoch = int(window_end.timestamp())
         return (
-            "上一 MCP 工具调用失败。以下是 MCP 返回的实际错误，请据此调整参数或只读 SQL "
-            "后继续：\n" + _safe_error_detail(error)
+            "上一条 mysql_slow_query_review_history 查询被 Archery 服务端超时终止。"
+            "这表示实时证据暂缺，不能作为任何根因假设的反证。不要原样重试，也不要仅靠"
+            "添加或更换 FORCE INDEX 重复相同扫描范围。若尚未确认索引，只能通过只读 "
+            "SELECT 查询 information_schema.statistics；SHOW INDEX 不符合当前 Host 的 "
+            "SELECT/WITH 安全边界。若真实联合索引的前导列为 hostname_max、ts_min，下一次"
+            "优先复用已解析的 hostname_max 等值条件，并使用索引对齐的精确窗口："
+            f"ts_min >= FROM_UNIXTIME({window_start_epoch}) AND "
+            f"ts_min < FROM_UNIXTIME({window_end_epoch})，再按 ts_min DESC 排序并 LIMIT 20；"
+            "只投影诊断所需字段，不要在 ts_min 列上包裹函数。若真实索引不同，应依据已返回的"
+            "索引列顺序调整，而不是猜测索引名。MCP 返回的实际错误：\n" + detail
         )
 
     @staticmethod
@@ -2048,6 +2163,10 @@ class ArcheryMCPClient:
                 "authentication_confirmed": True,
                 "host_login_counts_toward_budget": False,
                 "remaining_model_tool_calls": self.max_agent_steps,
+                "budget_basis": "calls_sent_to_mcp",
+                "model_decision_limit": (
+                    self.max_agent_steps * ARCHERY_MCP_MODEL_DECISION_MULTIPLIER
+                ),
                 "instruction": (
                     "登录已由 Host 完成。不要再次调用登录工具；请从当前只读 tools 中"
                     "选择调查工具继续。"
@@ -2066,13 +2185,18 @@ class ArcheryMCPClient:
         canonical_result: str,
         *,
         model_calls_used: int,
+        model_decisions_used: int,
+        max_model_decisions: int,
     ) -> str:
         remaining = max(self.max_agent_steps - model_calls_used, 0)
+        remaining_decisions = max(max_model_decisions - model_decisions_used, 0)
         return (
             canonical_result
-            + "\nHost工具调用预算：模型已使用"
+            + "\nHost远端MCP调用预算：已实际发送"
             + f"{model_calls_used}/{self.max_agent_steps}次，剩余{remaining}次；"
-            "会话开头由Host完成的登录不计入该预算。"
+            "Host登录和未通过Host校验的调用不计入该预算。"
+            + "Host模型决策保护上限：已选择"
+            + f"{model_decisions_used}/{max_model_decisions}次，剩余{remaining_decisions}次。"
         )
 
     @classmethod

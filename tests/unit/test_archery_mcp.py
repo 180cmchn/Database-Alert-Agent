@@ -24,6 +24,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TABLE,
     ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
     ARCHERY_SLOW_LOG_TOOL_NAME,
+    ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPClient,
     ArcheryMCPProtocolError,
     ArcheryMCPReadOnlyViolation,
@@ -465,7 +466,8 @@ async def test_archery_mcp_executes_alert_window_query_and_parses_sse_result() -
     assert "三张表都在该实例和数据库中" in task_prompt
     assert "若 history 表的必经解析链路走不通" in task_prompt
     assert "MCP返回的错误在其它慢日志表或只读探针中选择合理替代路径" in task_prompt
-    assert "总数不得超过12" in task_prompt
+    assert "12次远端调用预算" in task_prompt
+    assert "被Host拒绝的调用不消耗远端预算" in task_prompt
     assert (
         "表名可来自list_db_tables、元数据查询或推荐线索"
         in (model.calls[0]["messages"][0]["content"])
@@ -989,10 +991,215 @@ async def test_archery_mcp_preserves_last_budgeted_call_for_query_error_recovery
     ]
     retry_feedback = model.calls[-1]["messages"][-1]["content"]
     assert "剩余1次" in retry_feedback
-    assert "Host完成的登录不计入该预算" in retry_feedback
+    assert "Host登录和未通过Host校验的调用不计入该预算" in retry_feedback
     assert result.diagnostics is not None
     assert result.diagnostics["query_trace"][0]["outcome"] == "tool_error"
     assert "Unknown column" in result.diagnostics["query_trace"][0]["error_detail"]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_host_rejection_does_not_consume_remote_call_budget() -> None:
+    tool_calls: list[str] = []
+    query_sql_calls: list[str] = []
+
+    class RejectedThenValidModel(PromptFollowingMCPModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            call = await super().request_mcp_tool_call(messages=messages, tools=tools)
+            if len(self.calls) != 1:
+                return call
+            arguments = {**call.arguments, "sql_content": "SHOW INDEX FROM slow_query"}
+            self.calls[-1]["arguments"] = arguments
+            return MCPModelToolCall(
+                call_id=call.call_id,
+                name=call.name,
+                arguments=arguments,
+                request_id=call.request_id,
+            )
+
+    model = RejectedThenValidModel(
+        sequence=(ARCHERY_MCP_QUERY_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(TEST_SLOW_LOG_QUERY, TEST_SLOW_LOG_QUERY),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result={
+                "structuredContent": {"status": "ok", "rows": [[1]]},
+                "isError": False,
+            },
+            tool_calls=tool_calls,
+            query_sql_calls=query_sql_calls,
+        ),
+        model=model,
+        max_agent_steps=1,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.query_completed is True
+    assert query_sql_calls == [TEST_SLOW_LOG_QUERY]
+    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME]
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
+    assert result.diagnostics is not None
+    assert result.diagnostics["model_attempted_tool_calls"] == [
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+    assert result.diagnostics["model_decision_count"] == 2
+    assert result.diagnostics["mcp_tool_call_count"] == 1
+    rejection_feedback = model.calls[-1]["messages"][-1]["content"]
+    assert "已实际发送0/1次，剩余1次" in rejection_feedback
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_bounds_repeated_host_rejections_by_decision_limit() -> None:
+    tool_calls: list[str] = []
+
+    class AlwaysRejectedModel(PromptFollowingMCPModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            call = await super().request_mcp_tool_call(messages=messages, tools=tools)
+            arguments = {**call.arguments, "sql_content": "SHOW INDEX FROM slow_query"}
+            self.calls[-1]["arguments"] = arguments
+            return MCPModelToolCall(
+                call_id=call.call_id,
+                name=call.name,
+                arguments=arguments,
+                request_id=call.request_id,
+            )
+
+    model = AlwaysRejectedModel(
+        sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,) * 4,
+        query_sqls=(TEST_SLOW_LOG_QUERY,),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result={"structuredContent": {"status": "ok"}, "isError": False},
+            tool_calls=tool_calls,
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.query_completed is False
+    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+    assert result.diagnostics is not None
+    assert result.diagnostics["model_decision_count"] == 4
+    assert result.diagnostics["model_decision_limit"] == 4
+    assert result.diagnostics["mcp_tool_call_count"] == 0
+    assert "有限决策次数" in result.diagnostics["reason"]
+
+
+@pytest.mark.asyncio
+async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_window() -> None:
+    tool_calls: list[str] = []
+    query_sql_calls: list[str] = []
+    timed_out_sql = (
+        "SELECT hostname_max, sample, ts_min, ts_max "
+        f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+        "WHERE hostname_max = 'db-1:3306' "
+        "AND ts_min < FROM_UNIXTIME(1784793600) "
+        "AND ts_max >= FROM_UNIXTIME(1784793300) LIMIT 20"
+    )
+    recovered_sql = (
+        "SELECT hostname_max, sample, ts_min, ts_max "
+        f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+        "WHERE hostname_max = 'db-1:3306' "
+        "AND ts_min >= FROM_UNIXTIME(1784793300) "
+        "AND ts_min < FROM_UNIXTIME(1784793600) "
+        "ORDER BY ts_min DESC LIMIT 20"
+    )
+    model = PromptFollowingMCPModel(
+        sequence=(ARCHERY_MCP_QUERY_TOOL_NAME, ARCHERY_MCP_QUERY_TOOL_NAME),
+        query_sqls=(timed_out_sql, recovered_sql),
+    )
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result=[
+                {
+                    "structuredContent": {
+                        "status": "failed",
+                        "message": "查询超时被KILL，请优化SQL后执行",
+                    },
+                    "isError": False,
+                },
+                {
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["hostname_max", "sample", "ts_min", "ts_max"],
+                        "rows": [["db-1:3306", "select 1", "2026-07-23 15:59:00", None]],
+                    },
+                    "isError": False,
+                },
+            ],
+            tool_calls=tool_calls,
+            query_sql_calls=query_sql_calls,
+        ),
+        model=model,
+        max_agent_steps=2,
+    )
+
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert result.query_completed is True
+    assert result.requested_sql == recovered_sql
+    assert query_sql_calls == [timed_out_sql, recovered_sql]
+    timeout_feedback = model.calls[-1]["messages"][-1]["content"]
+    assert "实时证据暂缺" in timeout_feedback
+    assert "不能作为任何根因假设的反证" in timeout_feedback
+    assert "information_schema.statistics" in timeout_feedback
+    assert "SHOW INDEX" in timeout_feedback
+    assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
+    assert "ts_min < FROM_UNIXTIME(1784793600)" in timeout_feedback
+    assert "不要原样重试" in timeout_feedback
+    assert "剩余1次" in timeout_feedback
+
+
+def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> None:
+    target = (17, "archery")
+    common = {
+        "target": target,
+        "alert_endpoint": "100.84.97.135:3306",
+        "member_instance_ids": {target: {53}},
+        "resolved_endpoints": {target: {"db-1:3306"}},
+        "table_columns": {
+            target: {
+                ARCHERY_SLOW_QUERY_REVIEW_TABLE: {
+                    "hostname_max",
+                    "ts_min",
+                    "ts_max",
+                }
+            }
+        },
+    }
+
+    assert ArcheryMCPClient._metadata_resolution_stage(
+        **common,
+        query_trace=[],
+    ) == "等待 history 查询成功"
+    assert ArcheryMCPClient._metadata_resolution_stage(
+        **common,
+        query_trace=[
+            {
+                "chain_stage": "history",
+                "outcome": "tool_error",
+                "error_detail": "查询超时被KILL，请优化SQL后执行",
+            }
+        ],
+    ) == "等待优化后的 history 查询"
 
 
 @pytest.mark.asyncio
