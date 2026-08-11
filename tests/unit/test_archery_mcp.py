@@ -614,6 +614,52 @@ def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> No
         ],
     ) == "等待优化后的 history 查询"
 
+    maximum_execution_time_error = (
+        "(1028, 'Sort aborted: Query execution was interrupted, "
+        "maximum statement execution time exceeded')"
+    )
+    assert ArcheryMCPClient._is_query_timeout_detail(maximum_execution_time_error)
+    assert ArcheryMCPClient.metadata_resolution_stage(
+        **{**common, "table_columns": {}},
+        query_trace=[
+            {
+                "chain_stage": "history",
+                "outcome": "tool_error",
+                "error_detail": maximum_execution_time_error,
+            }
+        ],
+    ) == "等待优化后的 history 查询"
+
+
+def test_archery_mcp_bounds_final_history_sort_and_identifies_index_probe() -> None:
+    expensive = (
+        "SELECT hostname_max, sample, ts_min, Query_time_sum "
+        "FROM mysql_slow_query_review_history "
+        "WHERE hostname_max = 'db-1:3306' "
+        "AND ts_min >= FROM_UNIXTIME(1784793300) "
+        "AND ts_min < FROM_UNIXTIME(1784793600) "
+        "ORDER BY Query_time_sum DESC LIMIT 20"
+    )
+    bounded = expensive.replace("Query_time_sum DESC", "ts_min DESC")
+    index_probe = (
+        "SELECT index_name, seq_in_index, column_name "
+        "FROM information_schema.statistics "
+        "WHERE table_schema = 'archery' "
+        "AND table_name = 'mysql_slow_query_review_history' LIMIT 20"
+    )
+
+    assert "只能按真实ts_min字段排序" in (
+        ArcheryMCPClient.history_query_efficiency_issue(expensive) or ""
+    )
+    assert ArcheryMCPClient.history_query_efficiency_issue(bounded) is None
+    assert ArcheryMCPClient.is_history_index_probe(index_probe) is True
+    assert (
+        ArcheryMCPClient.is_history_index_probe(
+            "SELECT * FROM information_schema.tables"
+        )
+        is False
+    )
+
 
 
 
@@ -1565,6 +1611,42 @@ class FlakyRecordingArcheryClient(RecordingArcheryClient):
         )
 
 
+class FailedHistoryRecordingArcheryClient(RecordingArcheryClient):
+    async def execute_slow_log_query(
+        self,
+        occurred_at: datetime,
+        *,
+        alert_context: dict[str, Any] | None = None,
+    ) -> ArcherySlowLogQueryResult:
+        self.calls += 1
+        self.occurred_at = occurred_at
+        self.alert_context = alert_context
+        error_detail = (
+            "Query execution was interrupted, maximum statement execution time exceeded"
+        )
+        return ArcherySlowLogQueryResult(
+            payload={"status": "evidence_insufficient"},
+            requested_sql=None,
+            window_start=TEST_WINDOW_START,
+            window_end=TEST_WINDOW_END,
+            instance_id=TEST_INSTANCE_ID,
+            db_name=TEST_DB_NAME,
+            query_completed=False,
+            diagnostics={
+                "reason": f"remote budget exhausted; last query error: {error_detail}",
+                "next_stage": "等待优化后的 history 查询",
+                "query_trace": [
+                    {
+                        "chain_stage": "history",
+                        "sent_to_mcp": True,
+                        "outcome": "tool_error",
+                        "error_detail": error_detail,
+                    }
+                ],
+            },
+        )
+
+
 def _context(
     alert_type: str,
     *,
@@ -1679,6 +1761,28 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
             _context("慢查询过多", title="MySQL/mysql_slow_queryable_400/db-1:3306"),
         )
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_archery_evidence_distinguishes_failed_history_from_never_executed() -> None:
+    client = FailedHistoryRecordingArcheryClient()
+    outcome = await ArcherySlowLogEvidenceTool(client).execute(  # type: ignore[arg-type]
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-1:3306",
+        ),
+    )
+
+    assert isinstance(outcome, ToolExecutionResult)
+    assert outcome.status == ToolStatus.NO_DATA
+    assert "最终 history 查询未成功" in outcome.summary
+    assert "未执行最终 history 查询" not in outcome.summary
+    assert "下一阶段：等待优化后的 history 查询" in outcome.summary
+    assert outcome.structured_data["query_completed"] is False
+    assert outcome.structured_data["root_cause_ineligible_reason"] == (
+        "最终慢查询 SQL 未成功；当前证据不足"
+    )
 
 
 

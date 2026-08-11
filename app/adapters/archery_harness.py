@@ -20,6 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 from app.adapters.archery_mcp import (
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
+    ARCHERY_MCP_FINALIZATION_CALL_RESERVE,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
     ARCHERY_MCP_MAX_SESSION_ATTEMPTS,
     ARCHERY_MCP_MODEL_DECISION_MULTIPLIER,
@@ -75,7 +76,7 @@ if TYPE_CHECKING:
 
 
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-read-only-harness-v1"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-read-only-harness-v2"
 ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v1"
 
 
@@ -612,6 +613,7 @@ class ArcheryHarnessScenario:
                 "request_id": model_call.request_id,
             }
 
+        trace: dict[str, Any] | None = None
         if action.tool_name == self.client.query_tool_name:
             trace = self.client.query_trace_entry(
                 model_call
@@ -623,7 +625,6 @@ class ArcheryHarnessScenario:
             )
             state.query_trace.append(trace)
             metadata["trace_index"] = len(state.query_trace) - 1
-            state.last_query_target = self.client.target_key(action.arguments)
             requested_sql = action.arguments.get("sql_content")
             if isinstance(requested_sql, str) and self._uses_legacy_slow_log_table(requested_sql):
                 reason = (
@@ -652,6 +653,22 @@ class ArcheryHarnessScenario:
                     repair_hint="Use one bounded read-only SELECT/WITH statement.",
                 )
 
+        stateful_rejection = self._stateful_call_rejection(
+            state,
+            tool_name=action.tool_name,
+            arguments=action.arguments,
+            trace=trace,
+        )
+        if stateful_rejection is not None:
+            if trace is not None:
+                trace["outcome"] = "host_rejected"
+                trace["continuation_reason"] = stateful_rejection.message
+            state.last_host_rejection = stateful_rejection.message
+            return stateful_rejection
+
+        if action.tool_name == self.client.query_tool_name:
+            state.last_query_target = self.client.target_key(action.arguments)
+
         return PreparedCall(
             tool_name=action.tool_name,
             objective=action.objective,
@@ -660,6 +677,150 @@ class ArcheryHarnessScenario:
             effective_arguments=dict(action.arguments),
             timeout_seconds=self.client.timeout_seconds,
             metadata=metadata,
+        )
+
+    def _stateful_call_rejection(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        trace: Mapping[str, Any] | None,
+    ) -> HostRejection | None:
+        target = self.client.target_key(arguments)
+        chain_stage = trace.get("chain_stage") if trace is not None else None
+        if target is not None:
+            if chain_stage == "t_instance_member" and state.member_instance_ids.get(target):
+                return self._completed_metadata_rejection("t_instance_member")
+            if chain_stage == "sql_instance" and state.resolved_endpoints.get(target):
+                return self._completed_metadata_rejection("sql_instance")
+
+        table_name = arguments.get("tb_name")
+        normalized_table = (
+            self.client.clean_table_name(table_name).casefold()
+            if isinstance(table_name, str)
+            else None
+        )
+        if tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME and target is not None:
+            if normalized_table == "t_instance_member" and state.member_instance_ids.get(target):
+                return self._completed_metadata_rejection("t_instance_member")
+            if normalized_table == "sql_instance" and state.resolved_endpoints.get(target):
+                return self._completed_metadata_rejection("sql_instance")
+            if normalized_table in state.table_columns.get(target, {}):
+                return self._completed_metadata_rejection(f"{normalized_table}字段")
+
+        resolved_targets = {
+            known_target
+            for known_target, endpoints in state.resolved_endpoints.items()
+            if endpoints
+        }
+        remaining = max(
+            self.client.max_agent_steps - len(state.executed_model_calls),
+            0,
+        )
+        reserve = min(
+            ARCHERY_MCP_FINALIZATION_CALL_RESERVE,
+            self.client.max_agent_steps,
+        )
+        if not resolved_targets or remaining > reserve:
+            return None
+        if target not in resolved_targets:
+            known = ", ".join(
+                f"instance_id={instance_id},db_name={db_name}"
+                for instance_id, db_name in sorted(resolved_targets)
+            )
+            return HostRejection(
+                code="archery_finalization_target_drift",
+                message=(
+                    "Archery目标端点已经解析，最终取证保留额度不能再用于其它实例、数据库或"
+                    f"无目标资源枚举；已解析目标为 {known}。"
+                ),
+                repair_hint="复用已解析目标，直接完成history字段、索引或最终窗口查询。",
+            )
+
+        if tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME:
+            if (
+                normalized_table is not None
+                and self.client._is_slow_log_table_name(normalized_table)
+            ):
+                return None
+            return self._finalization_reserve_rejection(remaining)
+
+        if tool_name != self.client.query_tool_name:
+            return self._finalization_reserve_rejection(remaining)
+        requested_sql = arguments.get("sql_content")
+        if not isinstance(requested_sql, str):
+            return self._finalization_reserve_rejection(remaining)
+        if self.client.is_history_index_probe(requested_sql):
+            if self._history_timeout_pending(state) and remaining <= 1:
+                return HostRejection(
+                    code="archery_last_call_reserved_for_history_retry",
+                    message=(
+                        "上一条history查询已超时，最后一次远端额度必须直接用于有界history恢复"
+                        "查询，不能再执行索引探针。"
+                    ),
+                    repair_hint=(
+                        "使用已解析hostname_max、ts_min半开窗口、ORDER BY ts_min DESC和"
+                        "LIMIT 20直接重试。"
+                    ),
+                )
+            return None
+        if self.client.is_slow_log_select(requested_sql):
+            completion_issue = self.client.slow_log_query_completion_issue(
+                requested_sql,
+                window_start=state.window_start,
+                window_end=state.window_end,
+            )
+            if completion_issue is not None:
+                return HostRejection(
+                    code="archery_finalization_query_incomplete",
+                    message=(
+                        "剩余远端额度已保留给最终慢查询，但当前SQL仍不是完整窗口证据："
+                        + completion_issue
+                    ),
+                    repair_hint=(
+                        "提交包含已解析目标、Host精确时间窗和LIMIT 20的最终慢查询。"
+                    ),
+                )
+            efficiency_issue = self.client.history_query_efficiency_issue(requested_sql)
+            if efficiency_issue is not None:
+                return HostRejection(
+                    code="archery_history_query_expensive_sort",
+                    message=efficiency_issue,
+                    repair_hint=(
+                        "只按真实ts_min排序；若没有该字段则移除ORDER BY，并保留有界窗口。"
+                    ),
+                )
+            return None
+        return self._finalization_reserve_rejection(remaining)
+
+    @staticmethod
+    def _completed_metadata_rejection(stage: str) -> HostRejection:
+        return HostRejection(
+            code="archery_metadata_stage_already_completed",
+            message=f"Archery元数据阶段 {stage} 已完成，不得重复查询。",
+            repair_hint="复用已记录结果并继续下一阶段；端点已解析后直接进入history取证。",
+        )
+
+    @staticmethod
+    def _finalization_reserve_rejection(remaining: int) -> HostRejection:
+        return HostRejection(
+            code="archery_finalization_budget_reserved",
+            message=(
+                f"Archery只剩 {remaining} 次远端调用，且目标端点已经解析；剩余额度只保留给"
+                "慢日志字段、history索引和最终窗口查询。"
+            ),
+            repair_hint=(
+                "停止资源枚举和实例归属查询，复用已解析目标完成最终慢查询。"
+            ),
+        )
+
+    def _history_timeout_pending(self, state: ArcheryHarnessState) -> bool:
+        return any(
+            entry.get("chain_stage") == "history"
+            and entry.get("outcome") == "tool_error"
+            and self.client._is_query_timeout_detail(entry.get("error_detail"))
+            for entry in state.query_trace
         )
 
     def on_result(
@@ -957,7 +1118,7 @@ class ArcheryHarnessScenario:
         )
 
     def _with_budget(self, state: ArcheryHarnessState, canonical: str) -> str:
-        return self.client.with_model_budget_status(
+        message = self.client.with_model_budget_status(
             canonical,
             model_calls_used=len(state.executed_model_calls),
             model_decisions_used=state.model_decision_count,
@@ -965,6 +1126,27 @@ class ArcheryHarnessScenario:
                 self.client.max_agent_steps * ARCHERY_MCP_MODEL_DECISION_MULTIPLIER
             ),
         )
+        resolved_targets = any(state.resolved_endpoints.values())
+        remaining = max(
+            self.client.max_agent_steps - len(state.executed_model_calls),
+            0,
+        )
+        reserve = min(
+            ARCHERY_MCP_FINALIZATION_CALL_RESERVE,
+            self.client.max_agent_steps,
+        )
+        if resolved_targets and remaining <= reserve:
+            message += (
+                "\nHost最终取证保留区：目标端点已经解析，剩余远端额度只能用于慢日志字段、"
+                "history索引和最终窗口查询；不要再枚举资源或查询t_instance_member、"
+                "sql_instance。"
+            )
+        if self._history_timeout_pending(state) and remaining <= 1:
+            message += (
+                "\nHost最后调用约束：不要再查询information_schema；直接使用已解析的"
+                "hostname_max、ts_min半开窗口、ORDER BY ts_min DESC和LIMIT 20执行恢复查询。"
+            )
+        return message
 
     def _completion_issue(
         self,

@@ -411,6 +411,12 @@ sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链�
 部署窗口计算，默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在
 预览确认步骤。
 
+Host 会记录已经完成的 `t_instance_member` 和 `sql_instance` 元数据阶段，后续重复查询会在发送到
+MCP 前被拒绝且不消耗远端预算。目标端点解析完成并进入最后 4 次远端额度后，剩余调用只允许用于
+慢日志字段、`information_schema.statistics` 索引探针和完整的最终窗口查询；资源枚举、目标漂移和
+重复实例归属查询都会被拒绝。最终 history 查询若包含 `ORDER BY`，只能按真实 `ts_min` 排序，不能
+按 `Query_time`、`Rows_examined` 等诊断值触发大范围 filesort。
+
 最终慢日志查询成功并返回日志内容后，结果直接作为当前告警窗口的实时证据，不再对告警端点和
 `hostname_max` 结果端点追加 `t_instance_member.f_instance_id` 查询，也不生成 `MATCHED`、
 `MISMATCHED`、`UNVERIFIED` 或 `analysis_usable` 等归属状态。AI 分析和独立验收提示词明确禁止
@@ -430,12 +436,13 @@ JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使�
 确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
 提示词要求最终查询和 `sql_query` 的 `limit_num` 都不得超过 20；即使 MCP 返回更多已解析行，
 Host 也只保留前 20 行。回传给模型的单次结果文本最多保留 24,000 字符。
-若 `mysql_slow_query_review_history` 查询被 Archery 超时 KILL，Host 将其作为缺失证据回传模型，
+若 `mysql_slow_query_review_history` 查询被 Archery 超时 KILL，或返回 MySQL 的
+`Query execution was interrupted, maximum statement execution time exceeded`，Host 将其作为缺失证据回传模型，
 明确禁止原样重试或盲目添加 `FORCE INDEX`。模型可通过只读 `SELECT` 查询
 `information_schema.statistics`；`SHOW INDEX` 仍不在 Host 的 `SELECT/WITH` 安全边界内。若真实
 联合索引以 `hostname_max, ts_min` 开头，恢复查询优先同时使用 `hostname_max = ...`、
 `ts_min >= window_start` 和 `ts_min < window_end` 的半开窗口，并减少投影字段。Host 不会自动改写
-模型 SQL。
+模型 SQL。若超时后只剩一次远端额度，该额度直接保留给有界 history 恢复查询，不再允许索引探针。
 history 字段已经发现但查询未完成时，诊断返回“等待 history 查询成功”；若轨迹中存在 history
 超时，则返回更具体的“等待优化后的 history 查询”，不再误报“等待 history 表字段”。
 

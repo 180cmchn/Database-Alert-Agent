@@ -55,10 +55,11 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 ARCHERY_MCP_MAX_AGENT_STEPS: Final = 12
 ARCHERY_MCP_MODEL_DECISION_MULTIPLIER: Final = 2
 ARCHERY_MCP_MAX_SESSION_ATTEMPTS: Final = 2
+ARCHERY_MCP_FINALIZATION_CALL_RESERVE: Final = 4
 ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v24"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v25"
 ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v1"
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -104,7 +105,9 @@ _BUSINESS_ERROR_TEXT: Final = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 _QUERY_TIMEOUT_TEXT: Final = re.compile(
-    r"查询超时(?:被\s*)?kill|执行超时|query\s+timeout|timed?\s+out|\btimeout\b",
+    r"查询超时(?:被\s*)?kill|执行超时|query\s+timeout|timed?\s+out|\btimeout\b"
+    r"|query\s+execution\s+was\s+interrupted"
+    r"|maximum\s+statement\s+execution\s+time\s+exceeded",
     re.IGNORECASE,
 )
 _FAILURE_STATUSES: Final = {
@@ -535,6 +538,10 @@ class ArcheryMCPClient:
             "information_schema.statistics确认真实索引。若联合索引以前导列hostname_max、"
             "ts_min开头，恢复查询优先把ts_min同时限定在Host给出的窗口起止范围内，使索引"
             "同时获得等值列和有界范围；SHOW INDEX不符合Host的SELECT/WITH安全边界。"
+            "最终history查询不得按Query_time、Rows_examined等诊断值排序；只在真实字段包含"
+            "ts_min时使用ORDER BY ts_min DESC，否则去掉ORDER BY，避免服务端对候选行做昂贵"
+            "filesort。若Host反馈远端预算只剩一次且上一条history查询已超时，不要再查询索引"
+            "元数据，直接提交使用hostname_max等值条件、ts_min半开窗口和LIMIT 20的恢复查询。"
             "对于DATETIME或TIMESTAMP字段，可直接使用Host给出的Unix秒配合FROM_UNIXTIME；"
             "若真实字段中同时存在f_insert_time、f_start_time和f_time_point，分钟级窗口优先使用"
             "f_insert_time，不要把只有日期或格式未知的varchar字段与完整时间戳比较。"
@@ -549,7 +556,10 @@ class ArcheryMCPClient:
             "Archery 登录已由 Host 在模型调用前完成，既不需要也不允许模型再次调用登录工具，"
             "该 Host 登录不计入以下预算。只有实际发送至MCP的辅助查询和重试才消耗"
             f"{self.max_agent_steps}次远端调用预算；被Host拒绝的调用不消耗远端预算，但所有"
-            "模型工具选择仍受独立的有限决策上限约束。以Host反馈的两个剩余数为准。"
+            "模型工具选择仍受独立的有限决策上限约束。端点解析成功且剩余远端预算不超过"
+            f"{ARCHERY_MCP_FINALIZATION_CALL_RESERVE}次后，Host会把剩余额度保留给history字段、"
+            "索引和最终窗口查询；不得再枚举资源或重复t_instance_member、sql_instance归属查询。"
+            "以Host反馈的两个剩余数为准。"
         )
         return [
             {
@@ -818,6 +828,56 @@ class ArcheryMCPClient:
             elif not 1 <= limit <= ARCHERY_SLOW_LOG_LIMIT:
                 issues.append(f"LIMIT必须在1到{ARCHERY_SLOW_LOG_LIMIT}之间")
         return "；".join(issues) if issues else None
+
+    @classmethod
+    def history_query_efficiency_issue(cls, sql: str) -> str | None:
+        """Reject expensive final-history ordering once the target is resolved."""
+
+        if not cls._is_slow_query_review_history_select(sql):
+            return None
+        code = cls._sql_code_only(sql)
+        if code is None:
+            return "无法验证history查询的排序语义"
+        order = re.search(
+            r"(?is)\border\s+by\s+(?P<body>.*?)(?:\blimit\b|$)",
+            code,
+        )
+        if order is None:
+            return None
+        ts_min = (
+            r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?ts_min`?\s*(?:asc|desc)?"
+        )
+        if re.fullmatch(ts_min, order.group("body").strip(), re.IGNORECASE):
+            return None
+        return (
+            "最终history查询只能按真实ts_min字段排序，或完全去掉ORDER BY；"
+            "不得按诊断指标或其它非索引字段排序"
+        )
+
+    @classmethod
+    def is_history_index_probe(cls, sql: str) -> bool:
+        """Identify a bounded read-only index lookup for the prescribed table."""
+
+        statement = cls._sql_without_comments(sql)
+        if statement is None or re.match(r"(?is)^\s*(?:select|with)\b", statement) is None:
+            return False
+        if (
+            re.search(
+                r"(?is)\bfrom\s+`?information_schema`?\s*\.\s*`?statistics`?\b",
+                statement,
+            )
+            is None
+        ):
+            return False
+        return (
+            re.search(
+                rf"(?is)\btable_name\b\s*=\s*"
+                rf"['\"]{re.escape(ARCHERY_SLOW_QUERY_REVIEW_TABLE)}['\"]",
+                statement,
+            )
+            is not None
+        )
 
     @classmethod
     def _query_uses_exact_window(
@@ -1657,7 +1717,8 @@ class ArcheryMCPClient:
             f"ts_min >= FROM_UNIXTIME({window_start_epoch}) AND "
             f"ts_min < FROM_UNIXTIME({window_end_epoch})，再按 ts_min DESC 排序并 LIMIT 20；"
             "只投影诊断所需字段，不要在 ts_min 列上包裹函数。若真实索引不同，应依据已返回的"
-            "索引列顺序调整，而不是猜测索引名。MCP 返回的实际错误：\n" + detail
+            "索引列顺序调整，而不是猜测索引名。若Host预算反馈只剩一次远端调用，不再执行索引"
+            "探针，直接提交上述有界恢复查询。MCP 返回的实际错误：\n" + detail
         )
 
     @staticmethod
@@ -2267,15 +2328,32 @@ class ArcherySlowLogEvidenceTool:
         if not result.query_completed:
             reason = str(diagnostics.get("reason") or "慢查询证据不足")
             next_stage = str(diagnostics.get("next_stage") or "等待补充可用证据")
+            query_trace = diagnostics.get("query_trace")
+            history_attempted = isinstance(query_trace, list) and any(
+                isinstance(entry, Mapping)
+                and entry.get("chain_stage") == "history"
+                and entry.get("sent_to_mcp") is True
+                for entry in query_trace
+            )
+            summary_prefix = (
+                "Archery 最终 history 查询未成功"
+                if history_attempted
+                else "Archery 慢查询未执行最终 history 查询"
+            )
+            ineligible_reason = (
+                "最终慢查询 SQL 未成功；当前证据不足"
+                if history_attempted
+                else "未执行最终慢查询 SQL；当前证据不足"
+            )
             structured_data = self._build_slow_query_evidence(
                 result,
                 session_attempts=session_attempts,
-                root_cause_ineligible_reason="未执行最终慢查询 SQL；当前证据不足",
+                root_cause_ineligible_reason=ineligible_reason,
             )
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
                 summary=(
-                    f"Archery 慢查询未执行最终 history 查询：{reason}；"
+                    f"{summary_prefix}：{reason}；"
                     f"下一阶段：{next_stage}。"
                     "已保留只读 MCP 调用轨迹，告警分析可继续但当前结论不充分。"
                 ),

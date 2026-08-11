@@ -637,6 +637,126 @@ async def test_shared_harness_returns_progressive_repair_after_server_timeout() 
 
 
 @pytest.mark.asyncio
+async def test_shared_harness_reserves_final_calls_and_recovers_actual_mysql_timeout() -> None:
+    member_sql = (
+        "SELECT f_instance_id FROM t_instance_member "
+        "WHERE f_ip = 'db-1.example' AND f_port = 3306 LIMIT 1"
+    )
+    instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
+    redundant_instance_sql = (
+        "SELECT host, port, instance_name FROM sql_instance WHERE id = 53 LIMIT 1"
+    )
+    expensive_history_sql = FINAL_SQL.replace(
+        "ORDER BY ts_min DESC",
+        "ORDER BY Query_time_sum DESC",
+    )
+    overlap_history_sql = FINAL_SQL.replace(
+        "ts_min >= FROM_UNIXTIME(1784793300) ",
+        "ts_max >= FROM_UNIXTIME(1784793300) ",
+    )
+    index_sql = (
+        "SELECT index_name, seq_in_index, column_name "
+        "FROM information_schema.statistics "
+        "WHERE table_schema = 'archery' "
+        "AND table_name = 'mysql_slow_query_review_history' LIMIT 20"
+    )
+    timeout_message = (
+        "SQL 查询失败：{'errors': ErrorDetail(string=\"(1028, 'Sort aborted: "
+        "Query execution was interrupted, maximum statement execution time exceeded')\", "
+        "code='invalid')}"
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", member_sql),
+            _call("instance", instance_sql),
+            _call("redundant-instance", redundant_instance_sql),
+            _call("expensive-history", expensive_history_sql),
+            _call("overlap-history", overlap_history_sql),
+            _call("history-index", index_sql),
+            _call("recovered-history", FINAL_SQL),
+        ]
+    )
+    timeout = ReplayCallFixture(
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        expected_arguments={**TARGET_ARGUMENTS, "sql_content": overlap_history_sql},
+        result={
+            "structuredContent": {
+                "status": "failed",
+                "message": timeout_message,
+            }
+        },
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-finalization-reserve",
+                tools=_tools(),
+                calls=[
+                    _login(),
+                    _success(member_sql, rows=[{"f_instance_id": 53}]),
+                    _success(instance_sql, rows=[{"host": "db-1.example", "port": 3306}]),
+                    timeout,
+                    _success(
+                        index_sql,
+                        rows=[
+                            {
+                                "index_name": "idx_hostname_ts_min",
+                                "seq_in_index": 1,
+                                "column_name": "hostname_max",
+                            },
+                            {
+                                "index_name": "idx_hostname_ts_min",
+                                "seq_in_index": 2,
+                                "column_name": "ts_min",
+                            },
+                        ],
+                    ),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "ts_min": "2026-07-23 15:59:00",
+                                "sql_text": "SELECT recovered",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(
+        model,
+        connector,
+        max_agent_steps=6,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == FINAL_SQL
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 5
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_tool_call_count"] == 5
+    trace = result.diagnostics["query_trace"]
+    assert len(trace) == 7
+    assert trace[2]["outcome"] == "host_rejected"
+    assert "sql_instance 已完成" in trace[2]["continuation_reason"]
+    assert trace[3]["outcome"] == "host_rejected"
+    assert "只能按真实ts_min字段排序" in trace[3]["continuation_reason"]
+    assert trace[4]["outcome"] == "tool_error"
+    assert "maximum statement execution time exceeded" in trace[4]["error_detail"]
+    assert "Host最终取证保留区" in str(model.requests[2]["messages"])
+    timeout_feedback = str(model.requests[5]["messages"])
+    assert "实时证据暂缺" in timeout_feedback
+    assert "不能作为任何根因假设的反证" in timeout_feedback
+    assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
+
+
+@pytest.mark.asyncio
 async def test_shared_harness_persists_and_resumes_completed_run_without_reconnect(
     tmp_path: Path,
 ) -> None:
