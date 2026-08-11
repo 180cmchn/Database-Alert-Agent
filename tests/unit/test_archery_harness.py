@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +13,7 @@ import pytest
 from sqlalchemy import select
 
 import app.adapters.archery_harness as archery_harness_module
+from app.adapters.ai import OpenAICompatibleAdvisor
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_harness import (
     ARCHERY_HARNESS_PROVIDER,
@@ -288,6 +291,73 @@ async def test_shared_harness_repairs_a_model_response_without_a_tool_call() -> 
     assert len(model.requests) == 2
     assert "Return exactly one valid Agent action" in str(model.requests[1]["messages"])
     assert connector.opened_session_ids == ["archery-1"]
+
+
+@pytest.mark.asyncio
+async def test_shared_archery_harness_executes_text_agent_action_history_query() -> None:
+    action = {
+        "action": "call_tool",
+        "tool_name": ARCHERY_MCP_QUERY_TOOL_NAME,
+        "objective": "Collect read-only Archery evidence for the fixed alert window",
+        "hypothesis_ids": ["slow_query_evidence"],
+        "arguments": {**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
+    }
+
+    class TextActionCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="archery-text-action-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content=json.dumps(action),
+                            tool_calls=[],
+                        ),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=TextActionCompletions())
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-text-action",
+                tools=_tools(),
+                calls=[
+                    _login(),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sql_text": "SELECT from text action",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(advisor, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == FINAL_SQL
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
+    assert result.model_request_ids == ("archery-text-action-request",)
+    assert connector.opened_session_ids == ["archery-text-action"]
 
 
 @pytest.mark.asyncio

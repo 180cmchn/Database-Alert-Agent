@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 import ssl
+from hashlib import sha256
 from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from app.agent_runtime.contracts import ToolSpec
+from app.agent_runtime.contracts import CallToolAction, ToolSpec, parse_agent_action
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.alert_preprocessing import (
     preprocess_alert_data,
@@ -103,6 +104,43 @@ def _mcp_response_diagnostic(choice: Any, message: Any) -> str:
     )
     details.append(f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0}")
     return ", ".join(details)
+
+
+def _mcp_call_from_agent_action_content(
+    content: Any,
+    *,
+    tool_names: set[str],
+    request_id: Any,
+) -> MCPModelToolCall | None:
+    """Accept one complete Harness call_tool action when a provider omits tool_calls."""
+
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        payload = json.loads(content)
+        action = parse_agent_action(payload)
+    except (json.JSONDecodeError, ValidationError):
+        return None
+    if not isinstance(action, CallToolAction):
+        return None
+    if action.tool_name not in tool_names:
+        raise AdvisorError(
+            "AI provider selected an unavailable MCP tool "
+            f"{action.tool_name!r} (request_id={request_id})"
+        )
+    canonical_action = json.dumps(
+        action.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    call_key = f"{request_id if isinstance(request_id, str) else ''}\0{canonical_action}"
+    return MCPModelToolCall(
+        call_id=f"agent-action-{sha256(call_key.encode('utf-8')).hexdigest()[:24]}",
+        name=action.tool_name,
+        arguments=action.arguments,
+        request_id=request_id if isinstance(request_id, str) else None,
+    )
 
 
 def _system_trust_http_client(timeout_seconds: float) -> httpx.AsyncClient:
@@ -739,6 +777,14 @@ class OpenAICompatibleAdvisor:
             raise AdvisorError(f"AI provider returned no MCP tool choice (request_id={request_id})")
         message = response.choices[0].message
         tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            content_call = _mcp_call_from_agent_action_content(
+                getattr(message, "content", None),
+                tool_names=tool_names,
+                request_id=request_id,
+            )
+            if content_call is not None:
+                return content_call
         if len(tool_calls) != 1:
             raise AdvisorError(
                 "AI provider must return exactly one MCP tool call "

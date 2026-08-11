@@ -771,6 +771,228 @@ async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_advisor_accepts_one_harness_call_tool_action_from_text_content() -> None:
+    action = {
+        "action": "call_tool",
+        "tool_name": "sql_query_gymJPA",
+        "objective": "Collect read-only Archery evidence for the fixed alert window",
+        "hypothesis_ids": ["slow_query_evidence"],
+        "arguments": {
+            "db_name": "archery",
+            "instance_id": 17,
+            "limit_num": 10,
+            "sql_content": (
+                "SELECT id, instance_name, host, port FROM sql_instance "
+                "WHERE id = 3 LIMIT 10"
+            ),
+        },
+    }
+
+    class TextActionCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="text-action-request-1",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content=json.dumps(action),
+                            tool_calls=[],
+                        ),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=TextActionCompletions())
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "sql_query_gymJPA",
+            "parameters": {"type": "object"},
+        },
+    }
+
+    first = await advisor.request_mcp_tool_call(messages=[], tools=[tool])
+    second = await advisor.request_mcp_tool_call(messages=[], tools=[tool])
+
+    assert first.name == "sql_query_gymJPA"
+    assert first.arguments == action["arguments"]
+    assert first.request_id == "text-action-request-1"
+    assert first.call_id.startswith("agent-action-")
+    assert second.call_id == first.call_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps(
+            {
+                "action": "finish",
+                "reason": "COMPLETED",
+                "summary": "No more evidence is required.",
+            }
+        ),
+        json.dumps(
+            {
+                "action": "call_tool",
+                "tool_name": "monitoring_query",
+                "objective": "Collect evidence",
+                "hypothesis_ids": [],
+                "arguments": [],
+            }
+        ),
+        'result: {"action":"call_tool"}',
+    ],
+)
+async def test_advisor_rejects_non_call_tool_text_actions(content: str) -> None:
+    class InvalidTextActionCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="invalid-text-action-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=content, tool_calls=[]),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=InvalidTextActionCompletions())
+    )
+
+    with pytest.raises(AdvisorError, match="exactly one MCP tool call"):
+        await advisor.request_mcp_tool_call(
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "monitoring_query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_advisor_rejects_unavailable_tool_in_text_action() -> None:
+    content = json.dumps(
+        {
+            "action": "call_tool",
+            "tool_name": "write_database",
+            "objective": "Change the database",
+            "hypothesis_ids": [],
+            "arguments": {},
+        }
+    )
+
+    class UnknownToolCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="unknown-text-tool-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=content, tool_calls=[]),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=UnknownToolCompletions())
+    )
+
+    with pytest.raises(AdvisorError, match="selected an unavailable MCP tool"):
+        await advisor.request_mcp_tool_call(
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "monitoring_query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_advisor_does_not_use_text_fallback_for_multiple_native_tool_calls() -> None:
+    content = json.dumps(
+        {
+            "action": "call_tool",
+            "tool_name": "monitoring_query",
+            "objective": "Collect evidence",
+            "hypothesis_ids": [],
+            "arguments": {},
+        }
+    )
+    raw_call = SimpleNamespace(
+        id="native-call",
+        function=SimpleNamespace(name="monitoring_query", arguments="{}"),
+    )
+
+    class MultipleToolCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="multiple-tool-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="tool_calls",
+                        message=SimpleNamespace(
+                            content=content,
+                            tool_calls=[raw_call, raw_call],
+                        ),
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=MultipleToolCompletions())
+    )
+
+    with pytest.raises(AdvisorError, match="count=2"):
+        await advisor.request_mcp_tool_call(
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "monitoring_query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
 async def test_advisor_mcp_tool_error_exposes_safe_upstream_diagnostics() -> None:
     secret = "provider-secret-that-must-not-appear"
 
