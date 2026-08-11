@@ -19,8 +19,8 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
     ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-    ARCHERY_SLOW_LOG_PROMPT_VERSION,
     ARCHERY_SLOW_LOG_TABLE,
     ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD,
     ARCHERY_SLOW_LOG_TOOL_NAME,
@@ -38,6 +38,7 @@ from app.adapters.investigation import (
     AlertContextTool,
     DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
+    ToolExecutor,
 )
 from app.application.factory import apply_runtime_settings, build_runtime
 from app.config import Settings
@@ -1334,6 +1335,9 @@ async def test_archery_mcp_parses_wrapped_json_array_as_slow_log_rows() -> None:
     summary, structured_data = outcome
     assert "返回 18 行" in summary
     assert structured_data["root_cause_eligible"] is True
+    assert structured_data["reported_row_count"] == 18
+    assert structured_data["included_row_count"] == 18
+    assert structured_data["rows"][0]["sample"] == "select 0"
 
 
 @pytest.mark.asyncio
@@ -1435,6 +1439,39 @@ class RecordingArcheryClient:
         )
 
 
+def _large_slow_query_row(index: int, *, sample_chars: int = 900) -> dict[str, Any]:
+    return {
+        "id": 1000 + index,
+        "hostname_max": "db-history:3306",
+        "client_max": f"10.0.0.{index + 1}",
+        "user_max": "app_user",
+        "db_max": "orders",
+        "checksum": f"{index:032x}",
+        "sample": (
+            f"SELECT * FROM orders WHERE shard_id = {index} /*"
+            + ("x" * sample_chars)
+            + "*/"
+        ),
+        "ts_min": "2026-07-23T15:55:00.000000",
+        "ts_max": "2026-07-23T16:00:00.000000",
+        "ts_cnt": float(index + 1),
+        "Query_time_sum": 120.5 + index,
+        "Query_time_max": 18.25 + index,
+        "Lock_time_max": 0.25 + index,
+        "Rows_sent_sum": 10 + index,
+        "Rows_examined_sum": 1_000_000 + index,
+        "Merge_passes_sum": index,
+        "InnoDB_IO_r_wait_max": 0.75 + index,
+        "QC_Hit_sum": 0,
+        "Full_scan_sum": 1,
+        "Full_join_sum": 0,
+        "Tmp_table_on_disk_sum": 1,
+        "Filesort_on_disk_sum": 1,
+        "Bytes_sum": 4096 + index,
+        "unrelated_text": "must not enter semantic evidence",
+    }
+
+
 def test_archery_outer_tool_declares_strict_empty_input_schema() -> None:
     assert ArcherySlowLogEvidenceTool.input_schema == {
         "type": "object",
@@ -1532,35 +1569,30 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert f"慢日志表 {ARCHERY_SLOW_LOG_TABLE}" in summary
     assert "实际执行 SQL 已由 Archery 回显并与模型提交一致" in summary
     assert "可能被截断" not in summary
-    assert data["sql"] == TEST_SLOW_LOG_QUERY
-    assert data["executed_sql"] == TEST_SLOW_LOG_QUERY
-    assert data["login_confirmed"] is True
-    assert data["login_tool"] == ARCHERY_MCP_LOGIN_TOOL_NAME
-    assert data["mcp_invocation"] == "shared_agent_harness"
+    assert data["schema_version"] == ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION
+    assert data["query_completed"] is True
     assert data["allow_followup_dispatch"] is False
-    assert data["prompt_version"] == ARCHERY_SLOW_LOG_PROMPT_VERSION
     assert data["actual_sql_verified"] is True
     assert data["target"] == {
-        "selection_basis": "alert_context_and_mcp_discovery",
         "instance_id": TEST_INSTANCE_ID,
         "db_name": TEST_DB_NAME,
         "table_name": ARCHERY_SLOW_LOG_TABLE,
-        "alert_context": client.alert_context,
     }
     assert data["query_window"] == {
-        "basis": "alert.occurred_at",
-        "alert_occurred_at": TEST_ALERT_OCCURRED_AT.isoformat(),
         "start": TEST_WINDOW_START.isoformat(),
         "end": TEST_WINDOW_END.isoformat(),
         "duration_seconds": 300,
         "time_column": TEST_TIME_COLUMN,
     }
-    assert data["scope"] == "alert_target_slow_log_snapshot"
-    assert data["result_bounds"]["truncation_possible"] is False
+    assert data["reported_row_count"] == 0
+    assert data["included_row_count"] == 0
+    assert data["omitted_row_count"] == 0
+    assert data["rows"] == []
+    assert "result" not in data
+    assert "diagnostics" not in data
     assert data["root_cause_eligible"] is False
     assert "实际执行 SQL 未核对" not in data["root_cause_ineligible_reason"]
     assert "可能截断" not in data["root_cause_ineligible_reason"]
-    assert data["result"]["rows"] == []
 
     with pytest.raises(ArcheryMCPReadOnlyViolation):
         await tool.execute(
@@ -1611,6 +1643,134 @@ async def test_archery_evidence_with_logs_is_usable_without_endpoint_comparison(
     assert "analysis_usable" not in data
     assert data["root_cause_eligible"] is True
     assert data["root_cause_ineligible_reason"] == ""
+    assert data["rows"] == [
+        {
+            "hostname_max": "100.84.97.20:3311",
+            "sample": "select 1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_archery_semantic_summary_avoids_outer_executor_blind_truncation() -> None:
+    max_result_chars = 12_000
+    rows = [_large_slow_query_row(index) for index in range(18)]
+    tool = ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(
+            payload={
+                "status": "ok",
+                "rows": rows,
+                "rowCount": len(rows),
+                "opaque_diagnostics": "z" * 50_000,
+            }
+        ),
+        max_evidence_chars=max_result_chars,
+    )
+    executor = ToolExecutor(
+        InvestigationToolRegistry([tool]),
+        max_result_chars=max_result_chars,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-history:3306",
+        ),
+    )
+
+    serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
+    parsed = json.loads(serialized)
+    assert record.status == ToolStatus.SUCCESS
+    assert record.truncated is False
+    assert len(serialized) < max_result_chars
+    assert parsed["root_cause_eligible"] is True
+    assert parsed["reported_row_count"] == 18
+    assert 0 < parsed["included_row_count"] < 18
+    assert parsed["omitted_row_count"] == 18 - parsed["included_row_count"]
+    assert parsed["semantic_compression"]["sample_truncated_count"] == 0
+    first = parsed["rows"][0]
+    assert first["hostname_max"] == "db-history:3306"
+    assert first["client_max"] == "10.0.0.1"
+    assert first["user_max"] == "app_user"
+    assert first["db_max"] == "orders"
+    assert first["checksum"] == "00000000000000000000000000000000"
+    assert first["sample"] == rows[0]["sample"]
+    assert first["Query_time_max"] == 18.25
+    assert first["Rows_examined_sum"] == 1_000_000
+    assert first["InnoDB_IO_r_wait_max"] == 0.75
+    assert "id" not in first
+    assert "unrelated_text" not in first
+    assert "opaque_diagnostics" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_archery_semantic_summary_removes_only_complete_tail_rows() -> None:
+    max_result_chars = 2_200
+    rows = [_large_slow_query_row(index, sample_chars=700) for index in range(3)]
+    tool = ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload={"rows": rows, "rowCount": len(rows)}),
+        max_evidence_chars=max_result_chars,
+    )
+    executor = ToolExecutor(
+        InvestigationToolRegistry([tool]),
+        max_result_chars=max_result_chars,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-history:3306",
+        ),
+    )
+
+    serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
+    assert record.truncated is False
+    assert len(serialized) < max_result_chars
+    assert record.structured_data["included_row_count"] == 1
+    assert record.structured_data["omitted_row_count"] == 2
+    assert record.structured_data["rows"][0]["sample"] == rows[0]["sample"]
+    assert "sample_truncated" not in record.structured_data["rows"][0]
+    assert json.loads(serialized)["rows"] == record.structured_data["rows"]
+
+
+@pytest.mark.asyncio
+async def test_archery_semantic_summary_bounds_one_oversized_sql_statement() -> None:
+    max_result_chars = 1_000
+    row = _large_slow_query_row(0, sample_chars=20_000)
+    tool = ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload={"rows": [row], "rowCount": 1}),
+        max_evidence_chars=max_result_chars,
+    )
+    executor = ToolExecutor(
+        InvestigationToolRegistry([tool]),
+        max_result_chars=max_result_chars,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-history:3306",
+        ),
+    )
+
+    serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
+    summarized_row = record.structured_data["rows"][0]
+    assert record.status == ToolStatus.SUCCESS
+    assert record.truncated is False
+    assert len(serialized) < max_result_chars
+    assert record.structured_data["included_row_count"] == 1
+    assert record.structured_data["omitted_row_count"] == 0
+    assert record.structured_data["root_cause_eligible"] is True
+    assert summarized_row["sample_truncated"] is True
+    assert summarized_row["sample_original_char_count"] == len(row["sample"])
+    assert summarized_row["sample"]
+    assert row["sample"].startswith(summarized_row["sample"])
+    assert len(summarized_row["sample"]) < len(row["sample"])
+    assert record.structured_data["semantic_compression"]["sample_truncated_count"] == 1
+    assert json.loads(serialized)["rows"][0]["checksum"] == row["checksum"]
 
 
 @pytest.mark.asyncio
@@ -1698,7 +1858,10 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
 @pytest.mark.asyncio
 async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path) -> None:
     settings = _settings(tmp_path, real_model=True).model_copy(
-        update={"archery_mcp_max_agent_steps": 18}
+        update={
+            "archery_mcp_max_agent_steps": 18,
+            "tool_max_result_chars": 4321,
+        }
     )
     runtime = build_runtime(settings)
 
@@ -1709,14 +1872,21 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
     assert tool.client.db_name == ""
     assert tool.client.window_seconds == 300
     assert tool.client.max_agent_steps == 18
+    assert tool.max_evidence_chars == 4321
 
     apply_runtime_settings(
         runtime,
-        settings.model_copy(update={"archery_mcp_max_agent_steps": 24}),
+        settings.model_copy(
+            update={
+                "archery_mcp_max_agent_steps": 24,
+                "tool_max_result_chars": 5432,
+            }
+        ),
     )
     updated_tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
     assert isinstance(updated_tool, ArcherySlowLogEvidenceTool)
     assert updated_tool.client.max_agent_steps == 24
+    assert updated_tool.max_evidence_chars == 5432
 
     apply_runtime_settings(
         runtime,
@@ -1774,12 +1944,14 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     assert evidence.status == ToolStatus.NO_DATA
     assert evidence.source_system == "archery_mcp"
     assert evidence.request == {}
-    assert evidence.structured_data["result"]["affected_rows"] == 0
-    assert evidence.structured_data["login_confirmed"] is True
-    assert evidence.structured_data["sql"] == TEST_SLOW_LOG_QUERY
+    assert evidence.structured_data["reported_row_count"] == 0
+    assert evidence.structured_data["included_row_count"] == 0
+    assert evidence.structured_data["rows"] == []
     assert evidence.structured_data["actual_sql_verified"] is True
     assert evidence.structured_data["target"]["instance_id"] == TEST_INSTANCE_ID
-    assert evidence.structured_data["query_window"]["basis"] == "alert.occurred_at"
+    assert evidence.structured_data["query_window"]["start"] == (
+        TEST_WINDOW_START.isoformat()
+    )
     assert evidence.structured_data["root_cause_eligible"] is False
     assert result.recommendation is not None
     assert result.recommendation.root_causes[0].status.value == "UNKNOWN"

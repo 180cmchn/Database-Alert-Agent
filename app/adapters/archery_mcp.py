@@ -7,6 +7,7 @@ belong exclusively to :mod:`app.adapters.archery_harness`.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 # character limit can still truncate non-empty evidence.
 ARCHERY_SLOW_LOG_LIMIT: Final = 20
 ARCHERY_SLOW_LOG_MAX_RESULT_CHARS: Final = 24_000
+ARCHERY_SLOW_LOG_EVIDENCE_MAX_CHARS: Final = 12_000
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # Backward-compatible constant: this is the default; deployments may override it.
 ARCHERY_MCP_MAX_AGENT_STEPS: Final = 12
@@ -57,6 +59,32 @@ ARCHERY_MCP_MAX_MODEL_RESULT_CHARS: Final = 24_000
 SLOW_QUERY_TITLE_IDENTIFIER: Final = "slow_query"
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
 ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v24"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v1"
+
+_SLOW_QUERY_IDENTITY_FIELDS: Final = (
+    "hostname_max",
+    "client_max",
+    "user_max",
+    "db_max",
+    "checksum",
+    "sample",
+    "ts_min",
+    "ts_max",
+)
+_SLOW_QUERY_NUMERIC_FIELDS: Final = {"ts_cnt"}
+_SLOW_QUERY_NUMERIC_PREFIXES: Final = (
+    "query_time_",
+    "lock_time_",
+    "rows_",
+    "merge_passes_",
+    "innodb_",
+    "qc_hit_",
+    "full_scan_",
+    "full_join_",
+    "tmp_table_",
+    "filesort_",
+    "bytes_",
+)
 
 _TOOL_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -2086,8 +2114,16 @@ class ArcherySlowLogEvidenceTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, client: ArcheryMCPClient) -> None:
+    def __init__(
+        self,
+        client: ArcheryMCPClient,
+        *,
+        max_evidence_chars: int = ARCHERY_SLOW_LOG_EVIDENCE_MAX_CHARS,
+    ) -> None:
+        if type(max_evidence_chars) is not int or max_evidence_chars < 1000:
+            raise ValueError("Archery evidence character limit must be at least 1000")
         self.client = client
+        self.max_evidence_chars = max_evidence_chars
         # The second outer attempt resumes the same durable child checkpoint.
         self.max_attempts = 2
 
@@ -2130,6 +2166,11 @@ class ArcherySlowLogEvidenceTool:
         if not result.query_completed:
             reason = str(diagnostics.get("reason") or "慢查询证据不足")
             next_stage = str(diagnostics.get("next_stage") or "等待补充可用证据")
+            structured_data = self._build_slow_query_evidence(
+                result,
+                session_attempts=session_attempts,
+                root_cause_ineligible_reason="未执行最终慢查询 SQL；当前证据不足",
+            )
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
                 summary=(
@@ -2137,48 +2178,11 @@ class ArcherySlowLogEvidenceTool:
                     f"下一阶段：{next_stage}。"
                     "已保留只读 MCP 调用轨迹，告警分析可继续但当前结论不充分。"
                 ),
-                structured_data={
-                    "query_completed": False,
-                    "sql": result.requested_sql or None,
-                    "executed_sql": None,
-                    "actual_sql_verified": False,
-                    "login_confirmed": True,
-                    "login_tool": self.client.login_tool_name,
-                    "mcp_tool": self.client.query_tool_name,
-                    "mcp_invocation": "shared_agent_harness",
-                    "allow_followup_dispatch": False,
-                    "mcp_session_attempts": session_attempts,
-                    "reconnect_error_type": diagnostics.get("reconnect_error_type"),
-                    "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
-                    "model_tool_calls": list(result.model_tool_calls),
-                    "model_request_ids": list(result.model_request_ids),
-                    "metadata_resolution_tables": list(result.metadata_resolution_tables),
-                    "diagnostics": diagnostics,
-                    "target": {
-                        "selection_basis": "alert_context_and_mcp_discovery",
-                        "instance_id": result.instance_id,
-                        "db_name": result.db_name,
-                        "table_name": None,
-                        "alert_context": alert_target_context,
-                    },
-                    "query_window": {
-                        "basis": "alert.occurred_at",
-                        "alert_occurred_at": context.alert.occurred_at.isoformat(),
-                        "start": result.window_start.isoformat(),
-                        "end": result.window_end.isoformat(),
-                        "duration_seconds": self.client.window_seconds,
-                        "time_column": None,
-                    },
-                    "scope": "alert_target_slow_log_incomplete",
-                    "root_cause_eligible": False,
-                    "root_cause_ineligible_reason": (
-                        "未执行最终慢查询 SQL；当前证据不足"
-                    ),
-                    "result": result.payload,
-                },
+                structured_data=structured_data,
             )
-        row_count = self._row_count(result.payload)
-        has_log_content = self._has_parsed_log_rows(result.payload)
+        parsed_rows = ArcheryMCPClient._tabular_rows(result.payload)
+        row_count = self._reported_row_count(result.payload)
+        has_log_content = any(self._semantic_slow_query_row(row) for row in parsed_rows)
         if has_log_content and row_count is not None:
             row_summary = f"返回 {row_count} 行"
         elif row_count is not None and row_count > 0:
@@ -2197,14 +2201,6 @@ class ArcherySlowLogEvidenceTool:
             if result.actual_sql_verified
             else "Archery 未返回可与模型提交内容核对的实际执行 SQL"
         )
-        truncation_possible = row_count is None or row_count > 0
-        limitations: list[str] = []
-        if not result.actual_sql_verified:
-            limitations.append("实际执行 SQL 未核对")
-        if result.instance_id is None or not result.db_name or not result.table_name:
-            limitations.append("未获得完整的 MCP 目标标识")
-        if truncation_possible:
-            limitations.append("结果受字符上限约束并可能截断")
         evidence_summary = (
             "慢查询日志已作为本次告警窗口的实时证据进入分析"
             if has_log_content
@@ -2216,62 +2212,25 @@ class ArcherySlowLogEvidenceTool:
             f"{evidence_summary}。"
             "具体根因仍须结合日志内容和其他实时信号判断。"
         )
-        structured_data = {
-            "sql": result.requested_sql,
-            "query_completed": True,
-            "executed_sql": result.executed_sql,
-            "actual_sql_verified": result.actual_sql_verified,
-            "login_confirmed": True,
-            "login_tool": self.client.login_tool_name,
-            "mcp_tool": self.client.query_tool_name,
-            "mcp_invocation": "shared_agent_harness",
-            "allow_followup_dispatch": False,
-            "mcp_session_attempts": session_attempts,
-            "reconnect_error_type": diagnostics.get("reconnect_error_type"),
-            "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
-            "model_tool_calls": list(result.model_tool_calls),
-            "model_request_ids": list(result.model_request_ids),
-            "metadata_resolution_tables": list(result.metadata_resolution_tables),
-            "diagnostics": result.diagnostics or {},
-            "target": {
-                "selection_basis": "alert_context_and_mcp_discovery",
-                "instance_id": result.instance_id,
-                "db_name": result.db_name,
-                "table_name": result.table_name,
-                "alert_context": alert_target_context,
-            },
-            "query_window": {
-                "basis": "alert.occurred_at",
-                "alert_occurred_at": context.alert.occurred_at.isoformat(),
-                "start": result.window_start.isoformat(),
-                "end": result.window_end.isoformat(),
-                "duration_seconds": self.client.window_seconds,
-                "time_column": result.query_time_column,
-            },
-            "scope": "alert_target_slow_log_snapshot",
-            "result_bounds": {
-                "row_limit": ARCHERY_SLOW_LOG_LIMIT,
-                "character_limit": ARCHERY_SLOW_LOG_MAX_RESULT_CHARS,
-                "truncation_possible": truncation_possible,
-            },
-            "evidence_limitations": limitations,
-            "root_cause_eligible": has_log_content,
-            "root_cause_ineligible_reason": (
-                ""
-                if has_log_content
+        ineligible_reason = (
+            ""
+            if has_log_content
+            else (
+                "慢查询结果为空，未返回可分析的日志内容"
+                if row_count == 0
                 else (
-                    "慢查询结果为空，未返回可分析的日志内容"
-                    if row_count == 0
-                    else (
-                        "MCP仅报告存在慢查询记录，但未返回可解析的日志行，"
-                        "不得作为根因支持证据"
-                        if row_count is not None and row_count > 0
-                        else "无法解析慢查询返回行数，不得作为根因支持证据"
-                    )
+                    "MCP仅报告存在慢查询记录，但未返回可解析的日志行，不得作为根因支持证据"
+                    if row_count is not None and row_count > 0
+                    else "无法解析慢查询返回行数，不得作为根因支持证据"
                 )
-            ),
-            "result": result.payload,
-        }
+            )
+        )
+        structured_data = self._build_slow_query_evidence(
+            result,
+            session_attempts=session_attempts,
+            parsed_rows=parsed_rows,
+            root_cause_ineligible_reason=ineligible_reason,
+        )
         if not has_log_content:
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
@@ -2279,6 +2238,218 @@ class ArcherySlowLogEvidenceTool:
                 structured_data=structured_data,
             )
         return summary, structured_data
+
+    def _build_slow_query_evidence(
+        self,
+        result: ArcherySlowLogQueryResult,
+        *,
+        session_attempts: int,
+        root_cause_ineligible_reason: str,
+        parsed_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return complete semantic evidence that fits the outer executor budget."""
+
+        source_rows = parsed_rows or []
+        semantic_rows = [self._semantic_slow_query_row(row) for row in source_rows]
+        semantic_rows = [row for row in semantic_rows if row]
+        reported_row_count = self._reported_row_count(result.payload)
+        total_row_count = max(reported_row_count or 0, len(source_rows))
+        structured_data: dict[str, Any] = {
+            "schema_version": ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
+            "query_completed": result.query_completed,
+            "actual_sql_verified": result.actual_sql_verified,
+            "allow_followup_dispatch": False,
+            "mcp_session_attempts": session_attempts,
+            "target": {
+                "instance_id": result.instance_id,
+                "db_name": self._bounded_scalar(result.db_name),
+                "table_name": self._bounded_scalar(result.table_name),
+            },
+            "query_window": {
+                "start": result.window_start.isoformat(),
+                "end": result.window_end.isoformat(),
+                "duration_seconds": self.client.window_seconds,
+                "time_column": self._bounded_scalar(result.query_time_column),
+            },
+            "reported_row_count": reported_row_count,
+            "parsed_row_count": len(source_rows),
+            "included_row_count": len(semantic_rows),
+            "omitted_row_count": max(total_row_count - len(semantic_rows), 0),
+            "rows": semantic_rows,
+            "semantic_compression": {
+                "max_result_chars": self.max_evidence_chars,
+                "sample_truncated_count": 0,
+                "omitted_numeric_field_count": 0,
+            },
+            "root_cause_eligible": bool(semantic_rows),
+            "root_cause_ineligible_reason": root_cause_ineligible_reason,
+        }
+        return self._fit_slow_query_evidence(structured_data, total_row_count)
+
+    def _fit_slow_query_evidence(
+        self,
+        structured_data: dict[str, Any],
+        total_row_count: int,
+    ) -> dict[str, Any]:
+        rows = structured_data["rows"]
+        while len(rows) > 1 and not self._evidence_fits(structured_data):
+            rows.pop()
+            self._update_compression_counts(structured_data, total_row_count)
+
+        if not self._evidence_fits(structured_data) and rows:
+            self._drop_optional_evidence_metadata(structured_data)
+            if not self._evidence_fits(structured_data):
+                self._truncate_sample_to_fit(structured_data)
+        elif not self._evidence_fits(structured_data):
+            self._drop_optional_evidence_metadata(structured_data)
+
+        if not self._evidence_fits(structured_data):
+            structured_data.pop("target", None)
+
+        if not self._evidence_fits(structured_data) and rows:
+            self._drop_numeric_metrics_to_fit(structured_data)
+
+        self._update_compression_counts(structured_data, total_row_count)
+        safe_data = sanitize(structured_data)
+        if self._serialized_chars(safe_data) >= self.max_evidence_chars:
+            raise ArcheryMCPProtocolError(
+                "Archery semantic evidence could not fit the configured character limit"
+            )
+        return safe_data
+
+    def _truncate_sample_to_fit(self, structured_data: dict[str, Any]) -> None:
+        row = structured_data["rows"][0]
+        sample = row.get("sample")
+        if not isinstance(sample, str):
+            return
+        original_char_count = len(sample)
+        row["sample_truncated"] = True
+        row["sample_original_char_count"] = original_char_count
+        compression = structured_data["semantic_compression"]
+        compression["sample_truncated_count"] = 1
+
+        row["sample"] = ""
+        if not self._evidence_fits(structured_data):
+            structured_data.pop("target", None)
+        if not self._evidence_fits(structured_data):
+            self._drop_numeric_metrics_to_fit(structured_data)
+
+        lower = 0
+        upper = original_char_count
+        best = -1
+        while lower <= upper:
+            midpoint = (lower + upper) // 2
+            row["sample"] = sample[:midpoint]
+            if self._evidence_fits(structured_data):
+                best = midpoint
+                lower = midpoint + 1
+            else:
+                upper = midpoint - 1
+        row["sample"] = sample[: max(best, 0)]
+
+    def _drop_numeric_metrics_to_fit(
+        self,
+        structured_data: dict[str, Any],
+    ) -> None:
+        row = structured_data["rows"][0]
+        metric_keys = [key for key in row if self._is_numeric_metric_field(key)]
+        for key in reversed(metric_keys):
+            row.pop(key)
+            structured_data["semantic_compression"]["omitted_numeric_field_count"] += 1
+            if self._evidence_fits(structured_data):
+                return
+
+    def _drop_optional_evidence_metadata(
+        self,
+        structured_data: dict[str, Any],
+    ) -> None:
+        optional_fields = (
+            (structured_data["query_window"], "duration_seconds"),
+            (structured_data["query_window"], "time_column"),
+            (structured_data, "parsed_row_count"),
+            (structured_data["target"], "db_name"),
+            (structured_data["target"], "table_name"),
+            (structured_data, "actual_sql_verified"),
+            (structured_data, "mcp_session_attempts"),
+        )
+        for container, key in optional_fields:
+            container.pop(key, None)
+            if self._evidence_fits(structured_data):
+                return
+
+    def _update_compression_counts(
+        self,
+        structured_data: dict[str, Any],
+        total_row_count: int,
+    ) -> None:
+        included = len(structured_data["rows"])
+        structured_data["included_row_count"] = included
+        structured_data["omitted_row_count"] = max(total_row_count - included, 0)
+        structured_data["root_cause_eligible"] = included > 0
+        if included == 0 and not structured_data["root_cause_ineligible_reason"]:
+            structured_data["root_cause_ineligible_reason"] = (
+                "语义压缩预算内未保留可分析的慢查询日志"
+            )
+
+    def _evidence_fits(self, structured_data: Mapping[str, Any]) -> bool:
+        return self._serialized_chars(sanitize(dict(structured_data))) < self.max_evidence_chars
+
+    @staticmethod
+    def _serialized_chars(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+
+    @classmethod
+    def _semantic_slow_query_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        casefolded = {str(key).casefold(): value for key, value in row.items()}
+        semantic: dict[str, Any] = {}
+        for field in _SLOW_QUERY_IDENTITY_FIELDS:
+            if field in casefolded:
+                limit = None if field == "sample" else 64
+                semantic[field] = cls._bounded_scalar(
+                    casefolded[field],
+                    max_chars=limit,
+                )
+        for key, value in row.items():
+            field = str(key)
+            if field.casefold() in _SLOW_QUERY_IDENTITY_FIELDS:
+                continue
+            if cls._is_numeric_metric_field(field) and value is not None:
+                semantic[field] = cls._bounded_scalar(value)
+        return semantic
+
+    @staticmethod
+    def _is_numeric_metric_field(field: str) -> bool:
+        normalized = field.casefold()
+        return normalized in _SLOW_QUERY_NUMERIC_FIELDS or normalized.startswith(
+            _SLOW_QUERY_NUMERIC_PREFIXES
+        )
+
+    @staticmethod
+    def _bounded_scalar(value: Any, *, max_chars: int | None = 512) -> Any:
+        safe_value = sanitize(value)
+        if safe_value is None or isinstance(safe_value, (bool, int)):
+            return safe_value
+        if isinstance(safe_value, float):
+            return safe_value if math.isfinite(safe_value) else str(safe_value)
+        text = safe_value if isinstance(safe_value, str) else str(safe_value)
+        return text if max_chars is None else text[:max_chars]
+
+    @staticmethod
+    def _reported_row_count(result: Mapping[str, Any]) -> int | None:
+        for key in (
+            "mcp_reported_row_count",
+            "rowCount",
+            "row_count",
+            "total",
+            "affected_rows",
+        ):
+            value = result.get(key)
+            if type(value) is int and value >= 0:
+                return value
+        data = result.get("data")
+        if isinstance(data, Mapping):
+            return ArcherySlowLogEvidenceTool._reported_row_count(data)
+        return ArcherySlowLogEvidenceTool._row_count(result)
 
     @staticmethod
     def _alert_target_context(alert: NormalizedAlert) -> dict[str, Any]:

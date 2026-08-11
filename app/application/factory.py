@@ -177,7 +177,8 @@ def _build_archery_mcp_tool(
                 if repository is not None
                 else None
             ),
-        )
+        ),
+        max_evidence_chars=settings.tool_max_result_chars,
     )
 
 
