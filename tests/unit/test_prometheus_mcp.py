@@ -10,7 +10,11 @@ import pytest
 
 import app.adapters.prometheus_harness as prometheus_harness_module
 import app.application.factory as factory_module
-from app.adapters.investigation import DefaultInvestigationStrategyProvider
+from app.adapters.investigation import (
+    DefaultInvestigationStrategyProvider,
+    InvestigationToolRegistry,
+    ToolExecutor,
+)
 from app.adapters.prometheus_mcp import (
     PROMETHEUS_METRICS_TOOL_NAME,
     PrometheusMCPClient,
@@ -94,6 +98,28 @@ def _mysql_context() -> InvestigationContext:
                         engine="mysql",
                         instance="mysql-17:3306",
                         host="mysql-17",
+                    ),
+                }
+            )
+        }
+    )
+
+
+def _mysql_slow_context() -> InvestigationContext:
+    context = _mysql_context()
+    return context.model_copy(
+        update={
+            "alert": context.alert.model_copy(
+                update={
+                    "title": "mysql_slow_query_300",
+                    "reason": "database_latency",
+                    "alert_type": "mysql_slow_query_300",
+                    "metric_name": "mysql_slow_query_300",
+                    "cluster": "mysql-prod-pcm",
+                    "database": DatabaseTarget(
+                        engine="mysql",
+                        instance="100.84.97.117:3306",
+                        host="100.84.97.117",
                     ),
                 }
             )
@@ -574,6 +600,45 @@ def test_prometheus_policy_reserves_range_budget_and_hides_finish_without_data()
     ]
 
 
+def test_prometheus_catalog_relevance_requires_alert_signal_semantics() -> None:
+    alert = _mysql_slow_context().alert
+    unrelated = [
+        {
+            "capability": "catalog",
+            "result": {
+                "metrics": [
+                    "mysql_output_process_metrics_count",
+                    "mysql_output_write_sql_count",
+                    "mysql_sls_output_discard_count",
+                ]
+            },
+        }
+    ]
+    relevant = [
+        {
+            "capability": "catalog",
+            "result": {"metrics": {"mysql_global_status_slow_queries": {"type": "counter"}}},
+        }
+    ]
+    incomplete = [
+        {
+            "capability": "catalog",
+            "result": {
+                "metrics": ["mysql_output_write_sql_count"],
+                "total_count": 20,
+                "returned_count": 10,
+                "offset": 0,
+                "has_more": True,
+            },
+        }
+    ]
+
+    assert PrometheusMCPClient.catalog_metric_relevance(alert, unrelated) == "irrelevant"
+    assert PrometheusMCPClient.catalog_metric_relevance(alert, relevant) == "relevant"
+    assert PrometheusMCPClient.catalog_metric_relevance(alert, incomplete) == "unknown"
+    assert PrometheusMCPClient.catalog_metric_relevance(alert, []) == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_prometheus_model_cannot_call_tool_outside_local_policy(
     monkeypatch: pytest.MonkeyPatch,
@@ -760,6 +825,211 @@ async def test_prometheus_rejects_oceanbase_series_for_mysql_then_accepts_mysql_
 
 
 @pytest.mark.asyncio
+async def test_prometheus_stops_after_two_target_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oceanbase_result = {
+        "structuredContent": {
+            "series": [
+                {
+                    "metric": {
+                        "__name__": "ob_sysstat_cpu_usage",
+                        "cluster": "oceanbase-prod",
+                        "job": "oceanbase",
+                    },
+                    "values": [[1786067700, "95"]],
+                }
+            ]
+        }
+    }
+    _SequencedSession.calls = []
+    _SequencedSession.results = [oceanbase_result, oceanbase_result]
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+        ],
+        arguments=[
+            {"query": "ob_sysstat_cpu_usage"},
+            {"query": 'ob_sysstat_cpu_usage{cluster="oceanbase-prod"}'},
+            {"query": "mysql_cpu_usage"},
+        ],
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=8,
+    )
+
+    result = await client.collect_alert_window(_mysql_context())
+
+    assert len(_SequencedSession.calls) == 2
+    assert len(model.messages) == 2
+    assert result.has_monitoring_data is False
+    assert result.call_limit_reached is False
+    assert result.termination_reason == "no_discriminating_evidence"
+    assert result.inconclusive_reason is not None
+    assert "仍与告警目标不一致" in result.inconclusive_reason
+
+
+@pytest.mark.asyncio
+async def test_prometheus_stops_when_catalog_has_no_slow_query_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CatalogAndRangeTool:
+        def __init__(self, name: str, input_schema: dict[str, Any]) -> None:
+            self.name = name
+            self.input_schema = input_schema
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            assert mode == "json"
+            return {
+                "name": self.name,
+                "description": f"Fixture tool {self.name}",
+                "inputSchema": self.input_schema,
+                "annotations": {"readOnlyHint": True},
+            }
+
+    class CatalogAndRangeSession(_FakeSession):
+        calls: list[tuple[str, dict[str, Any]]] = []
+        results = [
+            {
+                "status": "success",
+                "data": {"resultType": "matrix", "result": []},
+            },
+            {
+                "metrics": [],
+                "total_count": 0,
+                "returned_count": 0,
+                "has_more": False,
+            },
+            {
+                "metrics": [
+                    "mysql_output_process_metrics_count",
+                    "mysql_output_write_sql_count",
+                    "mysql_output_write_sql_milliseconds_summary_sum",
+                    "mysql_sls_output_discard_count",
+                ],
+                "total_count": 4,
+                "returned_count": 4,
+                "has_more": False,
+            },
+        ]
+
+        async def list_tools(self, cursor: str | None = None) -> Any:
+            assert cursor is None
+            tools = [
+                CatalogAndRangeTool(
+                    "execute_range_query",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "start": {"type": "string"},
+                            "end": {"type": "string"},
+                            "step": {"type": "string"},
+                        },
+                        "required": ["query", "start", "end"],
+                        "additionalProperties": False,
+                    },
+                ),
+                CatalogAndRangeTool(
+                    "list_metrics",
+                    {
+                        "type": "object",
+                        "properties": {"filter_pattern": {"type": "string"}},
+                        "required": ["filter_pattern"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ]
+            return type("ToolList", (), {"tools": tools, "nextCursor": None})()
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            type(self).calls.append((name, arguments))
+            payload = type(self).results[len(type(self).calls) - 1]
+            raw = {"structuredContent": payload}
+            return type(
+                "ToolResult",
+                (),
+                {"model_dump": lambda _self, **_: raw},
+            )()
+
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "ClientSession",
+        CatalogAndRangeSession,
+    )
+    model = _SequenceModel(
+        [
+            "execute_range_query",
+            "list_metrics",
+            "list_metrics",
+            "execute_range_query",
+        ],
+        arguments=[
+            {
+                "query": (
+                    "rate(mysql_global_status_slow_queries"
+                    '{cluster="mysql-prod-pcm",instance="100.84.97.117:3306"}[5m])'
+                ),
+                "step": "30s",
+            },
+            {"filter_pattern": "mysql.*slow"},
+            {"filter_pattern": "mysql"},
+            {"query": "mysql_up", "step": "30s"},
+        ],
+    )
+    client = PrometheusMCPClient(
+        PrometheusMCPServerSettings(
+            url="https://prometheus.example.test/sse",
+            headers={},
+            tool_policies=(
+                PrometheusMCPToolPolicy(
+                    name="execute_range_query",
+                    capability="range_query",
+                    start_argument_path=("start",),
+                    end_argument_path=("end",),
+                    timestamp_encoding="rfc3339",
+                ),
+                PrometheusMCPToolPolicy(
+                    name="list_metrics",
+                    capability="catalog",
+                ),
+            ),
+        ),
+        model,
+        max_agent_steps=8,
+    )
+
+    result = await client.collect_alert_window(_mysql_slow_context())
+
+    assert [name for name, _arguments in CatalogAndRangeSession.calls] == [
+        "execute_range_query",
+        "list_metrics",
+        "list_metrics",
+    ]
+    assert len(model.messages) == 3
+    assert result.has_monitoring_data is False
+    assert result.call_limit_reached is False
+    assert result.termination_reason == "no_discriminating_evidence"
+    assert result.inconclusive_reason is not None
+    assert "未发现与当前告警信号语义相关的指标" in result.inconclusive_reason
+
+
+@pytest.mark.asyncio
 async def test_prometheus_client_deduplicates_empty_calls_without_spending_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -819,6 +1089,50 @@ async def test_prometheus_client_deduplicates_empty_calls_without_spending_budge
     assert first_feedback["host_control"]["remote_calls_remaining"] == 1
 
 
+@pytest.mark.asyncio
+async def test_prometheus_stops_after_three_distinct_empty_range_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        {"isError": False},
+        {"isError": False},
+        {"isError": False},
+    ]
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+        ],
+        arguments=[
+            {"query": "mysql_up"},
+            {"query": "mysql_threads_running"},
+            {"query": "mysql_global_status_questions"},
+            {"query": "mysql_global_status_slow_queries"},
+        ],
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=8,
+    )
+
+    result = await client.collect_alert_window(_mysql_context())
+
+    assert len(_SequencedSession.calls) == 3
+    assert len(model.messages) == 3
+    assert result.call_limit_reached is False
+    assert result.termination_reason == "no_discriminating_evidence"
+    assert result.inconclusive_reason is not None
+    assert "3 次不同的告警窗口范围查询且均无样本" in result.inconclusive_reason
 
 
 @pytest.mark.asyncio
@@ -909,6 +1223,7 @@ def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
         mcp_settings_path=settings_path,
         prometheus_mcp_sse_url="https://prometheus.example.test/sse",
         prometheus_mcp_tool_timeout_seconds=777,
+        tool_max_result_chars=4_321,
     )
 
     tool = factory_module._build_prometheus_mcp_tool(
@@ -918,10 +1233,7 @@ def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
 
     assert tool is not None
     assert tool.client.sse_read_timeout_seconds == 777
-
-
-
-
+    assert tool.max_evidence_chars == 4_321
 
 
 @pytest.mark.asyncio
@@ -1340,7 +1652,9 @@ async def test_prometheus_outer_tool_rejects_caller_parameters() -> None:
 
 @pytest.mark.asyncio
 async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_result_exists(
-) -> None:
+) -> (
+    None
+):
     base = {
         "window_start": ALERT_TIME.replace(minute=55),
         "window_end": ALERT_TIME,
@@ -1380,6 +1694,132 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
     assert empty.status == ToolStatus.NO_DATA
     assert empty.structured_data["root_cause_eligible"] is False
     assert empty.summary == "Prometheus MCP 调用次数达到上限，实时证据不足。"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_no_data_trace_avoids_outer_executor_blind_truncation() -> None:
+    max_result_chars = 12_000
+    tool_attempts: list[dict[str, Any]] = []
+    responses: list[dict[str, Any]] = []
+    for index in range(8):
+        catalog = index in {1, 2}
+        arguments = (
+            {"filter_pattern": "mysql.*slow" if index == 1 else "mysql"}
+            if catalog
+            else {
+                "query": (
+                    "rate(mysql_global_status_slow_queries"
+                    '{cluster="mysql-prod-pcm",instance="100.84.97.117:3306"}[5m])'
+                ),
+                "start": "2026-08-11T08:22:42+00:00",
+                "end": "2026-08-11T08:27:42+00:00",
+                "step": "30s",
+            }
+        )
+        capability = "catalog" if catalog else "range_query"
+        outcome = "auxiliary_result" if catalog else "no_data"
+        tool_attempts.append(
+            {
+                "tool_name": "list_metrics" if catalog else "execute_range_query",
+                "model_arguments": arguments,
+                "arguments": arguments,
+                "capability": capability,
+                "outcome": outcome,
+                "window_verification": "unknown" if catalog else "exact",
+                "target_verification": "not_applicable" if catalog else "unknown",
+                "target_mismatch_reasons": [],
+            }
+        )
+        result_payload: dict[str, Any]
+        if index == 1:
+            result_payload = {"metrics": [], "total_count": 0}
+        elif index == 2:
+            result_payload = {
+                "metrics": [
+                    "mysql_output_process_metrics_count",
+                    "mysql_output_write_sql_count",
+                    "mysql_sls_output_discard_count",
+                ],
+                "total_count": 3,
+            }
+        else:
+            result_payload = {
+                "resultType": "matrix",
+                "result": [],
+                "links": [{"href": "http://prometheus.invalid/" + "x" * 4_000}],
+            }
+        responses.append(
+            {
+                "tool_name": "list_metrics" if catalog else "execute_range_query",
+                "model_arguments": arguments,
+                "arguments": arguments,
+                "capability": capability,
+                "has_monitoring_observation": False,
+                "window_verification": "unknown" if catalog else "exact",
+                "target_verification": "not_applicable" if catalog else "unknown",
+                "target_mismatch_reasons": [],
+                "root_cause_eligible": False,
+                "root_cause_ineligible_reason": (
+                    "auxiliary_result" if catalog else "no_observation"
+                ),
+                "result": result_payload,
+            }
+        )
+    result = PrometheusMCPQueryResult(
+        responses=tuple(responses),
+        window_start=datetime(2026, 8, 11, 8, 22, 42, tzinfo=UTC),
+        window_end=datetime(2026, 8, 11, 8, 27, 42, tzinfo=UTC),
+        model_tool_calls=tuple(item["tool_name"] for item in tool_attempts),
+        model_request_ids=tuple(f"request-{index}" for index in range(8)),
+        call_limit_reached=True,
+        finished_by_model=False,
+        tool_attempts=tuple(tool_attempts),
+        termination_reason="call_limit_reached",
+    )
+    tool = PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
+        _RecordingPrometheusClient(result),
+        max_evidence_chars=max_result_chars,
+    )
+    executor = ToolExecutor(
+        InvestigationToolRegistry([tool]),
+        max_result_chars=max_result_chars,
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _mysql_slow_context(),
+    )
+
+    serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
+    assert record.status == ToolStatus.NO_DATA
+    assert record.truncated is False
+    assert len(serialized) < max_result_chars
+    assert record.structured_data["schema_version"] == "prometheus-evidence-v2"
+    assert record.structured_data["root_cause_eligible"] is False
+    assert record.structured_data["root_cause_ineligible_reason"] != ("evidence_payload_truncated")
+    assert record.structured_data["catalog_inventory"]["metric_count"] == 3
+    assert record.structured_data["semantic_compression"]["source_tool_attempt_count"] == 8
+    assert "prometheus.invalid" not in serialized
+
+    minimum_tool = PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
+        _RecordingPrometheusClient(result),
+        max_evidence_chars=1_000,
+    )
+    minimum_record = await ToolExecutor(
+        InvestigationToolRegistry([minimum_tool]),
+        max_result_chars=1_000,
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _mysql_slow_context(),
+    )
+    minimum_serialized = json.dumps(
+        minimum_record.structured_data,
+        ensure_ascii=False,
+        default=str,
+    )
+    assert minimum_record.truncated is False
+    assert len(minimum_serialized) < 1_000
+    assert minimum_record.structured_data["root_cause_eligible"] is False
 
 
 @pytest.mark.asyncio

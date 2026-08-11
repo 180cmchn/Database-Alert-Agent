@@ -27,6 +27,8 @@ from app.adapters.prometheus_mcp import (
     _FINISH_TOOL_NAME,
     PROMETHEUS_ALERT_WINDOW_SECONDS,
     PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER,
+    PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS,
+    PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS,
     PROMETHEUS_MCP_PROMPT_VERSION,
     PROMETHEUS_MCP_SERVER_NAME,
     PrometheusMCPClient,
@@ -599,21 +601,35 @@ class PrometheusHarnessScenario:
                     }
                 )
             if target_mismatch:
+                mismatch_count = 1 + sum(
+                    attempt.get("outcome") == "target_mismatch" for attempt in updated.tool_attempts
+                )
                 model_payload = {
                     "tool_result": result,
                     "host_target_verification": target_verification,
                     "target_mismatch_reasons": target_mismatch_reasons,
                     "instruction": (
-                        "该返回不属于required_target，不能作为告警证据；修正指标或目标标签后"
-                        "重新执行range_query，不要结束调查。"
+                        "该返回不属于required_target，不能作为告警证据；"
+                        + (
+                            "只允许修正指标或目标标签后重新执行range_query一次。"
+                            if mismatch_count < PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS
+                            else "已达到目标不匹配停止阈值，Host 将结束无效探测。"
+                        )
                     ),
                 }
-                next_instruction = (
-                    "返回目标与告警目标不一致；修正指标或标签后重新执行 range_query。"
+                next_instruction = "返回目标与告警目标不一致；" + (
+                    "只再修正一次指标或标签并执行 range_query。"
+                    if mismatch_count < PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS
+                    else "Host 将以无可区分证据结束。"
                 )
             else:
-                next_instruction = (
-                    "该调用已完成但没有数据；不要原样重试，修改查询或选择其它 range_query。"
+                empty_count = 1 + sum(
+                    attempt.get("outcome") == "no_data" for attempt in updated.tool_attempts
+                )
+                next_instruction = "该调用已完成但没有数据；" + (
+                    "不要原样重试，只选择其它最相关的 range_query。"
+                    if empty_count < PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS
+                    else "已达到空范围查询停止阈值，Host 将结束无效探测。"
                 )
             status = ToolInvocationStatus.NO_DATA
         else:
@@ -848,11 +864,61 @@ class PrometheusHarnessScenario:
         observations: Sequence[HarnessObservation[dict[str, Any]]],
     ) -> Finish | None:
         del observations
+        inconclusive_reason = self.inconclusive_reason(state)
+        if inconclusive_reason is not None:
+            return Finish(
+                reason=RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE,
+                summary=inconclusive_reason,
+                requires_human=True,
+            )
         if len(state.executed_calls) >= self.client.max_agent_steps:
             return Finish(
                 reason=RuntimeStopReason.BUDGET_EXHAUSTED,
                 summary="Prometheus remote_tool_calls budget was exhausted.",
                 requires_human=not state.has_monitoring_data,
+            )
+        return None
+
+    def inconclusive_reason(self, state: PrometheusHarnessState) -> str | None:
+        if state.has_monitoring_data:
+            return None
+        range_attempts = [
+            attempt for attempt in state.tool_attempts if attempt.get("capability") == "range_query"
+        ]
+        target_mismatches = sum(
+            attempt.get("outcome") == "target_mismatch" for attempt in range_attempts
+        )
+        if target_mismatches >= PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS:
+            return (
+                "Prometheus 已执行两次目标修正后的范围查询，但返回序列仍与告警目标不一致；"
+                "继续探测不能提供可归属的实时证据。"
+            )
+
+        catalog_calls = sum(
+            attempt.get("capability") == "catalog" for attempt in state.tool_attempts
+        )
+        missing_range_results = sum(
+            attempt.get("outcome") in {"no_data", "target_mismatch"} for attempt in range_attempts
+        )
+        if (
+            missing_range_results
+            and catalog_calls >= self.client.catalog_call_limit()
+            and self.client.catalog_metric_relevance(
+                self.context.alert,
+                state.responses,
+            )
+            == "irrelevant"
+        ):
+            return (
+                "Prometheus 指标目录中未发现与当前告警信号语义相关的指标；"
+                "继续查询仅共享数据库引擎前缀的指标不能区分候选原因。"
+            )
+
+        empty_ranges = sum(attempt.get("outcome") == "no_data" for attempt in range_attempts)
+        if empty_ranges >= PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS:
+            return (
+                f"Prometheus 已执行 {empty_ranges} 次不同的告警窗口范围查询且均无样本；"
+                "继续猜测指标或标签不能提供可区分的实时证据。"
             )
         return None
 
@@ -1174,6 +1240,11 @@ async def collect_prometheus_with_harness(
         reconnect_error_type=(
             PrometheusMCPProtocolError.__name__
             if harness_result.budget.consumed.session_attempts > 1
+            else None
+        ),
+        inconclusive_reason=(
+            scenario.inconclusive_reason(state)
+            if finish.reason == RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE
             else None
         ),
     )
