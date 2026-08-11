@@ -1844,15 +1844,23 @@ class ArcheryMCPClient:
         markers = list(re.finditer(r"结果\s*[：:]", text))
         decoder = json.JSONDecoder()
         for marker in reversed(markers):
-            object_start = text.find("{", marker.end())
-            if object_start < 0:
-                continue
-            try:
-                decoded, _end = decoder.raw_decode(text[object_start:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(decoded, dict):
-                return decoded
+            starts = sorted(
+                start
+                for start in (
+                    text.find("[", marker.end()),
+                    text.find("{", marker.end()),
+                )
+                if start >= 0
+            )
+            for start in starts:
+                try:
+                    decoded, _end = decoder.raw_decode(text[start:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(decoded, dict):
+                    return decoded
+                if isinstance(decoded, list):
+                    return {"rows": decoded}
         return None
 
     @staticmethod
@@ -2171,9 +2179,14 @@ class ArcherySlowLogEvidenceTool:
             )
         row_count = self._row_count(result.payload)
         has_log_content = self._has_parsed_log_rows(result.payload)
-        row_summary = (
-            f"返回 {row_count} 行" if row_count is not None else "返回行数未能从 MCP 响应中解析"
-        )
+        if has_log_content and row_count is not None:
+            row_summary = f"返回 {row_count} 行"
+        elif row_count is not None and row_count > 0:
+            row_summary = f"MCP 报告 {row_count} 行，但日志行未能解析"
+        elif row_count == 0:
+            row_summary = "返回 0 行"
+        else:
+            row_summary = "返回行数未能从 MCP 响应中解析"
         instance_summary = (
             f"实例 ID {result.instance_id}" if result.instance_id is not None else "实例 ID 未解析"
         )
@@ -2195,7 +2208,7 @@ class ArcherySlowLogEvidenceTool:
         evidence_summary = (
             "慢查询日志已作为本次告警窗口的实时证据进入分析"
             if has_log_content
-            else "查询成功但未返回慢查询日志，不作为根因支持证据"
+            else "当前没有可解析的慢查询日志，不作为根因支持证据"
         )
         summary = (
             f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "

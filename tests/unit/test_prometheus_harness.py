@@ -604,6 +604,8 @@ async def test_semantically_empty_range_result_is_persisted_as_missing_no_data(
                 "capability": "range_query",
                 "outcome": "no_data",
                 "window_verification": "exact",
+                "target_verification": "unknown",
+                "target_mismatch_reasons": [],
                 "evidence_disposition": "MISSING",
                 "is_contradiction": False,
             },

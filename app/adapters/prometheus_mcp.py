@@ -22,6 +22,7 @@ from app.application.sanitization import sanitize, sanitize_text
 from app.domain.alert_preprocessing import preprocess_alert_data
 from app.domain.models import (
     InvestigationContext,
+    NormalizedAlert,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolStatus,
@@ -33,8 +34,9 @@ PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS: Final = 8
 PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER: Final = 2
 PROMETHEUS_MCP_MIN_RANGE_CALL_RESERVE: Final = 2
+PROMETHEUS_MCP_MAX_CATALOG_CALLS: Final = 2
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v5"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v6"
 PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS: Final = 8_000
 PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS: Final = 24_000
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -69,6 +71,42 @@ _SAMPLE_CONTAINER_KEYS: Final = {
     "value",
     "values",
 }
+_PROMETHEUS_METRIC_IDENTIFIER: Final = re.compile(r"^[A-Za-z_:][A-Za-z0-9_:]*$")
+_ALERT_THRESHOLD_SUFFIX: Final = re.compile(
+    r"(?i)_(?:more|less|greater|higher|lower)_than_\d+(?:\.\d+)?%?$"
+)
+_MONITORING_IDENTITY_CONTAINERS: Final = {
+    "labels",
+    "labelset",
+    "metric",
+    "tags",
+}
+_MONITORING_IDENTITY_KEYS: Final = {
+    "__name__",
+    "address",
+    "addr",
+    "cluster",
+    "clusterid",
+    "clustername",
+    "dbengine",
+    "dbtype",
+    "endpoint",
+    "engine",
+    "host",
+    "hostname",
+    "instance",
+    "ip",
+    "job",
+    "server",
+    "target",
+}
+_ENGINE_FAMILY_MARKERS: Final = {
+    "oceanbase": ("oceanbase", "obcluster", "obproxy"),
+    "tidb": ("tidb", "tikv", "tiflash"),
+    "postgresql": ("postgres", "postgresql"),
+    "mysql": ("mysql", "mysqld"),
+}
+_UNKNOWN_METRIC_IDENTIFIERS: Final = {"n/a", "none", "null", "unknown"}
 
 
 class PrometheusMCPError(RuntimeError):
@@ -143,11 +181,7 @@ class PrometheusMCPQueryResult:
 
     @property
     def has_monitoring_data(self) -> bool:
-        return any(
-            response.get("has_monitoring_observation") is True
-            and response.get("window_verification") == "exact"
-            for response in self.responses
-        )
+        return PrometheusMCPClient.responses_have_monitoring_data(list(self.responses))
 
 
 def has_monitoring_observation(value: Any, *, observation_context: bool = False) -> bool:
@@ -464,8 +498,9 @@ class PrometheusMCPClient:
         authorized_policies: Mapping[str, PrometheusMCPToolPolicy],
         calls: list[MCPModelToolCall],
         responses: list[dict[str, Any]],
+        alert: NormalizedAlert | None = None,
     ) -> list[dict[str, Any]]:
-        """Reserve the final remote calls for range evidence when it is still missing."""
+        """Prefer direct range evidence and cap auxiliary catalogue exploration."""
 
         has_monitoring_data = self.responses_have_monitoring_data(responses)
         range_names = {
@@ -478,10 +513,31 @@ class PrometheusMCPClient:
             PROMETHEUS_MCP_MIN_RANGE_CALL_RESERVE,
             self.max_agent_steps,
         )
+        catalog_call_limit = min(
+            PROMETHEUS_MCP_MAX_CATALOG_CALLS,
+            max(self.max_agent_steps - range_call_reserve, 0),
+        )
+        catalog_calls = sum(
+            1
+            for call in calls
+            if (
+                policy := authorized_policies.get(call.name)
+            ) is not None
+            and policy.capability == "catalog"
+        )
+        direct_range_first = (
+            not calls
+            and alert is not None
+            and bool(self.alert_metric_candidates(alert))
+        )
         require_range = (
             bool(range_names)
             and not has_monitoring_data
-            and remaining <= range_call_reserve
+            and (
+                direct_range_first
+                or catalog_calls >= catalog_call_limit
+                or remaining <= range_call_reserve
+            )
         )
         selected = [
             tool
@@ -516,8 +572,155 @@ class PrometheusMCPClient:
         return any(
             response.get("has_monitoring_observation") is True
             and response.get("window_verification") == "exact"
+            and response.get("target_verification") != "mismatch"
             for response in responses
         )
+
+    @staticmethod
+    def alert_metric_candidates(alert: NormalizedAlert) -> list[str]:
+        """Return literal or threshold-stripped metrics suitable for a first range query."""
+
+        candidates: list[str] = []
+        configured = alert.attributes.get("flashduty_metrics")
+        if isinstance(configured, Mapping):
+            expression = configured.get("expr") or configured.get("query_expr")
+            if isinstance(expression, str) and expression.strip():
+                candidates.append(expression.strip())
+        for raw in (
+            alert.metric_name,
+            alert.title,
+            alert.alert_type,
+            alert.alert_name,
+            alert.reason,
+        ):
+            if not isinstance(raw, str):
+                continue
+            candidate = _ALERT_THRESHOLD_SUFFIX.sub("", raw.strip())
+            if (
+                candidate.casefold() not in _UNKNOWN_METRIC_IDENTIFIERS
+                and _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(candidate)
+            ):
+                candidates.append(candidate)
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def monitoring_target_context(alert: NormalizedAlert) -> dict[str, Any]:
+        database = alert.database
+        candidates = [
+            value.strip()
+            for value in (
+                database.instance if database else None,
+                database.host if database else None,
+                alert.labels.get("instance"),
+                alert.labels.get("host"),
+                alert.labels.get("host_ip"),
+                alert.labels.get("alarm_host"),
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+        return {
+            "database_engine": database.engine if database else None,
+            "cluster": alert.cluster,
+            "instance_candidates": list(dict.fromkeys(candidates)),
+            "metric_candidates": PrometheusMCPClient.alert_metric_candidates(alert),
+        }
+
+    @classmethod
+    def target_verification(
+        cls,
+        alert: NormalizedAlert,
+        payload: Any,
+    ) -> tuple[str, list[str]]:
+        """Reject explicit cross-engine series without guessing target ownership."""
+
+        expected_engine = cls._engine_family(
+            alert.database.engine if alert.database else None
+        )
+        identity_values = cls._monitoring_identity_values(payload)
+        returned_families = {
+            family
+            for value in identity_values
+            if (family := cls._engine_family(value)) is not None
+        }
+        if expected_engine == "mysql":
+            conflicts = returned_families.intersection(
+                {"oceanbase", "postgresql", "tidb"}
+            )
+        elif expected_engine == "oceanbase":
+            conflicts = returned_families.intersection({"postgresql", "tidb"})
+        elif expected_engine is not None:
+            conflicts = returned_families - {expected_engine}
+        else:
+            conflicts = set()
+        if conflicts:
+            returned = "、".join(sorted(conflicts))
+            return (
+                "mismatch",
+                [f"监控序列标识为 {returned}，与告警引擎 {expected_engine} 不一致"],
+            )
+        if expected_engine is not None and expected_engine in returned_families:
+            return "compatible", []
+        return "unknown", []
+
+    @staticmethod
+    def _engine_family(value: str | None) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.strip().casefold()
+        compact = re.sub(r"[^a-z0-9_]+", "", normalized)
+        if (
+            compact.startswith("ob_")
+            or compact.startswith(("obagent", "obmonitor"))
+            or re.search(r"(?:^|[^a-z0-9])ob(?:[^a-z0-9]|$)", normalized)
+        ):
+            return "oceanbase"
+        if compact.startswith("pg_"):
+            return "postgresql"
+        for family, markers in _ENGINE_FAMILY_MARKERS.items():
+            if any(marker in compact for marker in markers):
+                return family
+        return None
+
+    @classmethod
+    def _monitoring_identity_values(
+        cls,
+        value: Any,
+        *,
+        identity_context: bool = False,
+    ) -> list[str]:
+        if isinstance(value, Mapping):
+            identities: list[str] = []
+            for raw_key, nested in value.items():
+                key = re.sub(r"[^a-z0-9_]+", "", str(raw_key).casefold())
+                nested_context = identity_context or key in _MONITORING_IDENTITY_CONTAINERS
+                if isinstance(nested, (str, int, float)) and not isinstance(nested, bool):
+                    if nested_context or key in _MONITORING_IDENTITY_KEYS:
+                        identities.extend((str(raw_key), str(nested)))
+                    continue
+                identities.extend(
+                    cls._monitoring_identity_values(
+                        nested,
+                        identity_context=nested_context,
+                    )
+                )
+            return identities
+        if isinstance(value, list):
+            return [
+                identity
+                for nested in value
+                for identity in cls._monitoring_identity_values(
+                    nested,
+                    identity_context=identity_context,
+                )
+            ]
+        if isinstance(value, str):
+            decoded = cls._decode_json_text(value)
+            if decoded is not None:
+                return cls._monitoring_identity_values(
+                    decoded,
+                    identity_context=identity_context,
+                )
+        return []
 
     @classmethod
     def window_verification(
@@ -1103,6 +1306,9 @@ class PrometheusMCPClient:
                     "只分析当前告警发生前五分钟的区间，避免将其它时段数据作为本次告警证据。"
                     "若服务同时提供即时查询和范围查询，必须使用范围查询并把起止参数精确设置为"
                     "Host给出的required_window；默认查询当前时刻的即时结果不能作为本次告警证据。"
+                    "范围查询必须使用required_target中的引擎、集群和实例信息约束 PromQL；"
+                    "不得用未限定目标的跨集群聚合结果代替告警目标证据。若 Host 标记"
+                    "target_verification=mismatch，必须修正指标或标签后重新执行范围查询。"
                     "调用预算有限：发现指标、标签或能力后立即使用最相关的查询工具取得该时间窗"
                     "证据；除非上一次调用报错、参数已改变或结果要求分页，否则不得重复同一工具"
                     "和相同参数。不要反复枚举完整指标目录。超大工具结果只会提供带长度标记的预览，"
@@ -1129,6 +1335,7 @@ class PrometheusMCPClient:
                             "end": window_end.isoformat(),
                             "duration_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
                         },
+                        "required_target": self.monitoring_target_context(context.alert),
                         "remote_call_budget": {
                             "used": 0,
                             "limit": self.max_agent_steps,
@@ -1169,6 +1376,11 @@ class PrometheusMCPEvidenceTool:
                 "Prometheus evidence parameters are derived only from the alert context"
             )
         result = await self.client.collect_alert_window(context)
+        required_target = PrometheusMCPClient.monitoring_target_context(context.alert)
+        target_mismatch_count = sum(
+            response.get("target_verification") == "mismatch"
+            for response in result.responses
+        )
         structured_data = {
             "window_start": result.window_start.isoformat(),
             "window_end": result.window_end.isoformat(),
@@ -1186,6 +1398,8 @@ class PrometheusMCPEvidenceTool:
             "termination_error_detail": result.termination_error_detail,
             "mcp_session_attempts": result.mcp_session_attempts,
             "reconnect_error_type": result.reconnect_error_type,
+            "required_target": required_target,
+            "target_mismatch_count": target_mismatch_count,
             "monitoring_results": list(result.responses),
             "query_completed": result.has_monitoring_data,
             "root_cause_eligible": result.has_monitoring_data and not result.partial,
@@ -1199,6 +1413,8 @@ class PrometheusMCPEvidenceTool:
                 suffix = "；已达到 MCP 调用上限，但已取得可用监控返回"
             else:
                 suffix = ""
+            if target_mismatch_count:
+                suffix += f"；另有 {target_mismatch_count} 条目标不匹配返回已排除"
             return ToolExecutionResult(
                 status=ToolStatus.SUCCESS,
                 summary=(
@@ -1207,14 +1423,21 @@ class PrometheusMCPEvidenceTool:
                 ),
                 structured_data=structured_data,
             )
-        if result.call_limit_reached:
+        if target_mismatch_count:
+            reason = (
+                f"Prometheus MCP 返回 {target_mismatch_count} 条与告警目标不一致的监控结果，"
+                "未取得告警目标的可用实时证据。"
+            )
+        elif result.call_limit_reached:
             reason = "Prometheus MCP 调用次数达到上限，实时证据不足。"
         elif result.termination_reason == "model_error_no_result":
             reason = "Prometheus MCP 模型连续两次未能选择有效工具，未取得实时证据。"
         else:
             reason = "Prometheus MCP 未返回可用监控结果，实时证据不足。"
         structured_data["root_cause_eligible"] = False
-        structured_data["root_cause_ineligible_reason"] = "no_usable_monitoring_result"
+        structured_data["root_cause_ineligible_reason"] = (
+            "target_mismatch" if target_mismatch_count else "no_usable_monitoring_result"
+        )
         return ToolExecutionResult(
             status=ToolStatus.NO_DATA,
             summary=reason,

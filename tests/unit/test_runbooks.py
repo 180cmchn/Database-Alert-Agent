@@ -267,6 +267,49 @@ async def test_local_pdf_search_never_falls_back_to_another_alert_type(
 
 
 @pytest.mark.asyncio
+async def test_local_pdf_recalls_cpu_runbook_when_alert_type_directory_is_absent(
+    tmp_path: Path,
+) -> None:
+    alert_type = "mysqlcpu飙升"
+    directory = tmp_path / alert_type
+    directory.mkdir()
+    runbook_id = "mysql-cpu-spike-guide"
+    _write_text_pdf(
+        directory / f"{runbook_id}.pdf",
+        "MySQL CPU spike troubleshooting guide with read-only diagnostic steps.",
+    )
+    _write_minimal_index(
+        directory,
+        alert_type,
+        runbook_id,
+        annotation_fields={
+            "scope": {"database_engines": ["mysql"], "components": []},
+            "match": {
+                "alert_names": ["MySQLCPU飙升"],
+                "metric_names": [],
+                "aliases": ["MySQL CPU 飙升"],
+                "keywords": ["CPU"],
+            },
+        },
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "mysql_cpu_usage_more_than_90%",
+            "reason": "mysql_cpu_usage_more_than_90%",
+            "alert_type": "mysql_cpu_usage_more_than_90%",
+            "database": {"engine": "mysql"},
+        }
+    )
+
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert [item.runbook_id for item in matches] == [runbook_id]
+    assert "告警信号归一化命中" in matches[0].match_reasons
+    assert matches[0].metadata["alert_type"] == alert_type
+
+
+@pytest.mark.asyncio
 async def test_exact_cause_evidence_outweighs_alert_definition_section(
     tmp_path: Path,
 ) -> None:

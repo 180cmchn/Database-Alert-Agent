@@ -277,6 +277,31 @@ def _match_terms(value: str) -> set[str]:
     return set(_lexical_terms(value))
 
 
+def _signal_families(value: str) -> set[str]:
+    """Map narrowly supported alert wording variants to one diagnostic signal."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    compact = "".join(character for character in normalized if character.isalnum())
+    families: set[str] = set()
+    if "cpu" in compact and any(
+        marker in compact
+        for marker in (
+            "cpu飙升",
+            "cpu过高",
+            "cpu高负载",
+            "cpuhigh",
+            "cpuspike",
+            "cpusurge",
+            "cpuusagehigh",
+            "cpuusageover",
+            "cpuusageabove",
+            "cpuusagemorethan",
+        )
+    ):
+        families.add("high_cpu")
+    return families
+
+
 def _alert_weighted_values(alert: NormalizedAlert) -> list[tuple[str, float, str]]:
     values: list[tuple[str | None, float, str]] = [
         (alert.reason, 18, "告警原因"),
@@ -339,6 +364,48 @@ def runbook_match_metadata(
         if field in profile:
             result[field] = _metadata_strings(profile, field)
     return result
+
+
+def _cross_type_identity_matches(document: RunbookDocument, alert: NormalizedAlert) -> bool:
+    """Allow cross-directory recall only for strong structured identities.
+
+    Alert-type directories remain the primary routing boundary. This fallback is
+    intentionally narrower than section scoring so an absent directory cannot
+    retrieve an unrelated PDF merely because both documents mention a database.
+    """
+
+    alert_values = [value for value, _, _ in _alert_weighted_values(alert)]
+    metadata = document.metadata
+    match_metadata = metadata.get("match") or {}
+    document_values = [
+        *_metadata_strings(metadata, "alert_types"),
+        str(metadata.get("alert_type") or ""),
+        *(
+            value
+            for field in ("alert_names", "metric_names", "aliases")
+            for value in _metadata_strings(match_metadata, field)
+        ),
+    ]
+    alert_keys: set[str] = set()
+    document_keys: set[str] = set()
+    for value, destination in (
+        *((value, alert_keys) for value in alert_values),
+        *((value, document_keys) for value in document_values),
+    ):
+        try:
+            destination.add(alert_type_directory_name(value))
+        except ValueError:
+            continue
+    if alert_keys.intersection(document_keys):
+        return True
+
+    alert_signals = {
+        signal for value in alert_values for signal in _signal_families(value)
+    }
+    document_signals = {
+        signal for value in document_values for signal in _signal_families(value)
+    }
+    return bool(alert_signals.intersection(document_signals))
 
 
 def _scalar_filter_text(value: Any) -> str | None:
@@ -674,6 +741,15 @@ def _score_section(
                 reasons.append(f"{label}精确命中")
             direct_match = True
 
+    alert_signals = {
+        signal for value, _, _ in weighted_values for signal in _signal_families(value)
+    }
+    document_signals = _signal_families(searchable)
+    if alert_signals.intersection(document_signals):
+        score += 24
+        reasons.append("告警信号归一化命中")
+        direct_match = True
+
     if not direct_match:
         for value, _, label in weighted_values[:5]:
             value_terms = _match_terms(value)
@@ -817,10 +893,20 @@ class LocalPDFRunbookLibrary:
             alert_type = alert_type_directory_name(alert.alert_type)
         except ValueError as exc:
             raise RunbookAlertTypeNotFoundError(alert.alert_type) from exc
+        exact_directory_found = True
         async with self._lock:
-            documents = await asyncio.to_thread(
-                self._list_alert_type_sync, alert_type
-            )
+            try:
+                documents = await asyncio.to_thread(
+                    self._list_alert_type_sync, alert_type
+                )
+            except RunbookAlertTypeNotFoundError:
+                exact_directory_found = False
+                documents = await asyncio.to_thread(
+                    self._list_cross_type_candidates_sync,
+                    alert,
+                )
+        if not exact_directory_found and not documents:
+            raise RunbookAlertTypeNotFoundError(alert.alert_type)
         candidates = [
             (document, section)
             for document in documents
@@ -1041,6 +1127,26 @@ class LocalPDFRunbookLibrary:
         documents, _ = self._list_directory_sync(alert_type_directory)
         for document in documents:
             self._paths_for(document.id)
+        return documents
+
+    def _list_cross_type_candidates_sync(
+        self,
+        alert: NormalizedAlert,
+    ) -> list[RunbookDocument]:
+        documents: list[RunbookDocument] = []
+        active_paths: set[Path] = set()
+        for alert_type_directory in self._alert_type_directories_sync():
+            type_documents, type_paths = self._list_directory_sync(
+                alert_type_directory
+            )
+            active_paths.update(type_paths)
+            for document in type_documents:
+                self._paths_for(document.id)
+                if _cross_type_identity_matches(document, alert):
+                    documents.append(document)
+        self._cache = {
+            path: cached for path, cached in self._cache.items() if path in active_paths
+        }
         return documents
 
     def _list_directory_sync(

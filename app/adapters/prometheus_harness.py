@@ -324,6 +324,7 @@ class PrometheusHarnessPlanner:
             authorized_policies=self.scenario.authorized_policies,
             calls=state.executed_calls,
             responses=state.responses,
+            alert=self.scenario.context.alert,
         )
         model_messages = deepcopy(messages)
         model_messages.append(
@@ -557,12 +558,27 @@ class PrometheusHarnessScenario:
             window_start=updated.window_start,
             window_end=updated.window_end,
         )
-        usable_observation = has_observation and window_verification == "exact"
+        if policy.capability == "range_query":
+            target_verification, target_mismatch_reasons = (
+                self.client.target_verification(
+                    self.context.alert,
+                    result,
+                )
+            )
+        else:
+            target_verification, target_mismatch_reasons = "not_applicable", []
+        target_mismatch = target_verification == "mismatch"
+        usable_observation = (
+            has_observation
+            and window_verification == "exact"
+            and not target_mismatch
+        )
         no_data = result is None or (
-            policy.capability == "range_query" and not has_observation
+            policy.capability == "range_query"
+            and (not has_observation or target_mismatch)
         )
         if no_data:
-            outcome = "no_data"
+            outcome = "target_mismatch" if target_mismatch else "no_data"
             model_payload = result
             if result is not None:
                 updated.responses.append(
@@ -571,14 +587,34 @@ class PrometheusHarnessScenario:
                         "model_arguments": sanitize(call.model_arguments),
                         "arguments": sanitize(call.effective_arguments),
                         "capability": policy.capability,
-                        "has_monitoring_observation": False,
+                        "has_monitoring_observation": has_observation,
                         "window_verification": window_verification,
+                        "target_verification": target_verification,
+                        "target_mismatch_reasons": target_mismatch_reasons,
+                        "root_cause_eligible": False,
+                        "root_cause_ineligible_reason": (
+                            "target_mismatch" if target_mismatch else "no_observation"
+                        ),
                         "result": self.client.evidence_visible_payload(result),
                     }
                 )
-            next_instruction = (
-                "该调用已完成但没有数据；不要原样重试，修改查询或选择其它 range_query。"
-            )
+            if target_mismatch:
+                model_payload = {
+                    "tool_result": result,
+                    "host_target_verification": target_verification,
+                    "target_mismatch_reasons": target_mismatch_reasons,
+                    "instruction": (
+                        "该返回不属于required_target，不能作为告警证据；修正指标或目标标签后"
+                        "重新执行range_query，不要结束调查。"
+                    ),
+                }
+                next_instruction = (
+                    "返回目标与告警目标不一致；修正指标或标签后重新执行 range_query。"
+                )
+            else:
+                next_instruction = (
+                    "该调用已完成但没有数据；不要原样重试，修改查询或选择其它 range_query。"
+                )
             status = ToolInvocationStatus.NO_DATA
         else:
             outcome = (
@@ -595,6 +631,18 @@ class PrometheusHarnessScenario:
                 "capability": policy.capability,
                 "has_monitoring_observation": has_observation,
                 "window_verification": window_verification,
+                "target_verification": target_verification,
+                "target_mismatch_reasons": target_mismatch_reasons,
+                "root_cause_eligible": usable_observation,
+                "root_cause_ineligible_reason": (
+                    ""
+                    if usable_observation
+                    else (
+                        "unverified_window"
+                        if has_observation
+                        else "auxiliary_result"
+                    )
+                ),
                 "result": self.client.evidence_visible_payload(result),
             }
             updated.responses.append(response)
@@ -633,6 +681,8 @@ class PrometheusHarnessScenario:
             "capability": policy.capability,
             "outcome": outcome,
             "window_verification": window_verification,
+            "target_verification": target_verification,
+            "target_mismatch_reasons": target_mismatch_reasons,
         }
         if status == ToolInvocationStatus.NO_DATA:
             attempt.update(
@@ -648,6 +698,8 @@ class PrometheusHarnessScenario:
             "outcome": outcome,
             "has_monitoring_observation": has_observation,
             "window_verification": window_verification,
+            "target_verification": target_verification,
+            "target_mismatch_reasons": target_mismatch_reasons,
         }
         if status == ToolInvocationStatus.NO_DATA:
             observation.update(

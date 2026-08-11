@@ -1290,6 +1290,53 @@ async def test_archery_mcp_parses_wrapped_positional_rows_without_post_query_che
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_parses_wrapped_json_array_as_slow_log_rows() -> None:
+    history_sql = (
+        "SELECT hostname_max, sample, ts_min FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '100.84.97.139:3306' {TEST_HISTORY_TIME_CLAUSE}"
+        "ORDER BY ts_min LIMIT 20"
+    )
+    rows = [
+        {
+            "hostname_max": "100.84.97.139:3306",
+            "sample": f"select {index}",
+            "ts_min": "2026-08-03T13:42:26",
+        }
+        for index in range(18)
+    ]
+    wrapped_result = (
+        f"SQL 查询已执行。\n执行的SQL：{history_sql}\n\n返回 18 行。\n结果：\n"
+        + json.dumps(rows, ensure_ascii=False)
+    )
+
+    payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"result": wrapped_result},
+        requested_sql=history_sql,
+    )
+
+    assert payload["rows"] == rows
+    assert ArcheryMCPClient.payload_row_count(payload) == 18
+    assert ArcherySlowLogEvidenceTool._has_parsed_log_rows(payload) is True
+    assert executed_sql == history_sql
+    assert actual_sql_verified is True
+
+    outcome = await ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload=payload)
+    ).execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-1:3306",
+        ),
+    )
+
+    assert isinstance(outcome, tuple)
+    summary, structured_data = outcome
+    assert "返回 18 行" in summary
+    assert structured_data["root_cause_eligible"] is True
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_limits_parsed_slow_log_rows_to_twenty() -> None:
     slow_log_endpoint = "db-history:3306"
     history_sql = (
@@ -1587,6 +1634,8 @@ async def test_archery_reported_count_without_parsed_rows_is_no_data() -> None:
 
     assert isinstance(outcome, ToolExecutionResult)
     assert outcome.status == ToolStatus.NO_DATA
+    assert "MCP 报告 20 行，但日志行未能解析" in outcome.summary
+    assert "返回 20 行" not in outcome.summary
     assert outcome.structured_data["root_cause_eligible"] is False
     assert "未返回可解析的日志行" in outcome.structured_data[
         "root_cause_ineligible_reason"

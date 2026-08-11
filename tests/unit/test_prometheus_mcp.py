@@ -28,6 +28,7 @@ from app.adapters.prometheus_mcp import (
 )
 from app.config import RUNTIME_SETTINGS_KEYS, Settings
 from app.domain.models import (
+    DatabaseTarget,
     InvestigationContext,
     InvestigationStrategy,
     NormalizedAlert,
@@ -76,6 +77,27 @@ def _context() -> InvestigationContext:
             title="Prometheus test",
             description="test",
         ),
+    )
+
+
+def _mysql_context() -> InvestigationContext:
+    context = _context()
+    return context.model_copy(
+        update={
+            "alert": context.alert.model_copy(
+                update={
+                    "title": "mysql_cpu_usage_more_than_90%",
+                    "reason": "mysql_cpu_usage_more_than_90%",
+                    "alert_type": "mysql_cpu_usage_more_than_90%",
+                    "metric_name": "mysql_cpu_usage",
+                    "database": DatabaseTarget(
+                        engine="mysql",
+                        instance="mysql-17:3306",
+                        host="mysql-17",
+                    ),
+                }
+            )
+        }
     )
 
 
@@ -536,6 +558,21 @@ def test_prometheus_policy_reserves_range_budget_and_hides_finish_without_data()
         item["function"]["name"] for item in finishable
     }
 
+    direct_range = client.model_tools_for_state(
+        model_tool_list=tools,
+        authorized_policies={
+            catalog_policy.name: catalog_policy,
+            _FAKE_RANGE_POLICY.name: _FAKE_RANGE_POLICY,
+        },
+        calls=[],
+        responses=[],
+        alert=_mysql_context().alert,
+    )
+
+    assert [item["function"]["name"] for item in direct_range] == [
+        _FAKE_RANGE_POLICY.name
+    ]
+
 
 @pytest.mark.asyncio
 async def test_prometheus_model_cannot_call_tool_outside_local_policy(
@@ -636,6 +673,90 @@ async def test_prometheus_client_deduplicates_successful_calls_without_remote_ro
     assert result.window_start.isoformat() == "2026-08-07T01:55:00+00:00"
     first_request = json.loads(model.messages[0][1]["content"])
     assert first_request["required_window"]["duration_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_prometheus_rejects_oceanbase_series_for_mysql_then_accepts_mysql_series(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SequencedSession.calls = []
+    _SequencedSession.results = [
+        {
+            "structuredContent": {
+                "series": [
+                    {
+                        "metric": {
+                            "__name__": "ob_sysstat_cpu_usage",
+                            "cluster": "oceanbase-prod",
+                            "job": "oceanbase",
+                        },
+                        "values": [[1786067700, "95"]],
+                    }
+                ]
+            }
+        },
+        {
+            "structuredContent": {
+                "series": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_cpu_usage",
+                            "instance": "mysql-17:3306",
+                            "job": "mysql",
+                        },
+                        "values": [[1786067700, "91"]],
+                    }
+                ]
+            }
+        },
+    ]
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _SequencedSession)
+    model = _SequenceModel(
+        [
+            "arbitrary_monitoring_tool",
+            "arbitrary_monitoring_tool",
+            "finish_prometheus_investigation",
+        ],
+        arguments=[
+            {"query": "ob_sysstat_cpu_usage"},
+            {"query": 'mysql_cpu_usage{instance="mysql-17:3306"}'},
+            {},
+        ],
+    )
+    client = PrometheusMCPClient(
+        _server_settings(),
+        model,
+        max_agent_steps=3,
+    )
+
+    result = await client.collect_alert_window(_mysql_context())
+
+    assert result.has_monitoring_data is True
+    assert [item["target_verification"] for item in result.responses] == [
+        "mismatch",
+        "compatible",
+    ]
+    assert [item["root_cause_eligible"] for item in result.responses] == [False, True]
+    assert [item["outcome"] for item in result.tool_attempts] == [
+        "target_mismatch",
+        "observation",
+    ]
+    assert "finish_prometheus_investigation" not in model.available_tools[1]
+    first_feedback = next(
+        payload
+        for message in model.messages[1]
+        if isinstance(message.get("content"), str)
+        and message["content"].lstrip().startswith("{")
+        for payload in [json.loads(message["content"])]
+        if payload.get("host_control", {}).get("outcome") == "target_mismatch"
+    )
+    assert first_feedback["monitoring_result"]["host_target_verification"] == "mismatch"
+    assert "重新执行range_query" in first_feedback["monitoring_result"]["instruction"]
 
 
 @pytest.mark.asyncio
@@ -1259,6 +1380,42 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
     assert empty.status == ToolStatus.NO_DATA
     assert empty.structured_data["root_cause_eligible"] is False
     assert empty.summary == "Prometheus MCP 调用次数达到上限，实时证据不足。"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_target_mismatch_is_preserved_but_is_no_data() -> None:
+    result = PrometheusMCPQueryResult(
+        responses=(
+            {
+                "tool_name": "query_range",
+                "has_monitoring_observation": True,
+                "window_verification": "exact",
+                "target_verification": "mismatch",
+                "target_mismatch_reasons": ["监控序列标识为 oceanbase"],
+                "result": {"series": [{"metric": {"job": "oceanbase"}, "value": 95}]},
+            },
+        ),
+        window_start=ALERT_TIME.replace(minute=55),
+        window_end=ALERT_TIME,
+        model_tool_calls=("query_range",),
+        model_request_ids=(),
+        call_limit_reached=True,
+        finished_by_model=False,
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
+        _RecordingPrometheusClient(result)
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _mysql_context(),
+    )
+
+    assert result.has_monitoring_data is False
+    assert evidence.status == ToolStatus.NO_DATA
+    assert evidence.structured_data["target_mismatch_count"] == 1
+    assert evidence.structured_data["required_target"]["database_engine"] == "mysql"
+    assert evidence.structured_data["root_cause_ineligible_reason"] == "target_mismatch"
+    assert "与告警目标不一致" in evidence.summary
 
 
 @pytest.mark.asyncio

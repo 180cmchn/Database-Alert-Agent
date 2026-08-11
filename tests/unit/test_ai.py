@@ -43,6 +43,9 @@ def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> No
     assert "instance_identity_verification.status=MATCHED" not in (ai_module.SYSTEM_PROMPT)
     assert "不得比较告警标题" in ai_module.VALIDATION_PROMPT
     assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
+    assert "target_verification=mismatch" in ai_module.SYSTEM_PROMPT
+    assert "target_verification=mismatch" in ai_module.PLANNER_PROMPT
+    assert "target_verification=mismatch" in ai_module.VALIDATION_PROMPT
 
 
 def test_system_prompt_requires_chinese_user_facing_recommendations() -> None:
@@ -273,6 +276,64 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
 
     assert "中文最终输出规则" in repair_prompt
     assert "所有面向用户的自然语言字段使用简体中文" in repair_prompt
+
+
+@pytest.mark.asyncio
+async def test_advisor_repairs_archery_endpoint_comparison() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    invalid = Recommendation(
+        summary=(
+            "Archery 慢日志查询因实例 IP 定位偏差（查询了 100.84.97.139:3306 "
+            "而非告警目标实例）未能获取有效慢日志证据。"
+        ),
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
+        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        confidence=0.3,
+        manual_matched=False,
+    )
+    repaired = invalid.model_copy(update={"summary": "Archery 慢日志证据不足，需继续只读核查。"})
+    calls = 0
+    repair_prompt = ""
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        nonlocal calls, repair_prompt
+        calls += 1
+        if calls == 1:
+            return invalid.model_dump_json(), object()
+        repair_prompt = messages[-1]["content"]
+        return repaired.model_dump_json(), object()
+
+    advisor._complete = complete
+
+    recommendation, _ = await advisor.advise(make_alert(), [])
+
+    assert recommendation.summary == repaired.summary
+    assert "must not compare Archery query endpoints" in repair_prompt
+
+
+@pytest.mark.asyncio
+async def test_advisor_rejects_archery_endpoint_comparison_after_repair() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    invalid = Recommendation(
+        summary="Archery 查询的实例与告警目标不一致，因此慢日志无效。",
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
+        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        confidence=0.3,
+        manual_matched=False,
+    )
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        del messages
+        return invalid.model_dump_json(), object()
+
+    advisor._complete = complete
+
+    with pytest.raises(AdvisorError, match="invalid after repair"):
+        await advisor.advise(make_alert(), [])
 
 
 @pytest.mark.asyncio
