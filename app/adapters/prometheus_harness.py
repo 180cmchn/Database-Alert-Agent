@@ -87,6 +87,10 @@ class PrometheusHarnessState:
     consecutive_model_errors: list[dict[str, Any]] = field(default_factory=list)
     last_error_type: str | None = None
     last_error_detail: str | None = None
+    monitoring_scope_status: str = "not_checked"
+    monitoring_scope_reason: str | None = None
+    monitored_database_engines: list[str] = field(default_factory=list)
+    monitoring_target_identifiers: list[str] = field(default_factory=list)
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -327,12 +331,15 @@ class PrometheusHarnessPlanner:
             calls=state.executed_calls,
             responses=state.responses,
             alert=self.scenario.context.alert,
+            monitoring_scope_status=state.monitoring_scope_status,
         )
         model_messages = deepcopy(messages)
         model_messages.append(
             self.client.host_investigation_state_message(
                 authorized_policies=self.scenario.authorized_policies,
                 remote_calls_used=len(state.executed_calls),
+                monitoring_scope_status=state.monitoring_scope_status,
+                monitoring_scope_reason=state.monitoring_scope_reason,
             )
         )
         if messages and "Return exactly one valid Agent action" in str(
@@ -553,6 +560,13 @@ class PrometheusHarnessScenario:
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
         policy = self.authorized_policies[call.tool_name]
+        if policy.capability == "target_discovery":
+            return self._on_target_discovery_result(
+                updated,
+                model_call,
+                call,
+                result,
+            )
         has_observation = has_monitoring_observation(result)
         window_verification = self.client.window_verification(
             policy=policy,
@@ -740,6 +754,95 @@ class PrometheusHarnessScenario:
             status=status,
         )
 
+    def _on_target_discovery_result(
+        self,
+        updated: PrometheusHarnessState,
+        model_call: MCPModelToolCall,
+        call: PreparedCall,
+        result: Any,
+    ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
+        scope_status, scope_reason, monitored_engines, identifiers = (
+            self.client.monitoring_scope_verification(self.context.alert, result)
+        )
+        updated.monitoring_scope_status = scope_status
+        updated.monitoring_scope_reason = scope_reason
+        updated.monitored_database_engines = monitored_engines
+        updated.monitoring_target_identifiers = identifiers
+        outcome = {
+            "in_scope": "monitoring_scope_included",
+            "out_of_scope": "monitoring_scope_excluded",
+            "unknown": "monitoring_scope_unknown",
+        }.get(scope_status, "monitoring_scope_unknown")
+        response = {
+            "tool_name": call.tool_name,
+            "model_arguments": sanitize(call.model_arguments),
+            "arguments": sanitize(call.effective_arguments),
+            "capability": "target_discovery",
+            "has_monitoring_observation": False,
+            "window_verification": "not_applicable",
+            "target_verification": "not_applicable",
+            "monitoring_scope_status": scope_status,
+            "monitoring_scope_reason": scope_reason,
+            "monitored_database_engines": monitored_engines,
+            "monitoring_target_identifiers": identifiers,
+            "root_cause_eligible": False,
+            "root_cause_ineligible_reason": "monitoring_scope_discovery",
+            "result": self.client.evidence_visible_payload(result),
+        }
+        updated.responses.append(response)
+        updated.tool_attempts.append(
+            {
+                "tool_name": call.tool_name,
+                "model_arguments": sanitize(call.model_arguments),
+                "arguments": sanitize(call.effective_arguments),
+                "capability": "target_discovery",
+                "outcome": outcome,
+                "monitoring_scope_status": scope_status,
+                "monitoring_scope_reason": scope_reason,
+                "monitored_database_engines": monitored_engines,
+                "evidence_disposition": "MISSING",
+                "is_contradiction": False,
+            }
+        )
+        self._state = updated
+        instruction = (
+            "已确认告警数据库在 Prometheus 监控范围内；继续选择最小的目录或范围查询。"
+            if scope_status == "in_scope"
+            else (
+                "告警数据库不在 Prometheus 监控范围内；Host 将停止后续指标查询。"
+                if scope_status == "out_of_scope"
+                else "无法可靠确认监控覆盖范围；Host 将停止后续指标查询。"
+            )
+        )
+        invocation_status = (
+            ToolInvocationStatus.SUCCEEDED
+            if result is not None
+            else ToolInvocationStatus.NO_DATA
+        )
+        observation = {
+            "tool_name": call.tool_name,
+            "outcome": outcome,
+            "monitoring_scope_status": scope_status,
+            "monitoring_scope_reason": scope_reason,
+            "evidence_disposition": "MISSING",
+            "is_contradiction": False,
+        }
+        return ScenarioTransition(
+            state=updated,
+            observation=observation,
+            message=self.client.completed_tool_messages(
+                model_call,
+                result,
+                host_control=self.client.host_control_feedback(
+                    remote_calls_used=len(updated.executed_calls),
+                    outcome=outcome,
+                    capability="target_discovery",
+                    instruction=instruction,
+                ),
+            ),
+            status=invocation_status,
+        )
+
     def result_error_directive(
         self,
         state: PrometheusHarnessState,
@@ -781,6 +884,11 @@ class PrometheusHarnessScenario:
         if not is_tool_error:
             updated.last_error_type = error.code
             updated.last_error_detail = detail
+        elif capability == "target_discovery":
+            updated.monitoring_scope_status = "unknown"
+            updated.monitoring_scope_reason = (
+                "Prometheus 目标发现工具执行失败，无法确认告警数据库是否受监控。"
+            )
         self._state = updated
         instruction = (
             "根据实际错误修改参数，并选择最小的只读范围查询。"
@@ -882,6 +990,14 @@ class PrometheusHarnessScenario:
     def inconclusive_reason(self, state: PrometheusHarnessState) -> str | None:
         if state.has_monitoring_data:
             return None
+        if state.monitoring_scope_status == "out_of_scope":
+            return state.monitoring_scope_reason or (
+                "告警数据库不在 Prometheus 当前配置的监控范围内，已跳过后续指标查询。"
+            )
+        if state.monitoring_scope_status == "unknown":
+            return state.monitoring_scope_reason or (
+                "无法确认告警数据库是否在 Prometheus 监控范围内，未继续执行指标查询。"
+            )
         range_attempts = [
             attempt for attempt in state.tool_attempts if attempt.get("capability") == "range_query"
         ]
@@ -1143,7 +1259,11 @@ async def collect_prometheus_with_harness(
         finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED
         and "remote_tool_calls" in finish.summary
     )
-    if finished_by_model:
+    if state.monitoring_scope_status == "out_of_scope":
+        termination_reason = "database_not_monitored"
+    elif state.monitoring_scope_status == "unknown" and not has_monitoring_data:
+        termination_reason = "monitoring_scope_unknown"
+    elif finished_by_model:
         termination_reason = "finished_by_model"
     elif model_failure:
         termination_reason = (
@@ -1247,6 +1367,10 @@ async def collect_prometheus_with_harness(
             if finish.reason == RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE
             else None
         ),
+        monitoring_scope_status=state.monitoring_scope_status,
+        monitoring_scope_reason=state.monitoring_scope_reason,
+        monitored_database_engines=tuple(state.monitored_database_engines),
+        monitoring_target_identifiers=tuple(state.monitoring_target_identifiers),
     )
 
 

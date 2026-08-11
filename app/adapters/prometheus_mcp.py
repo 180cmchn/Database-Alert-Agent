@@ -38,7 +38,7 @@ PROMETHEUS_MCP_MAX_CATALOG_CALLS: Final = 2
 PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS: Final = 3
 PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS: Final = 2
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v7"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v8"
 PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS: Final = 8_000
 PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS: Final = 24_000
 PROMETHEUS_MCP_EVIDENCE_MAX_CHARS: Final = 12_000
@@ -103,6 +103,11 @@ _MONITORING_IDENTITY_KEYS: Final = {
     "job",
     "server",
     "target",
+}
+_MONITORING_TARGET_COLLECTION_KEYS: Final = {
+    "activetargets",
+    "configuredtargets",
+    "targets",
 }
 _ENGINE_FAMILY_MARKERS: Final = {
     "oceanbase": ("oceanbase", "obcluster", "obproxy"),
@@ -194,7 +199,7 @@ class PrometheusMCPToolPolicy:
     """Deployment-owned authorization and execution contract for one MCP tool."""
 
     name: str
-    capability: Literal["catalog", "range_query"]
+    capability: Literal["target_discovery", "catalog", "range_query"]
     start_argument_path: tuple[str, ...] = ()
     end_argument_path: tuple[str, ...] = ()
     timestamp_encoding: Literal["rfc3339", "unix_seconds", "unix_millis"] | None = None
@@ -226,6 +231,12 @@ class PrometheusMCPQueryResult:
     mcp_session_attempts: int = 1
     reconnect_error_type: str | None = None
     inconclusive_reason: str | None = None
+    monitoring_scope_status: Literal[
+        "not_checked", "in_scope", "out_of_scope", "unknown"
+    ] = "not_checked"
+    monitoring_scope_reason: str | None = None
+    monitored_database_engines: tuple[str, ...] = ()
+    monitoring_target_identifiers: tuple[str, ...] = ()
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -386,7 +397,7 @@ def _parse_tool_policies(raw: Any) -> tuple[PrometheusMCPToolPolicy, ...]:
                 "Prometheus MCP toolPolicies entries must map tool names to objects"
             )
         capability = value.get("capability")
-        if capability not in {"catalog", "range_query"}:
+        if capability not in {"target_discovery", "catalog", "range_query"}:
             raise PrometheusMCPConfigurationError(
                 f"Prometheus MCP policy {name!r} has an unsupported capability"
             )
@@ -547,8 +558,29 @@ class PrometheusMCPClient:
         calls: list[MCPModelToolCall],
         responses: list[dict[str, Any]],
         alert: NormalizedAlert | None = None,
+        monitoring_scope_status: str = "not_checked",
     ) -> list[dict[str, Any]]:
-        """Prefer direct range evidence and cap auxiliary catalogue exploration."""
+        """Require target discovery, then prefer direct range evidence."""
+
+        target_discovery_names = {
+            name
+            for name, policy in authorized_policies.items()
+            if policy.capability == "target_discovery"
+        }
+        if target_discovery_names and monitoring_scope_status != "in_scope":
+            if monitoring_scope_status != "not_checked":
+                return []
+            return [
+                tool
+                for tool in model_tool_list
+                if tool.get("function", {}).get("name") in target_discovery_names
+            ]
+        if target_discovery_names:
+            model_tool_list = [
+                tool
+                for tool in model_tool_list
+                if tool.get("function", {}).get("name") not in target_discovery_names
+            ]
 
         has_monitoring_data = self.responses_have_monitoring_data(responses)
         range_names = {
@@ -570,8 +602,16 @@ class PrometheusMCPClient:
             ) is not None
             and policy.capability == "catalog"
         )
+        evidence_calls = [
+            call
+            for call in calls
+            if (
+                policy := authorized_policies.get(call.name)
+            ) is not None
+            and policy.capability != "target_discovery"
+        ]
         direct_range_first = (
-            not calls
+            not evidence_calls
             and alert is not None
             and bool(self.alert_metric_candidates(alert))
         )
@@ -850,10 +890,169 @@ class PrometheusMCPClient:
         ]
         return {
             "database_engine": database.engine if database else None,
+            "database": database.database if database else None,
             "cluster": alert.cluster,
             "instance_candidates": list(dict.fromkeys(candidates)),
             "metric_candidates": PrometheusMCPClient.alert_metric_candidates(alert),
         }
+
+    @classmethod
+    def monitoring_scope_verification(
+        cls,
+        alert: NormalizedAlert,
+        payload: Any,
+    ) -> tuple[str, str, list[str], list[str]]:
+        """Compare a discovered monitoring target inventory with the alert database."""
+
+        inventory_observed, target_count, raw_identities = cls._monitoring_target_inventory(
+            payload
+        )
+        identities = list(dict.fromkeys(item.strip() for item in raw_identities if item.strip()))
+        monitored_engines = sorted(
+            {
+                family
+                for value in identities
+                if (family := cls._engine_family(value)) is not None
+            }
+        )
+        database = alert.database
+        expected_engine = cls._engine_family(database.engine if database else None)
+        alert_candidates = [
+            value
+            for value in (
+                database.engine if database else None,
+                database.instance if database else None,
+                database.database if database else None,
+                database.host if database else None,
+                alert.cluster,
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+        candidate_variants = {
+            variant
+            for value in alert_candidates
+            for variant in cls._monitoring_identity_variants(value)
+        }
+        identity_variants = {
+            variant
+            for value in identities
+            for variant in cls._monitoring_identity_variants(value)
+        }
+
+        if not inventory_observed:
+            return (
+                "unknown",
+                "Prometheus 目标发现结果未包含可识别的目标清单，无法确认告警数据库是否受监控。",
+                monitored_engines,
+                identities[:100],
+            )
+        if target_count == 0:
+            return (
+                "out_of_scope",
+                "Prometheus 目标清单为空，当前告警数据库未配置监控目标。",
+                monitored_engines,
+                [],
+            )
+        if not identities:
+            return (
+                "unknown",
+                "Prometheus 目标清单非空，但缺少可识别的数据库类型或目标标识。",
+                monitored_engines,
+                [],
+            )
+        if expected_engine is not None and expected_engine in monitored_engines:
+            return (
+                "in_scope",
+                f"Prometheus 目标清单包含告警数据库类型 {expected_engine}。",
+                monitored_engines,
+                identities[:100],
+            )
+        if expected_engine is not None and monitored_engines:
+            configured = "、".join(monitored_engines)
+            return (
+                "out_of_scope",
+                (
+                    f"Prometheus 目标清单仅识别到 {configured}，"
+                    f"不包含告警数据库类型 {expected_engine}。"
+                ),
+                monitored_engines,
+                identities[:100],
+            )
+        if candidate_variants.intersection(identity_variants):
+            return (
+                "in_scope",
+                "Prometheus 目标清单包含与告警数据库一致的目标标识。",
+                monitored_engines,
+                identities[:100],
+            )
+        return (
+            "unknown",
+            "Prometheus 已返回目标清单，但其中没有足够的数据库类型或目标标识用于可靠匹配。",
+            monitored_engines,
+            identities[:100],
+        )
+
+    @classmethod
+    def _monitoring_target_inventory(
+        cls,
+        value: Any,
+        *,
+        accept_direct_list: bool = True,
+    ) -> tuple[bool, int, list[str]]:
+        if isinstance(value, str):
+            decoded = cls._decode_json_text(value)
+            if decoded is None:
+                return False, 0, []
+            return cls._monitoring_target_inventory(
+                decoded,
+                accept_direct_list=accept_direct_list,
+            )
+        if isinstance(value, list):
+            if not accept_direct_list:
+                return False, 0, []
+            return True, len(value), cls._monitoring_identity_values(value)
+        if not isinstance(value, Mapping):
+            return False, 0, []
+
+        observed = False
+        target_count = 0
+        identities: list[str] = []
+        for raw_key, nested in value.items():
+            key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
+            if key in _MONITORING_TARGET_COLLECTION_KEYS and isinstance(
+                nested, (Mapping, list)
+            ):
+                observed = True
+                target_count += len(nested)
+                identities.extend(cls._monitoring_identity_values(nested))
+                continue
+            if isinstance(nested, (Mapping, list, str)):
+                nested_observed, nested_count, nested_identities = (
+                    cls._monitoring_target_inventory(
+                        nested,
+                        accept_direct_list=False,
+                    )
+                )
+                observed = observed or nested_observed
+                target_count += nested_count
+                identities.extend(nested_identities)
+        return observed, target_count, identities
+
+    @staticmethod
+    def _monitoring_identity_variants(value: str) -> set[str]:
+        normalized = value.strip().casefold().rstrip("/")
+        if not normalized:
+            return set()
+        variants = {normalized}
+        parsed = urlsplit(
+            normalized if "://" in normalized else f"//{normalized}",
+            allow_fragments=False,
+        )
+        if parsed.hostname:
+            variants.add(parsed.hostname.casefold())
+        if parsed.netloc:
+            variants.add(parsed.netloc.casefold())
+        return variants
 
     @classmethod
     def target_verification(
@@ -1193,7 +1392,13 @@ class PrometheusMCPClient:
         policy: PrometheusMCPToolPolicy,
         remote_description: str,
     ) -> str:
-        if policy.capability == "range_query":
+        if policy.capability == "target_discovery":
+            host_contract = (
+                "Host policy capability=target_discovery. This tool must be called before "
+                "catalog or range_query tools to discover which database targets are monitored. "
+                "Its result establishes monitoring coverage but is not root-cause evidence."
+            )
+        elif policy.capability == "range_query":
             start_path = ".".join(policy.start_argument_path)
             end_path = ".".join(policy.end_argument_path)
             host_contract = (
@@ -1216,7 +1421,13 @@ class PrometheusMCPClient:
         *,
         authorized_policies: Mapping[str, PrometheusMCPToolPolicy],
         remote_calls_used: int,
+        monitoring_scope_status: str = "not_checked",
+        monitoring_scope_reason: str | None = None,
     ) -> dict[str, Any]:
+        requires_target_discovery = any(
+            policy.capability == "target_discovery"
+            for policy in authorized_policies.values()
+        )
         return {
             "role": "user",
             "content": json.dumps(
@@ -1231,13 +1442,23 @@ class PrometheusMCPClient:
                         name: policy.capability
                         for name, policy in sorted(authorized_policies.items())
                     },
+                    "monitoring_scope_status": monitoring_scope_status,
+                    "monitoring_scope_reason": monitoring_scope_reason,
                     "host_window_binding": (
                         "range_query 的起止参数由 Host 覆盖为 required_window；"
                         "catalog 结果不能作为实时证据。"
                     ),
                     "instruction": (
-                        "只做必要的 catalog 发现，并至少为 range_query 保留两次调用"
-                        "额度；优先选择最能区分告警候选原因的范围查询。"
+                        (
+                            "若监控范围尚未确认，先调用 target_discovery；只有 Host 确认"
+                            "in_scope 后才能做必要的 catalog 发现和 range_query，并至少为"
+                            "range_query 保留两次调用额度。"
+                        )
+                        if requires_target_discovery
+                        else (
+                            "只做必要的 catalog 发现，并至少为 range_query 保留两次调用"
+                            "额度；优先选择最能区分告警候选原因的范围查询。"
+                        )
                     ),
                 },
                 ensure_ascii=False,
@@ -1527,12 +1748,23 @@ class PrometheusMCPClient:
         window_start: datetime,
         window_end: datetime,
     ) -> list[dict[str, Any]]:
+        target_discovery_instruction = (
+            "每次调查必须先调用 capability=target_discovery 的工具，发现当前配置了监控的"
+            "数据库目标；只有 Host 判定告警数据库为 in_scope 后，才可继续目录或范围查询。"
+            "out_of_scope 或 unknown 时 Host 会停止调查，不得用其它数据库的指标替代。"
+            if any(
+                policy.capability == "target_discovery"
+                for policy in self._tool_policies.values()
+            )
+            else ""
+        )
         return [
             {
                 "role": "system",
                 "content": (
                     "你是 Prometheus MCP 监控调查 Agent。"
                     "根据 MCP 动态发现的工具 Schema 自主选择调用，每轮只调用一个工具。"
+                    f"{target_discovery_instruction}"
                     "只分析当前告警发生前五分钟的区间，避免将其它时段数据作为本次告警证据。"
                     "若服务同时提供即时查询和范围查询，必须使用范围查询并把起止参数精确设置为"
                     "Host给出的required_window；默认查询当前时刻的即时结果不能作为本次告警证据。"
@@ -1643,6 +1875,10 @@ class PrometheusMCPEvidenceTool:
             "reconnect_error_type": result.reconnect_error_type,
             "inconclusive_reason": result.inconclusive_reason,
             "required_target": required_target,
+            "monitoring_scope_status": result.monitoring_scope_status,
+            "monitoring_scope_reason": result.monitoring_scope_reason,
+            "monitored_database_engines": list(result.monitored_database_engines),
+            "monitoring_target_identifiers": list(result.monitoring_target_identifiers),
             "target_mismatch_count": target_mismatch_count,
             "monitoring_results": list(result.responses),
             "query_completed": result.has_monitoring_data,
@@ -1659,15 +1895,40 @@ class PrometheusMCPEvidenceTool:
                 suffix = ""
             if target_mismatch_count:
                 suffix += f"；另有 {target_mismatch_count} 条目标不匹配返回已排除"
+            coverage_prefix = (
+                "Prometheus MCP 已确认告警数据库在监控范围内，并"
+                if result.monitoring_scope_status == "in_scope"
+                else "Prometheus MCP "
+            )
             return ToolExecutionResult(
                 status=ToolStatus.SUCCESS,
                 summary=(
-                    "Prometheus MCP 已取得告警发生前五分钟的实时监控证据"
+                    f"{coverage_prefix}已取得告警发生前五分钟的实时监控证据"
                     f"（{len(result.responses)} 条工具返回）{suffix}。"
                 ),
                 structured_data=structured_data,
             )
-        if target_mismatch_count:
+        if result.monitoring_scope_status == "out_of_scope":
+            structured_data["reason_code"] = "database_not_monitored"
+            structured_data["root_cause_eligible"] = False
+            structured_data["root_cause_ineligible_reason"] = "database_not_monitored"
+            structured_data = self._compact_missing_evidence(structured_data, result)
+            return ToolExecutionResult(
+                status=ToolStatus.SKIPPED,
+                summary=(
+                    "Prometheus MCP 已完成监控范围发现："
+                    f"{result.monitoring_scope_reason or '告警数据库不在当前监控范围内'}"
+                    "已跳过后续指标查询。"
+                ),
+                structured_data=structured_data,
+            )
+        if result.monitoring_scope_status == "unknown":
+            reason = (
+                "Prometheus MCP 无法确认告警数据库是否在当前监控范围内，"
+                "未继续执行指标查询："
+                f"{result.monitoring_scope_reason or '目标发现结果不足'}"
+            )
+        elif target_mismatch_count:
             reason = (
                 f"Prometheus MCP 返回 {target_mismatch_count} 条与告警目标不一致的监控结果，"
                 "未取得告警目标的可用实时证据。"
@@ -1685,12 +1946,16 @@ class PrometheusMCPEvidenceTool:
             reason = "Prometheus MCP 未返回可用监控结果，实时证据不足。"
         structured_data["root_cause_eligible"] = False
         structured_data["root_cause_ineligible_reason"] = (
-            "target_mismatch"
-            if target_mismatch_count
+            "monitoring_scope_unknown"
+            if result.monitoring_scope_status == "unknown"
             else (
-                "no_discriminating_evidence"
-                if result.termination_reason == "no_discriminating_evidence"
-                else "no_usable_monitoring_result"
+                "target_mismatch"
+                if target_mismatch_count
+                else (
+                    "no_discriminating_evidence"
+                    if result.termination_reason == "no_discriminating_evidence"
+                    else "no_usable_monitoring_result"
+                )
             )
         )
         structured_data = self._compact_missing_evidence(structured_data, result)
@@ -1743,10 +2008,15 @@ class PrometheusMCPEvidenceTool:
             "reconnect_error_type",
             "inconclusive_reason",
             "required_target",
+            "monitoring_scope_status",
+            "monitoring_scope_reason",
+            "monitored_database_engines",
+            "monitoring_target_identifiers",
             "target_mismatch_count",
             "query_completed",
             "root_cause_eligible",
             "root_cause_ineligible_reason",
+            "reason_code",
         ):
             value = structured_data.get(key)
             if value is not None:
@@ -1788,6 +2058,9 @@ class PrometheusMCPEvidenceTool:
                 "window_verification",
                 "target_verification",
                 "target_mismatch_reasons",
+                "monitoring_scope_status",
+                "monitoring_scope_reason",
+                "monitored_database_engines",
                 "evidence_disposition",
                 "is_contradiction",
                 "error_type",
@@ -1813,6 +2086,10 @@ class PrometheusMCPEvidenceTool:
                 "window_verification",
                 "target_verification",
                 "target_mismatch_reasons",
+                "monitoring_scope_status",
+                "monitoring_scope_reason",
+                "monitored_database_engines",
+                "monitoring_target_identifiers",
                 "root_cause_eligible",
                 "root_cause_ineligible_reason",
             )
@@ -1883,6 +2160,7 @@ class PrometheusMCPEvidenceTool:
             "model_tool_calls",
             "reconnect_error_type",
             "target_mismatch_reasons",
+            "monitoring_target_identifiers",
         ):
             if self._evidence_fits(compact):
                 break
@@ -1919,6 +2197,10 @@ class PrometheusMCPEvidenceTool:
                 compact.get("root_cause_ineligible_reason") or "no_usable_monitoring_result"
             )[:160],
             "termination_reason": str(compact.get("termination_reason") or "unknown")[:160],
+            "monitoring_scope_status": str(
+                compact.get("monitoring_scope_status") or "not_checked"
+            )[:40],
+            "monitoring_scope_reason": str(compact.get("monitoring_scope_reason") or "")[:160],
             "call_limit_reached": bool(compact.get("call_limit_reached")),
             "model_tool_call_count": int(compact.get("model_tool_call_count") or 0),
             "monitoring_result_count": int(compact.get("monitoring_result_count") or 0),

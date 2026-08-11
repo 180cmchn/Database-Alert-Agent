@@ -506,17 +506,26 @@ MCP Host。
 的工具会暴露给 AI Agent；调用前还会再次校验授权。模型负责选择指标和查询语义，Host 负责只读
 工具边界、固定参数和时间窗，不依赖提示词自律。
 
-`toolPolicies` 的 `catalog` 能力只用于目录、标签和辅助探针；`range_query` 必须声明同一对象中的
-`startArgument`、`endArgument` 及 `rfc3339`、`unix_seconds` 或 `unix_millis` 编码。Host 在发网前
-覆盖这两个参数为 `occurred_at - 5 分钟` 到 `occurred_at`，并将模型参数和实际参数分别留痕。
+`toolPolicies` 的 `target_discovery` 能力用于发现当前 Prometheus 配置的数据库监控目标，`catalog`
+只用于目录、标签和辅助探针；`range_query` 必须声明同一对象中的 `startArgument`、`endArgument` 及
+`rfc3339`、`unix_seconds` 或 `unix_millis` 编码。Host 在发网前覆盖这两个参数为
+`occurred_at - 5 分钟` 到 `occurred_at`，并将模型参数和实际参数分别留痕。
 只有本地授权的 `range_query` 返回真实观测后才有根因支持资格；样本时间戳可因越界否决资格，但
 即时查询中偶然落入窗口的单点时间戳不能把未知工具升级为范围证据。策略配置的参数路径必须存在于
 实时 Schema；可选 `schemaSha256` 不匹配时整个工具 fail closed。
 
+配置 `target_discovery` 后，每次调查首轮只向模型开放该能力；当前配置将 `get_targets` 用作目标发现
+工具。Host 从返回的目标标签中识别数据库类型和目标标识，并与规范化告警数据库比较：`in_scope` 才
+继续开放 `catalog` 和 `range_query`；`out_of_scope` 返回 `SKIPPED`，明确说明告警数据库未纳入当前
+监控范围；无法可靠识别告警数据库或目标清单时返回 `NO_DATA` 和 `monitoring_scope_unknown`。三种
+结果都会保留 `monitoring_scope_status`、原因、识别到的数据库类型和有界目标标识。目标发现结果只是
+覆盖范围上下文，不能支持或反驳本次告警根因。
+
 SSE 空闲读取期限使用外层 Prometheus 工具期限，避免模型规划期间沿用单次 MCP 读取的 60 秒期限而
-提前断流。模型看到的每个工具说明会附加 Host 审核后的 `catalog` 或 `range_query` 能力；首轮和每轮
-结果都包含远端调用的已用、上限与剩余次数。取得合格范围观测后模型可主动结束调查；尚无可用观测
-时由 Host 根据目录相关性、空查询次数和目标归属决定是否继续，模型不能靠提前结束掩盖缺失证据。
+提前断流。模型看到的每个工具说明会附加 Host 审核后的 `target_discovery`、`catalog` 或
+`range_query` 能力；首轮和每轮结果都包含远端调用的已用、上限与剩余次数。取得合格范围观测后
+模型可主动结束调查；尚无可用观测时由 Host 根据监控覆盖范围、目录相关性、空查询次数和目标归属
+决定是否继续，模型不能靠提前结束掩盖缺失证据。
 
 当尚无合格范围观测且远端预算只剩两次时，Host 会暂时隐藏 `catalog` 工具，为 `range_query` 保留两次
 探针机会；在此之前不限制真实 MCP 所需的指标、标签或标签值发现链路。
@@ -554,9 +563,10 @@ JSON 或 JSON 代码块会先解包再识别观测与样本时间戳，避免已
 
 项目配置文件只保存环境变量占位符。请在你自己的部署环境中填写端点、认证请求头名和值：
 
-由于本机无法连接公司内网，仓库中的 `toolPolicies` 默认为空。配置了 Prometheus URL 但未配置至少
-一个本地策略时，Host 会在启动构建阶段明确失败，不会猜测远端工具是否只读。请先在内网受控环境
-抓取并审核真实 `tools/list`，再按实际工具名和 Schema 更新配置，例如：
+仓库中的 `toolPolicies` 按当前部署使用的工具名配置，但本机无法连接公司内网验证实时 Schema。
+配置了 Prometheus URL 但未配置至少一个本地策略时，Host 会在启动构建阶段明确失败，不会猜测远端
+工具是否只读。部署前仍应在内网受控环境抓取并审核真实 `tools/list`，确保工具名和 Schema 一致，
+核心配置形态如下：
 
 ```json
 {
@@ -567,7 +577,11 @@ JSON 或 JSON 代码块会先解包再识别观测与样本时间戳，避免已
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
       },
       "toolPolicies": {
-        "replace_with_actual_range_tool": {
+        "get_targets": {
+          "capability": "target_discovery",
+          "fixedArguments": {}
+        },
+        "execute_range_query": {
           "capability": "range_query",
           "startArgument": "start",
           "endArgument": "end",

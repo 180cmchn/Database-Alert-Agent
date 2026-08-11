@@ -105,6 +105,28 @@ def _mysql_context() -> InvestigationContext:
     )
 
 
+def _oceanbase_context() -> InvestigationContext:
+    context = _context()
+    return context.model_copy(
+        update={
+            "alert": context.alert.model_copy(
+                update={
+                    "title": "OceanBase tenant CPU elevated",
+                    "reason": "oceanbase_cpu_usage",
+                    "alert_type": "oceanbase_cpu_usage",
+                    "metric_name": "ob_sysstat_cpu_usage",
+                    "cluster": "oceanbase-prod",
+                    "database": DatabaseTarget(
+                        engine="oceanbase",
+                        instance="ob-1:2886",
+                        host="ob-1",
+                    ),
+                }
+            )
+        }
+    )
+
+
 def _mysql_slow_context() -> InvestigationContext:
     context = _mysql_context()
     return context.model_copy(
@@ -143,6 +165,10 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
                             )
                         },
                         "toolPolicies": {
+                            "get_targets": {
+                                "capability": "target_discovery",
+                                "fixedArguments": {},
+                            },
                             "query_range": {
                                 "capability": "range_query",
                                 "startArgument": "start",
@@ -170,6 +196,11 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
     assert resolved.url == "https://prometheus.example.test/sse"
     assert resolved.headers == {"X-API-Key": "test-prometheus-secret"}
     assert resolved.tool_policies == (
+        PrometheusMCPToolPolicy(
+            name="get_targets",
+            capability="target_discovery",
+            fixed_arguments={},
+        ),
         PrometheusMCPToolPolicy(
             name="query_range",
             capability="range_query",
@@ -486,6 +517,109 @@ class _SequenceModel:
         )
 
 
+class _TargetAwareTool:
+    def __init__(self, name: str, schema: dict[str, Any]) -> None:
+        self.name = name
+        self.schema = schema
+
+    def model_dump(self, *, mode: str) -> dict[str, Any]:
+        assert mode == "json"
+        return {
+            "name": self.name,
+            "description": f"Fixture tool {self.name}",
+            "inputSchema": self.schema,
+            "annotations": {"readOnlyHint": True},
+        }
+
+
+class _TargetAwareSession(_FakeSession):
+    calls: list[tuple[str, dict[str, Any]]] = []
+    results: list[dict[str, Any]] = []
+
+    async def list_tools(self, cursor: str | None = None) -> Any:
+        assert cursor is None
+        tools = [
+            _TargetAwareTool(
+                "get_targets",
+                {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            _TargetAwareTool(
+                "execute_range_query",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "start": {"type": "string"},
+                        "end": {"type": "string"},
+                    },
+                    "required": ["query", "start", "end"],
+                    "additionalProperties": False,
+                },
+            ),
+            _TargetAwareTool(
+                "list_metrics",
+                {
+                    "type": "object",
+                    "properties": {"filter_pattern": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            ),
+        ]
+        return type("ToolList", (), {"tools": tools, "nextCursor": None})()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        index = len(type(self).calls)
+        type(self).calls.append((name, arguments))
+        result = type(self).results[index]
+        return type("ToolResult", (), {"model_dump": lambda _self, **_: result})()
+
+
+def _target_aware_settings() -> PrometheusMCPServerSettings:
+    return _server_settings(
+        tool_policies=(
+            PrometheusMCPToolPolicy(
+                name="get_targets",
+                capability="target_discovery",
+            ),
+            PrometheusMCPToolPolicy(
+                name="execute_range_query",
+                capability="range_query",
+                start_argument_path=("start",),
+                end_argument_path=("end",),
+                timestamp_encoding="rfc3339",
+            ),
+            PrometheusMCPToolPolicy(
+                name="list_metrics",
+                capability="catalog",
+            ),
+        )
+    )
+
+
+def _oceanbase_target_result() -> dict[str, Any]:
+    return {
+        "structuredContent": {
+            "status": "success",
+            "data": {
+                "activeTargets": [
+                    {
+                        "labels": {
+                            "job": "oceanbase",
+                            "cluster": "oceanbase-prod",
+                            "instance": "ob-1:2886",
+                        },
+                        "health": "up",
+                    }
+                ]
+            },
+        }
+    }
+
+
 def test_prometheus_local_policy_rejects_unknown_and_destructive_tools() -> None:
     schema = {
         "type": "object",
@@ -523,6 +657,120 @@ def test_prometheus_local_policy_rejects_unknown_and_destructive_tools() -> None
     description = converted[0]["function"]["description"]
     assert "capability=range_query" in description
     assert "root-cause-eligible" in description
+
+
+def test_prometheus_scope_verification_uses_discovered_database_targets() -> None:
+    payload = _oceanbase_target_result()["structuredContent"]
+
+    mysql = PrometheusMCPClient.monitoring_scope_verification(
+        _mysql_context().alert,
+        payload,
+    )
+    oceanbase = PrometheusMCPClient.monitoring_scope_verification(
+        _oceanbase_context().alert,
+        payload,
+    )
+
+    assert mysql[0] == "out_of_scope"
+    assert mysql[2] == ["oceanbase"]
+    assert "不包含告警数据库类型 mysql" in mysql[1]
+    assert oceanbase[0] == "in_scope"
+    assert oceanbase[2] == ["oceanbase"]
+    opaque = PrometheusMCPClient.monitoring_scope_verification(
+        _mysql_context().alert,
+        {"data": {"activeTargets": [{"health": "up"}]}},
+    )
+    unrelated_empty_list = PrometheusMCPClient.monitoring_scope_verification(
+        _mysql_context().alert,
+        {"data": {"warnings": []}},
+    )
+    assert opaque[0] == "unknown"
+    assert unrelated_empty_list[0] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_stops_after_target_discovery_for_unmonitored_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _TargetAwareSession.calls = []
+    _TargetAwareSession.results = [_oceanbase_target_result()]
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _TargetAwareSession)
+    model = _SequenceModel(["get_targets"], arguments=[{}])
+    client = PrometheusMCPClient(
+        _target_aware_settings(),
+        model,
+        max_agent_steps=4,
+    )
+
+    result = await client.collect_alert_window(_mysql_context())
+
+    assert _TargetAwareSession.calls == [("get_targets", {})]
+    assert model.available_tools == [{"get_targets"}]
+    assert result.monitoring_scope_status == "out_of_scope"
+    assert result.monitored_database_engines == ("oceanbase",)
+    assert result.termination_reason == "database_not_monitored"
+    assert result.has_monitoring_data is False
+
+
+@pytest.mark.asyncio
+async def test_prometheus_queries_metrics_only_after_target_discovery_matches_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _TargetAwareSession.calls = []
+    _TargetAwareSession.results = [
+        _oceanbase_target_result(),
+        {
+            "structuredContent": {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {
+                                "__name__": "ob_sysstat_cpu_usage",
+                                "job": "oceanbase",
+                                "cluster": "oceanbase-prod",
+                            },
+                            "values": [[1786067700, "91"]],
+                        }
+                    ],
+                },
+            }
+        },
+    ]
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _TargetAwareSession)
+    model = _SequenceModel(
+        ["get_targets", "execute_range_query", "finish_prometheus_investigation"],
+        arguments=[{}, {"query": 'ob_sysstat_cpu_usage{cluster="oceanbase-prod"}'}, {}],
+    )
+    client = PrometheusMCPClient(
+        _target_aware_settings(),
+        model,
+        max_agent_steps=4,
+    )
+
+    result = await client.collect_alert_window(_oceanbase_context())
+
+    assert [name for name, _arguments in _TargetAwareSession.calls] == [
+        "get_targets",
+        "execute_range_query",
+    ]
+    assert model.available_tools[0] == {"get_targets"}
+    assert "get_targets" not in model.available_tools[1]
+    assert model.available_tools[1] == {"execute_range_query"}
+    assert result.monitoring_scope_status == "in_scope"
+    assert result.has_monitoring_data is True
+    assert result.finished_by_model is True
 
 
 def test_prometheus_policy_reserves_range_budget_and_hides_finish_without_data() -> None:
@@ -1625,6 +1873,51 @@ def test_prometheus_outer_tool_declares_strict_empty_input_schema() -> None:
         "properties": {},
         "additionalProperties": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_prometheus_evidence_marks_unmonitored_database_as_skipped() -> None:
+    result = PrometheusMCPQueryResult(
+        responses=(
+            {
+                "tool_name": "get_targets",
+                "capability": "target_discovery",
+                "has_monitoring_observation": False,
+                "monitoring_scope_status": "out_of_scope",
+                "root_cause_eligible": False,
+                "result": {"data": {"activeTargets": []}},
+            },
+        ),
+        window_start=ALERT_TIME.replace(minute=55),
+        window_end=ALERT_TIME,
+        model_tool_calls=("get_targets",),
+        model_request_ids=(),
+        call_limit_reached=False,
+        finished_by_model=False,
+        termination_reason="database_not_monitored",
+        inconclusive_reason="当前仅发现 OceanBase 监控目标。",
+        monitoring_scope_status="out_of_scope",
+        monitoring_scope_reason=(
+            "Prometheus 目标清单仅识别到 oceanbase，不包含告警数据库类型 mysql。"
+        ),
+        monitored_database_engines=("oceanbase",),
+    )
+
+    evidence = await PrometheusMCPEvidenceTool(
+        _RecordingPrometheusClient(result)
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _mysql_context(),
+    )
+
+    assert evidence.status == ToolStatus.SKIPPED
+    assert "已跳过后续指标查询" in evidence.summary
+    assert evidence.structured_data["reason_code"] == "database_not_monitored"
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert (
+        evidence.structured_data["root_cause_ineligible_reason"]
+        == "database_not_monitored"
+    )
 
 
 @pytest.mark.asyncio
