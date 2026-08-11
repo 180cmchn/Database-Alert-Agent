@@ -1,14 +1,13 @@
-"""Prometheus provider profile for the shared MCP Agent harness.
+"""Prometheus transport, planning, and scenario adapter for the shared Harness.
 
-This module keeps transport, model planning, Host policy, and compatibility
-mapping separate.  It intentionally reuses the existing Prometheus policy and
-payload helpers so opting into the shared runtime does not create a second
-authorization contract.
+Provider authorization and payload semantics come from the public policy/codec
+surface on ``PrometheusMCPClient`` so there is only one Host contract.
 """
 
 from __future__ import annotations
 
 import json
+from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
@@ -20,7 +19,9 @@ from uuid import uuid4
 
 import httpx
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
+from mcp import ClientSession
 from mcp import types as mcp_types
+from mcp.client.sse import sse_client
 
 from app.adapters.prometheus_mcp import (
     _FINISH_TOOL_NAME,
@@ -36,7 +37,7 @@ from app.adapters.prometheus_mcp import (
     PrometheusMCPQueryResult,
     PrometheusMCPToolError,
     PrometheusMCPToolPolicy,
-    _has_monitoring_observation,
+    has_monitoring_observation,
 )
 from app.agent_runtime import (
     AgentEventKind,
@@ -87,7 +88,7 @@ class PrometheusHarnessState:
 
     @property
     def has_monitoring_data(self) -> bool:
-        return PrometheusMCPClient._responses_have_monitoring_data(self.responses)
+        return PrometheusMCPClient.responses_have_monitoring_data(self.responses)
 
 
 _PROMETHEUS_SSE_TRANSPORT_ERROR_CODE = "prometheus_sse_transport_error"
@@ -181,7 +182,16 @@ class PrometheusSSEMCPToolSession:
 
     async def list_tools(self) -> list[DiscoveredMCPTool]:
         try:
-            raw_tools = await self.client._list_tools(self._session)
+            raw_tools: list[Any] = []
+            cursor: str | None = None
+            for _page in range(10):
+                response = await self._session.list_tools(cursor=cursor)
+                raw_tools.extend(response.tools)
+                cursor = getattr(response, "nextCursor", None)
+                if not cursor:
+                    break
+            if not raw_tools:
+                raise PrometheusMCPProtocolError("Prometheus MCP returned no tools")
         except BaseException as exc:
             normalized = _normalized_sse_exception(exc, operation="tool discovery")
             if normalized is None or normalized is exc:
@@ -197,7 +207,7 @@ class PrometheusSSEMCPToolSession:
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
-        return self.client._result_payload(raw_result)
+        return self.client.result_payload(raw_result)
 
     async def close(self) -> None:
         if self._closed:
@@ -233,7 +243,7 @@ class PrometheusSSEMCPToolSession:
 
 
 class PrometheusSSEMCPConnector:
-    """Open the legacy SSE transport behind the provider-neutral connector API."""
+    """Open one SSE MCP session behind the provider-neutral connector API."""
 
     provider = PROMETHEUS_MCP_SERVER_NAME
 
@@ -241,22 +251,18 @@ class PrometheusSSEMCPConnector:
         self.client = client
 
     async def open_session(self) -> PrometheusSSEMCPToolSession:
-        # Resolve these symbols at call time so existing tests and deployments can
-        # monkeypatch the legacy adapter's MCP SDK boundary.
-        from app.adapters import prometheus_mcp as prometheus_module
-
         stack = AsyncExitStack()
         try:
             read_stream, write_stream = await stack.enter_async_context(
-                prometheus_module.sse_client(
+                sse_client(
                     self.client.mcp_url,
-                    headers=self.client._headers,
+                    headers=self.client.headers,
                     timeout=self.client.timeout_seconds,
                     sse_read_timeout=self.client.sse_read_timeout_seconds,
                 )
             )
             session = await stack.enter_async_context(
-                prometheus_module.ClientSession(
+                ClientSession(
                     read_stream,
                     write_stream,
                     read_timeout_seconds=timedelta(
@@ -313,7 +319,7 @@ class PrometheusHarnessPlanner:
             for name, tool in sorted(self.scenario.model_tools.items())
             if name in advertised_names
         ]
-        model_tools = self.client._model_tools_for_state(
+        model_tools = self.client.model_tools_for_state(
             model_tool_list=model_tool_list,
             authorized_policies=self.scenario.authorized_policies,
             calls=state.executed_calls,
@@ -321,7 +327,7 @@ class PrometheusHarnessPlanner:
         )
         model_messages = deepcopy(messages)
         model_messages.append(
-            self.client._host_investigation_state_message(
+            self.client.host_investigation_state_message(
                 authorized_policies=self.scenario.authorized_policies,
                 remote_calls_used=len(state.executed_calls),
             )
@@ -338,6 +344,8 @@ class PrometheusHarnessPlanner:
                     ),
                 }
             )
+        if len(self.consecutive_errors) >= 2:
+            raise self._selection_error(model_tools, state)
         try:
             call = await self.client.model.request_mcp_tool_call(
                 messages=model_messages,
@@ -351,34 +359,7 @@ class PrometheusHarnessPlanner:
                 "error": sanitize_text(str(exc))[:500],
             }
             self.consecutive_errors.append(diagnostic)
-            first = self.consecutive_errors[0]
-            latest = self.consecutive_errors[-1]
-            raise PrometheusMCPModelError(
-                "Model failed to select a Prometheus MCP tool: "
-                f"first={first['error']}; latest={latest['error']}",
-                diagnostic_data={
-                    "first_error_type": first["error_type"],
-                    "first_error": first["error"],
-                    "second_error_type": (
-                        latest["error_type"]
-                        if len(self.consecutive_errors) > 1
-                        else None
-                    ),
-                    "second_error": (
-                        latest["error"] if len(self.consecutive_errors) > 1 else None
-                    ),
-                    "remote_calls_used": len(state.executed_calls),
-                    "remote_call_limit": self.client.max_agent_steps,
-                    "remote_calls_remaining": max(
-                        self.client.max_agent_steps - len(state.executed_calls), 0
-                    ),
-                    "available_tools": [
-                        item.get("function", {}).get("name")
-                        for item in model_tools
-                        if isinstance(item, dict)
-                    ],
-                },
-            ) from exc
+            raise self._selection_error(model_tools, state) from exc
 
         self.consecutive_errors.clear()
         if call.name == _FINISH_TOOL_NAME:
@@ -399,6 +380,38 @@ class PrometheusHarnessPlanner:
             "hypothesis_ids": [],
             "arguments": deepcopy(call.arguments),
         }
+
+    def _selection_error(
+        self,
+        model_tools: list[dict[str, Any]],
+        state: PrometheusHarnessState,
+    ) -> PrometheusMCPModelError:
+        first = self.consecutive_errors[0]
+        latest = self.consecutive_errors[-1]
+        return PrometheusMCPModelError(
+            "Model failed to select a Prometheus MCP tool: "
+            f"first={first['error']}; latest={latest['error']}",
+            diagnostic_data={
+                "first_error_type": first["error_type"],
+                "first_error": first["error"],
+                "second_error_type": (
+                    latest["error_type"] if len(self.consecutive_errors) > 1 else None
+                ),
+                "second_error": (
+                    latest["error"] if len(self.consecutive_errors) > 1 else None
+                ),
+                "remote_calls_used": len(state.executed_calls),
+                "remote_call_limit": self.client.max_agent_steps,
+                "remote_calls_remaining": max(
+                    self.client.max_agent_steps - len(state.executed_calls), 0
+                ),
+                "available_tools": [
+                    item.get("function", {}).get("name")
+                    for item in model_tools
+                    if isinstance(item, dict)
+                ],
+            },
+        )
 
 
 class PrometheusHarnessScenario:
@@ -439,7 +452,7 @@ class PrometheusHarnessScenario:
 
     def initial_messages(self, state: PrometheusHarnessState) -> list[dict[str, Any]]:
         self._state = state
-        return self.client._agent_messages(
+        return self.client.agent_messages(
             self.context,
             state.window_start,
             state.window_end,
@@ -455,7 +468,7 @@ class PrometheusHarnessScenario:
         return state
 
     def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
-        converted, authorized = self.client._authorized_model_tools(tools)
+        converted, authorized = self.client.authorized_model_tools(tools)
         self.authorized_policies = dict(authorized)
         self.model_tools = {
             str(item["function"]["name"]): deepcopy(item) for item in converted
@@ -507,7 +520,7 @@ class PrometheusHarnessScenario:
                 message="Prometheus tool is not authorized by local read-only policy.",
                 repair_hint="Choose one of the currently advertised Prometheus tools.",
             )
-        effective_arguments = self.client._effective_arguments(
+        effective_arguments = self.client.effective_arguments(
             action.arguments,
             policy=policy,
             window_start=state.window_start,
@@ -537,8 +550,8 @@ class PrometheusHarnessScenario:
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
         policy = self.authorized_policies[call.tool_name]
-        has_observation = _has_monitoring_observation(result)
-        window_verification = self.client._window_verification(
+        has_observation = has_monitoring_observation(result)
+        window_verification = self.client.window_verification(
             policy=policy,
             payload=result,
             window_start=updated.window_start,
@@ -560,7 +573,7 @@ class PrometheusHarnessScenario:
                         "capability": policy.capability,
                         "has_monitoring_observation": False,
                         "window_verification": window_verification,
-                        "result": self.client._evidence_visible_payload(result),
+                        "result": self.client.evidence_visible_payload(result),
                     }
                 )
             next_instruction = (
@@ -582,7 +595,7 @@ class PrometheusHarnessScenario:
                 "capability": policy.capability,
                 "has_monitoring_observation": has_observation,
                 "window_verification": window_verification,
-                "result": self.client._evidence_visible_payload(result),
+                "result": self.client.evidence_visible_payload(result),
             }
             updated.responses.append(response)
             model_payload = result
@@ -646,10 +659,10 @@ class PrometheusHarnessScenario:
         return ScenarioTransition(
             state=updated,
             observation=observation,
-            message=self.client._completed_tool_messages(
+            message=self.client.completed_tool_messages(
                 model_call,
                 model_payload,
-                host_control=self.client._host_control_feedback(
+                host_control=self.client.host_control_feedback(
                     remote_calls_used=len(updated.executed_calls),
                     outcome=outcome,
                     capability=policy.capability,
@@ -665,7 +678,7 @@ class PrometheusHarnessScenario:
         call: PreparedCall,
         error: Exception,
     ) -> RetryDirective | None:
-        leaf = self.client._first_exception_leaf(error)
+        leaf = self.client.first_exception_leaf(error)
         if not isinstance(leaf, PrometheusMCPToolError):
             return None
         return self.retry_directive(state, call, error)
@@ -715,10 +728,10 @@ class PrometheusHarnessScenario:
                 "evidence_disposition": "MISSING",
                 "is_contradiction": False,
             },
-            message=self.client._completed_tool_messages(
+            message=self.client.completed_tool_messages(
                 model_call,
                 {"tool_error": error.code, "detail": detail},
-                host_control=self.client._host_control_feedback(
+                host_control=self.client.host_control_feedback(
                     remote_calls_used=len(updated.executed_calls),
                     outcome=outcome,
                     capability=capability,
@@ -735,7 +748,7 @@ class PrometheusHarnessScenario:
         error: Exception,
     ) -> RetryDirective:
         del state
-        leaf = self.client._first_exception_leaf(error)
+        leaf = self.client.first_exception_leaf(error)
         if isinstance(leaf, PrometheusMCPConfigurationError):
             return RetryDirective(
                 reason=sanitize_text(str(leaf))[:1000],
@@ -782,7 +795,13 @@ class PrometheusHarnessScenario:
         state: PrometheusHarnessState,
         observations: Sequence[HarnessObservation[dict[str, Any]]],
     ) -> Finish | None:
-        del state, observations
+        del observations
+        if len(state.executed_calls) >= self.client.max_agent_steps:
+            return Finish(
+                reason=RuntimeStopReason.BUDGET_EXHAUSTED,
+                summary="Prometheus remote_tool_calls budget was exhausted.",
+                requires_human=not state.has_monitoring_data,
+            )
         return None
 
     def validate_finish(
@@ -867,7 +886,7 @@ async def collect_prometheus_with_harness(
     client: PrometheusMCPClient,
     context: InvestigationContext,
 ) -> PrometheusMCPQueryResult:
-    """Run one Prometheus child investigation and preserve the legacy result API."""
+    """Run one Prometheus child investigation and return the public result model."""
 
     occurred_at = context.alert.occurred_at
     if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
@@ -960,22 +979,37 @@ async def collect_prometheus_with_harness(
         if event.payload.get("provider") == PROMETHEUS_MCP_SERVER_NAME
         and event_matches_dispatch_scope(event, context.outer_dispatch_id)
     ]
-    attempts = list(deepcopy(state.tool_attempts))
+    state_attempts = deque(deepcopy(state.tool_attempts))
+    attempts: list[dict[str, Any]] = []
     for event in events:
-        if event.kind != AgentEventKind.HOST_REJECTED:
-            continue
-        code = str(event.payload.get("code") or "host_rejected")
-        outcome = {
-            "duplicate_call": "host_rejected_duplicate",
-            "tool_not_approved": "host_rejected_unauthorized",
-            "tool_not_in_local_policy": "host_rejected_unauthorized",
-        }.get(code, f"host_rejected_{code}")
-        attempts.append(
-            {
-                "outcome": outcome,
-                "detail": sanitize_text(str(event.payload.get("message") or ""))[:500],
-            }
-        )
+        if event.kind == AgentEventKind.HOST_REJECTED:
+            code = str(event.payload.get("code") or "host_rejected")
+            outcome = {
+                "duplicate_call": "host_rejected_duplicate",
+                "tool_not_approved": "host_rejected_unauthorized",
+                "tool_not_in_local_policy": "host_rejected_unauthorized",
+            }.get(code, f"host_rejected_{code}")
+            if state_attempts and state_attempts[0].get("outcome") == outcome:
+                attempts.append(state_attempts.popleft())
+            else:
+                attempts.append(
+                    {
+                        "outcome": outcome,
+                        "detail": sanitize_text(
+                            str(event.payload.get("message") or "")
+                        )[:500],
+                    }
+                )
+        elif event.kind in {
+            AgentEventKind.TOOL_INVOCATION_FAILED,
+            AgentEventKind.TOOL_INVOCATION_NO_DATA,
+            AgentEventKind.TOOL_INVOCATION_SUCCEEDED,
+            AgentEventKind.TOOL_INVOCATION_TIMED_OUT,
+            AgentEventKind.TOOL_INVOCATION_UNKNOWN_OUTCOME,
+        }:
+            if state_attempts:
+                attempts.append(state_attempts.popleft())
+    attempts.extend(state_attempts)
 
     has_monitoring_data = state.has_monitoring_data
     finished_by_model = (
@@ -1024,11 +1058,25 @@ async def collect_prometheus_with_harness(
                 "outcome": "model_selection_error",
                 "error_type": termination_error_type,
                 "detail": termination_error_detail,
+                "remote_calls_used": len(state.executed_calls),
+                "remote_calls_remaining": max(
+                    client.max_agent_steps - len(state.executed_calls), 0
+                ),
                 "evidence_disposition": "MISSING",
                 "is_contradiction": False,
                 "diagnostics": sanitize(
                     {
                         "errors": state.consecutive_model_errors,
+                        "first_error": (
+                            state.consecutive_model_errors[0]["error"]
+                            if state.consecutive_model_errors
+                            else None
+                        ),
+                        "second_error": (
+                            state.consecutive_model_errors[-1]["error"]
+                            if len(state.consecutive_model_errors) > 1
+                            else None
+                        ),
                         "remote_calls_used": len(state.executed_calls),
                         "remote_calls_remaining": max(
                             client.max_agent_steps - len(state.executed_calls), 0
@@ -1070,6 +1118,12 @@ async def collect_prometheus_with_harness(
         partial=has_monitoring_data and not finished_by_model,
         termination_error_type=termination_error_type,
         termination_error_detail=termination_error_detail,
+        mcp_session_attempts=harness_result.budget.consumed.session_attempts,
+        reconnect_error_type=(
+            PrometheusMCPProtocolError.__name__
+            if harness_result.budget.consumed.session_attempts > 1
+            else None
+        ),
     )
 
 

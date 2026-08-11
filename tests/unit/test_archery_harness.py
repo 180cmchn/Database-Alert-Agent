@@ -156,7 +156,6 @@ def _client(
         ),
         model,
         max_agent_steps=max_agent_steps,
-        use_shared_harness=True,
         harness_connector=connector,
         harness_runtime_dependencies=(
             ArcheryHarnessRuntimeDependencies(repository)
@@ -289,6 +288,134 @@ async def test_shared_harness_repairs_a_model_response_without_a_tool_call() -> 
     assert len(model.requests) == 2
     assert "Return exactly one valid Agent action" in str(model.requests[1]["messages"])
     assert connector.opened_session_ids == ["archery-1"]
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_stops_after_one_model_repair_and_keeps_diagnostics() -> None:
+    model = _ScriptedModel(
+        [
+            RuntimeError("provider returned zero tool calls request-1"),
+            RuntimeError("provider returned zero tool calls request-2"),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-1",
+                tools=_tools(),
+                calls=[_login()],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is False
+    assert len(model.requests) == 2
+    assert result.diagnostics is not None
+    assert [
+        item["error"] for item in result.diagnostics["model_selection_errors"]
+    ] == [
+        "provider returned zero tool calls request-1",
+        "provider returned zero tool calls request-2",
+    ]
+    assert result.diagnostics["mcp_tool_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
+    tmp_path: Path,
+) -> None:
+    class FailureThenInterruptModel(_ScriptedModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            self.requests.append(
+                {
+                    "messages": deepcopy(messages),
+                    "tool_names": [item["function"]["name"] for item in tools],
+                }
+            )
+            if len(self.requests) == 1:
+                raise RuntimeError("first selection failed before restart")
+            raise asyncio.CancelledError
+
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'archery-model-repair.db'}"
+    repository = SQLAlchemyAlertRepository(database_url)
+    await repository.initialize()
+    _, run = await _create_durable_run(repository, external_id="archery-model-repair")
+    assert run.lease_owner is not None
+    outer_dispatch_id = uuid4()
+    with pytest.raises(asyncio.CancelledError):
+        await _client(
+            FailureThenInterruptModel([]),
+            ReplayMCPConnector(
+                ARCHERY_HARNESS_PROVIDER,
+                [
+                    ReplaySessionFixture(
+                        session_id="archery-model-before-restart",
+                        tools=_tools(),
+                        calls=[_login()],
+                    )
+                ],
+            ),
+            repository=repository,
+        ).execute_slow_log_query(
+            OCCURRED_AT,
+            alert_context=ALERT_CONTEXT,
+            run_id=run.id,
+            outer_dispatch_id=outer_dispatch_id,
+            outer_dispatch_attempt=1,
+            lease_owner=run.lease_owner,
+            fencing_token=run.fencing_token,
+        )
+    await repository.close()
+
+    restarted_repository = SQLAlchemyAlertRepository(database_url)
+    await restarted_repository.initialize()
+    resumed_model = _ScriptedModel(
+        [RuntimeError("second selection failed after restart")]
+    )
+    result = await _client(
+        resumed_model,
+        ReplayMCPConnector(
+            ARCHERY_HARNESS_PROVIDER,
+            [
+                ReplaySessionFixture(
+                    session_id="archery-model-after-restart",
+                    tools=_tools(),
+                    calls=[_login()],
+                )
+            ],
+        ),
+        repository=restarted_repository,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
+        outer_dispatch_id=outer_dispatch_id,
+        outer_dispatch_attempt=2,
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+
+    assert len(resumed_model.requests) == 1
+    assert result.query_completed is False
+    assert result.diagnostics is not None
+    assert [
+        item["error"] for item in result.diagnostics["model_selection_errors"]
+    ] == [
+        "first selection failed before restart",
+        "second selection failed after restart",
+    ]
+    await restarted_repository.close()
 
 
 @pytest.mark.asyncio
@@ -563,6 +690,109 @@ async def test_shared_harness_persists_and_resumes_completed_run_without_reconne
     assert resumed_checkpoint.version == checkpoint.version + 1
     assert resumed_checkpoint.sequence == checkpoint.sequence
     await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
+    tmp_path: Path,
+) -> None:
+    class InterruptingModel(_ScriptedModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            if self.responses:
+                return await super().request_mcp_tool_call(messages=messages, tools=tools)
+            self.requests.append({"messages": deepcopy(messages), "tool_names": []})
+            raise asyncio.CancelledError
+
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'archery-mid-run-resume.db'}"
+    repository = SQLAlchemyAlertRepository(database_url)
+    await repository.initialize()
+    _, run = await _create_durable_run(repository, external_id="archery-mid-run-resume")
+    assert run.lease_owner is not None
+    outer_dispatch_id = uuid4()
+    auxiliary_sql = (
+        "SELECT index_name, column_name FROM information_schema.statistics "
+        "WHERE table_schema = 'archery' LIMIT 20"
+    )
+    first_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-before-restart",
+                tools=_tools(),
+                calls=[
+                    _login(),
+                    _success(auxiliary_sql, rows=[{"index_name": "idx_host_ts"}]),
+                ],
+            )
+        ],
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await _client(
+            InterruptingModel([_call("auxiliary-before-restart", auxiliary_sql)]),
+            first_connector,
+            repository=repository,
+        ).execute_slow_log_query(
+            OCCURRED_AT,
+            alert_context=ALERT_CONTEXT,
+            run_id=run.id,
+            outer_dispatch_id=outer_dispatch_id,
+            outer_dispatch_attempt=1,
+            lease_owner=run.lease_owner,
+            fencing_token=run.fencing_token,
+        )
+    await repository.close()
+
+    restarted_repository = SQLAlchemyAlertRepository(database_url)
+    await restarted_repository.initialize()
+    resumed_login = ReplayCallFixture(
+        tool_name=ARCHERY_MCP_LOGIN_TOOL_NAME,
+        expected_arguments={},
+        result={
+            "structuredContent": {
+                "status": "success",
+                "username": "resumed-fixture",
+            }
+        },
+    )
+    resume_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-after-restart",
+                tools=_tools(),
+                calls=[resumed_login, _success(FINAL_SQL)],
+            )
+        ],
+    )
+    resumed_model = _ScriptedModel([_call("final-after-restart", FINAL_SQL)])
+    resumed = await _client(
+        resumed_model,
+        resume_connector,
+        repository=restarted_repository,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
+        outer_dispatch_id=outer_dispatch_id,
+        outer_dispatch_attempt=2,
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+
+    assert resumed.query_completed is True
+    assert resumed.model_tool_calls == (
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+    assert resumed.diagnostics is not None
+    assert resumed.diagnostics["model_decision_count"] == 2
+    assert "resumed-fixture" in str(resumed_model.requests[0]["messages"])
+    await restarted_repository.close()
 
 
 @pytest.mark.asyncio

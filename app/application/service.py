@@ -638,16 +638,6 @@ class AlertAnalysisService:
             prometheus_mcp_max_agent_steps=int(
                 self.runtime_manifest_config.get("prometheus_mcp_max_agent_steps", 0)
             ),
-            archery_mcp_use_shared_harness=bool(
-                self.runtime_manifest_config.get(
-                    "archery_mcp_use_shared_harness", True
-                )
-            ),
-            prometheus_mcp_use_shared_harness=bool(
-                self.runtime_manifest_config.get(
-                    "prometheus_mcp_use_shared_harness", False
-                )
-            ),
             tool_schema_versions={item.name: item.schema_version for item in tool_specs},
             tool_policy_versions={item.name: item.policy_version for item in tool_specs},
         )

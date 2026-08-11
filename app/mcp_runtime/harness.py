@@ -2056,8 +2056,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         actual_names = set(actual)
         changed: dict[str, list[str]] = {}
         for name in sorted(expected_names & actual_names):
-            expected_payload = expected[name].model_dump(mode="json")
-            actual_payload = actual[name].model_dump(mode="json")
+            # Compare typed values so set-backed policy fields remain order-insensitive
+            # after checkpoint serialization and process restart.
+            expected_payload = expected[name].model_dump(mode="python")
+            actual_payload = actual[name].model_dump(mode="python")
             fields = sorted(
                 field
                 for field in expected_payload.keys() | actual_payload.keys()

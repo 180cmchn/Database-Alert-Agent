@@ -86,10 +86,6 @@ def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
         "ai_max_tokens": settings.ai_max_tokens,
         "archery_mcp_max_agent_steps": settings.archery_mcp_max_agent_steps,
         "prometheus_mcp_max_agent_steps": settings.prometheus_mcp_max_agent_steps,
-        "archery_mcp_use_shared_harness": True,
-        "prometheus_mcp_use_shared_harness": (
-            settings.prometheus_mcp_use_shared_harness
-        ),
     }
 
 
@@ -206,7 +202,6 @@ def _build_prometheus_mcp_tool(
             max_agent_steps=settings.prometheus_mcp_max_agent_steps,
             timeout_seconds=settings.prometheus_mcp_timeout_seconds,
             sse_read_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
-            use_shared_harness=settings.prometheus_mcp_use_shared_harness,
             harness_runtime_dependencies=(
                 PrometheusHarnessRuntimeDependencies(repository)
                 if repository is not None

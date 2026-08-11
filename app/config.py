@@ -44,7 +44,6 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "flashduty_poll_lookback_seconds",
         "archery_mcp_max_agent_steps",
         "prometheus_mcp_max_agent_steps",
-        "prometheus_mcp_use_shared_harness",
         "external_knowledge_api_key",
         "external_knowledge_api_key_base_url",
     }
@@ -167,7 +166,6 @@ class Settings(BaseSettings):
     prometheus_mcp_api_key: str = Field(default="", repr=False)
     prometheus_mcp_api_key_header: str = "Authorization"
     prometheus_mcp_max_agent_steps: int = Field(default=8, ge=1, le=100)
-    prometheus_mcp_use_shared_harness: bool = False
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
 

@@ -66,9 +66,9 @@ START → fingerprint → runbook → strategy
 
 动态调查按工具名和规范化 JSON 参数识别同一逻辑请求。完整的 `SUCCESS` 以及 `FAILED`、
 `TIMEOUT`、`SKIPPED`、`NO_DATA` 都会关闭当前外层 ReAct 运行中的同一探针，避免重复消耗动态轮次；
-MCP 子 harness 会在返回这些终态前按只读与重试策略完成受控重试。通用工具的 `partial=true` 结果只有
-在 `allow_followup_dispatch` 未设置为 `false` 时才能分配新的外层逻辑派发；Archery shared harness 和
-Prometheus shared harness 均设置 `allow_followup_dispatch=false`，不会由外层 Agent 再次派发同一
+MCP 子 Harness 会在返回这些终态前按只读与重试策略完成受控重试。通用工具的 `partial=true` 结果只有
+在 `allow_followup_dispatch` 未设置为 `false` 时才能分配新的外层逻辑派发；Archery 和 Prometheus
+均设置 `allow_followup_dispatch=false`，不会由外层 Agent 再次派发同一
 MCP 调查。下表同时列出对外证据状态和 durable invocation 的保守终态语义：
 
 | 状态 | 语义 | 根因判定用途 |
@@ -439,7 +439,7 @@ history 字段已经发现但查询未完成时，诊断返回“等待 history 
 传输失败、登录确认失败、鉴权失败、超时、MCP 标准错误或不可恢复的 Archery 业务错误形成失败
 证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。SQL
 工具错误的脱敏类型和详情会写入对应 `query_trace`，便于区分字段错误、语法错误和权限错误。首次
-协议或传输失败时，shared harness 可在策略允许时新建会话并重新登录。所有重连会话共享同一个
+协议或传输失败时，统一 Harness 可在策略允许时新建会话并重新登录。所有重连会话共享同一个
 运行状态、成功观测、调用轨迹、checkpoint、重试状态和远端调用预算；实际发送到 MCP 的调查调用
 总数不会超过 `ARCHERY_MCP_MAX_AGENT_STEPS`。若结束时只有 partial 结果，证据会设置
 `allow_followup_dispatch=false`，外层 Agent 不会再创建一个满额预算的 Archery 调查。Host bootstrap
@@ -514,12 +514,12 @@ SSE 空闲读取期限使用外层 Prometheus 工具期限，避免模型规划�
 最多允许重试一次。工具错误、空结果和目录结果会分别给出下一步提示，避免模型反复枚举或原样重试。
 工具选择失败时，第二次模型请求会带上脱敏的错误类型、错误详情、可用工具及剩余预算；连续两次
 仍未形成工具调用时返回带两次安全诊断的 `NO_DATA`，而不是丢失调查轨迹。
-shared harness 中每条告警的一次分析运行，其远端调用总数由
+统一 Harness 中每条告警的一次分析运行，其远端调用总数由
 `PROMETHEUS_MCP_MAX_AGENT_STEPS` 控制（默认 `8`，范围 `1–100`）；首次会话、重连、checkpoint 恢复
 和受控重试共享该总预算。模型决策另有有限上限以避免反复提前结束或重复选择。达到远端调用上限时：
 
 - 已取得至少一条包含样本、序列或数值的可解析监控返回：保留为 `SUCCESS` 观测并以
-  `call_limit_reached=true` 标示调用已截断；shared harness 同时将未正常结束的调查标记为
+  `call_limit_reached=true` 标示调用已截断；Harness 同时将未正常结束的调查标记为
   `partial=true`，该条 partial 记录不能支持或反驳根因。
 - 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
   后续分析以 `INCONCLUSIVE` 结束。
@@ -575,28 +575,24 @@ PROMETHEUS_MCP_SSE_URL=https://prometheus-mcp.example.internal/sse
 PROMETHEUS_MCP_API_KEY_HEADER=Authorization
 PROMETHEUS_MCP_API_KEY=Bearer replace-with-your-token
 PROMETHEUS_MCP_MAX_AGENT_STEPS=8
-PROMETHEUS_MCP_USE_SHARED_HARNESS=false
 PROMETHEUS_MCP_TIMEOUT_SECONDS=60
 PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
 端点、请求头名与密钥均为部署级配置，不会由管理 API 返回或修改；最大调用次数可经 Runtime
 Settings 调整。生产环境必须使用 HTTPS。密钥只在本服务到 MCP 的请求头中使用，不会写入 MCP
-配置文件、工具参数、证据或日志。`PROMETHEUS_MCP_USE_SHARED_HARNESS=false`（默认）使用 legacy
-执行路径；设为 `true` 才启用持久化 shared harness canary。共享 harness 在所有重连和恢复尝试之间
-保留成功观测、调用轨迹、checkpoint 与同一个远端调用预算，因此每条告警的一次分析运行总调用数
-不会超过 `PROMETHEUS_MCP_MAX_AGENT_STEPS`。shared harness 返回 partial 结果时会设置
+配置文件、工具参数、证据或日志。Prometheus 和 Archery 都只有统一 Harness 执行路径；不存在运行时
+legacy/canary 分支。Harness 在所有重连和恢复尝试之间保留成功观测、调用轨迹、checkpoint 与同一个
+远端调用预算，因此每条告警的一次分析运行总调用数不会超过各 Provider 的 `MCP_MAX_AGENT_STEPS`。
+Harness 返回 partial 结果时会设置
 `allow_followup_dispatch=false`，外层 Agent 不会通过新的逻辑派发重置预算。传输中断造成结果未知时，
 只有本地策略仍确认工具只读、场景显式授权且 `RetryPolicy` 尚有额度，才会在新会话中重试原查询；
-写工具和未授权工具不会使用该例外。默认 legacy 路径没有 durable child checkpoint，上述跨重连恢复
-和 per-alert 总预算保证仅适用于 shared harness canary。
+写工具和未授权工具不会使用该例外。
 
 当前开发机未连接公司内网，Archery MCP 和 Prometheus MCP 均未做真实 Host 连通、鉴权、Schema 或
-超时行为测试。发布时应先审核 Prometheus 的真实 `tools/list` 与本地 `toolPolicies` 是否一致，再仅对
-少量 worker 设置 `PROMETHEUS_MCP_USE_SHARED_HARNESS=true`。观察 timeout、reconnect、no-data、预算
-消耗和 checkpoint 恢复事件后再逐步扩大部署范围；Archery shared harness 也应先在受控 worker 验证
-真实 Host 行为。Prometheus 布尔开关不负责自动流量分配；回滚时将对应 worker 的值恢复为 `false`
-并重启即可。已产生的 run、checkpoint 和审计事件继续保留，但不会被 legacy 路径当作新的实时证据。
+超时行为测试。发布时应先在受控 worker 审核 Prometheus 的真实 `tools/list` 与本地 `toolPolicies`
+是否一致，并验证两套 Host 的 timeout、reconnect、no-data、预算消耗和 checkpoint 恢复事件，再通过
+部署批次逐步扩大范围。回滚应回退应用版本；已产生的 run、checkpoint 和审计事件继续保留。
 
 ## 本地运行
 

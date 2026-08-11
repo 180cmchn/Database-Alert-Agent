@@ -126,7 +126,6 @@ class RuntimeSettingsPatch(BaseModel):
     flashduty_poll_lookback_seconds: int | None = Field(default=None, ge=300, le=2678400)
     archery_mcp_max_agent_steps: int | None = Field(default=None, ge=1, le=100)
     prometheus_mcp_max_agent_steps: int | None = Field(default=None, ge=1, le=100)
-    prometheus_mcp_use_shared_harness: bool | None = None
     external_knowledge_api_key: str | None = Field(default=None, max_length=8192, repr=False)
 
     def updates(self) -> dict[str, Any]:
@@ -167,7 +166,6 @@ class RuntimeSettingsResponse(BaseModel):
     flashduty_poll_integration_ids: list[int]
     archery_mcp_max_agent_steps: int
     prometheus_mcp_max_agent_steps: int
-    prometheus_mcp_use_shared_harness: bool
     external_knowledge_enabled: bool
     external_knowledge_base_url: str
     external_knowledge_api_key_configured: bool
@@ -221,9 +219,6 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_poll_integration_ids=settings.flashduty_poll_integration_ids,
             archery_mcp_max_agent_steps=settings.archery_mcp_max_agent_steps,
             prometheus_mcp_max_agent_steps=settings.prometheus_mcp_max_agent_steps,
-            prometheus_mcp_use_shared_harness=(
-                settings.prometheus_mcp_use_shared_harness
-            ),
             external_knowledge_enabled=settings.external_knowledge_enabled,
             external_knowledge_base_url=settings.external_knowledge_base_url,
             external_knowledge_api_key_configured=(

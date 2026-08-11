@@ -30,13 +30,14 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPConfigurationError,
     ArcheryMCPError,
+    ArcheryMCPModelError,
     ArcheryMCPProtocolError,
     ArcheryMCPReadOnlyViolation,
     ArcheryMCPToolError,
     ArcherySlowLogQueryResult,
-    _first_exception_leaf,
-    _nested_archery_error,
-    _safe_error_detail,
+    first_exception_leaf,
+    nested_archery_error,
+    safe_error_detail,
 )
 from app.agent_runtime import (
     ArtifactRef,
@@ -51,7 +52,7 @@ from app.agent_runtime import (
     ToolRisk,
     ToolSpec,
 )
-from app.application.sanitization import sanitize
+from app.application.sanitization import sanitize, sanitize_text
 from app.domain.ports import AlertRepository
 from app.domain.tool_calling import MCPModelToolCall
 from app.mcp_runtime import (
@@ -107,6 +108,7 @@ class ArcheryHarnessState:
     last_slow_log_probe_issue: str | None = None
     final_result: ArcherySlowLogQueryResult | None = None
     pending_artifact_content: dict[str, dict[str, Any]] = field(default_factory=dict)
+    consecutive_model_errors: list[dict[str, str]] = field(default_factory=list)
     fatal_error_kind: str | None = None
     fatal_error_message: str | None = None
     fatal_error_diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -239,14 +241,16 @@ class ArcheryHarnessPlanner:
     def __init__(
         self,
         client: ArcheryMCPClient,
-        state: ArcheryHarnessState,
+        scenario: ArcheryHarnessScenario,
         registry: _PlannerCallRegistry,
-        artifact_buffer: _ArcheryArtifactBuffer | None = None,
     ) -> None:
         self.client = client
-        self.state = state
+        self.scenario = scenario
         self.registry = registry
-        self.artifact_buffer = artifact_buffer
+
+    @property
+    def state(self) -> ArcheryHarnessState:
+        return self.scenario.current_state
 
     async def plan(
         self,
@@ -256,7 +260,7 @@ class ArcheryHarnessPlanner:
     ) -> dict[str, Any]:
         model_messages = deepcopy(messages)
         if self.state.login_payload:
-            model_messages.insert(2, self.client._host_login_message(self.state.login_payload))
+            model_messages.insert(2, self.client.host_login_message(self.state.login_payload))
         model_tools = [
             {
                 "type": "function",
@@ -268,10 +272,24 @@ class ArcheryHarnessPlanner:
             }
             for item in tools
         ]
-        call = await self.client._request_model_tool_call(
-            messages=model_messages,
-            tools=model_tools,
-        )
+        if len(self.state.consecutive_model_errors) >= 2:
+            raise self._selection_error(model_tools)
+        try:
+            call = await self.client.model.request_mcp_tool_call(
+                messages=model_messages,
+                tools=model_tools,
+            )
+            if not isinstance(call, MCPModelToolCall):
+                raise TypeError("MCP model did not return MCPModelToolCall")
+        except Exception as exc:
+            self.state.consecutive_model_errors.append(
+                {
+                    "error_type": type(exc).__name__,
+                    "error": sanitize_text(str(exc))[:500],
+                }
+            )
+            raise self._selection_error(model_tools) from exc
+        self.state.consecutive_model_errors.clear()
         self.state.attempted_model_calls.append(call.name)
         self.state.model_decision_count += 1
         self.registry.pending.append(call)
@@ -282,6 +300,27 @@ class ArcheryHarnessPlanner:
             "hypothesis_ids": ["slow_query_evidence"],
             "arguments": call.arguments,
         }
+
+    def _selection_error(
+        self,
+        model_tools: list[dict[str, Any]],
+    ) -> ArcheryMCPModelError:
+        first = self.state.consecutive_model_errors[0]
+        latest = self.state.consecutive_model_errors[-1]
+        return ArcheryMCPModelError(
+            "Model failed to select an approved Archery MCP tool: "
+            f"first={first['error']}; latest={latest['error']}",
+            diagnostic_data={
+                "errors": deepcopy(self.state.consecutive_model_errors),
+                "remote_calls_used": len(self.state.executed_model_calls),
+                "remote_call_limit": self.client.max_agent_steps,
+                "remote_calls_remaining": max(
+                    self.client.max_agent_steps - len(self.state.executed_model_calls),
+                    0,
+                ),
+                "available_tools": [item["function"]["name"] for item in model_tools],
+            },
+        )
 
 
 class _ArcheryTransportError(ArcheryMCPProtocolError):
@@ -319,7 +358,29 @@ class _ArcherySDKSession:
 
     async def list_tools(self) -> list[DiscoveredMCPTool]:
         try:
-            tools = await self.owner._list_tools(self.session)
+            tools: dict[str, dict[str, Any]] = {}
+            cursor: str | None = None
+            for _page in range(10):
+                result = await self.session.list_tools(
+                    params=(
+                        mcp_types.PaginatedRequestParams(cursor=cursor)
+                        if cursor
+                        else None
+                    )
+                )
+                for item in result.tools:
+                    tools[item.name] = item.model_dump(
+                        by_alias=True,
+                        mode="json",
+                        exclude_none=True,
+                    )
+                if not result.nextCursor:
+                    break
+                cursor = result.nextCursor
+            else:
+                raise ArcheryMCPProtocolError(
+                    "Archery MCP tools/list pagination exceeded 10 pages"
+                )
         except Exception as exc:
             raise _transport_error(exc, unknown_outcome=False) from exc
         return [
@@ -346,10 +407,15 @@ class _ArcherySDKSession:
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
-            return await self.owner._call_tool(
-                self.session,
-                tool_name=name,
-                arguments=arguments,
+            result = await self.session.call_tool(
+                name,
+                arguments,
+                read_timeout_seconds=timedelta(seconds=self.owner.timeout_seconds),
+            )
+            return result.model_dump(
+                by_alias=True,
+                mode="json",
+                exclude_none=True,
             )
         except Exception as exc:
             raise _transport_error(exc, unknown_outcome=True) from exc
@@ -375,9 +441,9 @@ class ArcheryMCPConnector:
             http_client = await stack.enter_async_context(
                 httpx.AsyncClient(
                     timeout=httpx.Timeout(self.client.timeout_seconds),
-                    transport=self.client._transport,
+                    transport=self.client.transport,
                     follow_redirects=False,
-                    headers=self.client._headers,
+                    headers=self.client.headers,
                 )
             )
             read_stream, write_stream, get_session_id = await stack.enter_async_context(
@@ -416,11 +482,11 @@ class ArcheryMCPConnector:
 
 
 def _transport_error(error: BaseException, *, unknown_outcome: bool) -> ArcheryMCPError:
-    nested = _nested_archery_error(error)
+    nested = nested_archery_error(error)
     if nested is not None:
         return nested
-    leaf = _first_exception_leaf(error)
-    detail = _safe_error_detail(leaf)
+    leaf = first_exception_leaf(error)
+    detail = safe_error_detail(leaf)
     suffix = f": {detail}" if detail else ""
     return _ArcheryTransportError(
         f"Archery MCP SDK client failed ({type(leaf).__name__}){suffix}",
@@ -446,11 +512,18 @@ class ArcheryHarnessScenario:
         self.artifact_buffer = artifact_buffer
         self._last_failure: BaseException | None = None
 
+    @property
+    def current_state(self) -> ArcheryHarnessState:
+        return self.state
+
+    def restore_state(self, state: ArcheryHarnessState) -> None:
+        self.state = state
+
     def initial_state(self) -> ArcheryHarnessState:
         return self.state
 
     def initial_messages(self, state: ArcheryHarnessState) -> list[dict[str, Any]]:
-        return self.client._agent_messages(
+        return self.client.agent_messages(
             occurred_at=state.occurred_at,
             window_start=state.window_start,
             window_end=state.window_end,
@@ -462,13 +535,14 @@ class ArcheryHarnessScenario:
         session: MCPToolSession,
         state: ArcheryHarnessState,
     ) -> ArcheryHarnessState:
+        self.state = state
         state.session_attempts += 1
         result = await session.call_tool(self.client.login_tool_name, {})
         state.mcp_roundtrip_count += 1
-        login_text = self.client._tool_text_blocks(result)
+        login_text = self.client.tool_text_blocks(result)
         try:
-            login_payload = self.client._extract_tool_payload(result)
-            self.client._validate_business_success(
+            login_payload = self.client.extract_tool_payload(result)
+            self.client.validate_business_success(
                 login_payload,
                 tool_name=self.client.login_tool_name,
                 supplemental_text=login_text,
@@ -476,7 +550,7 @@ class ArcheryHarnessScenario:
         except ArcheryMCPToolError as exc:
             raise ArcheryMCPToolError(
                 str(exc),
-                diagnostic_data=self.client._login_diagnostic_data(
+                diagnostic_data=self.client.login_diagnostic_data(
                     {},
                     login_text,
                     session_id=session.session_id,
@@ -526,6 +600,7 @@ class ArcheryHarnessScenario:
         catalog: dict[str, ToolSpec],
     ) -> PreparedCall | HostRejection:
         del catalog
+        self.state = state
         model_call = self.registry.take(
             tool_name=action.tool_name,
             arguments=action.arguments,
@@ -538,7 +613,7 @@ class ArcheryHarnessScenario:
             }
 
         if action.tool_name == self.client.query_tool_name:
-            trace = self.client._query_trace_entry(
+            trace = self.client.query_trace_entry(
                 model_call
                 or MCPModelToolCall(
                     call_id="harness-call",
@@ -548,7 +623,7 @@ class ArcheryHarnessScenario:
             )
             state.query_trace.append(trace)
             metadata["trace_index"] = len(state.query_trace) - 1
-            state.last_query_target = self.client._target_key(action.arguments)
+            state.last_query_target = self.client.target_key(action.arguments)
             requested_sql = action.arguments.get("sql_content")
             if isinstance(requested_sql, str) and self._uses_legacy_slow_log_table(requested_sql):
                 reason = (
@@ -566,7 +641,7 @@ class ArcheryHarnessScenario:
                         "resolution path."
                     ),
                 )
-            rejection = self.client._query_call_rejection(action.arguments)
+            rejection = self.client.query_call_rejection(action.arguments)
             if rejection is not None:
                 trace["outcome"] = "host_rejected"
                 trace["continuation_reason"] = rejection
@@ -593,12 +668,13 @@ class ArcheryHarnessScenario:
         call: PreparedCall,
         result: Any,
     ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        self.state = state
         if not isinstance(result, dict):
             raise ArcheryMCPProtocolError("Archery MCP tool result was not an object")
         self._record_remote_call(state, call)
-        result_text = self.client._tool_text_blocks(result)
-        payload = self.client._extract_tool_payload(result)
-        self.client._validate_business_success(
+        result_text = self.client.tool_text_blocks(result)
+        payload = self.client.extract_tool_payload(result)
+        self.client.validate_business_success(
             payload,
             tool_name=call.tool_name,
             supplemental_text=result_text,
@@ -616,20 +692,20 @@ class ArcheryHarnessScenario:
             trace["outcome"] = "ok"
 
         if call.tool_name == ARCHERY_MCP_TABLES_TOOL_NAME:
-            target = self.client._target_key(call.effective_arguments)
+            target = self.client.target_key(call.effective_arguments)
             if target is not None:
-                discovered = self.client._slow_log_tables_from_discovery(payload)
+                discovered = self.client.slow_log_tables_from_discovery(payload)
                 if discovered:
                     state.slow_log_tables.setdefault(target, set()).update(discovered)
 
         if call.tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME:
-            target = self.client._target_key(call.effective_arguments)
+            target = self.client.target_key(call.effective_arguments)
             table_name = call.effective_arguments.get("tb_name")
             if target is not None and isinstance(table_name, str):
-                columns = self.client._table_columns_from_payload(payload)
+                columns = self.client.table_columns_from_payload(payload)
                 if columns:
                     state.table_columns.setdefault(target, {})[
-                        self.client._clean_table_name(table_name).casefold()
+                        self.client.clean_table_name(table_name).casefold()
                     ] = columns
 
         if call.tool_name != self.client.query_tool_name:
@@ -641,16 +717,16 @@ class ArcheryHarnessScenario:
             )
 
         requested_sql = call.effective_arguments.get("sql_content")
-        if not isinstance(requested_sql, str) or not self.client._is_slow_log_select(
+        if not isinstance(requested_sql, str) or not self.client.is_slow_log_select(
             requested_sql
         ):
-            target = self.client._target_key(call.effective_arguments)
+            target = self.client.target_key(call.effective_arguments)
             if target is not None and isinstance(requested_sql, str):
-                normalized, _, _ = self.client._normalize_query_payload(
+                normalized, _, _ = self.client.normalize_query_payload(
                     payload,
                     requested_sql=requested_sql,
                 )
-                self.client._record_metadata_resolution_evidence(
+                self.client.record_metadata_resolution_evidence(
                     resolution_steps=state.metadata_resolution_steps,
                     member_instance_ids=state.member_instance_ids,
                     resolved_endpoints=state.resolved_endpoints,
@@ -668,9 +744,9 @@ class ArcheryHarnessScenario:
             )
 
         normalized_payload, executed_sql, actual_sql_verified = (
-            self.client._normalize_query_payload(payload, requested_sql=requested_sql)
+            self.client.normalize_query_payload(payload, requested_sql=requested_sql)
         )
-        normalized_payload = self.client._limit_result_rows(
+        normalized_payload = self.client.limit_result_rows(
             normalized_payload,
             limit=ARCHERY_SLOW_LOG_LIMIT,
         )
@@ -681,7 +757,7 @@ class ArcheryHarnessScenario:
                 trace["outcome"] = "probe_ok"
                 trace["completion"] = "probe"
                 trace["continuation_reason"] = completion_issue
-            message = self.client._model_slow_log_probe_result(
+            message = self.client.model_slow_log_probe_result(
                 normalized_payload,
                 completion_issue=completion_issue,
             )
@@ -692,11 +768,11 @@ class ArcheryHarnessScenario:
                 artifact_ref=artifact_ref,
             )
 
-        target = self.client._target_key(call.effective_arguments)
-        selected_table = self.client._matching_discovered_table(
+        target = self.client.target_key(call.effective_arguments)
+        selected_table = self.client.matching_discovered_table(
             requested_sql,
             state.slow_log_tables.get(target, set()),
-        ) or self.client._first_slow_log_table(requested_sql)
+        ) or self.client.first_slow_log_table(requested_sql)
         state.final_result = ArcherySlowLogQueryResult(
             payload=normalized_payload,
             requested_sql=requested_sql,
@@ -713,7 +789,7 @@ class ArcheryHarnessScenario:
                 else None
             ),
             table_name=selected_table,
-            query_time_column=self.client._query_time_column(executed_sql or requested_sql),
+            query_time_column=self.client.query_time_column(executed_sql or requested_sql),
             metadata_resolution_tables=tuple(
                 state.metadata_resolution_steps.get(target, []) if target is not None else []
             ),
@@ -722,10 +798,10 @@ class ArcheryHarnessScenario:
         return ScenarioTransition(
             state=state,
             observation={"payload": normalized_payload, "completion": "final"},
-            message={"role": "user", "content": self.client._model_tool_result(normalized_payload)},
+            message={"role": "user", "content": self.client.model_tool_result(normalized_payload)},
             status=(
                 ToolInvocationStatus.NO_DATA
-                if self.client._payload_row_count(normalized_payload) == 0
+                if self.client.payload_row_count(normalized_payload) == 0
                 else ToolInvocationStatus.SUCCEEDED
             ),
             artifact_ref=artifact_ref,
@@ -748,19 +824,20 @@ class ArcheryHarnessScenario:
         error: InvocationError,
         status: ToolInvocationStatus,
     ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        self.state = state
         self._record_remote_call(state, call)
         trace = self._trace(state, call)
         if trace is not None:
             trace["outcome"] = "tool_error"
             trace["error_type"] = error.code
-            trace["error_detail"] = _safe_error_detail(error.message)
+            trace["error_detail"] = safe_error_detail(error.message)
         requested_sql = call.effective_arguments.get("sql_content")
         if call.tool_name == self.client.query_tool_name:
             state.last_query_error = error.message
 
         original = self._last_failure
         if isinstance(original, ArcheryMCPToolError):
-            canonical = self.client._model_tool_error_result(
+            canonical = self.client.model_tool_error_result(
                 original,
                 requested_sql=requested_sql,
                 window_start=state.window_start,
@@ -770,7 +847,7 @@ class ArcheryHarnessScenario:
             canonical = (
                 "The previous MCP call did not produce available evidence "
                 "(evidence_disposition=MISSING, is_contradiction=false). "
-                f"Transport status={status.value}, error={_safe_error_detail(error.message)}. "
+                f"Transport status={status.value}, error={safe_error_detail(error.message)}. "
                 "Preserve prior successful observations and choose the next safe probe."
             )
         return ScenarioTransition(
@@ -790,10 +867,10 @@ class ArcheryHarnessScenario:
         error: Exception,
     ) -> RetryDirective:
         self._last_failure = error
-        nested = _nested_archery_error(error)
+        nested = nested_archery_error(error)
         effective: BaseException = nested or error
         if isinstance(effective, ArcheryMCPToolError):
-            retryable = self.client._is_retryable_tool_error(effective)
+            retryable = self.client.is_retryable_tool_error(effective)
             if not retryable:
                 self._record_fatal(state, effective)
             return RetryDirective(
@@ -837,6 +914,12 @@ class ArcheryHarnessScenario:
                 summary=state.fatal_error_message or "Archery MCP investigation failed.",
                 requires_human=True,
             )
+        if len(state.executed_model_calls) >= self.client.max_agent_steps:
+            return Finish(
+                reason=RuntimeStopReason.BUDGET_EXHAUSTED,
+                summary="Archery remote_tool_calls budget was exhausted.",
+                requires_human=True,
+            )
         return None
 
     def validate_finish(
@@ -865,7 +948,7 @@ class ArcheryHarnessScenario:
         *,
         artifact_ref: ArtifactRef | None,
     ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
-        canonical = self.client._model_tool_result(payload)
+        canonical = self.client.model_tool_result(payload)
         return ScenarioTransition(
             state=state,
             observation={"tool_name": call.tool_name, "payload": dict(payload)},
@@ -874,7 +957,7 @@ class ArcheryHarnessScenario:
         )
 
     def _with_budget(self, state: ArcheryHarnessState, canonical: str) -> str:
-        return self.client._with_model_budget_status(
+        return self.client.with_model_budget_status(
             canonical,
             model_calls_used=len(state.executed_model_calls),
             model_decisions_used=state.model_decision_count,
@@ -890,9 +973,9 @@ class ArcheryHarnessScenario:
         sql: str,
     ) -> str | None:
         issues: list[str] = []
-        if self.client._target_key(call.effective_arguments) is None:
+        if self.client.target_key(call.effective_arguments) is None:
             issues.append("missing a positive instance_id or database name")
-        issue = self.client._slow_log_query_completion_issue(
+        issue = self.client.slow_log_query_completion_issue(
             sql,
             window_start=state.window_start,
             window_end=state.window_end,
@@ -957,9 +1040,10 @@ class ArcheryHarnessScenario:
             "mcp_tool_call_limit": self.client.max_agent_steps,
             "mcp_roundtrip_count": state.mcp_roundtrip_count,
             "mcp_session_attempts": state.session_attempts,
+            "model_selection_errors": deepcopy(state.consecutive_model_errors),
             "alert_endpoint": state.alert_endpoint,
             "query_trace": deepcopy(state.query_trace),
-            "metadata_resolution_stage": self.client._metadata_resolution_stage(
+            "metadata_resolution_stage": self.client.metadata_resolution_stage(
                 target=target,
                 alert_endpoint=state.alert_endpoint,
                 member_instance_ids=state.member_instance_ids,
@@ -998,13 +1082,13 @@ class ArcheryHarnessScenario:
     def _table_references(sql: str) -> set[str]:
         from app.adapters.archery_mcp import ArcheryMCPClient
 
-        return ArcheryMCPClient._sql_table_references(sql)
+        return ArcheryMCPClient.sql_table_references(sql)
 
     @staticmethod
     def _clean_reference(value: str) -> str:
         from app.adapters.archery_mcp import ArcheryMCPClient
 
-        return ArcheryMCPClient._clean_table_name(value)
+        return ArcheryMCPClient.clean_table_name(value)
 
 
 async def execute_archery_harness(
@@ -1038,7 +1122,7 @@ async def execute_archery_harness(
         window_end=window_end,
         occurred_at=occurred_at,
         alert_context=dict(alert_context),
-        alert_endpoint=client._alert_endpoint_from_context(alert_context),
+        alert_endpoint=client.alert_endpoint_from_context(alert_context),
     )
     registry = _PlannerCallRegistry()
     artifact_buffer = _ArcheryArtifactBuffer() if runtime_dependencies is not None else None
@@ -1048,7 +1132,7 @@ async def execute_archery_harness(
         registry,
         artifact_buffer=artifact_buffer,
     )
-    planner = ArcheryHarnessPlanner(client, state, registry)
+    planner = ArcheryHarnessPlanner(client, scenario, registry)
     event_sink = InMemoryEventSink()
     invocation_store = None
     artifact_store = None
@@ -1136,8 +1220,7 @@ async def execute_archery_harness(
         restored_state = checkpoint.state
         if artifact_buffer is not None:
             artifact_buffer.restore(restored_state.pending_artifact_content)
-        planner.state = restored_state
-        scenario.state = restored_state
+        scenario.restore_state(restored_state)
         result = await runtime.resume(
             checkpoint,
             restored_budget=BudgetLedger.from_snapshot(checkpoint.budget),
@@ -1172,9 +1255,9 @@ def client_window(
     client: ArcheryMCPClient,
     occurred_at: datetime,
 ) -> tuple[datetime, datetime]:
-    from app.adapters.archery_mcp import _slow_log_window
+    from app.adapters.archery_mcp import slow_log_window
 
-    return _slow_log_window(occurred_at, window_seconds=client.window_seconds)
+    return slow_log_window(occurred_at, window_seconds=client.window_seconds)
 
 
 def _query_result(
@@ -1193,6 +1276,11 @@ def _query_result(
         )
         diagnostics = dict(final_result.diagnostics or {})
         diagnostics["mcp_session_attempts"] = harness.budget.consumed.session_attempts
+        diagnostics["reconnect_error_type"] = (
+            ArcheryMCPProtocolError.__name__
+            if harness.budget.consumed.session_attempts > 1
+            else None
+        )
         diagnostics["harness_stop_reason"] = (
             harness.finish.reason.value if harness.finish is not None else None
         )
@@ -1214,7 +1302,7 @@ def _query_result(
         else "Archery harness stopped without a final history query"
     )
     error_suffix = (
-        f"; last query error: {_safe_error_detail(state.last_query_error)}"
+        f"; last query error: {safe_error_detail(state.last_query_error)}"
         if state.last_query_error
         else ""
     )
@@ -1228,7 +1316,7 @@ def _query_result(
         if state.last_slow_log_probe_issue
         else ""
     )
-    partial = client._evidence_insufficient_result(
+    partial = client.evidence_insufficient_result(
         window_start=state.window_start,
         window_end=state.window_end,
         target=state.last_query_target,
@@ -1254,6 +1342,12 @@ def _query_result(
             "model_decision_count": state.model_decision_count,
             "mcp_tool_call_count": len(state.executed_model_calls),
             "mcp_session_attempts": harness.budget.consumed.session_attempts,
+            "reconnect_error_type": (
+                ArcheryMCPProtocolError.__name__
+                if harness.budget.consumed.session_attempts > 1
+                else None
+            ),
+            "model_selection_errors": deepcopy(state.consecutive_model_errors),
             "harness_stop_reason": (
                 harness.finish.reason.value if harness.finish is not None else None
             ),

@@ -51,17 +51,16 @@ class UnexpectedAgent:
         raise AssertionError("incompatible recovery must not execute the graph")
 
 
-def test_run_manifest_freezes_prometheus_harness_canary_mode(tmp_path: Path) -> None:
-    runtime = build_runtime(
-        _settings(tmp_path).model_copy(update={"prometheus_mcp_use_shared_harness": True})
-    )
+def test_run_manifest_uses_harness_only_mcp_configuration(tmp_path: Path) -> None:
+    runtime = build_runtime(_settings(tmp_path))
 
     snapshot = runtime.service._create_config_snapshot()
     manifest = runtime.service._create_run_manifest(uuid4(), snapshot)
 
-    assert snapshot.archery_mcp_use_shared_harness is True
-    assert snapshot.prometheus_mcp_use_shared_harness is True
-    assert manifest.configuration["prometheus_mcp_use_shared_harness"] is True
+    assert "archery_mcp_use_shared_harness" not in type(snapshot).model_fields
+    assert "prometheus_mcp_use_shared_harness" not in type(snapshot).model_fields
+    assert "archery_mcp_use_shared_harness" not in manifest.configuration
+    assert "prometheus_mcp_use_shared_harness" not in manifest.configuration
 
 
 @pytest.mark.asyncio

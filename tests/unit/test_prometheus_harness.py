@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ import pytest
 from anyio import ClosedResourceError, EndOfStream
 from sqlalchemy import select
 
-import app.adapters.prometheus_mcp as prometheus_module
+import app.adapters.prometheus_harness as prometheus_harness_module
 from app.adapters.persistence import SQLAlchemyAlertRepository, ToolInvocationRow
 from app.adapters.prometheus_harness import (
     PrometheusHarnessRuntimeDependencies,
@@ -177,7 +179,6 @@ def _client(
         ),
         model,
         max_agent_steps=max_agent_steps,
-        use_shared_harness=True,
         harness_runtime_dependencies=(
             PrometheusHarnessRuntimeDependencies(repository)
             if repository is not None
@@ -227,11 +228,11 @@ def _fake_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     _HarnessSession.results = []
     _HarnessSession.session_count = 0
     monkeypatch.setattr(
-        prometheus_module,
+        prometheus_harness_module,
         "sse_client",
         lambda *_args, **_kwargs: _AsyncContext((object(), object())),
     )
-    monkeypatch.setattr(prometheus_module, "ClientSession", _HarnessSession)
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _HarnessSession)
 
 
 @pytest.mark.asyncio
@@ -308,6 +309,40 @@ async def test_shared_harness_binds_window_and_fixed_arguments_before_schema_val
     assert result.responses[0]["model_arguments"]["operation"] == "delete"
     assert result.responses[0]["arguments"]["operation"] == "query"
     assert result.responses[0]["window_verification"] == "exact"
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_names_failed_window_verification_in_model_feedback() -> None:
+    _HarnessSession.results = [
+        {
+            "structuredContent": {
+                "data": {"result": [{"values": [[1_893_456_000, "1"]]}]}
+            }
+        },
+        {"structuredContent": {"series": [{"value": 1}]}},
+    ]
+    model = _SequenceModel(
+        [
+            MCPModelToolCall(
+                call_id="query-outside-window",
+                name="query_range",
+                arguments={"query": "mysql_up"},
+            ),
+            MCPModelToolCall(
+                call_id="query-exact-window",
+                name="query_range",
+                arguments={"query": "mysql_threads_running"},
+            ),
+        ]
+    )
+
+    await _client(model, max_agent_steps=2).collect_alert_window(_context())
+
+    tool_message = next(
+        message for message in reversed(model.messages[1]) if message["role"] == "tool"
+    )
+    feedback = json.loads(tool_message["content"])
+    assert feedback["monitoring_result"]["host_window_verification"] == "mismatch"
 
 
 @pytest.mark.asyncio
@@ -443,6 +478,72 @@ async def test_terminal_model_failure_diagnostics_survive_checkpoint_restart(
 
     assert resumed == first
     assert _HarnessSession.session_count == sessions_after_first_process
+    await restarted_repository.close()
+
+
+@pytest.mark.asyncio
+async def test_model_repair_checkpoint_resume_does_not_grant_a_third_selection(
+    tmp_path: Path,
+) -> None:
+    class FailureThenInterruptModel(_SequenceModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            self.messages.append(messages)
+            self.tools.append(tools)
+            if len(self.messages) == 1:
+                raise RuntimeError("first Prometheus selection failed before restart")
+            raise asyncio.CancelledError
+
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'prometheus-model-repair.db'}"
+    repository = SQLAlchemyAlertRepository(database_url)
+    await repository.initialize()
+    context, _, _run = await _durable_context(
+        repository,
+        external_id="prometheus-model-repair",
+    )
+    outer_dispatch_id = uuid4()
+    with pytest.raises(asyncio.CancelledError):
+        await _client(
+            FailureThenInterruptModel([]),
+            repository=repository,
+        ).collect_alert_window(
+            context.model_copy(
+                update={
+                    "outer_dispatch_id": outer_dispatch_id,
+                    "outer_dispatch_attempt": 1,
+                }
+            )
+        )
+    await repository.close()
+
+    restarted_repository = SQLAlchemyAlertRepository(database_url)
+    await restarted_repository.initialize()
+    resumed_model = _SequenceModel(
+        [RuntimeError("second Prometheus selection failed after restart")]
+    )
+    result = await _client(
+        resumed_model,
+        repository=restarted_repository,
+    ).collect_alert_window(
+        context.model_copy(
+            update={
+                "outer_dispatch_id": outer_dispatch_id,
+                "outer_dispatch_attempt": 2,
+            }
+        )
+    )
+
+    assert len(resumed_model.messages) == 1
+    assert result.termination_reason == "model_error_no_result"
+    diagnostics = result.tool_attempts[-1]["diagnostics"]
+    assert [item["error"] for item in diagnostics["errors"]] == [
+        "first Prometheus selection failed before restart",
+        "second Prometheus selection failed after restart",
+    ]
     await restarted_repository.close()
 
 

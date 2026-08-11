@@ -412,13 +412,11 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         runbook_limit=7,
         scheduler_workers=4,
         archery_mcp_max_agent_steps=18,
-        prometheus_mcp_use_shared_harness=True,
     )
     assert payload.updates() == {
         "runbook_limit": 7,
         "scheduler_workers": 4,
         "archery_mcp_max_agent_steps": 18,
-        "prometheus_mcp_use_shared_harness": True,
     }
     with pytest.raises(ValidationError):
         RuntimeSettingsPatch(
@@ -553,7 +551,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["archery_mcp_max_agent_steps"] == 12
-    assert body["prometheus_mcp_use_shared_harness"] is False
+    assert "prometheus_mcp_use_shared_harness" not in body
     assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
     assert "ai_api_key" not in body

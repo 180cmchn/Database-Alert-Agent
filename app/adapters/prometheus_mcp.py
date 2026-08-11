@@ -1,4 +1,4 @@
-"""Policy-bound Prometheus MCP evidence collection over the legacy SSE transport.
+"""Policy and facade for Harness-owned Prometheus MCP evidence collection.
 
 The model plans queries from the subset of discovered tools authorized by local
 deployment policy. The Host binds trusted range-query windows, enforces a finite
@@ -12,15 +12,11 @@ import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
-
-from mcp import ClientSession
-from mcp import types as mcp_types
-from mcp.client.sse import sse_client
 
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.alert_preprocessing import preprocess_alert_data
@@ -37,7 +33,6 @@ PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS: Final = 8
 PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER: Final = 2
 PROMETHEUS_MCP_MIN_RANGE_CALL_RESERVE: Final = 2
-PROMETHEUS_MCP_MAX_SESSION_ATTEMPTS: Final = 2
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
 PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v5"
 PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS: Final = 8_000
@@ -143,6 +138,8 @@ class PrometheusMCPQueryResult:
     partial: bool = False
     termination_error_type: str | None = None
     termination_error_detail: str | None = None
+    mcp_session_attempts: int = 1
+    reconnect_error_type: str | None = None
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -153,7 +150,7 @@ class PrometheusMCPQueryResult:
         )
 
 
-def _has_monitoring_observation(value: Any, *, observation_context: bool = False) -> bool:
+def has_monitoring_observation(value: Any, *, observation_context: bool = False) -> bool:
     """Conservatively distinguish samples from catalog or status-only results."""
 
     if value in (None, "", [], {}):
@@ -171,12 +168,12 @@ def _has_monitoring_observation(value: Any, *, observation_context: bool = False
             return False
         if not isinstance(decoded, (dict, list)):
             return False
-        return _has_monitoring_observation(
+        return has_monitoring_observation(
             decoded, observation_context=observation_context
         )
     if isinstance(value, list):
         return any(
-            _has_monitoring_observation(
+            has_monitoring_observation(
                 item,
                 observation_context=(
                     observation_context and not isinstance(item, dict)
@@ -190,7 +187,7 @@ def _has_monitoring_observation(value: Any, *, observation_context: bool = False
     for key, nested in value.items():
         normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
         nested_context = normalized_key in _OBSERVATION_KEYS
-        if _has_monitoring_observation(
+        if has_monitoring_observation(
             nested, observation_context=nested_context
         ):
             return True
@@ -364,7 +361,7 @@ def _parse_tool_policies(raw: Any) -> tuple[PrometheusMCPToolPolicy, ...]:
 
 
 class PrometheusMCPClient:
-    """Embedded SSE MCP host that lets the configured model explore monitoring tools."""
+    """Public Prometheus Provider facade backed exclusively by the shared Harness."""
 
     def __init__(
         self,
@@ -374,7 +371,6 @@ class PrometheusMCPClient:
         max_agent_steps: int = PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         sse_read_timeout_seconds: float | None = None,
-        use_shared_harness: bool = False,
         harness_runtime_dependencies: Any | None = None,
     ) -> None:
         parsed = urlsplit(server.url.strip())
@@ -404,10 +400,6 @@ class PrometheusMCPClient:
             raise PrometheusMCPConfigurationError(
                 "Prometheus MCP SSE read timeout must be positive"
             )
-        if not isinstance(use_shared_harness, bool):
-            raise PrometheusMCPConfigurationError(
-                "Prometheus MCP use_shared_harness must be a boolean"
-            )
         self.mcp_url = server.url.strip()
         self._headers = dict(server.headers)
         self._tool_policies = {policy.name: policy for policy in server.tool_policies}
@@ -427,8 +419,13 @@ class PrometheusMCPClient:
             if sse_read_timeout_seconds is not None
             else timeout_seconds
         )
-        self.use_shared_harness = use_shared_harness
         self.harness_runtime_dependencies = harness_runtime_dependencies
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        """Resolved transport headers exposed read-only to the Harness connector."""
+
+        return self._headers
 
     @classmethod
     def from_settings(
@@ -440,7 +437,6 @@ class PrometheusMCPClient:
         max_agent_steps: int = PROMETHEUS_MCP_DEFAULT_MAX_AGENT_STEPS,
         timeout_seconds: float = 60,
         sse_read_timeout_seconds: float | None = None,
-        use_shared_harness: bool = False,
         harness_runtime_dependencies: Any | None = None,
     ) -> PrometheusMCPClient:
         return cls(
@@ -451,513 +447,17 @@ class PrometheusMCPClient:
             max_agent_steps=max_agent_steps,
             timeout_seconds=timeout_seconds,
             sse_read_timeout_seconds=sse_read_timeout_seconds,
-            use_shared_harness=use_shared_harness,
             harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
     async def collect_alert_window(
         self, context: InvestigationContext
     ) -> PrometheusMCPQueryResult:
-        if self.use_shared_harness:
-            from app.adapters.prometheus_harness import (
-                collect_prometheus_with_harness,
-            )
+        from app.adapters.prometheus_harness import collect_prometheus_with_harness
 
-            return await collect_prometheus_with_harness(self, context)
-        return await self._collect_alert_window_legacy(context)
+        return await collect_prometheus_with_harness(self, context)
 
-    async def _collect_alert_window_legacy(
-        self, context: InvestigationContext
-    ) -> PrometheusMCPQueryResult:
-        occurred_at = context.alert.occurred_at
-        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
-            raise PrometheusMCPConfigurationError(
-                "Alert occurred_at must include a timezone for Prometheus evidence"
-            )
-        window_end = occurred_at.astimezone(UTC)
-        window_start = window_end - timedelta(
-            seconds=PROMETHEUS_ALERT_WINDOW_SECONDS
-        )
-        messages = self._agent_messages(context, window_start, window_end)
-        calls: list[MCPModelToolCall] = []
-        responses: list[dict[str, Any]] = []
-        tool_attempts: list[dict[str, Any]] = []
-        completed_call_fingerprints: set[str] = set()
-        remote_attempt_counts: dict[str, int] = {}
-        finished_by_model = False
-        termination_reason = "decision_limit_reached"
-        partial = False
-        termination_error_type: str | None = None
-        termination_error_detail: str | None = None
-
-        try:
-            async with sse_client(
-                self.mcp_url,
-                headers=self._headers,
-                timeout=self.timeout_seconds,
-                sse_read_timeout=self.sse_read_timeout_seconds,
-            ) as (read_stream, write_stream):
-                async with ClientSession(
-                    read_stream,
-                    write_stream,
-                    read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
-                    client_info=mcp_types.Implementation(
-                        name="database-alert-agent", version="0.1.0"
-                    ),
-                ) as session:
-                    await session.initialize()
-                    model_tool_list, authorized_policies = self._authorized_model_tools(
-                        await self._list_tools(session)
-                    )
-                    messages.append(
-                        self._host_investigation_state_message(
-                            authorized_policies=authorized_policies,
-                            remote_calls_used=0,
-                        )
-                    )
-                    decision_count = 0
-                    decision_limit = (
-                        self.max_agent_steps * PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER
-                    )
-                    while (
-                        decision_count < decision_limit
-                        and len(calls) < self.max_agent_steps
-                    ):
-                        decision_count += 1
-                        model_tools = self._model_tools_for_state(
-                            model_tool_list=model_tool_list,
-                            authorized_policies=authorized_policies,
-                            calls=calls,
-                            responses=responses,
-                        )
-                        try:
-                            call = await self._request_model_tool_call(
-                                messages=messages,
-                                tools=model_tools,
-                                remote_calls_used=len(calls),
-                            )
-                        except PrometheusMCPModelError as exc:
-                            has_monitoring_data = self._responses_have_monitoring_data(
-                                responses
-                            )
-                            termination_reason = (
-                                "model_error_after_partial_result"
-                                if has_monitoring_data
-                                else "model_error_no_result"
-                            )
-                            termination_error_type = type(exc).__name__
-                            termination_error_detail = sanitize_text(str(exc))[:1_000]
-                            partial = has_monitoring_data
-                            tool_attempts.append(
-                                {
-                                    "outcome": "model_selection_error",
-                                    "error_type": type(exc).__name__,
-                                    "detail": termination_error_detail,
-                                    "diagnostics": sanitize(exc.diagnostic_data),
-                                    "remote_calls_used": len(calls),
-                                    "remote_calls_remaining": max(
-                                        self.max_agent_steps - len(calls), 0
-                                    ),
-                                }
-                            )
-                            break
-                        if call.name == _FINISH_TOOL_NAME:
-                            if not self._responses_have_monitoring_data(responses):
-                                messages.extend(
-                                    self._completed_tool_messages(
-                                        call,
-                                        {
-                                            "host_rejected_finish": True,
-                                            "reason": "no_usable_monitoring_result",
-                                            "instruction": (
-                                                "尚未取得可用监控返回，请继续选择一个 Prometheus "
-                                                "MCP 查询工具。"
-                                            ),
-                                        },
-                                        host_control=self._host_control_feedback(
-                                            remote_calls_used=len(calls),
-                                            outcome="finish_rejected",
-                                            instruction=(
-                                                "finish 只有在 range_query 返回告警窗口样本后"
-                                                "才可使用。"
-                                            ),
-                                        ),
-                                    )
-                                )
-                                continue
-                            finished_by_model = True
-                            termination_reason = "finished_by_model"
-                            break
-                        policy = authorized_policies.get(call.name)
-                        if policy is None:
-                            tool_attempts.append(
-                                {
-                                    "tool_name": call.name,
-                                    "model_arguments": sanitize(call.arguments),
-                                    "outcome": "host_rejected_unauthorized",
-                                }
-                            )
-                            messages.extend(
-                                self._completed_tool_messages(
-                                    call,
-                                    {
-                                        "host_rejected_unauthorized": True,
-                                        "reason": "tool_not_in_local_policy",
-                                        "instruction": (
-                                            "该工具未通过本地只读策略授权，请从已提供的工具中重新选择。"
-                                        ),
-                                    },
-                                    host_control=self._host_control_feedback(
-                                        remote_calls_used=len(calls),
-                                        outcome="host_rejected_unauthorized",
-                                        instruction="从本轮提供的 tools 中选择一个工具。",
-                                    ),
-                                )
-                            )
-                            continue
-                        effective_arguments = self._effective_arguments(
-                            call.arguments,
-                            policy=policy,
-                            window_start=window_start,
-                            window_end=window_end,
-                        )
-                        fingerprint = self._call_fingerprint(
-                            call.name, effective_arguments
-                        )
-                        if fingerprint in completed_call_fingerprints:
-                            tool_attempts.append(
-                                {
-                                    "tool_name": call.name,
-                                    "model_arguments": sanitize(call.arguments),
-                                    "arguments": sanitize(effective_arguments),
-                                    "outcome": "host_rejected_duplicate",
-                                }
-                            )
-                            messages.extend(
-                                self._completed_tool_messages(
-                                    call,
-                                    {
-                                        "host_rejected_duplicate": True,
-                                        "reason": "duplicate_successful_call",
-                                        "instruction": (
-                                            "相同工具和参数已经执行完成；即使上次为空，重复查询"
-                                            "也不会增加证据。请修改查询或选择其它工具。"
-                                        ),
-                                    },
-                                    host_control=self._host_control_feedback(
-                                        remote_calls_used=len(calls),
-                                        outcome="host_rejected_duplicate",
-                                        capability=policy.capability,
-                                        instruction=(
-                                            "修改查询语义或标签；已有合格范围证据时可结束调查。"
-                                        ),
-                                    ),
-                                )
-                            )
-                            continue
-                        if remote_attempt_counts.get(fingerprint, 0) >= 2:
-                            tool_attempts.append(
-                                {
-                                    "tool_name": call.name,
-                                    "model_arguments": sanitize(call.arguments),
-                                    "arguments": sanitize(effective_arguments),
-                                    "capability": policy.capability,
-                                    "outcome": "host_rejected_repeated_failure",
-                                }
-                            )
-                            messages.extend(
-                                self._completed_tool_messages(
-                                    call,
-                                    {
-                                        "host_rejected_repeated_failure": True,
-                                        "reason": "same_failed_call_already_retried",
-                                    },
-                                    host_control=self._host_control_feedback(
-                                        remote_calls_used=len(calls),
-                                        outcome="host_rejected_repeated_failure",
-                                        capability=policy.capability,
-                                        instruction=(
-                                            "相同失败调用已经远端重试一次；必须修改查询参数或"
-                                            "选择其它工具。"
-                                        ),
-                                    ),
-                                )
-                            )
-                            continue
-                        calls.append(call)
-                        remote_attempt_counts[fingerprint] = (
-                            remote_attempt_counts.get(fingerprint, 0) + 1
-                        )
-                        attempt = {
-                            "tool_name": call.name,
-                            "model_arguments": sanitize(call.arguments),
-                            "arguments": sanitize(effective_arguments),
-                            "capability": policy.capability,
-                            "outcome": "pending",
-                        }
-                        tool_attempts.append(attempt)
-                        try:
-                            raw_result = await session.call_tool(
-                                call.name, effective_arguments
-                            )
-                            payload = self._result_payload(raw_result)
-                        except PrometheusMCPToolError as exc:
-                            # One server-side tool failure is missing evidence, not a
-                            # reason to discard usable monitoring data collected in a
-                            # previous round. Return the sanitized failure to the
-                            # model so it can choose another discovered tool.
-                            payload = None
-                            attempt.update(
-                                {
-                                    "outcome": "tool_error",
-                                    "error_type": type(exc).__name__,
-                                    "detail": sanitize_text(str(exc))[:500],
-                                }
-                            )
-                            messages.extend(
-                                self._completed_tool_messages(
-                                    call,
-                                    {
-                                        "tool_error": type(exc).__name__,
-                                        "detail": sanitize_text(str(exc))[:500],
-                                    },
-                                    host_control=self._host_control_feedback(
-                                        remote_calls_used=len(calls),
-                                        outcome="tool_error",
-                                        capability=policy.capability,
-                                        instruction=(
-                                            "根据实际错误修改参数；相同失败调用最多允许再重试一次。"
-                                        ),
-                                    ),
-                                )
-                            )
-                            continue
-                        except Exception as exc:
-                            attempt.update(
-                                {
-                                    "outcome": "transport_error",
-                                    "error_type": type(exc).__name__,
-                                }
-                            )
-                            if self._responses_have_monitoring_data(responses):
-                                termination_reason = "mcp_call_error_after_partial_result"
-                                termination_error_type = type(exc).__name__
-                                partial = True
-                                break
-                            # Standard and business-level tool failures are handled
-                            # above. An SDK exception before any usable response is
-                            # treated as a broken session so the outer evidence tool
-                            # can reconnect once with fresh MCP state.
-                            raise PrometheusMCPProtocolError(
-                                "Prometheus MCP tool call failed before any usable "
-                                f"response ({type(exc).__name__}): "
-                                f"{sanitize_text(str(exc))[:500]}"
-                            ) from exc
-                        if payload is not None:
-                            completed_call_fingerprints.add(fingerprint)
-                            has_observation = _has_monitoring_observation(payload)
-                            window_verification = self._window_verification(
-                                policy=policy,
-                                payload=payload,
-                                window_start=window_start,
-                                window_end=window_end,
-                            )
-                            usable_observation = (
-                                has_observation and window_verification == "exact"
-                            )
-                            attempt["outcome"] = (
-                                "observation"
-                                if usable_observation
-                                else (
-                                    "unverified_window"
-                                    if has_observation
-                                    else "auxiliary_result"
-                                )
-                            )
-                            attempt["window_verification"] = window_verification
-                            responses.append(
-                                {
-                                    "tool_name": call.name,
-                                    "model_arguments": sanitize(call.arguments),
-                                    "arguments": sanitize(effective_arguments),
-                                    "capability": policy.capability,
-                                    "has_monitoring_observation": has_observation,
-                                    "window_verification": window_verification,
-                                    "result": self._evidence_visible_payload(payload),
-                                }
-                            )
-                            model_payload = payload
-                            if has_observation and not usable_observation:
-                                model_payload = {
-                                    "tool_result": payload,
-                                    "host_window_verification": window_verification,
-                                    "instruction": (
-                                        "该返回尚不能证明属于required_window；请改用带精确"
-                                        "起止参数的范围查询工具。"
-                                    ),
-                                }
-                            if usable_observation:
-                                next_instruction = (
-                                    "已取得合格的告警窗口观测；证据足够时结束调查，"
-                                    "否则只再执行能区分候选原因的范围查询。"
-                                )
-                            elif policy.capability == "catalog":
-                                next_instruction = (
-                                    "目录结果不能作为实时证据；下一步使用 range_query，"
-                                    "不要继续枚举完整目录。"
-                                )
-                            elif has_observation:
-                                next_instruction = (
-                                    "返回包含观测但时间窗未通过验证；改用其它 range_query"
-                                    "或修正查询语义。"
-                                )
-                            else:
-                                next_instruction = (
-                                    "该范围查询没有样本；修改指标、标签或聚合语义后再查询。"
-                                )
-                        else:
-                            completed_call_fingerprints.add(fingerprint)
-                            attempt["outcome"] = "no_data"
-                            model_payload = None
-                            next_instruction = (
-                                "该调用已完成但没有数据；不要原样重试，修改查询或选择"
-                                "其它 range_query。"
-                            )
-                        messages.extend(
-                            self._completed_tool_messages(
-                                call,
-                                model_payload,
-                                host_control=self._host_control_feedback(
-                                    remote_calls_used=len(calls),
-                                    outcome=str(attempt["outcome"]),
-                                    capability=policy.capability,
-                                    instruction=next_instruction,
-                                ),
-                            )
-                        )
-                    else:
-                        termination_reason = (
-                            "call_limit_reached"
-                            if len(calls) >= self.max_agent_steps
-                            else "decision_limit_reached"
-                        )
-        except PrometheusMCPError as exc:
-            if not self._responses_have_monitoring_data(responses):
-                raise
-            termination_reason = "protocol_error_after_partial_result"
-            termination_error_type = type(exc).__name__
-            partial = True
-        except BaseExceptionGroup as exc:
-            leaf = self._first_exception_leaf(exc)
-            if not isinstance(leaf, Exception):
-                raise
-            if self._responses_have_monitoring_data(responses):
-                termination_reason = "sse_error_after_partial_result"
-                termination_error_type = type(leaf).__name__
-                partial = True
-            else:
-                raise PrometheusMCPProtocolError(
-                    f"Prometheus SSE MCP client failed ({type(leaf).__name__}): "
-                    f"{sanitize_text(str(leaf))[:500]}"
-                ) from exc
-        except Exception as exc:
-            if self._responses_have_monitoring_data(responses):
-                termination_reason = "sse_error_after_partial_result"
-                termination_error_type = type(exc).__name__
-                partial = True
-            else:
-                raise PrometheusMCPProtocolError(
-                    f"Prometheus SSE MCP client failed ({type(exc).__name__}): "
-                    f"{sanitize_text(str(exc))[:500]}"
-                ) from exc
-
-        return PrometheusMCPQueryResult(
-            responses=tuple(responses),
-            window_start=window_start,
-            window_end=window_end,
-            model_tool_calls=tuple(call.name for call in calls),
-            model_request_ids=tuple(
-                call.request_id for call in calls if call.request_id
-            ),
-            call_limit_reached=termination_reason == "call_limit_reached",
-            finished_by_model=finished_by_model,
-            tool_attempts=tuple(tool_attempts),
-            termination_reason=termination_reason,
-            partial=partial,
-            termination_error_type=termination_error_type,
-            termination_error_detail=termination_error_detail,
-        )
-
-    async def _request_model_tool_call(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        remote_calls_used: int,
-    ) -> MCPModelToolCall:
-        """Retry one malformed or transient model decision within the same state."""
-
-        try:
-            return await self.model.request_mcp_tool_call(
-                messages=messages,
-                tools=tools,
-            )
-        except Exception as first_exc:
-            repair_messages = [
-                *messages,
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "host_event": "model_tool_selection_retry",
-                            "previous_error_type": type(first_exc).__name__,
-                            "previous_error": sanitize_text(str(first_exc))[:500],
-                            "remote_calls_used": remote_calls_used,
-                            "remote_call_limit": self.max_agent_steps,
-                            "remote_calls_remaining": max(
-                                self.max_agent_steps - remote_calls_used, 0
-                            ),
-                            "instruction": (
-                                "上一轮未生成一个有效的单工具调用。请严格从当前 tools 中"
-                                "选择一个工具，并按其 JSON Schema 重新生成参数；不要用"
-                                "自然语言代替工具调用。"
-                            ),
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ]
-            try:
-                return await self.model.request_mcp_tool_call(
-                    messages=repair_messages,
-                    tools=tools,
-                )
-            except Exception as exc:
-                first_detail = sanitize_text(str(first_exc))[:500]
-                second_detail = sanitize_text(str(exc))[:500]
-                raise PrometheusMCPModelError(
-                    "Model failed twice to select a Prometheus MCP tool: "
-                    f"first={first_detail}; second={second_detail}",
-                    diagnostic_data={
-                        "first_error_type": type(first_exc).__name__,
-                        "first_error": first_detail,
-                        "second_error_type": type(exc).__name__,
-                        "second_error": second_detail,
-                        "remote_calls_used": remote_calls_used,
-                        "remote_call_limit": self.max_agent_steps,
-                        "remote_calls_remaining": max(
-                            self.max_agent_steps - remote_calls_used, 0
-                        ),
-                        "available_tools": [
-                            item.get("function", {}).get("name")
-                            for item in tools
-                            if isinstance(item, dict)
-                            and isinstance(item.get("function"), dict)
-                        ],
-                    },
-                ) from exc
-
-    def _model_tools_for_state(
+    def model_tools_for_state(
         self,
         *,
         model_tool_list: list[dict[str, Any]],
@@ -967,7 +467,7 @@ class PrometheusMCPClient:
     ) -> list[dict[str, Any]]:
         """Reserve the final remote calls for range evidence when it is still missing."""
 
-        has_monitoring_data = self._responses_have_monitoring_data(responses)
+        has_monitoring_data = self.responses_have_monitoring_data(responses)
         range_names = {
             name
             for name, policy in authorized_policies.items()
@@ -992,7 +492,7 @@ class PrometheusMCPClient:
             selected.append(self._finish_tool())
         return selected
 
-    def _host_control_feedback(
+    def host_control_feedback(
         self,
         *,
         remote_calls_used: int,
@@ -1012,18 +512,7 @@ class PrometheusMCPClient:
         return feedback
 
     @staticmethod
-    def _call_fingerprint(tool_name: str, arguments: Mapping[str, Any]) -> str:
-        arguments = json.dumps(
-            arguments,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        return f"{tool_name}:{arguments}"
-
-    @staticmethod
-    def _responses_have_monitoring_data(responses: list[dict[str, Any]]) -> bool:
+    def responses_have_monitoring_data(responses: list[dict[str, Any]]) -> bool:
         return any(
             response.get("has_monitoring_observation") is True
             and response.get("window_verification") == "exact"
@@ -1031,7 +520,7 @@ class PrometheusMCPClient:
         )
 
     @classmethod
-    def _window_verification(
+    def window_verification(
         cls,
         *,
         policy: PrometheusMCPToolPolicy,
@@ -1049,12 +538,12 @@ class PrometheusMCPClient:
         if sample_result == "mismatch":
             return "mismatch"
         # A deployment-owned range policy defines the server-side time semantics,
-        # and _effective_arguments always binds both endpoints before the call.
+        # and effective_arguments always binds both endpoints before the call.
         # Returned timestamps can contradict that contract but cannot establish it.
         return "exact"
 
     @staticmethod
-    def _effective_arguments(
+    def effective_arguments(
         arguments: Mapping[str, Any],
         *,
         policy: PrometheusMCPToolPolicy,
@@ -1197,26 +686,12 @@ class PrometheusMCPClient:
             return None
 
     @staticmethod
-    def _first_exception_leaf(error: BaseException) -> BaseException:
+    def first_exception_leaf(error: BaseException) -> BaseException:
         while isinstance(error, BaseExceptionGroup) and error.exceptions:
             error = error.exceptions[0]
         return error
 
-    @staticmethod
-    async def _list_tools(session: ClientSession) -> list[Any]:
-        tools: list[Any] = []
-        cursor: str | None = None
-        for _ in range(10):
-            response = await session.list_tools(cursor=cursor)
-            tools.extend(response.tools)
-            cursor = getattr(response, "nextCursor", None)
-            if not cursor:
-                break
-        if not tools:
-            raise PrometheusMCPProtocolError("Prometheus MCP returned no tools")
-        return tools
-
-    def _authorized_model_tools(
+    def authorized_model_tools(
         self, tools: list[Any]
     ) -> tuple[list[dict[str, Any]], dict[str, PrometheusMCPToolPolicy]]:
         converted: list[dict[str, Any]] = []
@@ -1303,7 +778,7 @@ class PrometheusMCPClient:
             )
         return f"{host_contract} Remote description: {remote_description}"
 
-    def _host_investigation_state_message(
+    def host_investigation_state_message(
         self,
         *,
         authorized_policies: Mapping[str, PrometheusMCPToolPolicy],
@@ -1420,7 +895,7 @@ class PrometheusMCPClient:
         }
 
     @staticmethod
-    def _result_payload(raw_result: Any) -> Any | None:
+    def result_payload(raw_result: Any) -> Any | None:
         raw = (
             raw_result.model_dump(mode="json")
             if hasattr(raw_result, "model_dump")
@@ -1543,7 +1018,7 @@ class PrometheusMCPClient:
         return sanitize_text(" ".join(parts))[:500]
 
     @staticmethod
-    def _completed_tool_messages(
+    def completed_tool_messages(
         call: MCPModelToolCall,
         payload: Any | None,
         *,
@@ -1601,7 +1076,7 @@ class PrometheusMCPClient:
         }
 
     @staticmethod
-    def _evidence_visible_payload(payload: Any) -> Any:
+    def evidence_visible_payload(payload: Any) -> Any:
         """Bound each retained response before accumulating the investigation."""
 
         serialized = json.dumps(payload, ensure_ascii=False, default=str)
@@ -1613,7 +1088,7 @@ class PrometheusMCPClient:
             "preview": serialized[:PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS],
         }
 
-    def _agent_messages(
+    def agent_messages(
         self,
         context: InvestigationContext,
         window_start: datetime,
@@ -1680,8 +1155,8 @@ class PrometheusMCPEvidenceTool:
 
     def __init__(self, client: PrometheusMCPClient) -> None:
         self.client = client
-        # Legacy collection has no durable child checkpoint and must not be replayed.
-        self.max_attempts = 2 if getattr(client, "use_shared_harness", False) else 1
+        # The second outer attempt resumes the same durable child checkpoint.
+        self.max_attempts = 2
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -1693,26 +1168,13 @@ class PrometheusMCPEvidenceTool:
             raise PrometheusMCPReadOnlyViolation(
                 "Prometheus evidence parameters are derived only from the alert context"
             )
-        session_attempts = 1
-        reconnect_error_type: str | None = None
-        try:
-            result = await self.client.collect_alert_window(context)
-        except PrometheusMCPProtocolError as exc:
-            reconnect_error_type = type(exc).__name__
-            session_attempts = PROMETHEUS_MCP_MAX_SESSION_ATTEMPTS
-            result = await self.client.collect_alert_window(context)
+        result = await self.client.collect_alert_window(context)
         structured_data = {
             "window_start": result.window_start.isoformat(),
             "window_end": result.window_end.isoformat(),
             "window_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
-            "mcp_invocation": (
-                "shared_agent_harness"
-                if getattr(self.client, "use_shared_harness", False)
-                else "model_tool_calling"
-            ),
-            "allow_followup_dispatch": not getattr(
-                self.client, "use_shared_harness", False
-            ),
+            "mcp_invocation": "shared_agent_harness",
+            "allow_followup_dispatch": False,
             "model_tool_calls": list(result.model_tool_calls),
             "model_request_ids": list(result.model_request_ids),
             "tool_attempts": list(result.tool_attempts),
@@ -1722,8 +1184,8 @@ class PrometheusMCPEvidenceTool:
             "partial": result.partial,
             "termination_error_type": result.termination_error_type,
             "termination_error_detail": result.termination_error_detail,
-            "mcp_session_attempts": session_attempts,
-            "reconnect_error_type": reconnect_error_type,
+            "mcp_session_attempts": result.mcp_session_attempts,
+            "reconnect_error_type": result.reconnect_error_type,
             "monitoring_results": list(result.responses),
             "query_completed": result.has_monitoring_data,
             "root_cause_eligible": result.has_monitoring_data and not result.partial,

@@ -467,8 +467,6 @@ class AnalysisConfigSnapshot(BaseModel):
     code_version: str = ""
     archery_mcp_max_agent_steps: int = 0
     prometheus_mcp_max_agent_steps: int = 0
-    archery_mcp_use_shared_harness: bool = True
-    prometheus_mcp_use_shared_harness: bool = False
     tool_schema_versions: dict[str, str] = Field(default_factory=dict)
     tool_policy_versions: dict[str, str] = Field(default_factory=dict)
 
