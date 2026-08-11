@@ -1341,6 +1341,75 @@ async def test_archery_mcp_parses_wrapped_json_array_as_slow_log_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_recovers_complete_rows_from_truncated_wrapped_json() -> None:
+    history_sql = (
+        "SELECT hostname_max, user_max, db_max, checksum, sample, ts_min "
+        "FROM mysql_slow_query_review_history "
+        f"WHERE hostname_max = '100.84.97.139:3306' {TEST_HISTORY_TIME_CLAUSE}"
+        "ORDER BY ts_min LIMIT 20"
+    )
+    complete_rows = [
+        {
+            "hostname_max": "100.84.97.139:3306",
+            "user_max": "app_user",
+            "db_max": "orders",
+            "checksum": f"{index:032x}",
+            "sample": f"select * from orders where id = {index}",
+            "ts_min": "2026-08-03T13:42:26",
+        }
+        for index in range(2)
+    ]
+    incomplete_row = {
+        **complete_rows[0],
+        "checksum": f"{2:032x}",
+        "sample": "select * from a very large table " + ("x" * 10_000),
+    }
+    truncated_result = (
+        '{"rows":['
+        + ",".join(json.dumps(row, ensure_ascii=False) for row in complete_rows)
+        + ","
+        + json.dumps(incomplete_row, ensure_ascii=False)[:200]
+    )
+    wrapped_result = (
+        f"SQL 查询已执行。\n执行的SQL：{history_sql}\n\n返回 18 行。\n结果：\n"
+        + truncated_result
+    )
+
+    payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"result": wrapped_result},
+        requested_sql=history_sql,
+    )
+
+    assert payload["rows"] == complete_rows
+    assert payload["rows_recovered_from_truncated_json"] is True
+    assert payload["mcp_reported_row_count"] == 18
+    assert payload["parsed_row_count"] == 2
+    assert executed_sql == history_sql
+    assert actual_sql_verified is True
+
+    outcome = await ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload=payload)
+    ).execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-1:3306",
+        ),
+    )
+
+    assert isinstance(outcome, tuple)
+    summary, structured_data = outcome
+    assert "返回 18 行" in summary
+    assert structured_data["root_cause_eligible"] is True
+    assert structured_data["reported_row_count"] == 18
+    assert structured_data["parsed_row_count"] == 2
+    assert structured_data["included_row_count"] == 2
+    assert structured_data["omitted_row_count"] == 16
+    assert structured_data["rows"][0]["checksum"] == complete_rows[0]["checksum"]
+    assert structured_data["rows"][1]["sample"] == complete_rows[1]["sample"]
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_limits_parsed_slow_log_rows_to_twenty() -> None:
     slow_log_endpoint = "db-history:3306"
     history_sql = (

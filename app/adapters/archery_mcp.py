@@ -518,6 +518,8 @@ class ArcheryMCPClient:
             f"{self._slow_query_target_resolution_guidance()}"
             f"查询告警时刻{occurred_at.isoformat()}之前{duration}的慢查询。"
             "最终只读SELECT必须使用发现到的慢日志相关表、返回hostname_max并显式包含LIMIT，"
+            "只投影慢查询语义证据需要的时间、库、用户、checksum、sample及少量诊断数值字段，"
+            "不得使用SELECT *，避免MCP在一条完整日志返回前先截断结果；"
             f"无论符合条件的记录有多少，LIMIT数值不得超过{ARCHERY_SLOW_LOG_LIMIT}，"
             f"sql_query的limit_num也不得超过{ARCHERY_SLOW_LOG_LIMIT}。"
             f"目标时间范围是{window_start.isoformat()}至{window_end.isoformat()}。"
@@ -1792,9 +1794,14 @@ class ArcheryMCPClient:
                 normalized_payload = embedded_result
                 break
 
-        if cls.payload_row_count(normalized_payload) is None and reported_row_count is not None:
-            normalized_payload["rowCount"] = reported_row_count
-            normalized_payload["row_count_source"] = "archery_text"
+        parsed_row_count = cls.payload_row_count(normalized_payload)
+        if reported_row_count is not None:
+            if parsed_row_count is None:
+                normalized_payload["rowCount"] = reported_row_count
+                normalized_payload["row_count_source"] = "archery_text"
+            elif reported_row_count > parsed_row_count:
+                normalized_payload["mcp_reported_row_count"] = reported_row_count
+                normalized_payload["parsed_row_count"] = parsed_row_count
 
         full_sql = normalized_payload.get("full_sql")
         executed_sql = (
@@ -1867,8 +1874,8 @@ class ArcheryMCPClient:
             columns.append(match.group("alias") or match.group("source"))
         return tuple(columns)
 
-    @staticmethod
-    def _embedded_result_object(text: str) -> dict[str, Any] | None:
+    @classmethod
+    def _embedded_result_object(cls, text: str) -> dict[str, Any] | None:
         markers = list(re.finditer(r"结果\s*[：:]", text))
         decoder = json.JSONDecoder()
         for marker in reversed(markers):
@@ -1889,7 +1896,101 @@ class ArcheryMCPClient:
                     return decoded
                 if isinstance(decoded, list):
                     return {"rows": decoded}
+            recovered = cls._recover_complete_rows_from_json_prefix(text[marker.end() :])
+            if recovered is not None:
+                return recovered
         return None
+
+    @classmethod
+    def _recover_complete_rows_from_json_prefix(
+        cls,
+        fragment: str,
+    ) -> dict[str, Any] | None:
+        """Recover only complete row values from a character-truncated JSON result."""
+
+        row_candidates: list[list[Any]] = []
+        stripped_offset = len(fragment) - len(fragment.lstrip())
+        if stripped_offset < len(fragment) and fragment[stripped_offset] == "[":
+            rows, _closed = cls._decode_json_array_prefix(
+                fragment,
+                stripped_offset,
+            )
+            row_candidates.append(rows)
+
+        for match in re.finditer(
+            r'(?<!\\)"(?:rows|result|data)"\s*:\s*(?P<array>\[)',
+            fragment,
+            re.IGNORECASE,
+        ):
+            rows, _closed = cls._decode_json_array_prefix(
+                fragment,
+                match.start("array"),
+            )
+            row_candidates.append(rows)
+
+        valid_candidates = [
+            rows
+            for rows in row_candidates
+            if rows
+            and all(isinstance(row, (Mapping, list, tuple)) for row in rows)
+        ]
+        if not valid_candidates:
+            return None
+        recovered_rows = max(valid_candidates, key=len)[:ARCHERY_SLOW_LOG_LIMIT]
+        recovered: dict[str, Any] = {
+            "rows": recovered_rows,
+            "rows_recovered_from_truncated_json": True,
+        }
+
+        for match in re.finditer(
+            r'(?<!\\)"(?:columns|column_list)"\s*:\s*(?P<array>\[)',
+            fragment,
+            re.IGNORECASE,
+        ):
+            columns, closed = cls._decode_json_array_prefix(
+                fragment,
+                match.start("array"),
+                limit=256,
+            )
+            if closed and columns and all(isinstance(column, str) for column in columns):
+                recovered["columns"] = columns
+                break
+        return recovered
+
+    @staticmethod
+    def _decode_json_array_prefix(
+        text: str,
+        array_start: int,
+        *,
+        limit: int = ARCHERY_SLOW_LOG_LIMIT,
+    ) -> tuple[list[Any], bool]:
+        """Decode complete array items and stop before the first incomplete value."""
+
+        decoder = json.JSONDecoder()
+        items: list[Any] = []
+        index = array_start + 1
+        while len(items) < limit:
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                return items, False
+            if text[index] == "]":
+                return items, True
+            try:
+                item, index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                return items, False
+            items.append(item)
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                return items, False
+            if text[index] == "]":
+                return items, True
+            if text[index] != ",":
+                return items, False
+            index += 1
+        return items, False
 
     @staticmethod
     def _executed_sql_from_text(text: str) -> str | None:

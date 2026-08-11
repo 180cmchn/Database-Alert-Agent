@@ -16,7 +16,6 @@ from app.adapters.pdf_runbooks import (
 )
 from app.domain.errors import (
     InvalidRunbookIdError,
-    RunbookAlertTypeNotFoundError,
     RunbookError,
 )
 from app.domain.models import RunbookDocument, RunbookExcerpt, RunbookVisualEvidence
@@ -214,7 +213,7 @@ async def test_local_pdf_runbook_extracts_text_matches_alert_and_caches(
 
 
 @pytest.mark.asyncio
-async def test_local_pdf_runbook_reports_missing_alert_type_directory(
+async def test_local_pdf_runbook_returns_no_match_for_unrelated_alert_signal(
     tmp_path: Path,
 ) -> None:
     directory = tmp_path / "synthetic_backup_task_failed"
@@ -232,28 +231,35 @@ async def test_local_pdf_runbook_reports_missing_alert_type_directory(
         }
     )
 
-    with pytest.raises(
-        RunbookAlertTypeNotFoundError,
-        match="匹配本地pdf失败，pdf中没有该类型告警的处理方法",
-    ):
-        await library.search(alert)
+    assert await library.search(alert) == []
 
 
 @pytest.mark.asyncio
-async def test_local_pdf_search_never_falls_back_to_another_alert_type(
+async def test_local_pdf_semantic_match_crosses_an_empty_exact_type_directory(
     tmp_path: Path,
 ) -> None:
     requested_directory = tmp_path / "mysql_slow_query_400"
-    other_directory = tmp_path / "replica_lag"
+    other_type = "mysql_slow_query_spike"
+    other_directory = tmp_path / other_type
     requested_directory.mkdir()
     other_directory.mkdir()
+    runbook_id = "slow-query-guide"
     _write_text_pdf(
-        requested_directory / "unrelated.pdf",
-        "Connection pool troubleshooting guide with safe diagnostic steps.",
+        other_directory / f"{runbook_id}.pdf",
+        "MySQL query troubleshooting guide with safe diagnostic steps.",
     )
-    _write_text_pdf(
-        other_directory / "strong-but-wrong-type.pdf",
-        "MySQL slow query 400 troubleshooting guide and diagnostic steps.",
+    _write_minimal_index(
+        other_directory,
+        other_type,
+        runbook_id,
+        annotation_fields={
+            "match": {
+                "alert_names": ["MySQL slow query spike"],
+                "metric_names": [],
+                "aliases": ["MySQL 慢查询飙升"],
+                "keywords": [],
+            }
+        },
     )
     alert = CanonicalAlertSourceAdapter().normalize(
         {
@@ -263,7 +269,11 @@ async def test_local_pdf_search_never_falls_back_to_another_alert_type(
         }
     )
 
-    assert await LocalPDFRunbookLibrary(tmp_path).search(alert) == []
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert [item.runbook_id for item in matches] == [runbook_id]
+    assert matches[0].metadata["alert_type"] == other_type
+    assert "告警信号与手册类型语义命中" in matches[0].match_reasons
 
 
 @pytest.mark.asyncio
@@ -305,8 +315,124 @@ async def test_local_pdf_recalls_cpu_runbook_when_alert_type_directory_is_absent
     matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
 
     assert [item.runbook_id for item in matches] == [runbook_id]
-    assert "告警信号归一化命中" in matches[0].match_reasons
+    assert "告警信号与手册类型语义命中" in matches[0].match_reasons
     assert matches[0].metadata["alert_type"] == alert_type
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_semantically_matches_replication_delay_alias(
+    tmp_path: Path,
+) -> None:
+    alert_type = "mysql_replica_lag"
+    directory = tmp_path / alert_type
+    directory.mkdir()
+    runbook_id = "mysql-replica-lag-guide"
+    _write_text_pdf(
+        directory / f"{runbook_id}.pdf",
+        "MySQL replication investigation guide with read-only diagnostic steps.",
+    )
+    _write_minimal_index(
+        directory,
+        alert_type,
+        runbook_id,
+        annotation_fields={
+            "scope": {"database_engines": ["mysql"], "components": []},
+            "match": {
+                "alert_names": ["MySQL Replica Lag"],
+                "metric_names": ["mysql_replica_lag_seconds"],
+                "aliases": ["MySQL replication delay"],
+                "keywords": [],
+            },
+        },
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "mysql_replica_delay_seconds_above_60",
+            "reason": "mysql_replica_delay_seconds_above_60",
+            "alert_type": "mysql_replica_delay_seconds_above_60",
+            "database": {"engine": "mysql"},
+        }
+    )
+
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert [item.runbook_id for item in matches] == [runbook_id]
+    assert "告警信号与手册类型语义命中" in matches[0].match_reasons
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_semantic_match_still_rejects_engine_conflict(
+    tmp_path: Path,
+) -> None:
+    alert_type = "postgres_replica_lag"
+    directory = tmp_path / alert_type
+    directory.mkdir()
+    runbook_id = "postgres-replica-lag-guide"
+    _write_text_pdf(
+        directory / f"{runbook_id}.pdf",
+        "PostgreSQL replication investigation guide with safe diagnostic steps.",
+    )
+    _write_minimal_index(
+        directory,
+        alert_type,
+        runbook_id,
+        annotation_fields={
+            "scope": {"database_engines": ["postgresql"], "components": []},
+            "match": {
+                "alert_names": ["PostgreSQL Replica Lag"],
+                "metric_names": [],
+                "aliases": ["replication delay"],
+                "keywords": [],
+            },
+        },
+    )
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": "mysql_replica_delay_seconds_above_60",
+            "reason": "mysql_replica_delay_seconds_above_60",
+            "alert_type": "mysql_replica_delay_seconds_above_60",
+            "database": {"engine": "mysql"},
+        }
+    )
+
+    assert await LocalPDFRunbookLibrary(tmp_path).search(alert) == []
+
+
+@pytest.mark.asyncio
+async def test_local_pdf_exact_identity_ranks_before_semantic_alias(
+    tmp_path: Path,
+) -> None:
+    exact_type = "mysql_replica_delay_seconds_above_60"
+    semantic_type = "mysql_replica_lag"
+    for alert_type, runbook_id in (
+        (exact_type, "exact-replica-delay-guide"),
+        (semantic_type, "semantic-replica-lag-guide"),
+    ):
+        directory = tmp_path / alert_type
+        directory.mkdir()
+        _write_text_pdf(
+            directory / f"{runbook_id}.pdf",
+            "Replication investigation guide with safe diagnostic steps.",
+        )
+        _write_minimal_index(directory, alert_type, runbook_id)
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "severity": "WARNING",
+            "title": exact_type,
+            "reason": exact_type,
+            "alert_type": exact_type,
+            "database": {"engine": "mysql"},
+        }
+    )
+
+    matches = await LocalPDFRunbookLibrary(tmp_path).search(alert)
+
+    assert [item.runbook_id for item in matches] == [
+        "exact-replica-delay-guide",
+        "semantic-replica-lag-guide",
+    ]
 
 
 @pytest.mark.asyncio

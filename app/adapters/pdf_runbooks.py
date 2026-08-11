@@ -65,6 +65,45 @@ _STOP_TERMS = {
     "数据库",
     "生产",
 }
+_SEMANTIC_GENERIC_TERMS = {
+    "above",
+    "alarm",
+    "alert",
+    "avg",
+    "database",
+    "db",
+    "high",
+    "host",
+    "instance",
+    "mariadb",
+    "max",
+    "more",
+    "mysql",
+    "oracle",
+    "percent",
+    "postgres",
+    "postgresql",
+    "rate",
+    "seconds",
+    "server",
+    "than",
+    "threshold",
+    "tidb",
+    "tikv",
+    "total",
+    "usage",
+    "utilization",
+}
+_SEMANTIC_TERM_ALIASES = {
+    "connections": "connection",
+    "delayed": "delay",
+    "delays": "delay",
+    "lagged": "lag",
+    "queries": "query",
+    "replicas": "replica",
+    "sessions": "session",
+    "transactions": "transaction",
+}
 
 
 @dataclass(frozen=True)
@@ -83,8 +122,9 @@ def alert_type_directory_name(value: str) -> str:
     """Return the shared, path-safe key used by processing and retrieval.
 
     Alert types are case-insensitive identifiers. Punctuation and whitespace are
-    normalized to underscores so an incoming alert and its processed PDF always
-    resolve to the same directory without using fuzzy matching.
+    normalized to underscores so processing and audit inventory use stable directory
+    names. Runtime retrieval compares alert and runbook identities semantically and
+    does not use this key as a hard routing boundary.
     """
 
     normalized = unicodedata.normalize("NFKC", value).strip().casefold()
@@ -277,28 +317,98 @@ def _match_terms(value: str) -> set[str]:
     return set(_lexical_terms(value))
 
 
+def _semantic_identifier_terms(value: str) -> set[str]:
+    """Split alert identifiers into stable, high-specificity semantic terms."""
+
+    expanded = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        " ",
+        unicodedata.normalize("NFKC", value),
+    ).casefold()
+    raw_terms = re.findall(r"[a-z][a-z0-9]*|[\u4e00-\u9fff]{2,}", expanded)
+    terms = {
+        _SEMANTIC_TERM_ALIASES.get(term, term)
+        for term in raw_terms
+        if term not in _SEMANTIC_GENERIC_TERMS
+        and term not in _STOP_TERMS
+        and term not in _IGNORED_VALUES
+        and not term.isdecimal()
+    }
+    return {term for term in terms if len(term) >= 2}
+
+
 def _signal_families(value: str) -> set[str]:
-    """Map narrowly supported alert wording variants to one diagnostic signal."""
+    """Map vendor wording variants to deterministic diagnostic signal families."""
 
     normalized = unicodedata.normalize("NFKC", value).casefold()
     compact = "".join(character for character in normalized if character.isalnum())
     families: set[str] = set()
-    if "cpu" in compact and any(
-        marker in compact
-        for marker in (
-            "cpu飙升",
-            "cpu过高",
-            "cpu高负载",
-            "cpuhigh",
-            "cpuspike",
-            "cpusurge",
-            "cpuusagehigh",
-            "cpuusageover",
-            "cpuusageabove",
-            "cpuusagemorethan",
-        )
-    ):
+    high_markers = (
+        "above",
+        "exceed",
+        "fillingup",
+        "high",
+        "morethan",
+        "over",
+        "pressure",
+        "spike",
+        "surge",
+        "usagehigh",
+        "飙升",
+        "过高",
+        "高负载",
+        "压力",
+    )
+
+    def contains_any(markers: tuple[str, ...]) -> bool:
+        return any(marker in compact for marker in markers)
+
+    if "cpu" in compact and contains_any(high_markers):
         families.add("high_cpu")
+    if contains_any(("memory", "memusage", "ram", "内存", "oom", "outofmemory")) and (
+        contains_any(high_markers)
+        or contains_any(("oom", "outofmemory", "不足", "耗尽"))
+    ):
+        families.add("memory_pressure")
+    if "swap" in compact and (
+        contains_any(high_markers) or contains_any(("full", "填满", "不足"))
+    ):
+        families.add("swap_pressure")
+    if contains_any(("disk", "filesystem", "storage", "磁盘", "文件系统")) and (
+        contains_any(high_markers)
+        or contains_any(("capacity", "full", "nospace", "空间不足", "容量"))
+    ):
+        families.add("disk_capacity")
+    if contains_any(("iops", "iosaturation", "iowait", "io延迟", "io饱和")):
+        families.add("io_saturation")
+    if contains_any(("connection", "connections", "session", "连接", "会话")) and (
+        contains_any(high_markers)
+        or contains_any(("exhaust", "full", "maxconnection", "toomany", "耗尽", "连接满"))
+    ):
+        families.add("connection_saturation")
+    if contains_any(("slowquery", "queryslow", "慢查询", "慢sql")):
+        families.add("slow_query")
+
+    replication_signal = contains_any(
+        ("replica", "replication", "slave", "replay", "applylag", "主从", "复制", "副本")
+    ) and contains_any(("delay", "lag", "behind", "延迟", "落后", "滞后", "不同步"))
+    if replication_signal:
+        families.add("replication_lag")
+    elif contains_any(("latency", "responsetime", "timeout", "耗时", "响应慢", "延迟", "超时")):
+        families.add("high_latency")
+
+    if contains_any(
+        ("deadlock", "lockwait", "lockcontention", "blocking", "死锁", "锁等待", "阻塞")
+    ):
+        families.add("lock_contention")
+    if contains_any(("crash", "crashed", "panic", "崩溃", "宕机")):
+        families.add("database_crash")
+    if contains_any(("unavailable", "unreachable", "connectionrefused", "不可用", "无法连接")):
+        families.add("availability")
+    if contains_any(("throughputdrop", "qpsdrop", "tpsdrop", "吞吐下降", "流量下降")):
+        families.add("throughput_drop")
+    if contains_any(("backupfailed", "backupfailure", "备份失败")):
+        families.add("backup_failure")
     return families
 
 
@@ -366,18 +476,10 @@ def runbook_match_metadata(
     return result
 
 
-def _cross_type_identity_matches(document: RunbookDocument, alert: NormalizedAlert) -> bool:
-    """Allow cross-directory recall only for strong structured identities.
-
-    Alert-type directories remain the primary routing boundary. This fallback is
-    intentionally narrower than section scoring so an absent directory cannot
-    retrieve an unrelated PDF merely because both documents mention a database.
-    """
-
-    alert_values = [value for value, _, _ in _alert_weighted_values(alert)]
+def _runbook_identity_values(document: RunbookDocument) -> list[str]:
     metadata = document.metadata
     match_metadata = metadata.get("match") or {}
-    document_values = [
+    return [
         *_metadata_strings(metadata, "alert_types"),
         str(metadata.get("alert_type") or ""),
         *(
@@ -386,6 +488,20 @@ def _cross_type_identity_matches(document: RunbookDocument, alert: NormalizedAle
             for value in _metadata_strings(match_metadata, field)
         ),
     ]
+
+
+def _semantic_identity_score(
+    document: RunbookDocument,
+    alert: NormalizedAlert,
+) -> tuple[float, list[str]]:
+    """Score the alert signal against structured runbook type identities."""
+
+    alert_values = [
+        value
+        for value, _, label in _alert_weighted_values(alert)
+        if label != "描述"
+    ]
+    document_values = _runbook_identity_values(document)
     alert_keys: set[str] = set()
     document_keys: set[str] = set()
     for value, destination in (
@@ -397,7 +513,7 @@ def _cross_type_identity_matches(document: RunbookDocument, alert: NormalizedAle
         except ValueError:
             continue
     if alert_keys.intersection(document_keys):
-        return True
+        return 52.0, ["告警信号与手册类型语义命中"]
 
     alert_signals = {
         signal for value in alert_values for signal in _signal_families(value)
@@ -405,7 +521,31 @@ def _cross_type_identity_matches(document: RunbookDocument, alert: NormalizedAle
     document_signals = {
         signal for value in document_values for signal in _signal_families(value)
     }
-    return bool(alert_signals.intersection(document_signals))
+    if alert_signals.intersection(document_signals):
+        return 32.0, ["告警信号与手册类型语义命中"]
+
+    best_overlap = 0
+    best_coverage = 0.0
+    for alert_value in alert_values:
+        alert_terms = _semantic_identifier_terms(alert_value)
+        if len(alert_terms) < 2:
+            continue
+        for document_value in document_values:
+            document_terms = _semantic_identifier_terms(document_value)
+            if len(document_terms) < 2:
+                continue
+            overlap = alert_terms.intersection(document_terms)
+            coverage = len(overlap) / min(len(alert_terms), len(document_terms))
+            if len(overlap) >= 2 and coverage >= 0.6 and (
+                len(overlap), coverage
+            ) > (best_overlap, best_coverage):
+                best_overlap = len(overlap)
+                best_coverage = coverage
+    if best_overlap:
+        return min(28.0, 18.0 + best_overlap * 2.0), [
+            "告警信号与手册类型语义命中"
+        ]
+    return 0.0, []
 
 
 def _scalar_filter_text(value: Any) -> str | None:
@@ -694,6 +834,9 @@ def _score_section(
     match_metadata = document.metadata.get("match") or {}
     if not _match_conditions(match_metadata, condition_blob=condition_blob):
         return 0, []
+    score, reasons = _semantic_identity_score(document, alert)
+    if score <= 0:
+        return 0, []
     visual_evidence = _section_visual_evidence(document, section)
     section_causes = _section_causes(document, section)
     visual_searchable = _normalized_match_text(_visual_search_text(visual_evidence))
@@ -721,9 +864,7 @@ def _score_section(
     weighted_values = _alert_weighted_values(alert)
     query_blob = " ".join(value for value, _, _ in weighted_values)
 
-    score = 0.0
-    reasons: list[str] = []
-    direct_match = False
+    direct_match = True
     for value, weight, label in weighted_values:
         visual_hit = value in visual_searchable or (
             len(_normalized_log_signature(value)) >= 4
@@ -740,15 +881,6 @@ def _score_section(
             else:
                 reasons.append(f"{label}精确命中")
             direct_match = True
-
-    alert_signals = {
-        signal for value, _, _ in weighted_values for signal in _signal_families(value)
-    }
-    document_signals = _signal_families(searchable)
-    if alert_signals.intersection(document_signals):
-        score += 24
-        reasons.append("告警信号归一化命中")
-        direct_match = True
 
     if not direct_match:
         for value, _, label in weighted_values[:5]:
@@ -889,24 +1021,11 @@ class LocalPDFRunbookLibrary:
     async def search(
         self, alert: NormalizedAlert, limit: int = 5
     ) -> list[RunbookExcerpt]:
-        try:
-            alert_type = alert_type_directory_name(alert.alert_type)
-        except ValueError as exc:
-            raise RunbookAlertTypeNotFoundError(alert.alert_type) from exc
-        exact_directory_found = True
         async with self._lock:
-            try:
-                documents = await asyncio.to_thread(
-                    self._list_alert_type_sync, alert_type
-                )
-            except RunbookAlertTypeNotFoundError:
-                exact_directory_found = False
-                documents = await asyncio.to_thread(
-                    self._list_cross_type_candidates_sync,
-                    alert,
-                )
-        if not exact_directory_found and not documents:
-            raise RunbookAlertTypeNotFoundError(alert.alert_type)
+            documents = await asyncio.to_thread(
+                self._list_semantic_candidates_sync,
+                alert,
+            )
         candidates = [
             (document, section)
             for document in documents
@@ -986,7 +1105,9 @@ class LocalPDFRunbookLibrary:
                 metadata={
                     **document.metadata,
                     "section_title": section.title,
-                    "retrieval": "structured_exact+visual_evidence+bm25_char_ngram",
+                    "retrieval": (
+                        "structured_semantic_identity+visual_evidence+bm25_char_ngram"
+                    ),
                 },
             )
             current = best_by_runbook.get(document.id)
@@ -1129,11 +1250,11 @@ class LocalPDFRunbookLibrary:
             self._paths_for(document.id)
         return documents
 
-    def _list_cross_type_candidates_sync(
+    def _list_semantic_candidates_sync(
         self,
         alert: NormalizedAlert,
     ) -> list[RunbookDocument]:
-        documents: list[RunbookDocument] = []
+        records_by_id: dict[str, list[tuple[RunbookDocument, Path]]] = {}
         active_paths: set[Path] = set()
         for alert_type_directory in self._alert_type_directories_sync():
             type_documents, type_paths = self._list_directory_sync(
@@ -1141,9 +1262,22 @@ class LocalPDFRunbookLibrary:
             )
             active_paths.update(type_paths)
             for document in type_documents:
-                self._paths_for(document.id)
-                if _cross_type_identity_matches(document, alert):
-                    documents.append(document)
+                records_by_id.setdefault(document.id, []).append(
+                    (document, alert_type_directory / f"{document.id}.pdf")
+                )
+
+        documents = [
+            document
+            for records in records_by_id.values()
+            for document, _path in records
+            if _semantic_identity_score(document, alert)[0] > 0
+        ]
+        matching_ids = {document.id for document in documents}
+        for runbook_id in matching_ids:
+            self._assert_equivalent_runbook_copies(
+                runbook_id,
+                [path for _document, path in records_by_id[runbook_id]],
+            )
         self._cache = {
             path: cached for path, cached in self._cache.items() if path in active_paths
         }

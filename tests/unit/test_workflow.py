@@ -393,7 +393,7 @@ def settings_for(tmp_path: Path) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_missing_alert_type_pdf_directory_is_reported_to_main_analysis(
+async def test_missing_pdf_semantic_match_is_reported_to_main_analysis(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(settings_for(tmp_path))
@@ -411,7 +411,7 @@ async def test_missing_alert_type_pdf_directory_is_reported_to_main_analysis(
 
     assert result.recommendation is not None
     assert (
-        "匹配本地pdf失败，pdf中没有该类型告警的处理方法"
+        "本地 PDF 候选未达到匹配阈值，已拒绝匹配"
         in result.recommendation.knowledge_match_summary
     )
     assert result.manual_matches == []
