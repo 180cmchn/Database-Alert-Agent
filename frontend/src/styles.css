@@ -676,6 +676,7 @@ input:disabled { color: #6d8291; background: #0b1925; cursor: not-allowed; }
 .wecom-overview-links { margin-top: 14px; display: grid; gap: 7px; }
 .wecom-overview-links a { min-height: 44px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; color: #abc0cb; background: rgba(72, 216, 173, 0.045); border: 1px solid rgba(72, 216, 173, 0.13); border-radius: 9px; font-size: 12px; }
 .wecom-root-cause { border-left: 3px solid var(--warning); }
+.wecom-root-cause.root-support,
 .wecom-root-cause.root-supported { border-left-color: var(--accent); }
 .wecom-root-cause.root-contradicted { border-left-color: var(--critical); opacity: 0.78; }
 .wecom-root-cause header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 10px; }

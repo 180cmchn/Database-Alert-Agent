@@ -143,8 +143,9 @@ export interface AnalysisBasis {
 
 export interface RootCauseAssessment {
   cause: string;
+  hypothesis_id?: string | null;
   cause_id?: string | null;
-  status: "SUPPORTED" | "CONTRADICTED" | "UNKNOWN";
+  status: "SUPPORT" | "SUPPORTED" | "CONTRADICTED" | "UNKNOWN";
   evidence_refs: string[];
   confidence: number;
   verified: boolean;

@@ -422,53 +422,10 @@ class DefaultInvestigationStrategyProvider:
                     alert.alert_name,
                     alert.title,
                     alert.reason,
-                    *[
-                        probe.objective
-                        for runbook in runbooks
-                        for cause in runbook.causes
-                        for probe in cause.probes
-                        if probe.tool_name == "query_database_diagnostics"
-                    ],
                 ]
             )
         )
         tool_plan = self._base_tool_plan(alert, diagnostics)
-        seen_tools = {item.tool_name for item in tool_plan}
-
-        for runbook in runbooks or []:
-            for cause in runbook.causes:
-                for probe in cause.probes:
-                    if (
-                        not probe.read_only
-                        or probe.tool_name in seen_tools
-                        or probe.tool_name not in self.available_tools
-                    ):
-                        continue
-                    parameters = self._parameters_for_tool(
-                        probe.tool_name, alert, probe.objective
-                    )
-                    if parameters is None:
-                        continue
-                    seen_tools.add(probe.tool_name)
-                    tool_plan.append(
-                        ToolExecutionRequest(
-                            tool_name=probe.tool_name,
-                            parameters={
-                                **parameters,
-                                "objective": probe.objective,
-                                "runbook_id": runbook.runbook_id,
-                                "section": runbook.section,
-                            },
-                            required=False,
-                            timeout_seconds=self.external_tool_timeout_seconds,
-                        )
-                    )
-                    if len(tool_plan) >= 6:
-                        break
-                if len(tool_plan) >= 6:
-                    break
-            if len(tool_plan) >= 6:
-                break
 
         connection_alert = alert.alert_type.casefold() in {
             "connection_exhausted",
@@ -495,11 +452,11 @@ class DefaultInvestigationStrategyProvider:
                 )
             ),
             description=(
-                "先采集告警上下文，再执行具备完整参数的基础只读探针；"
-                "命中手册时补充其诊断图中的可执行探针。"
+                "根据告警目标、信号和时间窗执行预定义只读采集；"
+                "采集阶段不生成或评估根因。"
             ),
             tool_plan=tool_plan,
-            max_dynamic_turns=self.max_dynamic_turns,
+            max_dynamic_turns=0,
         )
 
     def _base_tool_plan(

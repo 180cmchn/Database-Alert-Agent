@@ -711,7 +711,7 @@ class PrometheusHarnessScenario:
                 next_instruction = "返回目标与告警目标不一致；" + (
                     "只再修正一次指标或标签并执行 range_query。"
                     if mismatch_count < PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS
-                    else "Host 将以无可区分证据结束。"
+                    else "Host 将以告警信号事实不足结束采集。"
                 )
             else:
                 empty_count = 1 + sum(
@@ -765,8 +765,8 @@ class PrometheusHarnessScenario:
                 }
             if usable_observation:
                 next_instruction = (
-                    "已取得合格的告警窗口观测；证据足够时结束调查，否则只再执行能区分"
-                    "候选原因的范围查询。"
+                    "已取得合格的告警窗口观测；告警信号所需事实已覆盖时结束采集，"
+                    "否则只再执行与告警目标、信号和时间窗直接相关的范围查询。"
                 )
             elif policy.capability == "catalog":
                 next_instruction = (
@@ -1086,14 +1086,14 @@ class PrometheusHarnessScenario:
         ):
             return (
                 "Prometheus 指标目录中未发现与当前告警信号语义相关的指标；"
-                "继续查询仅共享数据库引擎前缀的指标不能区分候选原因。"
+                "继续查询仅共享数据库引擎前缀的指标不能补充告警信号事实。"
             )
 
         empty_ranges = sum(attempt.get("outcome") == "no_data" for attempt in range_attempts)
         if empty_ranges >= PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS:
             return (
                 f"Prometheus 已执行 {empty_ranges} 次不同的告警窗口范围查询且均无样本；"
-                "继续猜测指标或标签不能提供可区分的实时证据。"
+                "继续猜测指标或标签不能补充完整的告警信号事实。"
             )
         return None
 

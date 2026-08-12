@@ -8,6 +8,7 @@ from app.application.validation import (
     enforce_post_evidence_root_cause_policy,
 )
 from app.domain.models import (
+    INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
@@ -17,14 +18,6 @@ from app.domain.models import (
     RootCauseAssessment,
     RootCauseStatus,
     ToolStatus,
-)
-from app.investigations.models import (
-    EvidenceAssessment,
-    EvidenceNeed,
-    EvidenceRelation,
-    Hypothesis,
-    InvestigationMemory,
-    update_memory,
 )
 
 
@@ -41,256 +34,174 @@ def make_alert():  # type: ignore[no-untyped-def]
 
 def make_recommendation(
     *,
+    summary: str = INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     root_causes: list[RootCauseAssessment] | None = None,
+    likely_causes: list[str] | None = None,
     action: str = "只读核对指标",
 ) -> Recommendation:
+    causes = root_causes or []
     return Recommendation(
-        summary="candidate conclusion",
+        summary=summary,
+        likely_causes=(
+            [item.cause for item in causes] if likely_causes is None else likely_causes
+        ),
         analysis_bases=[
             AnalysisBasis(
                 source=AnalysisBasisSource.AI,
-                statement="AI analysis based on alert fields",
+                statement="AI 已审阅告警、知识与实时证据。",
             )
         ],
         steps=[RecommendationStep(order=1, action=action)],
         confidence=0.5,
         manual_matched=False,
-        root_causes=root_causes or [],
+        root_causes=causes,
     )
 
 
-def make_hypothesis(
-    hypothesis_id: str,
-    mechanism: str,
+def make_live_evidence(
     *,
-    causal_candidate: bool = True,
-) -> Hypothesis:
-    return Hypothesis(
-        hypothesis_id=hypothesis_id,
-        mechanism=mechanism,
-        causal_candidate=causal_candidate,
-        expected_observations=["实时观测符合该机制的必要预测。"],
-        contradicting_observations=["实时观测与该机制的必要预测冲突。"],
-        next_probe=EvidenceNeed(
-            need_id=f"{hypothesis_id}:probe",
-            objective=f"只读核验 {mechanism}",
-            expected_observation="出现必要预测。",
-            contradicting_observation="必要预测未出现。",
-            tool_name="query_database_diagnostics",
-        ),
-    )
-
-
-def assessed_memory(
-    hypotheses: list[Hypothesis],
-    evidence: EvidenceRecord,
-    *,
-    hypothesis_id: str,
-    relation: EvidenceRelation,
-) -> InvestigationMemory:
-    return update_memory(
-        InvestigationMemory(hypotheses=hypotheses),
-        evidence,
-        [
-            EvidenceAssessment(
-                hypothesis_id=hypothesis_id,
-                evidence_id=str(evidence.id),
-                relation=relation,
-                rationale="该观测用于检验指定机制。",
-            )
-        ],
-    )
-
-
-def test_post_evidence_policy_drops_contradicted_hypotheses() -> None:
-    live_evidence = EvidenceRecord(
+    status: ToolStatus = ToolStatus.SUCCESS,
+    source_system: str = "database_diagnostics",
+    structured_data: dict | None = None,
+    truncated: bool = False,
+) -> EvidenceRecord:
+    return EvidenceRecord(
         run_id=uuid4(),
-        tool_name="query_connection_sources",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="连接来源分布与平台采集 SQL 假设不符",
+        tool_name="query_database_diagnostics",
+        source_system=source_system,
+        status=status,
+        summary="已采集当前告警窗口内的数据库诊断事实。",
+        structured_data=structured_data or {},
+        truncated=truncated,
     )
-    contradicted_evidence_id = str(live_evidence.id)
+
+
+def test_post_evidence_policy_keeps_only_support_with_eligible_live_evidence() -> None:
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="实时证据表明长事务持续占用连接槽位。",
         root_causes=[
             RootCauseAssessment(
-                cause="连接泄漏",
-                status=RootCauseStatus.UNKNOWN,
-                next_probe="查询连接来源分布。",
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORT,
+                evidence_refs=[str(evidence.id), str(evidence.id)],
+                confidence=0.9,
+                verified=False,
+                next_probe="旧模型不应保留此字段。",
             ),
             RootCauseAssessment(
-                cause="数据库管理平台采集 SQL 导致告警",
-                status=RootCauseStatus.CONTRADICTED,
-                evidence_refs=[contradicted_evidence_id],
-            ),
-        ]
-    ).model_copy(update={"likely_causes": ["连接泄漏", "数据库管理平台采集 SQL 导致告警"]})
-
-    result = enforce_post_evidence_root_cause_policy(recommendation, [live_evidence])
-
-    assert [item.cause for item in result.root_causes] == ["连接泄漏"]
-    assert result.likely_causes == ["连接泄漏"]
-    assert not hasattr(result, "excluded_causes")
-
-
-def test_post_evidence_policy_keeps_no_causes_when_all_are_removed() -> None:
-    live_evidence = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_connection_sources",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="连接来源分布与平台采集 SQL 假设不符",
-    )
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="数据库管理平台采集 SQL 导致告警",
-                status=RootCauseStatus.CONTRADICTED,
-                evidence_refs=[str(live_evidence.id)],
-            )
-        ],
-    )
-
-    result = enforce_post_evidence_root_cause_policy(recommendation, [live_evidence])
-
-    assert result.root_causes == []
-    assert result.likely_causes == []
-
-
-def test_post_evidence_policy_drops_management_sql_cause_filtered_by_alert() -> None:
-    filter_note = "（已排除640个数据库管理平台采集数据用sql）"
-    alert = make_alert().model_copy(
-        update={"raw_payload": {"description": f"五分钟内慢查询触发值为646个{filter_note}"}}
-    )
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="本次告警完全由数据库管理平台采集 SQL 造成",
+                cause="连接池泄漏。",
                 status=RootCauseStatus.UNKNOWN,
-                next_probe="复核 SQL 来源。",
-            ),
-            RootCauseAssessment(
-                cause="业务 SQL 执行频次异常增加",
-                status=RootCauseStatus.UNKNOWN,
-                next_probe="按指纹核对慢查询执行次数。",
+                next_probe="查询连接来源。",
             ),
         ],
     )
 
-    result = enforce_post_evidence_root_cause_policy(recommendation, [], alert)
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
 
-    assert [item.cause for item in result.root_causes] == ["业务 SQL 执行频次异常增加"]
-    assert result.likely_causes == ["业务 SQL 执行频次异常增加"]
+    assert [item.cause for item in result.root_causes] == [
+        "长事务持续占用连接槽位，导致可用连接耗尽。"
+    ]
+    assert result.root_causes[0].status == RootCauseStatus.SUPPORT
+    assert result.root_causes[0].verified is True
+    assert result.root_causes[0].evidence_refs == [str(evidence.id)]
+    assert result.root_causes[0].hypothesis_id is None
+    assert result.root_causes[0].next_probe is None
+    assert result.likely_causes == [result.root_causes[0].cause]
 
 
 @pytest.mark.parametrize(
     "status",
-    [ToolStatus.FAILED, ToolStatus.TIMEOUT, ToolStatus.NO_DATA, ToolStatus.SKIPPED],
+    [
+        RootCauseStatus.SUPPORTED,
+        RootCauseStatus.UNKNOWN,
+        RootCauseStatus.CONTRADICTED,
+    ],
 )
-def test_post_evidence_policy_keeps_cause_unknown_without_live_success(
-    status: ToolStatus,
+def test_post_evidence_policy_rejects_historical_statuses_for_new_results(
+    status: RootCauseStatus,
 ) -> None:
-    unavailable_evidence = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_connection_sources",
-        source_system="database_diagnostics",
-        status=status,
-        summary="实时证据不可用",
-    )
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="旧三态输出。",
         root_causes=[
             RootCauseAssessment(
-                cause="数据库管理平台采集 SQL 导致告警",
-                status=RootCauseStatus.CONTRADICTED,
-                evidence_refs=[str(unavailable_evidence.id)],
-                confidence=0.9,
+                cause="连接池泄漏。",
+                status=status,
+                evidence_refs=[str(evidence.id)],
+                verified=status == RootCauseStatus.SUPPORTED,
+                next_probe=("查询连接来源。" if status == RootCauseStatus.UNKNOWN else None),
             )
         ],
     )
 
-    result = enforce_post_evidence_root_cause_policy(recommendation, [unavailable_evidence])
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
 
-    assert len(result.root_causes) == 1
-    assert result.root_causes[0].status == RootCauseStatus.UNKNOWN
-    assert result.root_causes[0].evidence_refs == []
-    assert result.root_causes[0].confidence == 0.45
-    assert result.root_causes[0].next_probe
-    assert result.likely_causes == ["数据库管理平台采集 SQL 导致告警"]
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.root_causes == []
+    assert result.likely_causes == []
+    assert result.confidence == 0
 
 
 @pytest.mark.parametrize(
-    ("status", "verified"),
+    ("status", "structured_data", "source_system", "truncated"),
     [
-        (RootCauseStatus.SUPPORTED, True),
-        (RootCauseStatus.CONTRADICTED, False),
+        (ToolStatus.FAILED, {}, "database_diagnostics", False),
+        (ToolStatus.TIMEOUT, {}, "database_diagnostics", False),
+        (ToolStatus.NO_DATA, {}, "database_diagnostics", False),
+        (ToolStatus.SKIPPED, {}, "database_diagnostics", False),
+        (ToolStatus.SUCCESS, {"partial": True}, "database_diagnostics", False),
+        (
+            ToolStatus.SUCCESS,
+            {"root_cause_eligible": False},
+            "database_diagnostics",
+            False,
+        ),
+        (ToolStatus.SUCCESS, {}, "alert_platform", False),
+        (ToolStatus.SUCCESS, {}, "database_diagnostics", True),
     ],
 )
-def test_post_evidence_policy_treats_partial_success_as_unknown(
-    status: RootCauseStatus,
-    verified: bool,
+def test_post_evidence_policy_returns_fixed_no_cause_for_ineligible_evidence(
+    status: ToolStatus,
+    structured_data: dict,
+    source_system: str,
+    truncated: bool,
 ) -> None:
-    partial_evidence = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_archery_slow_logs",
-        source_system="archery_mcp",
-        status=ToolStatus.SUCCESS,
-        summary="已采集部分慢日志。",
-        structured_data={
-            "partial": True,
-            "query_completed": True,
-            "root_cause_eligible": True,
-            "allow_followup_dispatch": False,
-        },
+    evidence = make_live_evidence(
+        status=status,
+        structured_data=structured_data,
+        source_system=source_system,
+        truncated=truncated,
     )
     recommendation = make_recommendation(
+        summary="模型尝试给出根因。",
         root_causes=[
             RootCauseAssessment(
-                cause="慢查询突增",
-                status=status,
-                evidence_refs=[str(partial_evidence.id)],
-                confidence=0.9,
-                verified=verified,
+                cause="长事务导致连接耗尽。",
+                status=RootCauseStatus.SUPPORT,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
             )
         ],
     )
 
-    result = enforce_post_evidence_root_cause_policy(
-        recommendation,
-        [partial_evidence],
-    )
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
 
-    assert result.root_causes[0].status == RootCauseStatus.UNKNOWN
-    assert result.root_causes[0].verified is False
-    assert result.root_causes[0].evidence_refs == []
-    assert result.root_causes[0].next_probe
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.root_causes == []
+    assert result.likely_causes == []
 
 
-def test_post_evidence_policy_canonicalizes_cause_to_bound_hypothesis() -> None:
-    evidence = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_database_diagnostics",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="长连接集中在同一应用连接池。",
-    )
-    hypothesis = make_hypothesis(
-        "pool-leak",
-        "连接池泄漏导致长连接持续占用连接槽位。",
-    )
-    memory = assessed_memory(
-        [hypothesis],
-        evidence,
-        hypothesis_id=hypothesis.hypothesis_id,
-        relation=EvidenceRelation.SUPPORTS,
-    )
+def test_post_evidence_policy_does_not_promote_alert_reason_to_root_cause() -> None:
+    alert = make_alert()
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="模型复述了告警。",
         root_causes=[
             RootCauseAssessment(
-                hypothesis_id=hypothesis.hypothesis_id,
-                cause="不相关的磁盘容量不足",
-                status=RootCauseStatus.SUPPORTED,
+                cause=alert.reason,
+                status=RootCauseStatus.SUPPORT,
                 evidence_refs=[str(evidence.id)],
-                confidence=0.9,
                 verified=True,
             )
         ],
@@ -299,210 +210,60 @@ def test_post_evidence_policy_canonicalizes_cause_to_bound_hypothesis() -> None:
     result = enforce_post_evidence_root_cause_policy(
         recommendation,
         [evidence],
-        investigation_memory=memory,
+        alert,
     )
 
-    assert len(result.root_causes) == 1
-    assert result.root_causes[0].hypothesis_id == hypothesis.hypothesis_id
-    assert result.root_causes[0].cause == hypothesis.mechanism
-    assert result.root_causes[0].status == RootCauseStatus.SUPPORTED
-    assert result.root_causes[0].evidence_refs == [str(evidence.id)]
-    assert result.root_causes[0].verified is True
-
-
-def test_post_evidence_policy_replaces_cross_hypothesis_evidence_refs() -> None:
-    evidence_a = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_connection_sources",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="长连接集中在应用 A。",
-    )
-    evidence_b = EvidenceRecord(
-        run_id=evidence_a.run_id,
-        tool_name="query_disk_latency",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="磁盘延迟显著升高。",
-    )
-    hypothesis_a = make_hypothesis("pool-leak", "连接池泄漏导致连接耗尽。")
-    hypothesis_b = make_hypothesis("disk-stall", "磁盘阻塞导致请求堆积。")
-    memory = assessed_memory(
-        [hypothesis_a, hypothesis_b],
-        evidence_a,
-        hypothesis_id=hypothesis_a.hypothesis_id,
-        relation=EvidenceRelation.SUPPORTS,
-    )
-    memory = update_memory(
-        memory,
-        evidence_b,
-        [
-            EvidenceAssessment(
-                hypothesis_id=hypothesis_b.hypothesis_id,
-                evidence_id=str(evidence_b.id),
-                relation=EvidenceRelation.SUPPORTS,
-                rationale="磁盘观测支持磁盘阻塞机制。",
-            )
-        ],
-    )
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                hypothesis_id=hypothesis_a.hypothesis_id,
-                cause=hypothesis_a.mechanism,
-                status=RootCauseStatus.SUPPORTED,
-                evidence_refs=[str(evidence_b.id)],
-                confidence=0.9,
-                verified=True,
-            )
-        ],
-    )
-
-    result = enforce_post_evidence_root_cause_policy(
-        recommendation,
-        [evidence_a, evidence_b],
-        investigation_memory=memory,
-    )
-
-    assert result.root_causes[0].evidence_refs == [str(evidence_a.id)]
-
-
-def test_post_evidence_policy_drops_unbound_new_model_cause() -> None:
-    hypothesis = make_hypothesis("pool-leak", "连接池泄漏导致连接耗尽。")
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="模型临时生成但未进入调查记忆的原因",
-                status=RootCauseStatus.UNKNOWN,
-                next_probe="执行只读核验。",
-            )
-        ],
-    )
-
-    result = enforce_post_evidence_root_cause_policy(
-        recommendation,
-        [],
-        investigation_memory=InvestigationMemory(hypotheses=[hypothesis]),
-    )
-
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
     assert result.root_causes == []
-    assert result.likely_causes == []
 
 
-def test_post_evidence_policy_cannot_promote_partial_memory_assessment() -> None:
-    partial = EvidenceRecord(
-        run_id=uuid4(),
-        tool_name="query_archery_slow_logs",
-        source_system="archery_mcp",
-        status=ToolStatus.SUCCESS,
-        summary="仅返回部分慢日志。",
-        structured_data={"partial": True, "root_cause_eligible": True},
+def test_post_evidence_policy_drops_filtered_management_sql_cause() -> None:
+    alert = make_alert().model_copy(
+        update={
+            "raw_payload": {
+                "description": (
+                    "五分钟内慢查询触发值为646个"
+                    "（已排除640个数据库管理平台采集数据用sql）"
+                )
+            }
+        }
     )
-    hypothesis = make_hypothesis("sql-burst", "业务 SQL 调用频率突增。")
-    memory = assessed_memory(
-        [hypothesis],
-        partial,
-        hypothesis_id=hypothesis.hypothesis_id,
-        relation=EvidenceRelation.SUPPORTS,
-    )
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="模型错误使用过滤说明。",
         root_causes=[
             RootCauseAssessment(
-                hypothesis_id=hypothesis.hypothesis_id,
-                cause=hypothesis.mechanism,
-                status=RootCauseStatus.SUPPORTED,
-                evidence_refs=[str(partial.id)],
-                confidence=0.9,
+                cause="本次告警完全由数据库管理平台采集 SQL 造成",
+                status=RootCauseStatus.SUPPORT,
+                evidence_refs=[str(evidence.id)],
                 verified=True,
             )
         ],
     )
 
-    result = enforce_post_evidence_root_cause_policy(
-        recommendation,
-        [partial],
-        investigation_memory=memory,
-    )
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence], alert)
 
-    assert memory.assessments[0].relation == EvidenceRelation.INCONCLUSIVE
-    assert result.root_causes[0].status == RootCauseStatus.UNKNOWN
-    assert result.root_causes[0].verified is False
-    assert result.root_causes[0].next_probe == hypothesis.next_probe.objective
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.root_causes == []
 
 
-def test_legacy_root_cause_json_without_hypothesis_id_remains_readable() -> None:
-    root_cause = RootCauseAssessment.model_validate(
+def test_legacy_root_cause_json_remains_readable() -> None:
+    cause = RootCauseAssessment.model_validate(
         {
-            "cause": "旧版持久化根因",
+            "cause": "历史候选原因",
             "status": "UNKNOWN",
             "confidence": 0.3,
             "verified": False,
-            "next_probe": "补充只读证据。",
+            "next_probe": "补充实时证据。",
         }
     )
 
-    assert root_cause.hypothesis_id is None
+    assert cause.status == RootCauseStatus.UNKNOWN
+    assert cause.hypothesis_id is None
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_rejects_missing_and_failed_evidence() -> None:
-    alert = make_alert()
-    run = InvestigationRun(alert_id=alert.id)
-    failed_evidence = EvidenceRecord(
-        run_id=run.id,
-        tool_name="query_metrics",
-        source_system="metrics",
-        status=ToolStatus.FAILED,
-        summary="metrics unavailable",
-    )
-    missing_id = uuid4()
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="connection leak",
-                evidence_refs=[str(failed_evidence.id), str(missing_id)],
-                confidence=0.9,
-                verified=True,
-            )
-        ]
-    )
-
-    result = await RuleConclusionValidator().validate(
-        run, alert, recommendation, [failed_evidence], []
-    )
-
-    assert result.passed is False
-    assert any("不是 SUCCESS" in issue for issue in result.issues)
-    assert any("不存在的证据" in issue for issue in result.issues)
-    assert any("必须至少引用一条 SUCCESS 证据" in issue for issue in result.issues)
-    assert result.evidence_sufficient is False
-
-
-@pytest.mark.asyncio
-async def test_rule_validator_accepts_honest_unknown_but_marks_evidence_insufficient() -> None:
-    alert = make_alert()
-    run = InvestigationRun(alert_id=alert.id)
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="connection leak",
-                status=RootCauseStatus.UNKNOWN,
-                confidence=0.3,
-                verified=False,
-                next_probe="查询连接来源和长会话分布。",
-            )
-        ]
-    )
-
-    result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
-
-    assert result.passed is True
-    assert result.evidence_sufficient is False
-    assert result.issues == []
-
-
-@pytest.mark.asyncio
-async def test_rule_validator_accepts_empty_cause_as_evidence_insufficient() -> None:
+async def test_rule_validator_accepts_fixed_no_cause_as_evidence_insufficient() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
     recommendation = make_recommendation()
@@ -515,61 +276,29 @@ async def test_rule_validator_accepts_empty_cause_as_evidence_insufficient() -> 
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_marks_supported_live_evidence_sufficient() -> None:
+async def test_rule_validator_rejects_empty_cause_with_noncanonical_summary() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    live_evidence = EvidenceRecord(
-        run_id=run.id,
-        tool_name="query_database_diagnostics",
-        source_system="flashduty_monitors",
-        status=ToolStatus.SUCCESS,
-        summary="connection sources confirm one leaking client",
-    )
-    recommendation = make_recommendation(
-        root_causes=[
-            RootCauseAssessment(
-                cause="connection leak",
-                status=RootCauseStatus.SUPPORTED,
-                evidence_refs=[str(live_evidence.id)],
-                confidence=0.9,
-                verified=True,
-            )
-        ],
-    )
+    recommendation = make_recommendation(summary="可能是连接池问题。")
 
-    result = await RuleConclusionValidator().validate(
-        run, alert, recommendation, [live_evidence], []
-    )
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
 
-    assert result.passed is True
-    assert result.evidence_sufficient is True
-    assert result.issues == []
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("summary 必须固定" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_rejects_cross_hypothesis_cause_binding() -> None:
+async def test_rule_validator_accepts_support_with_live_evidence() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    evidence = EvidenceRecord(
-        run_id=run.id,
-        tool_name="query_connection_sources",
-        source_system="database_diagnostics",
-        status=ToolStatus.SUCCESS,
-        summary="连接池 A 持有大量长连接。",
-    )
-    hypothesis = make_hypothesis("pool-leak", "连接池泄漏导致连接耗尽。")
-    memory = assessed_memory(
-        [hypothesis],
-        evidence,
-        hypothesis_id=hypothesis.hypothesis_id,
-        relation=EvidenceRelation.SUPPORTS,
-    )
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="长事务持续占用连接槽位，最终触发连接耗尽。",
         root_causes=[
             RootCauseAssessment(
-                hypothesis_id=hypothesis.hypothesis_id,
-                cause="磁盘容量不足",
-                status=RootCauseStatus.SUPPORTED,
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORT,
                 evidence_refs=[str(evidence.id)],
                 confidence=0.9,
                 verified=True,
@@ -583,71 +312,66 @@ async def test_rule_validator_rejects_cross_hypothesis_cause_binding() -> None:
         recommendation,
         [evidence],
         [],
-        memory,
     )
 
-    assert result.passed is False
-    assert result.evidence_sufficient is False
-    assert any("mechanism 不一致" in issue for issue in result.issues)
+    assert result.passed is True
+    assert result.evidence_sufficient is True
+    assert result.issues == []
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_rejects_live_evidence_marked_root_cause_ineligible() -> None:
+@pytest.mark.parametrize(
+    "status",
+    [
+        RootCauseStatus.SUPPORTED,
+        RootCauseStatus.UNKNOWN,
+        RootCauseStatus.CONTRADICTED,
+    ],
+)
+async def test_rule_validator_rejects_historical_status_in_new_result(
+    status: RootCauseStatus,
+) -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    unscoped_evidence = EvidenceRecord(
-        run_id=run.id,
-        tool_name="query_archery_slow_logs",
-        source_system="archery_mcp",
-        status=ToolStatus.SUCCESS,
-        summary="unscoped slow-log snapshot",
-        structured_data={"root_cause_eligible": False},
-    )
+    evidence = make_live_evidence()
     recommendation = make_recommendation(
+        summary="旧状态结果。",
         root_causes=[
             RootCauseAssessment(
-                cause="excessive slow queries on the alerted instance",
-                status=RootCauseStatus.SUPPORTED,
-                evidence_refs=[str(unscoped_evidence.id)],
-                confidence=0.9,
-                verified=True,
+                cause="连接池泄漏。",
+                status=status,
+                evidence_refs=[str(evidence.id)],
+                verified=status == RootCauseStatus.SUPPORTED,
+                next_probe=("查询连接来源。" if status == RootCauseStatus.UNKNOWN else None),
             )
         ],
     )
 
     result = await RuleConclusionValidator().validate(
-        run, alert, recommendation, [unscoped_evidence], []
+        run,
+        alert,
+        recommendation,
+        [evidence],
+        [],
     )
 
     assert result.passed is False
     assert result.evidence_sufficient is False
-    assert any("明确标记为不能支持根因" in issue for issue in result.issues)
+    assert any("状态必须为 SUPPORT" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_rejects_partial_success_as_causal_evidence() -> None:
+async def test_rule_validator_rejects_missing_partial_or_ineligible_support() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    partial_evidence = EvidenceRecord(
-        run_id=run.id,
-        tool_name="query_prometheus_metrics",
-        source_system="prometheus_mcp",
-        status=ToolStatus.SUCCESS,
-        summary="已采集部分监控样本。",
-        structured_data={
-            "partial": True,
-            "query_completed": True,
-            "root_cause_eligible": True,
-            "allow_followup_dispatch": False,
-        },
-    )
+    partial = make_live_evidence(structured_data={"partial": True})
     recommendation = make_recommendation(
+        summary="模型尝试使用部分证据。",
         root_causes=[
             RootCauseAssessment(
-                cause="数据库 CPU 饱和",
-                status=RootCauseStatus.SUPPORTED,
-                evidence_refs=[str(partial_evidence.id)],
-                confidence=0.9,
+                cause="长事务导致连接耗尽。",
+                status=RootCauseStatus.SUPPORT,
+                evidence_refs=[str(partial.id)],
                 verified=True,
             )
         ],
@@ -657,14 +381,44 @@ async def test_rule_validator_rejects_partial_success_as_causal_evidence() -> No
         run,
         alert,
         recommendation,
-        [partial_evidence],
+        [partial],
         [],
     )
 
     assert result.passed is False
     assert result.evidence_sufficient is False
-    assert any("partial=true 的部分证据" in issue for issue in result.issues)
-    assert any("部分结果只能作为描述性上下文" in issue for issue in result.issues)
+    assert any("partial=true" in issue for issue in result.issues)
+    assert any("缺少合格实时 SUCCESS 证据" in issue for issue in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_rejects_hypothesis_binding_in_new_result() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="旧假设绑定结果。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="长事务导致连接耗尽。",
+                hypothesis_id="legacy-hypothesis",
+                status=RootCauseStatus.SUPPORT,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [evidence],
+        [],
+    )
+
+    assert result.passed is False
+    assert any("不得绑定采证前假设" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio

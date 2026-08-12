@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Any, Literal
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -16,7 +16,6 @@ from app.agent_runtime.langgraph_checkpoint import RepositoryLangGraphCheckpoint
 from app.agents.nodes import (
     NodeContext,
     advise_node,
-    dynamic_investigation_node,
     execute_tools_node,
     fingerprint_node,
     report_node,
@@ -41,28 +40,9 @@ NODE_FINGERPRINT = "fingerprint"
 NODE_RUNBOOK = "runbook"
 NODE_STRATEGY = "strategy"
 NODE_EXECUTE_TOOLS = "execute_tools"
-NODE_DYNAMIC_INVESTIGATION = "dynamic_investigation"
 NODE_ADVISE = "advise"
 NODE_VALIDATE = "validate"
 NODE_REPORT = "report"
-
-
-def should_continue_dynamic_investigation(state: AgentState) -> Literal["execute_tools", "advise"]:
-    """Determine if dynamic investigation should continue or proceed to advise.
-
-    This is the conditional edge function for the investigation loop.
-    """
-    if state.should_continue_investigation and state.pending_tool_requests:
-        return "execute_tools"
-    return "advise"
-
-
-def should_start_tool_investigation(state: AgentState) -> Literal["execute_tools", "advise"]:
-    """Apply Host stop conditions before the first live tool dispatch."""
-
-    if state.stop_decision is not None and state.stop_decision.should_stop:
-        return "advise"
-    return "execute_tools"
 
 
 def build_investigation_graph(
@@ -74,14 +54,11 @@ def build_investigation_graph(
 
     The graph implements the following flow:
 
-    START -> fingerprint -> runbook -> strategy
-         -> execute_tools -> dynamic_investigation --(loop)--> execute_tools
-                                |
-                                v
-                              advise -> validate -> report -> END
+    START -> fingerprint -> runbook -> strategy -> execute_tools
+          -> advise -> validate -> report -> END
 
-    The dynamic_investigation node can loop back to execute_tools if the AI
-    advisor decides more tools are needed (React pattern).
+    Knowledge retrieval and every planned read-only collection finish before
+    the advisor is allowed to analyze a root cause.
 
     Args:
         ctx: NodeContext containing all dependencies for node execution
@@ -98,7 +75,6 @@ def build_investigation_graph(
     graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
     graph.add_node(NODE_STRATEGY, partial(select_strategy_node, ctx=ctx))
     graph.add_node(NODE_EXECUTE_TOOLS, partial(execute_tools_node, ctx=ctx))
-    graph.add_node(NODE_DYNAMIC_INVESTIGATION, partial(dynamic_investigation_node, ctx=ctx))
     graph.add_node(NODE_ADVISE, partial(advise_node, ctx=ctx))
     graph.add_node(NODE_VALIDATE, partial(validate_node, ctx=ctx))
     graph.add_node(NODE_REPORT, partial(report_node, ctx=ctx))
@@ -109,28 +85,8 @@ def build_investigation_graph(
     # Add linear edges
     graph.add_edge(NODE_FINGERPRINT, NODE_RUNBOOK)
     graph.add_edge(NODE_RUNBOOK, NODE_STRATEGY)
-    graph.add_conditional_edges(
-        NODE_STRATEGY,
-        should_start_tool_investigation,
-        {
-            "execute_tools": NODE_EXECUTE_TOOLS,
-            "advise": NODE_ADVISE,
-        },
-    )
-
-    # The deterministic plan always runs first. Dynamic investigation then decides
-    # whether to queue one additional tool call or finish with the gathered evidence.
-    graph.add_edge(NODE_EXECUTE_TOOLS, NODE_DYNAMIC_INVESTIGATION)
-    graph.add_conditional_edges(
-        NODE_DYNAMIC_INVESTIGATION,
-        should_continue_dynamic_investigation,
-        {
-            "execute_tools": NODE_EXECUTE_TOOLS,
-            "advise": NODE_ADVISE,
-        },
-    )
-
-    # Continue linear flow
+    graph.add_edge(NODE_STRATEGY, NODE_EXECUTE_TOOLS)
+    graph.add_edge(NODE_EXECUTE_TOOLS, NODE_ADVISE)
     graph.add_edge(NODE_ADVISE, NODE_VALIDATE)
     graph.add_edge(NODE_VALIDATE, NODE_REPORT)
     graph.add_edge(NODE_REPORT, END)

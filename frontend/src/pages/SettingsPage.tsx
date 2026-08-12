@@ -106,8 +106,8 @@ export function SettingsPage() {
         ai_max_retries: numberField(form, "ai_max_retries"),
         ai_json_mode: form.get("ai_json_mode") === "on",
         ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
-        react_enabled: form.get("react_enabled") === "on",
-        react_max_dynamic_turns: numberField(form, "react_max_dynamic_turns"),
+        react_enabled: settings.react_enabled,
+        react_max_dynamic_turns: settings.react_max_dynamic_turns,
         archery_mcp_max_agent_steps: numberField(form, "archery_mcp_max_agent_steps"),
         validation_enabled: form.get("validation_enabled") === "on",
         shadow_enabled: form.get("shadow_enabled") === "on",
@@ -221,16 +221,16 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        <SectionCard eyebrow="REASONING GUARDRAILS" title="推理与校验护栏" description="动态工具规划默认关闭；只有接入真实工具适配器后再开启。">
+        <SectionCard eyebrow="REASONING GUARDRAILS" title="推理与校验护栏" description="先完成知识匹配和只读事实采集，再统一分析根因。">
           <div className="switch-stack">
-            <label className="switch-row"><span><Sparkles size={17} /><span><strong>启用有界 ReAct</strong><small>允许模型在已注册工具内追加有限次数的证据采集</small></span></span><input name="react_enabled" type="checkbox" defaultChecked={settings.react_enabled} /><i /></label>
+            <label className="switch-row"><span><Sparkles size={17} /><span><strong>历史动态规划配置</strong><small>仅用于读取旧配置快照，当前分析流程不使用</small></span></span><input type="checkbox" checked={settings.react_enabled} disabled /><i /></label>
             <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则校验与同一配置模型的独立验收轮次</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
             <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，并以结论不充分结束</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>只生成候选分析并以结论不充分结束，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
+            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>执行完整分析但固定以结论不充分结束，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>
-            <label className="field"><span>最大动态工具轮次</span><input name="react_max_dynamic_turns" type="number" min="0" max="10" required defaultValue={settings.react_max_dynamic_turns} /></label>
+            <label className="field"><span>历史动态工具轮次（兼容字段）</span><input type="number" value={settings.react_max_dynamic_turns} readOnly /></label>
             <label className="field"><span>Archery MCP 最大调用步数</span><input name="archery_mcp_max_agent_steps" type="number" min="1" max="100" required defaultValue={settings.archery_mcp_max_agent_steps} /></label>
             <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>
           </div>

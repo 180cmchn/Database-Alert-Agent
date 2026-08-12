@@ -191,17 +191,7 @@ export function AlertDetailPage() {
   if (!record) return <EmptyState title="告警不存在" description="该记录可能已被删除，或链接中的 ID 不正确。" />;
 
   const { alert, recommendation } = record;
-  const contradictedCauseNames = new Set(
-    recommendation?.root_causes
-      .filter((rootCause) => rootCause.status === "CONTRADICTED")
-      .map((rootCause) => rootCause.cause) || [],
-  );
-  const visibleRootCauses = recommendation?.root_causes.filter(
-    (rootCause) => rootCause.status !== "CONTRADICTED",
-  ) || [];
-  const visibleLikelyCauses = recommendation?.likely_causes.filter(
-    (cause) => !contradictedCauseNames.has(cause),
-  ) || [];
+  const visibleRootCauses = recommendation?.root_causes || [];
   const isActive = isTracking;
 
   return (
@@ -380,8 +370,8 @@ export function AlertDetailPage() {
             </div>
           </div>
 
-          {visibleRootCauses.length > 0 && (
-            <SectionCard eyebrow="ROOT CAUSE" title="采证后根因判断">
+          <SectionCard eyebrow="ROOT CAUSE" title="采证后根因判断">
+            {visibleRootCauses.length > 0 ? (
               <div className="root-causes">
                 {visibleRootCauses.map((rootCause, index) => (
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
@@ -392,8 +382,10 @@ export function AlertDetailPage() {
                   </article>
                 ))}
               </div>
-            </SectionCard>
-          )}
+            ) : (
+              <EmptyState title="现有结果无法得出根因" description="" />
+            )}
+          </SectionCard>
 
           <section className="advice-grid">
             <SectionCard eyebrow="ACTION PLAN" title="建议处置步骤">
@@ -413,15 +405,6 @@ export function AlertDetailPage() {
             </SectionCard>
 
             <div className="advice-side">
-              {visibleLikelyCauses.length > 0 && (
-                <SectionCard eyebrow="HYPOTHESES" title="可能原因">
-                  <ol className="likely-causes">
-                    {visibleLikelyCauses.map((cause, index) => (
-                      <li key={`${cause}-${index}`}><span>{index + 1}</span>{cause}</li>
-                    ))}
-                  </ol>
-                </SectionCard>
-              )}
               <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
                 {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref">{basis.source === "EXTERNAL_KNOWLEDGE" ? <ExternalLink size={13} /> : <BookCheck size={13} />} {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
               </SectionCard>
@@ -640,11 +623,12 @@ export function AlertDetailPage() {
                         <dd>{formatPercent(run.config_snapshot.external_knowledge_min_relevance)}</dd>
                       </div>
                       <div>
-                        <dt>ReAct 模式</dt>
+                        <dt>历史动态规划配置</dt>
                         <dd>
                           {run.config_snapshot.react_enabled
-                            ? `启用 (最多 ${run.config_snapshot.react_max_dynamic_turns} 轮)`
-                            : "禁用"}
+                            ? `旧值启用（最多 ${run.config_snapshot.react_max_dynamic_turns} 轮）`
+                            : "旧值禁用"}
+                          ，当前流程不使用
                         </dd>
                       </div>
                       <div>

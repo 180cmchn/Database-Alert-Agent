@@ -13,7 +13,6 @@ from app.domain.models import (
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     InvestigationContext,
-    InvestigationDecision,
     InvestigationRun,
     InvestigationStage,
     InvestigationStrategy,
@@ -36,7 +35,6 @@ if TYPE_CHECKING:
         RunManifest,
         ToolInvocation,
         ToolInvocationStatus,
-        ToolSpec,
     )
     from app.agent_runtime.events import AgentEvent
     from app.investigations.models import InvestigationMemory
@@ -124,14 +122,6 @@ class AIAdvisor(Protocol):
         strategy: InvestigationStrategy | None = None,
         investigation_memory: InvestigationMemory | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]: ...
-
-    async def choose_next_tool(
-        self,
-        context: InvestigationContext,
-        evidence: list[EvidenceRecord],
-        available_tools: list[str | ToolSpec],
-    ) -> InvestigationDecision: ...
-
 
 class ManagementNotifier(Protocol):
     async def send(self, event: AnalysisResultEvent) -> str | None: ...

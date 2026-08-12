@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 from app.domain.alert_preprocessing import (
     has_management_platform_sql_filter_note,
     is_management_platform_collection_sql_cause,
 )
 from app.domain.models import (
+    INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasisSource,
     EvidenceRecord,
     ExternalKnowledgeReference,
@@ -22,11 +22,7 @@ from app.domain.models import (
     ValidationKind,
     ValidationRecord,
 )
-from app.investigations.models import (
-    EvidenceRelation,
-    Hypothesis,
-    InvestigationMemory,
-)
+from app.investigations.models import InvestigationMemory
 
 _DANGEROUS_ACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("DROP", re.compile(r"(?<![A-Z0-9_])DROP(?![A-Z0-9_])", re.IGNORECASE)),
@@ -50,288 +46,69 @@ _DANGEROUS_ACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-@dataclass(frozen=True)
-class _HypothesisBinding:
-    hypothesis: Hypothesis
-    status: RootCauseStatus
-    supporting_refs: tuple[str, ...]
-    contradicting_refs: tuple[str, ...]
-    inconclusive_refs: frozenset[str]
-
-
-def _build_hypothesis_bindings(
-    memory: InvestigationMemory,
-    evidence: list[EvidenceRecord],
-) -> dict[str, _HypothesisBinding]:
-    """Derive causal state from Host-owned assessments and eligible evidence."""
-
-    evidence_by_id = {str(item.id): item for item in evidence}
-    memory_evidence_by_id = memory.evidence_by_id()
-    relation_by_key = {
-        (assessment.hypothesis_id, assessment.evidence_id): assessment.relation
-        for assessment in memory.assessments
-    }
-
-    def is_same_qualified_record(evidence_id: str) -> bool:
-        record = evidence_by_id.get(evidence_id)
-        memory_record = memory_evidence_by_id.get(evidence_id)
-        return (
-            record is not None
-            and memory_record == record
-            and record.is_root_cause_support_eligible()
-        )
-
-    bindings: dict[str, _HypothesisBinding] = {}
-    for hypothesis in memory.hypotheses:
-        hypothesis_id = hypothesis.hypothesis_id
-        supporting_refs = tuple(
-            evidence_id
-            for evidence_id in hypothesis.supporting_evidence_ids
-            if hypothesis.causal_candidate
-            and relation_by_key.get((hypothesis_id, evidence_id)) == EvidenceRelation.SUPPORTS
-            and is_same_qualified_record(evidence_id)
-        )
-        contradicting_refs = tuple(
-            evidence_id
-            for evidence_id in hypothesis.contradicting_evidence_ids
-            if hypothesis.causal_candidate
-            and relation_by_key.get((hypothesis_id, evidence_id)) == EvidenceRelation.CONTRADICTS
-            and is_same_qualified_record(evidence_id)
-        )
-        inconclusive_refs = frozenset(
-            assessment.evidence_id
-            for assessment in memory.assessments
-            if assessment.hypothesis_id == hypothesis_id
-            and assessment.relation == EvidenceRelation.INCONCLUSIVE
-            and memory_evidence_by_id.get(assessment.evidence_id)
-            == evidence_by_id.get(assessment.evidence_id)
-            and assessment.evidence_id in evidence_by_id
-        )
-        status = (
-            RootCauseStatus.CONTRADICTED
-            if contradicting_refs
-            else RootCauseStatus.SUPPORTED
-            if supporting_refs
-            else RootCauseStatus.UNKNOWN
-        )
-        bindings[hypothesis_id] = _HypothesisBinding(
-            hypothesis=hypothesis,
-            status=status,
-            supporting_refs=supporting_refs,
-            contradicting_refs=contradicting_refs,
-            inconclusive_refs=inconclusive_refs,
-        )
-    return bindings
-
-
-def _bind_root_causes_to_memory(
-    root_causes: list[RootCauseAssessment],
-    memory: InvestigationMemory,
-    evidence: list[EvidenceRecord],
-) -> tuple[list[RootCauseAssessment], bool]:
-    """Canonicalize model output to one Host-verifiable hypothesis per cause."""
-
-    bindings = _build_hypothesis_bindings(memory, evidence)
-    bound_causes: list[RootCauseAssessment] = []
-    seen_hypothesis_ids: set[str] = set()
-    invalid_binding = False
-
-    for root_cause in root_causes:
-        hypothesis_id = root_cause.hypothesis_id
-        binding = bindings.get(hypothesis_id or "")
-        if hypothesis_id is None or binding is None or hypothesis_id in seen_hypothesis_ids:
-            invalid_binding = True
-            continue
-        seen_hypothesis_ids.add(hypothesis_id)
-
-        # Contradicted hypotheses are never user-visible final causes.
-        if binding.status == RootCauseStatus.CONTRADICTED:
-            continue
-
-        submitted_refs = tuple(dict.fromkeys(root_cause.evidence_refs))
-        allowed_refs = (
-            frozenset(binding.supporting_refs)
-            if binding.status == RootCauseStatus.SUPPORTED
-            else binding.inconclusive_refs
-        )
-        if (
-            len(submitted_refs) != len(root_cause.evidence_refs)
-            or any(evidence_id not in allowed_refs for evidence_id in submitted_refs)
-            or (binding.status == RootCauseStatus.SUPPORTED and not submitted_refs)
-        ):
-            invalid_binding = True
-
-        expected_verified = binding.status == RootCauseStatus.SUPPORTED
-        if (
-            root_cause.cause.strip() != binding.hypothesis.mechanism.strip()
-            or root_cause.status != binding.status
-            or root_cause.verified != expected_verified
-            or binding.hypothesis.status != binding.status
-        ):
-            invalid_binding = True
-
-        if binding.status == RootCauseStatus.SUPPORTED:
-            canonical_refs = list(binding.supporting_refs)
-            next_probe = None
-            confidence = root_cause.confidence
-        else:
-            canonical_refs = [
-                evidence_id
-                for evidence_id in submitted_refs
-                if evidence_id in binding.inconclusive_refs
-            ]
-            next_probe = (
-                binding.hypothesis.next_probe.objective
-                if binding.hypothesis.next_probe is not None
-                else root_cause.next_probe or "补充可验证该原因必要预测的实时只读证据。"
-            )
-            confidence = min(root_cause.confidence, 0.45)
-
-        bound_causes.append(
-            root_cause.model_copy(
-                update={
-                    "cause": binding.hypothesis.mechanism,
-                    "status": binding.status,
-                    "evidence_refs": canonical_refs,
-                    "confidence": confidence,
-                    "verified": expected_verified,
-                    "next_probe": next_probe,
-                }
-            )
-        )
-
-    return bound_causes, invalid_binding
-
-
-def _root_cause_binding_issues(
-    recommendation: Recommendation,
-    memory: InvestigationMemory,
-    evidence: list[EvidenceRecord],
-) -> list[str]:
-    """Validate the final object independently of the normalization path."""
-
-    bindings = _build_hypothesis_bindings(memory, evidence)
-    issues: list[str] = []
-    seen_hypothesis_ids: set[str] = set()
-    for index, root_cause in enumerate(recommendation.root_causes, start=1):
-        hypothesis_id = root_cause.hypothesis_id
-        if hypothesis_id is None:
-            issues.append(f"根因 #{index} 缺少 hypothesis_id，无法绑定调查假设")
-            continue
-        binding = bindings.get(hypothesis_id)
-        if binding is None:
-            issues.append(f"根因 #{index} 引用了不存在的调查假设：{hypothesis_id}")
-            continue
-        if hypothesis_id in seen_hypothesis_ids:
-            issues.append(f"根因 #{index} 重复引用调查假设：{hypothesis_id}")
-            continue
-        seen_hypothesis_ids.add(hypothesis_id)
-
-        if root_cause.cause.strip() != binding.hypothesis.mechanism.strip():
-            issues.append(
-                f"根因 #{index}（{root_cause.cause.strip() or '未命名根因'}）与调查假设"
-                f" {hypothesis_id} 的 mechanism 不一致"
-            )
-        if root_cause.status != binding.status:
-            issues.append(
-                f"根因 #{index} 的状态与调查假设 {hypothesis_id} 的 Host 评估不一致："
-                f"{root_cause.status.value} != {binding.status.value}"
-            )
-        if binding.hypothesis.status != binding.status:
-            issues.append(f"调查假设 {hypothesis_id} 的状态与其有效 evidence assessments 不一致")
-
-        evidence_refs = tuple(root_cause.evidence_refs)
-        if len(evidence_refs) != len(set(evidence_refs)):
-            issues.append(f"根因 #{index} 包含重复 evidence_refs")
-        if binding.status == RootCauseStatus.SUPPORTED:
-            if evidence_refs != binding.supporting_refs:
-                issues.append(
-                    f"根因 #{index} 的 evidence_refs 未完整绑定调查假设 "
-                    f"{hypothesis_id} 的 SUPPORTS assessments"
-                )
-            if not root_cause.verified:
-                issues.append(f"根因 #{index} 与 SUPPORTED 调查假设绑定时必须 verified=true")
-        elif binding.status == RootCauseStatus.UNKNOWN:
-            invalid_refs = [
-                evidence_id
-                for evidence_id in evidence_refs
-                if evidence_id not in binding.inconclusive_refs
-            ]
-            if invalid_refs:
-                issues.append(
-                    f"根因 #{index} 引用了不属于调查假设 {hypothesis_id} 的 "
-                    f"INCONCLUSIVE assessments：{', '.join(invalid_refs)}"
-                )
-            if root_cause.verified:
-                issues.append(f"根因 #{index} 与 UNKNOWN 调查假设绑定时必须 verified=false")
-
-    return issues
-
-
 def enforce_post_evidence_root_cause_policy(
     recommendation: Recommendation,
     evidence: list[EvidenceRecord],
     alert: NormalizedAlert | None = None,
     investigation_memory: InvestigationMemory | None = None,
 ) -> Recommendation:
-    """Enforce causal evidence eligibility on the final recommendation.
+    """Normalize a completed analysis to SUPPORT or the fixed no-cause result.
 
-    ``CONTRADICTED`` is retained in the enum so historical recommendations remain
-    readable. New recommendations contain only causes that remain plausible after
-    all collected evidence has been considered, and unsupported decisive states
-    are downgraded to ``UNKNOWN`` so the result remains inconclusive.
+    Historical status values remain deserializable, but they are never accepted as
+    output from the strict post-collection analysis phase.
     """
 
     evidence_by_id = {str(item.id): item for item in evidence}
-    plausible_causes: list[RootCauseAssessment] = []
-    root_causes = recommendation.root_causes
-    if investigation_memory is not None:
-        root_causes, _ = _bind_root_causes_to_memory(
-            root_causes,
-            investigation_memory,
-            evidence,
-        )
+    del investigation_memory
+    supported_causes: list[RootCauseAssessment] = []
     management_sql_already_filtered = bool(
         alert and has_management_platform_sql_filter_note(alert.raw_payload)
     )
 
-    for root_cause in root_causes:
+    alert_reason = alert.reason.strip().casefold() if alert else ""
+    for root_cause in recommendation.root_causes:
         if management_sql_already_filtered and is_management_platform_collection_sql_cause(
             root_cause.cause
         ):
             continue
-        if root_cause.status == RootCauseStatus.UNKNOWN:
-            plausible_causes.append(root_cause)
+        if not root_cause.cause.strip() or root_cause.status != RootCauseStatus.SUPPORT:
             continue
-
-        has_qualified_live_evidence = any(
-            (record := evidence_by_id.get(evidence_ref)) is not None
-            and record.is_root_cause_support_eligible()
+        if alert_reason and root_cause.cause.strip().casefold() == alert_reason:
+            continue
+        qualified_refs = [
+            evidence_ref
             for evidence_ref in dict.fromkeys(root_cause.evidence_refs)
-        )
-        if root_cause.status == RootCauseStatus.CONTRADICTED and has_qualified_live_evidence:
+            if (record := evidence_by_id.get(evidence_ref)) is not None
+            and record.is_root_cause_support_eligible()
+        ]
+        if not qualified_refs:
             continue
-        if root_cause.status == RootCauseStatus.SUPPORTED and has_qualified_live_evidence:
-            plausible_causes.append(root_cause)
-            continue
-
-        plausible_causes.append(
+        supported_causes.append(
             root_cause.model_copy(
                 update={
-                    "status": RootCauseStatus.UNKNOWN,
-                    "evidence_refs": [],
-                    "confidence": min(root_cause.confidence, 0.45),
-                    "verified": False,
-                    "next_probe": root_cause.next_probe
-                    or "补充可验证该原因必要预测的实时只读证据。",
+                    "hypothesis_id": None,
+                    "status": RootCauseStatus.SUPPORT,
+                    "evidence_refs": qualified_refs,
+                    "verified": True,
+                    "next_probe": None,
                 }
             )
         )
 
+    if not supported_causes:
+        return recommendation.model_copy(
+            update={
+                "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
+                "likely_causes": [],
+                "root_causes": [],
+                "confidence": 0,
+            }
+        )
+
     return recommendation.model_copy(
         update={
-            "root_causes": plausible_causes,
-            "likely_causes": [item.cause for item in plausible_causes],
+            "root_causes": supported_causes,
+            "likely_causes": [item.cause for item in supported_causes],
         }
     )
 
@@ -349,21 +126,31 @@ class RuleConclusionValidator:
         investigation_memory: InvestigationMemory | None = None,
     ) -> ValidationRecord:
         issues: list[str] = []
-        binding_issues: list[str] = []
-        if investigation_memory is not None:
-            binding_issues = _root_cause_binding_issues(
-                recommendation,
-                investigation_memory,
-                evidence,
-            )
-            issues.extend(binding_issues)
+        del investigation_memory
         evidence_by_id = {str(item.id): item for item in evidence}
-        has_supported_cause = False
-        all_causes_decisive = bool(recommendation.root_causes)
+        has_supported_cause = bool(recommendation.root_causes)
+
+        if not recommendation.root_causes:
+            if recommendation.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY:
+                issues.append(
+                    "无法得出根因时 summary 必须固定为“现有结果无法得出根因”"
+                )
+            if recommendation.likely_causes:
+                issues.append("无法得出根因时 likely_causes 必须为空")
 
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
             live_successful_refs: set[str] = set()
+            if root_cause.status != RootCauseStatus.SUPPORT:
+                issues.append(
+                    f"根因 #{index}（{cause_label}）状态必须为 SUPPORT，"
+                    f"不能使用历史状态 {root_cause.status.value}"
+                )
+                has_supported_cause = False
+            if not root_cause.cause.strip():
+                issues.append(f"根因 #{index} 必须填写因果机制")
+            if root_cause.hypothesis_id is not None:
+                issues.append(f"根因 #{index}（{cause_label}）不得绑定采证前假设")
 
             for evidence_ref in dict.fromkeys(root_cause.evidence_refs):
                 record = evidence_by_id.get(evidence_ref)
@@ -380,53 +167,27 @@ class RuleConclusionValidator:
                     continue
                 if record.is_root_cause_support_eligible():
                     live_successful_refs.add(evidence_ref)
-                elif (
-                    root_cause.status != RootCauseStatus.UNKNOWN
-                    and record.structured_data.get("partial") is True
-                ):
+                elif record.structured_data.get("partial") is True:
                     issues.append(
                         f"根因 #{index}（{cause_label}）引用了 partial=true 的部分证据："
                         f"{evidence_ref}；部分结果只能作为描述性上下文"
                     )
-                elif (
-                    root_cause.status != RootCauseStatus.UNKNOWN
-                    and record.structured_data.get("root_cause_eligible") is False
-                ):
+                elif record.structured_data.get("root_cause_eligible") is False:
                     issues.append(
                         f"根因 #{index}（{cause_label}）引用了明确标记为不能支持"
                         f"根因的证据：{evidence_ref}"
                     )
 
-            if root_cause.verified and not live_successful_refs:
-                issues.append(
-                    f"已验证根因 #{index}（{cause_label}）必须至少引用一条 SUCCESS 证据"
-                    "（且来自实时系统）"
-                )
-            if root_cause.status == RootCauseStatus.SUPPORTED and not live_successful_refs:
-                issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）缺少实时 SUCCESS 证据")
-                all_causes_decisive = False
-            if root_cause.status == RootCauseStatus.SUPPORTED:
-                has_supported_cause = True
-                if not root_cause.verified:
-                    issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）必须标记 verified=true")
-            elif root_cause.status == RootCauseStatus.CONTRADICTED:
-                issues.append(
-                    f"根因 #{index}（{cause_label}）已被实时证据反驳，必须在最终结果生成前直接移除"
-                )
-                all_causes_decisive = False
-            else:
-                all_causes_decisive = False
-                if not (root_cause.next_probe or "").strip():
-                    issues.append(f"UNKNOWN 根因 #{index}（{cause_label}）必须提供具体 next_probe")
-            if root_cause.status != RootCauseStatus.SUPPORTED and root_cause.verified:
-                issues.append(f"根因 #{index}（{cause_label}）只有 SUPPORTED 状态才能标记已验证")
+            if not live_successful_refs:
+                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据")
+                has_supported_cause = False
+            if not root_cause.verified:
+                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）必须标记 verified=true")
+                has_supported_cause = False
+            if root_cause.next_probe is not None:
+                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）不得提供 next_probe")
 
-        evidence_sufficient = (
-            has_supported_cause
-            and all_causes_decisive
-            and bool(recommendation.root_causes)
-            and not binding_issues
-        )
+        evidence_sufficient = has_supported_cause and bool(recommendation.root_causes)
         manual_matched = recommendation.manual_matched
         sources = [item.source for item in recommendation.analysis_bases]
         valid_runbook_refs = {(excerpt.runbook_id, excerpt.section) for excerpt in runbooks}
@@ -542,6 +303,6 @@ class RuleConclusionValidator:
                 "evidence_count": len(evidence),
                 "runbook_count": len(runbooks),
                 "external_knowledge_count": len(external_matches),
-                "investigation_memory_bound": investigation_memory is not None,
+                "investigation_memory_bound": False,
             },
         )

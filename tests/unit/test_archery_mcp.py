@@ -571,8 +571,7 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
     assert result.requested_sql == recovered_sql
     assert query_sql_calls == [timed_out_sql, recovered_sql]
     timeout_feedback = model.calls[-1]["messages"][-1]["content"]
-    assert "实时证据暂缺" in timeout_feedback
-    assert "不能作为任何根因假设的反证" in timeout_feedback
+    assert "当前告警窗口的日志事实仍不完整" in timeout_feedback
     assert "information_schema.statistics" in timeout_feedback
     assert "SHOW INDEX" in timeout_feedback
     assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
@@ -2127,6 +2126,7 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     )
     assert evidence.structured_data["root_cause_eligible"] is False
     assert result.recommendation is not None
-    assert result.recommendation.root_causes[0].status.value == "UNKNOWN"
-    assert str(evidence.id) not in result.recommendation.root_causes[0].evidence_refs
+    assert result.recommendation.summary == "现有结果无法得出根因"
+    assert result.recommendation.root_causes == []
+    assert result.recommendation.likely_causes == []
     await runtime.repository.close()  # type: ignore[attr-defined]

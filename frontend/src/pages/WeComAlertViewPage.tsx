@@ -17,6 +17,7 @@ import type { StoredAlert } from "../types/api";
 type WeComView = "overview" | "root-cause" | "recovery-advice";
 
 const rootCauseLabels = {
+  SUPPORT: "实时证据已支持",
   SUPPORTED: "已有实时证据支持",
   CONTRADICTED: "历史结果：已被实时证据反驳",
   UNKNOWN: "证据不足",
@@ -118,17 +119,7 @@ function OverviewContent({ record }: { record: StoredAlert }) {
 
 function RootCauseContent({ record }: { record: StoredAlert }) {
   const recommendation = record.recommendation!;
-  const contradictedCauseNames = new Set(
-    recommendation.root_causes
-      .filter((rootCause) => rootCause.status === "CONTRADICTED")
-      .map((rootCause) => rootCause.cause),
-  );
-  const visibleRootCauses = recommendation.root_causes.filter(
-    (rootCause) => rootCause.status !== "CONTRADICTED",
-  );
-  const visibleLikelyCauses = recommendation.likely_causes.filter(
-    (cause) => !contradictedCauseNames.has(cause),
-  );
+  const visibleRootCauses = recommendation.root_causes;
   return (
     <div className="wecom-content-stack">
       <section className="wecom-content-card">
@@ -152,15 +143,8 @@ function RootCauseContent({ record }: { record: StoredAlert }) {
             )}
           </article>
         ))
-      ) : visibleLikelyCauses.length > 0 ? (
-        <section className="wecom-content-card">
-          <div className="wecom-section-title"><CircleHelp size={20} /><h2>待验证的可能原因</h2></div>
-          <ol className="wecom-simple-list">
-            {visibleLikelyCauses.map((cause) => <li key={cause}>{cause}</li>)}
-          </ol>
-        </section>
       ) : (
-        <section className="wecom-content-card wecom-empty-content"><CircleHelp size={26} /><p>本次没有形成可展示的根因候选。</p></section>
+        <section className="wecom-content-card wecom-empty-content"><CircleHelp size={26} /><p>现有结果无法得出根因</p></section>
       )}
 
       {recommendation.analysis_bases.length > 0 && (

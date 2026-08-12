@@ -13,6 +13,7 @@ from app.adapters.ai import (
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.domain.errors import AdvisorError
 from app.domain.models import (
+    INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
@@ -26,7 +27,6 @@ from app.domain.models import (
     RunbookVisualEvidence,
     ToolStatus,
 )
-from app.investigations.models import EvidenceNeed, Hypothesis, InvestigationMemory
 
 
 def make_alert():
@@ -36,62 +36,46 @@ def make_alert():
 
 
 def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> None:
-    assert "才可作为本次告警窗口的因果证据使用" in ai_module.SYSTEM_PROMPT
+    assert "结果包含可解析日志" in ai_module.SYSTEM_PROMPT
     assert "partial 不为 true" in ai_module.SYSTEM_PROMPT
-    assert "不得再把它与告警标题中的主机或端口作字符串比较" in (ai_module.SYSTEM_PROMPT)
-    assert "不得要求或描述额外的 instance_id" in ai_module.SYSTEM_PROMPT
+    assert "不得比较告警标题端点与 hostname_max" in ai_module.SYSTEM_PROMPT
+    assert "不得输出 instance_id 归属核验" in ai_module.SYSTEM_PROMPT
     assert "instance_identity_verification.status=MATCHED" not in (ai_module.SYSTEM_PROMPT)
-    assert "不得比较告警标题" in ai_module.VALIDATION_PROMPT
+    assert "不得比较告警标题端点与 hostname_max" in ai_module.VALIDATION_PROMPT
     assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
     assert "target_verification=mismatch" in ai_module.SYSTEM_PROMPT
-    assert "target_verification=mismatch" in ai_module.PLANNER_PROMPT
     assert "target_verification=mismatch" in ai_module.VALIDATION_PROMPT
 
 
 def test_system_prompt_requires_chinese_user_facing_recommendations() -> None:
     assert "最终面向用户的自然语言必须使用简体中文" in ai_module.SYSTEM_PROMPT
-    assert "不得输出英文句子、英文推理过程、计算草稿或未核实的时间推导" in (ai_module.SYSTEM_PROMPT)
-    assert '"Let\'s calculate"' in ai_module.SYSTEM_PROMPT
-    assert "指标名、标签名、数据库对象名、原始技术值及必要缩写" in ai_module.SYSTEM_PROMPT
+    assert "不得输出英文推理过程、计算草稿" in ai_module.SYSTEM_PROMPT
+    assert "指标名" in ai_module.SYSTEM_PROMPT
+    assert "数据库对象名" in ai_module.SYSTEM_PROMPT
 
 
 def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
-    assert "先读取告警信息，再完整审阅本次已采集的 tool_evidence" in (ai_module.SYSTEM_PROMPT)
-    assert "不得先照抄候选原因，再在输出中逐条支持或反驳" in (ai_module.SYSTEM_PROMPT)
-    assert "不得在这两个字段中输出 CONTRADICTED" in ai_module.SYSTEM_PROMPT
-    assert "被 SUCCESS 实时证据反驳的调查假设必须直接从最终结果删除" in (ai_module.SYSTEM_PROMPT)
-    assert "不得展示已删除假设的名称或排除理由" in ai_module.SYSTEM_PROMPT
-    assert "此阶段只决定如何采集实时证据" in ai_module.PLANNER_PROMPT
-    assert "不得形成或输出最终根因" in ai_module.PLANNER_PROMPT
-    assert "只是附带的 SQL 过滤说明，不是告警计数口径" in (ai_module.SYSTEM_PROMPT)
-    assert "不得把数据库管理平台采集 SQL 作为本次告警的候选原因或根因" in (ai_module.SYSTEM_PROMPT)
-    assert "不是告警计数口径" in ai_module.PLANNER_PROMPT
-    assert "不得围绕这些 SQL 规划根因取证" in ai_module.PLANNER_PROMPT
-    assert "若建议据此重新计算触发值，或将这些已过滤 SQL 作为候选原因或根因" in (
-        ai_module.VALIDATION_PROMPT
+    assert "知识匹配和全部实时证据采集已经结束后工作" in ai_module.SYSTEM_PROMPT
+    assert "必须一次性完整审阅这些输入之后才分析根因" in ai_module.SYSTEM_PROMPT
+    assert "不得构造或展示待验证原因、假设" in ai_module.SYSTEM_PROMPT
+    assert "status 必须为 SUPPORT" in ai_module.SYSTEM_PROMPT
+    assert "现有结果无法得出根因" in ai_module.SYSTEM_PROMPT
+    assert "不得为新结果使用 SUPPORTED、UNKNOWN 或 CONTRADICTED" in (
+        ai_module.SYSTEM_PROMPT
     )
-    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
-    assert "root_causes 中出现 CONTRADICTED 时 analysis_contract_passed 必须为 false" in (
-        ai_module.VALIDATION_PROMPT
-    )
-    assert "cause 必须逐字复用该假设的 mechanism" in ai_module.SYSTEM_PROMPT
-    assert "使用假设 A 的证据包装原因 B" in ai_module.VALIDATION_PROMPT
-    assert "causal_candidate=false" in ai_module.PLANNER_PROMPT
+    assert not hasattr(ai_module.OpenAICompatibleAdvisor, "choose_next_tool")
+    assert "合法结果只有两种" in ai_module.VALIDATION_PROMPT
 
 
 def test_prompts_treat_partial_success_as_descriptive_missing_evidence() -> None:
-    assert "structured_data.partial=true 表示采集不完整" in ai_module.SYSTEM_PROMPT
-    assert "allow_followup_dispatch=false 只表示" in ai_module.SYSTEM_PROMPT
-    assert "本轮不再派发相同 MCP 调查，不代表证据充分" in ai_module.SYSTEM_PROMPT
-    assert "structured_data.partial=true 的部分结果" in ai_module.PLANNER_PROMPT
-    assert "一律只能标为 INCONCLUSIVE" in ai_module.PLANNER_PROMPT
-    assert "即使部分结果同时标记 root_cause_eligible=true" in (ai_module.PLANNER_PROMPT)
-    assert "partial=true 的记录即使" in ai_module.VALIDATION_PROMPT
-    assert "不代表证据充分" in ai_module.VALIDATION_PROMPT
+    assert "截断或部分结果只是证据缺失" in ai_module.SYSTEM_PROMPT
+    assert "structured_data.partial 不为 true" in ai_module.SYSTEM_PROMPT
+    assert "partial" in ai_module.VALIDATION_PROMPT
+    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
 
 
 @pytest.mark.asyncio
-async def test_fake_advisor_keeps_partial_success_as_descriptive_unknown_context() -> None:
+async def test_fake_advisor_returns_fixed_no_cause_for_partial_success() -> None:
     evidence = EvidenceRecord(
         run_id=uuid4(),
         tool_name="query_archery_slow_logs",
@@ -112,42 +96,25 @@ async def test_fake_advisor_keeps_partial_success_as_descriptive_unknown_context
         evidence=[evidence],
     )
 
-    assert recommendation.root_causes[0].status.value == "UNKNOWN"
-    assert recommendation.root_causes[0].verified is False
-    assert recommendation.root_causes[0].evidence_refs == [str(evidence.id)]
+    assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert recommendation.root_causes == []
+    assert recommendation.likely_causes == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("advisor", [FakeAIAdvisor(), ConservativeFallbackAdvisor()])
-async def test_deterministic_advisors_bind_causes_to_investigation_memory(
+async def test_deterministic_advisors_ignore_legacy_investigation_memory(
     advisor: FakeAIAdvisor,
 ) -> None:
-    hypothesis = Hypothesis(
-        hypothesis_id="pool-leak",
-        mechanism="连接池泄漏导致连接槽位持续占用。",
-        expected_observations=["长连接集中在单一应用。"],
-        contradicting_observations=["连接均匀且生命周期较短。"],
-        next_probe=EvidenceNeed(
-            need_id="pool-leak:probe",
-            objective="按应用只读核对连接年龄分布。",
-            expected_observation="长连接集中。",
-            contradicting_observation="连接分布均匀。",
-            tool_name="query_connection_sources",
-        ),
-    )
-    memory = InvestigationMemory(hypotheses=[hypothesis])
-
     recommendation, _ = await advisor.advise(
         make_alert(),
         [],
-        investigation_memory=memory,
+        investigation_memory=None,
     )
 
-    assert len(recommendation.root_causes) == 1
-    assert recommendation.root_causes[0].hypothesis_id == hypothesis.hypothesis_id
-    assert recommendation.root_causes[0].cause == hypothesis.mechanism
-    assert recommendation.root_causes[0].status.value == "UNKNOWN"
-    assert recommendation.root_causes[0].next_probe == hypothesis.next_probe.objective
+    assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert recommendation.root_causes == []
+    assert recommendation.likely_causes == []
 
 
 @pytest.mark.asyncio
@@ -243,8 +210,9 @@ async def test_fake_advisor_does_not_copy_slow_query_filter_note_into_cause() ->
 
     recommendation, _ = await FakeAIAdvisor().advise(alert, [])
 
-    assert recommendation.root_causes[0].cause == signal
-    assert recommendation.likely_causes == [signal]
+    assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert recommendation.root_causes == []
+    assert recommendation.likely_causes == []
 
 
 @pytest.mark.asyncio

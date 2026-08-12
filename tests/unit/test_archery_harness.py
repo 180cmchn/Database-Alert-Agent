@@ -299,7 +299,7 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
         "action": "call_tool",
         "tool_name": ARCHERY_MCP_QUERY_TOOL_NAME,
         "objective": "Collect read-only Archery evidence for the fixed alert window",
-        "hypothesis_ids": ["slow_query_evidence"],
+        "hypothesis_ids": [],
         "arguments": {**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
     }
 
@@ -751,8 +751,7 @@ async def test_shared_harness_reserves_final_calls_and_recovers_actual_mysql_tim
     assert "maximum statement execution time exceeded" in trace[4]["error_detail"]
     assert "Host最终取证保留区" in str(model.requests[2]["messages"])
     timeout_feedback = str(model.requests[5]["messages"])
-    assert "实时证据暂缺" in timeout_feedback
-    assert "不能作为任何根因假设的反证" in timeout_feedback
+    assert "当前告警窗口的日志事实仍不完整" in timeout_feedback
     assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
 
 

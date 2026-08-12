@@ -7,6 +7,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+INCONCLUSIVE_ROOT_CAUSE_SUMMARY = "现有结果无法得出根因"
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -74,6 +76,9 @@ class ExecutionClass(StrEnum):
 
 
 class RootCauseStatus(StrEnum):
+    SUPPORT = "SUPPORT"
+    # Historical values remain readable for persisted recommendations. New
+    # analyses may only emit SUPPORT.
     SUPPORTED = "SUPPORTED"
     CONTRADICTED = "CONTRADICTED"
     UNKNOWN = "UNKNOWN"
@@ -269,8 +274,8 @@ class RecommendationStep(BaseModel):
 
 class RootCauseAssessment(BaseModel):
     cause: str
-    # Optional so recommendations persisted before the Agent harness remain
-    # readable. New harness runs bind every final cause to Host-owned memory.
+    # Retained so recommendations persisted by the former hypothesis harness
+    # remain readable. New analyses do not create or bind hypotheses.
     hypothesis_id: str | None = Field(default=None, min_length=1, max_length=200)
     cause_id: str | None = None
     status: RootCauseStatus = RootCauseStatus.UNKNOWN

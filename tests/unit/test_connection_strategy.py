@@ -5,7 +5,7 @@ import pytest
 from app.adapters.investigation import AlertContextTool, InvestigationToolRegistry
 from app.application.factory import build_runtime
 from app.config import Settings
-from app.domain.models import AlertStatus, RootCauseStatus
+from app.domain.models import INCONCLUSIVE_ROOT_CAUSE_SUMMARY, AlertStatus
 
 
 class RecordingTool:
@@ -67,8 +67,8 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
         },
     )
 
-    # The probes succeeded, but ReAct is disabled in this fixture, so no
-    # hypothesis-to-evidence assessment has established a supported cause.
+    # The collected metrics describe the alert symptom but do not establish a
+    # causal mechanism, so the strict post-collection result stays empty.
     assert result.status == AlertStatus.INCONCLUSIVE
     assert [name for name, _ in calls] == ["query_metrics"]
     assert all(parameters["environment"] == "production" for _, parameters in calls)
@@ -79,8 +79,9 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
     assert all(item.passed for item in result.validations)
     assert all(not item.evidence_sufficient for item in result.validations)
     assert result.recommendation is not None
-    assert result.recommendation.root_causes[0].status == RootCauseStatus.UNKNOWN
-    assert result.recommendation.root_causes[0].verified is False
+    assert result.recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.recommendation.root_causes == []
+    assert result.recommendation.likely_causes == []
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -102,6 +103,7 @@ async def test_missing_live_connection_evidence_is_inconclusive(tmp_path: Path) 
     assert all(item.passed for item in result.validations)
     assert all(not item.evidence_sufficient for item in result.validations)
     assert result.recommendation is not None
-    assert result.recommendation.root_causes[0].status.value == "UNKNOWN"
-    assert result.recommendation.root_causes[0].next_probe
+    assert result.recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.recommendation.root_causes == []
+    assert result.recommendation.likely_causes == []
     await runtime.repository.close()  # type: ignore[attr-defined]

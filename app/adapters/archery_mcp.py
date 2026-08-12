@@ -1709,7 +1709,7 @@ class ArcheryMCPClient:
         window_end_epoch = int(window_end.timestamp())
         return (
             "上一条 mysql_slow_query_review_history 查询被 Archery 服务端超时终止。"
-            "这表示实时证据暂缺，不能作为任何根因假设的反证。不要原样重试，也不要仅靠"
+            "这表示当前告警窗口的日志事实仍不完整。不要原样重试，也不要仅靠"
             "添加或更换 FORCE INDEX 重复相同扫描范围。若尚未确认索引，只能通过只读 "
             "SELECT 查询 information_schema.statistics；SHOW INDEX 不符合当前 Host 的 "
             "SELECT/WITH 安全边界。若真实联合索引的前导列为 hostname_max、ts_min，下一次"
@@ -2383,7 +2383,7 @@ class ArcherySlowLogEvidenceTool:
         evidence_summary = (
             "慢查询日志已作为本次告警窗口的实时证据进入分析"
             if has_log_content
-            else "当前没有可解析的慢查询日志，不作为根因支持证据"
+            else "当前没有可解析的慢查询日志，采集结果不完整"
         )
         summary = (
             f"Archery 慢查询只读查询成功：{instance_summary}，数据库 "
@@ -2398,9 +2398,9 @@ class ArcherySlowLogEvidenceTool:
                 "慢查询结果为空，未返回可分析的日志内容"
                 if row_count == 0
                 else (
-                    "MCP仅报告存在慢查询记录，但未返回可解析的日志行，不得作为根因支持证据"
+                    "MCP仅报告存在慢查询记录，但未返回可解析的日志行"
                     if row_count is not None and row_count > 0
-                    else "无法解析慢查询返回行数，不得作为根因支持证据"
+                    else "无法解析慢查询返回行数"
                 )
             )
         )

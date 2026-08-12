@@ -13,7 +13,7 @@ from app.adapters.external_knowledge import (
 )
 from app.application.factory import build_runtime
 from app.config import Settings
-from app.domain.models import AnalysisBasisSource
+from app.domain.models import INCONCLUSIVE_ROOT_CAUSE_SUMMARY, AnalysisBasisSource
 
 
 def knowledge_result(
@@ -227,6 +227,8 @@ async def test_all_low_relevance_results_produce_explicit_no_match(
     assert result.recommendation is not None
     assert result.recommendation.external_knowledge_matches == []
     assert "已拒绝匹配" in result.recommendation.knowledge_match_summary
-    assert "所选知识来源均未命中" in result.recommendation.summary
+    assert "所选知识来源均未命中" in result.recommendation.knowledge_match_summary
+    assert result.recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.recommendation.root_causes == []
     assert result.recommendation.confidence <= 0.45
     await runtime.repository.close()  # type: ignore[attr-defined]

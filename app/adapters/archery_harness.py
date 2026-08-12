@@ -298,7 +298,7 @@ class ArcheryHarnessPlanner:
             "action": "call_tool",
             "tool_name": call.name,
             "objective": "Collect read-only Archery evidence for the fixed alert window",
-            "hypothesis_ids": ["slow_query_evidence"],
+            "hypothesis_ids": [],
             "arguments": call.arguments,
         }
 

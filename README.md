@@ -4,7 +4,7 @@
 
 1. 通过 FlashDuty 只读 Open API 定时轮询指定协作空间的告警并规范化；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
 2. 按运行时选择检索本地 PDF 和/或外部 KnowledgePack，完成精排、阈值过滤和拒识。
-3. 先完成实时证据采集，再由 AI Agent 根据告警与已采证据形成可能根因和只读核查建议。
+3. 先完成知识匹配和全部只读实时证据/MCP 日志采集，再由 AI Agent 一次性分析根因和只读建议。
 4. 本地 PDF 与外部知识库同级作为知识依据，并统一列在 AI 分析之前。
 5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
 
@@ -14,10 +14,8 @@
 项目采用 **LangGraph** 框架构建告警调查工作流。调查图定义了清晰的节点和边，实现可观测、可调试的分析链路：
 
 ```text
-START → fingerprint → runbook → strategy
-     → execute_tools → dynamic_investigation ──(循环)──→ execute_tools
-                            ↓
-                          advise → validate → report → END
+START → fingerprint → runbook → strategy → execute_tools
+      → advise → validate → report → END
 ```
 
 **节点说明：**
@@ -26,10 +24,9 @@ START → fingerprint → runbook → strategy
 | --- | --- |
 | `fingerprint` | 生成稳定告警指纹，用于去重和调查关联 |
 | `runbook` | 并行检索所选本地 PDF 与外部知识来源，并执行阈值拒识 |
-| `strategy` | 选择调查策略，生成工具执行计划 |
-| `execute_tools` | 执行调查工具，收集证据 |
-| `dynamic_investigation` | React 模式动态工具选择（可选） |
-| `advise` | 在实时证据采集完成后，AI 根据告警与证据生成结构化建议 |
+| `strategy` | 根据告警目标、信号和时间窗生成只读采集计划，不生成根因假设 |
+| `execute_tools` | 完整执行计划中的调查工具并保存原始证据 |
+| `advise` | 所有采集终态后，AI 根据知识与实时证据一次性分析根因 |
 | `validate` | 规则校验 + 独立结论验收 |
 | `report` | 生成最终报告，更新状态 |
 
@@ -37,8 +34,11 @@ START → fingerprint → runbook → strategy
 
 使用 `AgentState` (Pydantic BaseModel) 在节点间传递状态，支持：
 - 告警信息、运行记录、证据列表
-- 动态工具选择循环（React 模式）
 - 验证、影子分析、AI 降级等配置
+
+`react_enabled` 与 `react_max_dynamic_turns` 暂时保留为旧配置兼容字段，新运行不再进入动态根因
+规划循环。MCP 子 Harness 仍可在单个计划任务内部执行有界的目标发现、Schema 发现和多步只读查询，
+但这些步骤只采集事实，不生成、评估或引用根因假设。
 
 调查图使用 `state.error` 传播不可恢复错误。知识匹配、手册检索、策略选择、工具执行、建议生成和
 验证等中间节点发现上游错误后会立即短路，不再继续发起后续调查或 AI 调用；`report` 节点统一将
@@ -64,27 +64,23 @@ START → fingerprint → runbook → strategy
   owner/token 已变化时，旧 worker 会取消长操作并 fail closed；过期 worker 不能再写 event、
   checkpoint、invocation、artifact 或最终运行状态。
 
-动态调查按工具名和规范化 JSON 参数识别同一逻辑请求。完整的 `SUCCESS` 以及 `FAILED`、
-`TIMEOUT`、`SKIPPED`、`NO_DATA` 都会关闭当前外层 ReAct 运行中的同一探针，避免重复消耗动态轮次；
-MCP 子 Harness 会在返回这些终态前按只读与重试策略完成受控重试。通用工具的 `partial=true` 结果只有
-在 `allow_followup_dispatch` 未设置为 `false` 时才能分配新的外层逻辑派发；Archery 和 Prometheus
-均设置 `allow_followup_dispatch=false`，不会由外层 Agent 再次派发同一
-MCP 调查。下表同时列出对外证据状态和 durable invocation 的保守终态语义：
+每个计划任务由外层 durable dispatcher 负责幂等执行；MCP 子 Harness 会在返回终态前按只读与重试
+策略完成受控重试。Archery 和 Prometheus 的一个计划任务可包含内部多步调用，但外层 Agent 不会根据
+中间结果追加根因驱动探针。下表列出对外证据状态和 durable invocation 的保守终态语义：
 
 | 状态 | 语义 | 根因判定用途 |
 | --- | --- | --- |
-| `SUCCESS` | 调用完成并返回可用的本次实时观测 | 只有与候选机制相关时才可支持或反驳根因 |
-| `NO_DATA` | 调用成功，但没有返回可用观测 | `MISSING`，不能支持或反驳根因 |
-| `FAILED` | 调用执行失败 | `MISSING`，不能支持或反驳根因 |
-| `TIMEOUT` | 调用未在截止期内完成 | `MISSING`，不能支持或反驳根因 |
-| `SKIPPED` | 工具未注册、不可用或被 Host 策略拒绝，未发起远程调用 | `MISSING`，不能支持或反驳根因 |
-| `UNKNOWN_OUTCOME` | 调用已越过远程边界，但恢复时无法确认是否完成 | `MISSING`，不能支持或反驳根因，也不能当作查询已执行或未执行的证明 |
-| `CANCELLED` | 调用因租约丢失、运行终止或取消信号而停止 | `MISSING`，不能支持或反驳根因 |
+| `SUCCESS` | 调用完成并返回本次实时观测 | 仅完整、目标与时间窗匹配的实时记录可在采集后用于根因分析 |
+| `NO_DATA` | 调用成功，但没有返回可用观测 | 缺失证据，不能得出根因 |
+| `FAILED` | 调用执行失败 | 缺失证据，不能得出根因 |
+| `TIMEOUT` | 调用未在截止期内完成 | 缺失证据，不能得出根因 |
+| `SKIPPED` | 工具未注册、不可用或被 Host 策略拒绝，未发起远程调用 | 缺失证据，不能得出根因 |
+| `UNKNOWN_OUTCOME` | 调用已越过远程边界，但恢复时无法确认是否完成 | 缺失证据，不能当作查询已执行或未执行的证明 |
+| `CANCELLED` | 调用因租约丢失、运行终止或取消信号而停止 | 缺失证据，不能得出根因 |
 
-`partial=true` 表示本次调查未完整结束；即使其中保留了部分成功观测，整条 partial 证据也不能支持
-或反驳根因，只能用于审计和规划后续独立探针。未返回、被截断或失败的部分保持未知，
-不得被当作反证。动态调用沿用策略中该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host
-重新压缩到固定 10 秒。
+`partial=true` 表示本次调查未完整结束；即使其中保留了部分成功观测，整条 partial 证据也只能用于
+描述与审计，不能据此得出根因。未返回、被截断或失败的部分同样是证据缺口。计划调用沿用策略中
+该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host 重新压缩到固定 10 秒。
 
 ## 数据流
 
@@ -98,7 +94,7 @@ FlashDuty /alert/list（定时轮询）
 所选知识来源并行检索：本地 PDF 结构化匹配 + 外部 KnowledgePack 向量检索
           ↓
 LangGraph 调查图：fingerprint → runbook → strategy
-          → execute_tools → dynamic_investigation → advise → validate → report
+          → execute_tools → advise → validate → report
           ↓
 结构化原因与有序依据
           ↓
@@ -255,7 +251,7 @@ WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-m
 WECOM_PAGE_BASE_URL=https://alerts.intra.example.com
 ```
 
-`AI_MAX_TOKENS` 会显式传给主分析、动态规划和独立结论验收。对于默认启用 Thinking 的推理模型，
+`AI_MAX_TOKENS` 会显式传给主分析和独立结论验收。对于默认启用 Thinking 的推理模型，
 建议至少使用 `16384`，并配合足够的 `AI_TIMEOUT_SECONDS`；否则企业网关常见的 `4096` 默认上限
 可能全部消耗在 `reasoning_content`，以 `finish_reason=length` 结束且没有最终 `content`。
 
@@ -267,7 +263,7 @@ Kafka Worker 在下一批消息开始前读取并应用新值。
 启用企微通知时还必须配置 `WECOM_PAGE_BASE_URL`，它应是企微客户端可访问的前端 HTTPS 地址；
 开发环境未启用企微时仅写本地日志，便于测试。
 
-当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成严格受限的保守候选建议，继续走完 `VALIDATING → REPORTING → INCONCLUSIVE`，不会在建议阶段直接跳到 `FAILED`。该候选结果会降低置信度，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
+当模型请求超时、网关不支持结构化输出或模型连续两次返回不符合 Schema 的结果时，`AI_FALLBACK_ENABLED=true` 会生成固定的“现有结果无法得出根因”结果，继续走完 `VALIDATING → REPORTING → INCONCLUSIVE`，不会在建议阶段直接跳到 `FAILED`。该结果的置信度为零，并在校验记录中保留降级原因类型。数据库、持久化等不可恢复的系统错误仍会正确进入 `FAILED`。
 
 如果 `AI_FALLBACK_ENABLED=false` 或没有可用的降级 Advisor，建议生成失败会写入 `state.error`，
 后续中间节点短路并由 `report` 统一结束失败链路。服务同时记录包含异常类型和脱敏错误摘要的
@@ -313,7 +309,7 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 - `alert_context` 读取告警详情、原始事件、告警动态，以及关联故障的详情、时间线和告警；
 - 有 `incident_id` 时，默认追加 `query_similar_incidents`；历史故障只作为调查线索，不会单独支撑“已验证根因”；
-- `query_changes` 不再作为基础探针；只有显式设置 `FLASHDUTY_CHANGES_ENABLED=true` 后才注册该适配器，且仍需由手册或受限动态规划明确选择；
+- `query_changes` 不再作为基础采集项；只有显式设置 `FLASHDUTY_CHANGES_ENABLED=true` 后才注册该适配器，且必须由告警目标、信号和时间窗明确选择；
 - 所有 `/monit/*` 工具默认关闭。只有只读能力审计确认存在数据源或监控对象工具后，才设置 `FLASHDUTY_MONITORS_ENABLED=true`；`query_database_diagnostics` 不再由基础工作流自动调用；
 - 外部调用成功但业务记录为空时保存为 `NO_DATA`，未注册、未配置或目标未暴露能力时保存为 `SKIPPED`，两者都不能作为 `SUCCESS` 实时证据。
 
@@ -334,9 +330,14 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 `FLASHDUTY_POLL_CHANNEL_IDS` 只约束告警和变更的协作空间范围；FlashDuty 的 Monitors 数据源、监控对象与工具目录是账户级能力，不能仅凭协作空间 ID 推定存在。启用 Monitors 前必须先确认 `/monit/datasource/list` 或 `/monit/targets` 有对象，并对目标调用 `/monit/tools/catalog` 验证实际工具目录；接口存在不等于目标 Agent 已暴露工具。
 
-数据源查询需要真实存在的 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，也可由告警属性或动态调查参数显式提供 `expr`；数据库诊断需要可解析的 `target_locator` 和非空工具目录。缺少必要绑定时不会注册相应能力，也不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
+数据源查询需要真实存在的 `ds_name` 和查询表达式。指标查询可在告警中提供合法的 `metric_name`，
+也可由已配置的告警属性提供 `expr`；数据库诊断需要可解析的 `target_locator` 和非空工具目录。缺少
+必要绑定时不会注册相应能力，也不会猜测查询或降级到写操作。SQL 类查询只接受单条 `SELECT`、
+`SHOW`、`DESCRIBE` 或 `EXPLAIN`，同时仍应确保 FlashDuty 数据源自身使用数据库只读账户。
 
-FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次 `SUCCESS` 证据，才能把候选原因提升为 `SUPPORTED`。
+FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。
+只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次完整
+`SUCCESS` 证据，才可在全部采集结束后参与根因分析。
 
 影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `INCONCLUSIVE`，建议
 标记为 `analysis_mode=shadow`。生产准入验证完成前，建议保持开启。
@@ -547,22 +548,22 @@ Host 不会把只共享数据库引擎前缀的目录指标视为告警信号相
 
 - 已取得至少一条包含样本、序列或数值的可解析监控返回：保留为 `SUCCESS` 观测并以
   `call_limit_reached=true` 标示调用已截断；Harness 同时将未正常结束的调查标记为
-  `partial=true`，该条 partial 记录不能支持或反驳根因。
+  `partial=true`，该条 partial 记录只表示采集结果不完整。
 - 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
   后续分析以 `INCONCLUSIVE` 结束。
 
-指标目录、状态对象和空序列会保留给后续模型调用及审计，但不会被标为根因支持证据。若已取得
+指标目录、状态对象和空序列会保留给后续模型调用及审计，但只作为采集上下文。若已取得
 可用观测后模型、MCP 调用或 SSE 会话发生错误，当前运行保留已有结果并记录 `partial`、
-`termination_reason` 和错误类型，不再因后续单点故障丢弃整轮审计信息；该 partial 记录不能支持或
-反驳根因。普通、可修正的工具业务错误只记录在 `tool_attempts`，不会把已成功结束的调查标为
+`termination_reason` 和错误类型，不再因后续单点故障丢弃整轮审计信息；该 partial 记录只表示
+采集结果不完整。普通、可修正的工具业务错误只记录在 `tool_attempts`，不会把已成功结束的调查标为
 `partial`。标准 MCP `content[].text` 中完整的
 JSON 或 JSON 代码块会先解包再识别观测与样本时间戳，避免已经返回的 Prometheus 数据被文本外壳
 误判为空。每条审计响应最多保留 24,000 字符，回传模型的视图最多 8,000 字符。无可用样本时，外层
 证据会在进入通用 `ToolExecutor` 前压缩为完整 JSON：保留查询选择、结果状态、时间窗与目标校验、目录
 指标和调用计数，删除重复的有效参数及 Prometheus UI 链接，并保证低于 `TOOL_MAX_RESULT_CHARS`。
 
-结果存在不代表根因已被证明；只有关联的完整、非 partial 成功实时证据支持具体机制时，才可把原因标为
-`SUPPORTED`。被成功实时证据反驳的调查假设直接从最终结果删除，不向用户展示。MCP 返回内容
+结果存在不代表根因已被证明；只有完整、非 partial 的成功实时证据与知识内容共同建立具体因果机制
+时，最终原因才可标为 `SUPPORT`。否则根因列表为空并返回“现有结果无法得出根因”。MCP 返回内容
 一律视为不可信数据，不会执行其中的指令。
 
 项目配置文件只保存环境变量占位符。请在你自己的部署环境中填写端点、认证请求头名和值：
@@ -735,27 +736,22 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 所有引用必须对应本次实际召回结果。所选知识来源均未达到阈值时，结果必须明确说明拒绝匹配，
 并将置信度限制在 `0.45`。
 
-Agent 必须先完成实时证据采集，再形成最终可能根因：
+Agent 必须先完成知识匹配和全部实时证据/MCP 日志采集，采集期间不得创建、评估、存储或引用根因
+假设，也不得因为某个原因看似成立而提前结束采集。所有计划任务终态后只做一次根因分析：
 
-- `SUPPORTED`：存在非告警平台的实时 `SUCCESS` 证据；
-- `UNKNOWN`：证据不足，同时给出 `next_probe`。
+- 能由知识与合格实时证据建立因果机制时，返回根因，状态固定为 `SUPPORT`，设置
+  `verified=true` 并引用实时证据 ID；
+- 不能建立根因时，`root_causes=[]`、`likely_causes=[]`，`summary` 固定为
+  `现有结果无法得出根因`，最终状态为 `INCONCLUSIVE`。
 
-新运行中的每个最终根因必须通过 `hypothesis_id` 绑定显式调查内存中的同一假设。模型输出仅是
-提议；Host 会根据该假设的合格 evidence assessments 重新派生 `cause`、`status`、
-`evidence_refs` 和 `verified`，跨假设借用证据、未知或重复 ID 都会使结论判为不充分。没有具体候选
-机制时使用的 `unresolved-cause` 只是规划占位符，始终保持 `UNKNOWN`，不能被升级为已支持根因。
-
-`root_causes` 与 `likely_causes` 只包含采证后仍成立或尚未排除的原因。被实时证据反驳的调查
-假设直接从最终结果删除，不展示其名称、状态或排除理由。若现有假设全部被删除且证据不足以
-形成新原因，允许根因列表为空并以 `INCONCLUSIVE` 结束。只有
-`SUPPORTED` 可以设置 `verified=true`。手册诊断图中的候选原因，以及本地 PDF 或外部知识中的
-历史案例内容，都不是本次事故已经成立的事实，只能作为采证线索。
+新运行不得使用 `SUPPORTED`、`UNKNOWN` 或 `CONTRADICTED`，不得输出暂定原因、被排除原因或
+`next_probe`。这些旧枚举仅用于读取历史持久化结果。手册中的原因和历史事故案例只用于解释采集
+结果，不能在采集前转成本次告警的候选根因。
 
 校验记录把两个维度分开保存：`passed` 只表示分析契约诚实、可追溯且安全，
-`evidence_sufficient` 表示实时证据是否足以完成根因判断。一个正确声明为 `UNKNOWN`、
-设置 `verified=false` 并提供具体 `next_probe` 的结论可以通过分析契约，
-但 `evidence_sufficient=false`，最终状态仍为 `INCONCLUSIVE`。只有规则校验和 Agent
-校验的契约均通过且证据充分时，才允许进入 `COMPLETED`。
+`evidence_sufficient` 表示实时证据是否足以完成根因判断。固定的空根因结果可以通过诚实性和安全
+契约，但 `evidence_sufficient=false`，最终状态仍为 `INCONCLUSIVE`。只有每个根因均为
+`SUPPORT`、引用合格实时证据，且规则校验和 Agent 校验均通过时，才允许进入 `COMPLETED`。
 
 ## 离线评测与生产准入
 
