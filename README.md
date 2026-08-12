@@ -437,8 +437,9 @@ Archery 的角色和流程位于 [`config/mcp/prompts/archery/`](config/mcp/prom
   `alarm_host`、`alarm_port` 是唯一告警端点来源；
 - 调查窗口固定为 `occurred_at - 5 分钟` 到 `occurred_at`。会话根据 Archery 实际工具 Schema
   逐步发现实例、数据库、表和字段，再执行有界只读慢日志查询，不猜测部署结构；
-- Host 负责登录、只读工具过滤、单条 `SELECT/WITH` 校验、时间窗口、调用预算和审计。DDL、DML、
-  权限申请及其它写操作在网络调用前拒绝；
+- Host 负责登录、固定工具白名单、单条 `SELECT/WITH` 校验、时间窗口、调用预算和审计。Archery
+  服务端缺失可选的只读 annotations 时仍执行上述本地门禁；若显式声明非只读或破坏性则拒绝。
+  DDL、DML、权限申请及其它写操作在网络调用前拒绝；
 - 工具没有返回可用慢日志时记录 `NO_DATA`；连接、鉴权或超时失败按对应失败状态保存。该结果只表示
   Archery 本次没有提供可用证据，不会单独把其它证据判为不足。
 

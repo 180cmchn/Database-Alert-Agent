@@ -203,6 +203,25 @@ def _client(
     )
 
 
+def _scenario() -> archery_harness_module.ArcheryHarnessScenario:
+    client = _client(
+        _ScriptedModel([]),
+        ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, []),
+    )
+    state = archery_harness_module.ArcheryHarnessState(
+        window_start=OCCURRED_AT,
+        window_end=OCCURRED_AT,
+        occurred_at=OCCURRED_AT,
+        alert_context=dict(ALERT_CONTEXT),
+        alert_endpoint=ALERT_CONTEXT["alert_endpoint"],
+    )
+    return archery_harness_module.ArcheryHarnessScenario(
+        client,
+        state,
+        archery_harness_module._PlannerCallRegistry(),
+    )
+
+
 async def _create_durable_run(
     repository: SQLAlchemyAlertRepository,
     *,
@@ -415,6 +434,118 @@ async def test_shared_harness_repairs_a_model_response_without_a_tool_call() -> 
     assert len(model.requests) == 4
     assert "Return exactly one valid Agent action" in str(model.requests[1]["messages"])
     assert connector.opened_session_ids == ["archery-1"]
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_accepts_fixed_archery_tools_without_annotations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tools = _tools()
+    for tool in tools:
+        tool.annotations = {}
+    tools.extend(
+        DiscoveredMCPTool(name=name, input_schema={"type": "object"})
+        for name in (
+            archery_harness_module.ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+            archery_harness_module.ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            archery_harness_module.ARCHERY_MCP_DATABASES_TOOL_NAME,
+            archery_harness_module.ARCHERY_MCP_TABLES_TOOL_NAME,
+            archery_harness_module.ARCHERY_MCP_COLUMNS_TOOL_NAME,
+        )
+    )
+    model = _ScriptedModel(_lineage_actions())
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-without-annotations",
+                tools=tools,
+                calls=_lineage_replay_calls(
+                    rows=[{"hostname_max": "db-1.example:3306", "sql_text": "SELECT 1"}]
+                ),
+            )
+        ],
+    )
+
+    with caplog.at_level("WARNING", logger=archery_harness_module.__name__):
+        result = await _client(model, connector).execute_slow_log_query(
+            OCCURRED_AT,
+            alert_context=ALERT_CONTEXT,
+        )
+
+    assert result.query_completed is True
+    assert connector.opened_session_ids == ["archery-without-annotations"]
+    assert set(model.requests[0]["tool_names"]) == {
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        archery_harness_module.ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+        archery_harness_module.ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        archery_harness_module.ARCHERY_MCP_DATABASES_TOOL_NAME,
+        archery_harness_module.ARCHERY_MCP_TABLES_TOOL_NAME,
+        archery_harness_module.ARCHERY_MCP_COLUMNS_TOOL_NAME,
+    }
+    assert "omitted annotations.readOnlyHint" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("annotations", "expected_detail"),
+    [
+        ({"readOnlyHint": False}, "readOnlyHint=false"),
+        (
+            {"readOnlyHint": True, "destructiveHint": True},
+            "destructiveHint=true",
+        ),
+        ({"readOnlyHint": "true"}, "readOnlyHint must be boolean or null"),
+        (
+            {"readOnlyHint": True, "read_only_hint": False},
+            "conflicting readOnlyHint aliases",
+        ),
+    ],
+)
+def test_archery_harness_rejects_explicitly_unsafe_or_invalid_annotations(
+    annotations: dict[str, Any],
+    expected_detail: str,
+) -> None:
+    tools = _tools()
+    tools[-1].annotations = annotations
+
+    with pytest.raises(ArcheryMCPConfigurationError, match=expected_detail):
+        _scenario().build_tool_specs(tools)
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {},
+        {"readOnlyHint": None},
+        {"destructiveHint": False},
+        {"readOnlyHint": True},
+        {"readOnlyHint": True, "destructiveHint": False},
+    ],
+)
+def test_archery_harness_accepts_safe_or_missing_annotations(
+    annotations: dict[str, Any],
+) -> None:
+    tools = _tools()
+    tools[-1].annotations = annotations
+
+    specs = _scenario().build_tool_specs(tools)
+
+    assert [spec.name for spec in specs] == [ARCHERY_MCP_QUERY_TOOL_NAME]
+    assert all(spec.read_only for spec in specs)
+
+
+def test_archery_harness_never_exposes_unknown_unannotated_tools() -> None:
+    tools = [
+        *_tools(),
+        DiscoveredMCPTool(
+            name="request_query_permission_gymJPA",
+            input_schema={"type": "object"},
+        ),
+    ]
+
+    specs = _scenario().build_tool_specs(tools)
+
+    assert [spec.name for spec in specs] == [ARCHERY_MCP_QUERY_TOOL_NAME]
 
 
 @pytest.mark.asyncio

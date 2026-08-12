@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
@@ -75,8 +76,10 @@ if TYPE_CHECKING:
 
 
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-read-only-harness-v2"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-read-only-harness-v3"
 ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v1"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -583,20 +586,27 @@ class ArcheryHarnessScenario:
             ARCHERY_MCP_TABLES_TOOL_NAME,
             ARCHERY_MCP_COLUMNS_TOOL_NAME,
         }
-        unproven_read_only = sorted(
-            item.name
-            for item in tools
-            if item.name in approved | {self.client.login_tool_name}
-            and (
-                item.annotations.get("readOnlyHint") is not True
-                or item.annotations.get("destructiveHint") is True
-            )
-        )
-        if unproven_read_only:
+        annotation_conflicts: list[str] = []
+        missing_read_only_hints: list[str] = []
+        for item in tools:
+            if item.name not in approved | {self.client.login_tool_name}:
+                continue
+            conflict, missing_read_only_hint = self._annotation_conflict(item.annotations)
+            if conflict is not None:
+                annotation_conflicts.append(f"{item.name} ({conflict})")
+            elif missing_read_only_hint:
+                missing_read_only_hints.append(item.name)
+        if annotation_conflicts:
             raise ArcheryMCPConfigurationError(
-                "Archery MCP tools must declare annotations.readOnlyHint=true and "
-                "must not declare destructiveHint=true: "
-                + ", ".join(unproven_read_only)
+                "Archery MCP tool annotations explicitly conflict with the Host "
+                "read-only contract: "
+                + ", ".join(sorted(annotation_conflicts))
+            )
+        if missing_read_only_hints:
+            logger.warning(
+                "Archery MCP tools omitted annotations.readOnlyHint; allowing only the "
+                "fixed Archery tool allowlist under Host-enforced read-only policy: %s",
+                ", ".join(sorted(missing_read_only_hints)),
             )
         specs: list[ToolSpec] = []
         for item in tools:
@@ -626,6 +636,28 @@ class ArcheryHarnessScenario:
                 )
             )
         return specs
+
+    @staticmethod
+    def _annotation_conflict(annotations: Mapping[str, Any]) -> tuple[str | None, bool]:
+        values: dict[str, bool | None] = {}
+        for annotation_name, aliases in {
+            "readOnlyHint": ("readOnlyHint", "read_only_hint"),
+            "destructiveHint": ("destructiveHint", "destructive_hint"),
+        }.items():
+            present = [annotations[key] for key in aliases if key in annotations]
+            invalid = [value for value in present if value is not None and type(value) is not bool]
+            if invalid:
+                return f"{annotation_name} must be boolean or null", False
+            normalized = {value for value in present if value is not None}
+            if len(normalized) > 1:
+                return f"conflicting {annotation_name} aliases", False
+            values[annotation_name] = next(iter(normalized), None)
+
+        if values["readOnlyHint"] is False:
+            return "readOnlyHint=false", False
+        if values["destructiveHint"] is True:
+            return "destructiveHint=true", False
+        return None, values["readOnlyHint"] is None
 
     def prepare_call(
         self,
