@@ -25,6 +25,7 @@ from mcp.client.sse import sse_client
 
 from app.adapters.prometheus_mcp import (
     _FINISH_TOOL_NAME,
+    _SCOPE_AUDIT_ARGUMENT_NAMES,
     PROMETHEUS_ALERT_WINDOW_SECONDS,
     PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER,
     PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS,
@@ -318,6 +319,14 @@ class PrometheusHarnessPlanner:
         messages: list[dict[str, Any]],
         tools: list[ToolSpec],
     ) -> dict[str, Any]:
+        return await self._plan(messages=messages, tools=tools)
+
+    async def _plan(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[ToolSpec],
+    ) -> dict[str, Any]:
         state = self.scenario.current_state
         advertised_names = {tool.name for tool in tools}
         model_tool_list = [
@@ -373,13 +382,66 @@ class PrometheusHarnessPlanner:
 
         self.consecutive_errors.clear()
         if call.name == _FINISH_TOOL_NAME:
+            if state.monitoring_scope_status == "investigating":
+                scope_status = call.arguments.get("monitoring_scope_status")
+                reason = call.arguments.get("reason")
+                if scope_status not in {"out_of_scope", "unknown"}:
+                    raise PrometheusMCPModelError(
+                        "Prometheus scope finish must declare out_of_scope or unknown"
+                    )
+                if not isinstance(reason, str) or not reason.strip():
+                    raise PrometheusMCPModelError(
+                        "Prometheus scope conclusion must include a non-empty reason"
+                    )
+                state.monitoring_scope_status = scope_status
+                state.monitoring_scope_reason = sanitize_text(reason)[:1000]
+                state.monitored_database_engines = self._string_list(
+                    call.arguments.get("monitored_database_engines"),
+                    limit=20,
+                )
+                state.monitoring_target_identifiers = self._string_list(
+                    call.arguments.get("monitoring_target_identifiers"),
+                    limit=100,
+                )
+                return {
+                    "action": "finish",
+                    "reason": RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE.value,
+                    "summary": state.monitoring_scope_reason,
+                }
             return {
                 "action": "finish",
                 "reason": RuntimeStopReason.COMPLETED.value,
                 "summary": "Prometheus alert-window evidence collection is complete.",
             }
-        self.scenario.register_model_call(call)
         policy = self.scenario.authorized_policies.get(call.name)
+        if (
+            state.monitoring_scope_status == "investigating"
+            and policy is not None
+            and policy.capability == "range_query"
+        ):
+            reason = call.arguments.get("monitoring_scope_reason")
+            engines = self._string_list(
+                call.arguments.get("monitored_database_engines"),
+                limit=20,
+            )
+            identifiers = self._string_list(
+                call.arguments.get("monitoring_target_identifiers"),
+                limit=100,
+            )
+            if not isinstance(reason, str) or not reason.strip():
+                raise PrometheusMCPModelError(
+                    "Prometheus in-scope range query must include monitoring_scope_reason"
+                )
+            if not engines or not identifiers:
+                raise PrometheusMCPModelError(
+                    "Prometheus in-scope range query must include database engines "
+                    "and target identifiers"
+                )
+            state.monitoring_scope_status = "in_scope"
+            state.monitoring_scope_reason = sanitize_text(reason)[:1000]
+            state.monitored_database_engines = engines
+            state.monitoring_target_identifiers = identifiers
+        self.scenario.register_model_call(call)
         capability = policy.capability if policy is not None else "unapproved"
         return {
             "action": "call_tool",
@@ -390,6 +452,18 @@ class PrometheusHarnessPlanner:
             "hypothesis_ids": [],
             "arguments": deepcopy(call.arguments),
         }
+
+    @staticmethod
+    def _string_list(value: Any, *, limit: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return list(
+            dict.fromkeys(
+                sanitize_text(item)[:500]
+                for item in value[:limit]
+                if isinstance(item, str) and item.strip()
+            )
+        )
 
     def _selection_error(
         self,
@@ -536,6 +610,9 @@ class PrometheusHarnessScenario:
             window_start=state.window_start,
             window_end=state.window_end,
         )
+        if policy.capability == "range_query":
+            for argument_name in _SCOPE_AUDIT_ARGUMENT_NAMES:
+                effective_arguments.pop(argument_name, None)
         return PreparedCall(
             tool_name=action.tool_name,
             objective=action.objective,
@@ -761,18 +838,9 @@ class PrometheusHarnessScenario:
         call: PreparedCall,
         result: Any,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
-        scope_status, scope_reason, monitored_engines, identifiers = (
-            self.client.monitoring_scope_verification(self.context.alert, result)
-        )
-        updated.monitoring_scope_status = scope_status
-        updated.monitoring_scope_reason = scope_reason
-        updated.monitored_database_engines = monitored_engines
-        updated.monitoring_target_identifiers = identifiers
-        outcome = {
-            "in_scope": "monitoring_scope_included",
-            "out_of_scope": "monitoring_scope_excluded",
-            "unknown": "monitoring_scope_unknown",
-        }.get(scope_status, "monitoring_scope_unknown")
+        updated.monitoring_scope_status = "investigating"
+        updated.monitoring_scope_reason = None
+        outcome = "monitoring_scope_evidence_collected"
         response = {
             "tool_name": call.tool_name,
             "model_arguments": sanitize(call.model_arguments),
@@ -781,10 +849,7 @@ class PrometheusHarnessScenario:
             "has_monitoring_observation": False,
             "window_verification": "not_applicable",
             "target_verification": "not_applicable",
-            "monitoring_scope_status": scope_status,
-            "monitoring_scope_reason": scope_reason,
-            "monitored_database_engines": monitored_engines,
-            "monitoring_target_identifiers": identifiers,
+            "monitoring_scope_status": "investigating",
             "root_cause_eligible": False,
             "root_cause_ineligible_reason": "monitoring_scope_discovery",
             "result": self.client.evidence_visible_payload(result),
@@ -797,22 +862,17 @@ class PrometheusHarnessScenario:
                 "arguments": sanitize(call.effective_arguments),
                 "capability": "target_discovery",
                 "outcome": outcome,
-                "monitoring_scope_status": scope_status,
-                "monitoring_scope_reason": scope_reason,
-                "monitored_database_engines": monitored_engines,
+                "monitoring_scope_status": "investigating",
                 "evidence_disposition": "MISSING",
                 "is_contradiction": False,
             }
         )
         self._state = updated
         instruction = (
-            "已确认告警数据库在 Prometheus 监控范围内；继续选择最小的目录或范围查询。"
-            if scope_status == "in_scope"
-            else (
-                "告警数据库不在 Prometheus 监控范围内；Host 将停止后续指标查询。"
-                if scope_status == "out_of_scope"
-                else "无法可靠确认监控覆盖范围；Host 将停止后续指标查询。"
-            )
+            "结合目标标签、服务发现 URL、抓取路径、job、指标目录和元数据判断数据库监控归属。"
+            "证据支持范围内时，选择最相关的 range_query 并提交结构化范围依据；支持范围外或"
+            "证据仍不足时，调用 finish_prometheus_investigation。筛选后的空结果不能单独证明"
+            "数据库未受监控。"
         )
         invocation_status = (
             ToolInvocationStatus.SUCCEEDED
@@ -822,8 +882,7 @@ class PrometheusHarnessScenario:
         observation = {
             "tool_name": call.tool_name,
             "outcome": outcome,
-            "monitoring_scope_status": scope_status,
-            "monitoring_scope_reason": scope_reason,
+            "monitoring_scope_status": "investigating",
             "evidence_disposition": "MISSING",
             "is_contradiction": False,
         }
@@ -1051,6 +1110,15 @@ class PrometheusHarnessScenario:
             RuntimeStopReason.AMBIGUOUS_TARGET,
             RuntimeStopReason.NO_SAFE_ACTION,
         }:
+            return finish
+        if (
+            finish.reason == RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE
+            and state.monitoring_scope_status in {"out_of_scope", "unknown"}
+            and any(
+                attempt.get("capability") == "target_discovery"
+                for attempt in state.tool_attempts
+            )
+        ):
             return finish
         if state.has_monitoring_data:
             return finish

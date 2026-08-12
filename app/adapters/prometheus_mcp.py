@@ -38,13 +38,18 @@ PROMETHEUS_MCP_MAX_CATALOG_CALLS: Final = 2
 PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS: Final = 3
 PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS: Final = 2
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v8"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v9"
 PROMETHEUS_MCP_MODEL_RESULT_MAX_CHARS: Final = 8_000
 PROMETHEUS_MCP_EVIDENCE_RESULT_MAX_CHARS: Final = 24_000
 PROMETHEUS_MCP_EVIDENCE_MAX_CHARS: Final = 12_000
 PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v2"
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _FINISH_TOOL_NAME: Final = "finish_prometheus_investigation"
+_SCOPE_AUDIT_ARGUMENT_NAMES: Final = (
+    "monitoring_scope_reason",
+    "monitored_database_engines",
+    "monitoring_target_identifiers",
+)
 _OBSERVATION_KEYS: Final = {
     "data",
     "datapoint",
@@ -103,11 +108,6 @@ _MONITORING_IDENTITY_KEYS: Final = {
     "job",
     "server",
     "target",
-}
-_MONITORING_TARGET_COLLECTION_KEYS: Final = {
-    "activetargets",
-    "configuredtargets",
-    "targets",
 }
 _ENGINE_FAMILY_MARKERS: Final = {
     "oceanbase": ("oceanbase", "obcluster", "obproxy"),
@@ -232,7 +232,7 @@ class PrometheusMCPQueryResult:
     reconnect_error_type: str | None = None
     inconclusive_reason: str | None = None
     monitoring_scope_status: Literal[
-        "not_checked", "in_scope", "out_of_scope", "unknown"
+        "not_checked", "investigating", "in_scope", "out_of_scope", "unknown"
     ] = "not_checked"
     monitoring_scope_reason: str | None = None
     monitored_database_engines: tuple[str, ...] = ()
@@ -560,21 +560,51 @@ class PrometheusMCPClient:
         alert: NormalizedAlert | None = None,
         monitoring_scope_status: str = "not_checked",
     ) -> list[dict[str, Any]]:
-        """Require target discovery, then prefer direct range evidence."""
+        """Stage semantic scope discovery before alert-window evidence collection."""
 
         target_discovery_names = {
             name
             for name, policy in authorized_policies.items()
             if policy.capability == "target_discovery"
         }
-        if target_discovery_names and monitoring_scope_status != "in_scope":
-            if monitoring_scope_status != "not_checked":
-                return []
+        if target_discovery_names and monitoring_scope_status == "not_checked":
             return [
                 tool
                 for tool in model_tool_list
                 if tool.get("function", {}).get("name") in target_discovery_names
             ]
+        if target_discovery_names and monitoring_scope_status == "investigating":
+            remaining = max(self.max_agent_steps - len(calls), 0)
+            catalog_calls = sum(
+                1
+                for call in calls
+                if (
+                    policy := authorized_policies.get(call.name)
+                ) is not None
+                and policy.capability == "catalog"
+            )
+            allow_scope_discovery = (
+                catalog_calls < self.catalog_call_limit()
+                and remaining > PROMETHEUS_MCP_MIN_RANGE_CALL_RESERVE
+            )
+            selected: list[dict[str, Any]] = []
+            for tool in model_tool_list:
+                policy = authorized_policies.get(
+                    str(tool.get("function", {}).get("name") or "")
+                )
+                if policy is None:
+                    continue
+                if (
+                    allow_scope_discovery
+                    and policy.capability in {"target_discovery", "catalog"}
+                ):
+                    selected.append(tool)
+                elif policy.capability == "range_query":
+                    selected.append(self._scope_aware_range_tool(tool))
+            selected.append(self._scope_finish_tool())
+            return selected
+        if target_discovery_names and monitoring_scope_status != "in_scope":
+            return []
         if target_discovery_names:
             model_tool_list = [
                 tool
@@ -895,164 +925,6 @@ class PrometheusMCPClient:
             "instance_candidates": list(dict.fromkeys(candidates)),
             "metric_candidates": PrometheusMCPClient.alert_metric_candidates(alert),
         }
-
-    @classmethod
-    def monitoring_scope_verification(
-        cls,
-        alert: NormalizedAlert,
-        payload: Any,
-    ) -> tuple[str, str, list[str], list[str]]:
-        """Compare a discovered monitoring target inventory with the alert database."""
-
-        inventory_observed, target_count, raw_identities = cls._monitoring_target_inventory(
-            payload
-        )
-        identities = list(dict.fromkeys(item.strip() for item in raw_identities if item.strip()))
-        monitored_engines = sorted(
-            {
-                family
-                for value in identities
-                if (family := cls._engine_family(value)) is not None
-            }
-        )
-        database = alert.database
-        expected_engine = cls._engine_family(database.engine if database else None)
-        alert_candidates = [
-            value
-            for value in (
-                database.engine if database else None,
-                database.instance if database else None,
-                database.database if database else None,
-                database.host if database else None,
-                alert.cluster,
-            )
-            if isinstance(value, str) and value.strip()
-        ]
-        candidate_variants = {
-            variant
-            for value in alert_candidates
-            for variant in cls._monitoring_identity_variants(value)
-        }
-        identity_variants = {
-            variant
-            for value in identities
-            for variant in cls._monitoring_identity_variants(value)
-        }
-
-        if not inventory_observed:
-            return (
-                "unknown",
-                "Prometheus 目标发现结果未包含可识别的目标清单，无法确认告警数据库是否受监控。",
-                monitored_engines,
-                identities[:100],
-            )
-        if target_count == 0:
-            return (
-                "out_of_scope",
-                "Prometheus 目标清单为空，当前告警数据库未配置监控目标。",
-                monitored_engines,
-                [],
-            )
-        if not identities:
-            return (
-                "unknown",
-                "Prometheus 目标清单非空，但缺少可识别的数据库类型或目标标识。",
-                monitored_engines,
-                [],
-            )
-        if expected_engine is not None and expected_engine in monitored_engines:
-            return (
-                "in_scope",
-                f"Prometheus 目标清单包含告警数据库类型 {expected_engine}。",
-                monitored_engines,
-                identities[:100],
-            )
-        if expected_engine is not None and monitored_engines:
-            configured = "、".join(monitored_engines)
-            return (
-                "out_of_scope",
-                (
-                    f"Prometheus 目标清单仅识别到 {configured}，"
-                    f"不包含告警数据库类型 {expected_engine}。"
-                ),
-                monitored_engines,
-                identities[:100],
-            )
-        if candidate_variants.intersection(identity_variants):
-            return (
-                "in_scope",
-                "Prometheus 目标清单包含与告警数据库一致的目标标识。",
-                monitored_engines,
-                identities[:100],
-            )
-        return (
-            "unknown",
-            "Prometheus 已返回目标清单，但其中没有足够的数据库类型或目标标识用于可靠匹配。",
-            monitored_engines,
-            identities[:100],
-        )
-
-    @classmethod
-    def _monitoring_target_inventory(
-        cls,
-        value: Any,
-        *,
-        accept_direct_list: bool = True,
-    ) -> tuple[bool, int, list[str]]:
-        if isinstance(value, str):
-            decoded = cls._decode_json_text(value)
-            if decoded is None:
-                return False, 0, []
-            return cls._monitoring_target_inventory(
-                decoded,
-                accept_direct_list=accept_direct_list,
-            )
-        if isinstance(value, list):
-            if not accept_direct_list:
-                return False, 0, []
-            return True, len(value), cls._monitoring_identity_values(value)
-        if not isinstance(value, Mapping):
-            return False, 0, []
-
-        observed = False
-        target_count = 0
-        identities: list[str] = []
-        for raw_key, nested in value.items():
-            key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
-            if key in _MONITORING_TARGET_COLLECTION_KEYS and isinstance(
-                nested, (Mapping, list)
-            ):
-                observed = True
-                target_count += len(nested)
-                identities.extend(cls._monitoring_identity_values(nested))
-                continue
-            if isinstance(nested, (Mapping, list, str)):
-                nested_observed, nested_count, nested_identities = (
-                    cls._monitoring_target_inventory(
-                        nested,
-                        accept_direct_list=False,
-                    )
-                )
-                observed = observed or nested_observed
-                target_count += nested_count
-                identities.extend(nested_identities)
-        return observed, target_count, identities
-
-    @staticmethod
-    def _monitoring_identity_variants(value: str) -> set[str]:
-        normalized = value.strip().casefold().rstrip("/")
-        if not normalized:
-            return set()
-        variants = {normalized}
-        parsed = urlsplit(
-            normalized if "://" in normalized else f"//{normalized}",
-            allow_fragments=False,
-        )
-        if parsed.hostname:
-            variants.add(parsed.hostname.casefold())
-        if parsed.netloc:
-            variants.add(parsed.netloc.casefold())
-        return variants
 
     @classmethod
     def target_verification(
@@ -1396,7 +1268,8 @@ class PrometheusMCPClient:
             host_contract = (
                 "Host policy capability=target_discovery. This tool must be called before "
                 "catalog or range_query tools to discover which database targets are monitored. "
-                "Its result establishes monitoring coverage but is not root-cause evidence."
+                "Its result is semantic scope evidence for the Agent, not root-cause evidence; "
+                "a filtered empty page alone must not be treated as a global empty inventory."
             )
         elif policy.capability == "range_query":
             start_path = ".".join(policy.start_argument_path)
@@ -1410,9 +1283,10 @@ class PrometheusMCPClient:
             )
         else:
             host_contract = (
-                "Host policy capability=catalog. This tool is auxiliary discovery "
-                "only and can never complete the investigation. Use it sparingly, "
-                "then select a capability=range_query tool for alert-window samples."
+                "Host policy capability=catalog. This tool is auxiliary semantic discovery "
+                "for monitoring ownership, metrics, labels, and metadata; it is not root-cause "
+                "evidence. Use it sparingly, then submit a scope conclusion or select a "
+                "capability=range_query tool for alert-window samples."
             )
         return f"{host_contract} Remote description: {remote_description}"
 
@@ -1450,9 +1324,12 @@ class PrometheusMCPClient:
                     ),
                     "instruction": (
                         (
-                            "若监控范围尚未确认，先调用 target_discovery；只有 Host 确认"
-                            "in_scope 后才能做必要的 catalog 发现和 range_query，并至少为"
-                            "range_query 保留两次调用额度。"
+                            "先调用 target_discovery。之后由 Agent 综合目标标签、服务发现 URL、"
+                            "抓取路径、job、指标目录和元数据判断监控归属；需要时调用 catalog，"
+                            "再通过首个 range_query 提交 in_scope 结论和依据，或通过 "
+                            "finish_prometheus_investigation 提交 out_of_scope 或 unknown。"
+                            "筛选后的空结果不能单独证明未监控，并至少为 range_query 保留两次"
+                            "调用额度。"
                         )
                         if requires_target_discovery
                         else (
@@ -1532,6 +1409,94 @@ class PrometheusMCPClient:
                 )
             current = nested
         return current
+
+    @staticmethod
+    def _scope_aware_range_tool(tool: dict[str, Any]) -> dict[str, Any]:
+        scoped = deepcopy(tool)
+        function = scoped.get("function")
+        if not isinstance(function, dict):
+            return scoped
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            return scoped
+        raw_properties = parameters.get("properties")
+        properties = (
+            dict(raw_properties) if isinstance(raw_properties, Mapping) else {}
+        )
+        properties.update(
+            {
+                "monitoring_scope_reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": (
+                        "基于已返回目标、服务发现、指标目录或元数据，说明为何告警数据库"
+                        "属于当前 Prometheus 监控范围。"
+                    ),
+                },
+                "monitored_database_engines": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "description": "已从工具返回中识别出的数据库类型。",
+                },
+                "monitoring_target_identifiers": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": "支持监控归属判断的有界目标、路径、job 或服务发现标识。",
+                },
+            }
+        )
+        parameters["properties"] = properties
+        raw_required = parameters.get("required")
+        required = list(raw_required) if isinstance(raw_required, list) else []
+        parameters["required"] = list(
+            dict.fromkeys([*required, *_SCOPE_AUDIT_ARGUMENT_NAMES])
+        )
+        function["description"] = (
+            f"{str(function.get('description') or '')} "
+            "选择此范围查询即声明告警数据库在监控范围内；同时提交多项返回证据形成的"
+            "范围判断理由、数据库类型和目标标识。Host 只转发远端工具原有参数。"
+        ).strip()
+        return scoped
+
+    @staticmethod
+    def _scope_finish_tool() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": _FINISH_TOOL_NAME,
+                "description": (
+                    "结束 Prometheus 监控范围判断。只有工具返回能支持排除结论时选择 "
+                    "out_of_scope；筛选后的空结果、证据不足或冲突时选择 unknown。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "monitoring_scope_status": {
+                            "type": "string",
+                            "enum": ["out_of_scope", "unknown"],
+                        },
+                        "reason": {"type": "string", "minLength": 1},
+                        "monitored_database_engines": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 20,
+                        },
+                        "monitoring_target_identifiers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 100,
+                        },
+                    },
+                    "required": ["monitoring_scope_status", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+        }
 
     @staticmethod
     def _finish_tool() -> dict[str, Any]:
@@ -1750,8 +1715,12 @@ class PrometheusMCPClient:
     ) -> list[dict[str, Any]]:
         target_discovery_instruction = (
             "每次调查必须先调用 capability=target_discovery 的工具，发现当前配置了监控的"
-            "数据库目标；只有 Host 判定告警数据库为 in_scope 后，才可继续目录或范围查询。"
-            "out_of_scope 或 unknown 时 Host 会停止调查，不得用其它数据库的指标替代。"
+            "数据库目标。你负责结合目标标签、服务发现 URL、scrape URL/path、job、指标名称"
+            "及元数据识别数据库归属；例如 OCP 服务发现、/metrics/ob/* 和 obproxy 的组合可"
+            "支持 OceanBase 归属。名称本身只是线索，筛选后的空结果也不能单独证明未监控；"
+            "需要时调用 catalog 工具交叉验证。证据支持 in_scope 时，在首个 range_query "
+            "中同时提交结构化范围依据；证据支持 out_of_scope 或仍不足时，再用 "
+            "finish_prometheus_investigation 提交对应结论。"
             if any(
                 policy.capability == "target_discovery"
                 for policy in self._tool_policies.values()

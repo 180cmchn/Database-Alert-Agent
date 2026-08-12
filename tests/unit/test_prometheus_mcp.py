@@ -111,15 +111,15 @@ def _oceanbase_context() -> InvestigationContext:
         update={
             "alert": context.alert.model_copy(
                 update={
-                    "title": "OceanBase tenant CPU elevated",
-                    "reason": "oceanbase_cpu_usage",
-                    "alert_type": "oceanbase_cpu_usage",
-                    "metric_name": "ob_sysstat_cpu_usage",
-                    "cluster": "oceanbase-prod",
+                    "title": "OCEANBASE/sc_store_prod-OceanBase服务器数据盘使用率超限",
+                    "reason": "OceanBase服务器数据盘使用率超限",
+                    "alert_type": "oceanbase_disk_usage",
+                    "metric_name": None,
+                    "cluster": "sc_store_prod",
                     "database": DatabaseTarget(
                         engine="oceanbase",
-                        instance="ob-1:2886",
-                        host="ob-1",
+                        instance="10.126.106.14",
+                        host="10.126.106.14",
                     ),
                 }
             )
@@ -491,6 +491,7 @@ class _SequenceModel:
         self.arguments = arguments
         self.messages: list[list[dict[str, Any]]] = []
         self.available_tools: list[set[str]] = []
+        self.tool_definitions: list[list[dict[str, Any]]] = []
 
     async def request_mcp_tool_call(
         self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -499,6 +500,7 @@ class _SequenceModel:
         index = len(self.messages) - 1
         available = {item["function"]["name"] for item in tools}
         self.available_tools.append(available)
+        self.tool_definitions.append(json.loads(json.dumps(tools, ensure_ascii=False)))
         name = self.names[index]
         assert name in available
         return MCPModelToolCall(
@@ -543,7 +545,12 @@ class _TargetAwareSession(_FakeSession):
                 "get_targets",
                 {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "state": {"type": "string"},
+                        "scrape_pool": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "offset": {"type": "integer"},
+                    },
                     "additionalProperties": False,
                 },
             ),
@@ -565,6 +572,15 @@ class _TargetAwareSession(_FakeSession):
                 {
                     "type": "object",
                     "properties": {"filter_pattern": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            ),
+            _TargetAwareTool(
+                "get_metric_metadata",
+                {
+                    "type": "object",
+                    "properties": {"metric": {"type": "string"}},
+                    "required": ["metric"],
                     "additionalProperties": False,
                 },
             ),
@@ -596,6 +612,10 @@ def _target_aware_settings() -> PrometheusMCPServerSettings:
                 name="list_metrics",
                 capability="catalog",
             ),
+            PrometheusMCPToolPolicy(
+                name="get_metric_metadata",
+                capability="catalog",
+            ),
         )
     )
 
@@ -608,12 +628,28 @@ def _oceanbase_target_result() -> dict[str, Any]:
                 "activeTargets": [
                     {
                         "labels": {
-                            "job": "oceanbase",
-                            "cluster": "oceanbase-prod",
-                            "instance": "ob-1:2886",
+                            "job": "ocp-agent:62889/metrics/ob/basic",
+                            "instance": "10.126.106.15:62889",
                         },
+                        "discoveredLabels": {
+                            "__meta_url": (
+                                "http://ocp-prod.mcdchina.net:8080/api/v2/monitor/"
+                                "prometheus_sd"
+                            )
+                        },
+                        "scrapePool": "ocp_sd",
+                        "scrapeUrl": "http://10.126.106.15:62889/metrics/ob/basic",
                         "health": "up",
-                    }
+                    },
+                    {
+                        "labels": {
+                            "job": "ocp-agent:62889/metrics/obproxy",
+                            "instance": "10.126.106.166:62889",
+                        },
+                        "scrapePool": "ocp_sd",
+                        "scrapeUrl": "http://10.126.106.166:62889/metrics/obproxy",
+                        "health": "up",
+                    },
                 ]
             },
         }
@@ -659,35 +695,6 @@ def test_prometheus_local_policy_rejects_unknown_and_destructive_tools() -> None
     assert "root-cause-eligible" in description
 
 
-def test_prometheus_scope_verification_uses_discovered_database_targets() -> None:
-    payload = _oceanbase_target_result()["structuredContent"]
-
-    mysql = PrometheusMCPClient.monitoring_scope_verification(
-        _mysql_context().alert,
-        payload,
-    )
-    oceanbase = PrometheusMCPClient.monitoring_scope_verification(
-        _oceanbase_context().alert,
-        payload,
-    )
-
-    assert mysql[0] == "out_of_scope"
-    assert mysql[2] == ["oceanbase"]
-    assert "不包含告警数据库类型 mysql" in mysql[1]
-    assert oceanbase[0] == "in_scope"
-    assert oceanbase[2] == ["oceanbase"]
-    opaque = PrometheusMCPClient.monitoring_scope_verification(
-        _mysql_context().alert,
-        {"data": {"activeTargets": [{"health": "up"}]}},
-    )
-    unrelated_empty_list = PrometheusMCPClient.monitoring_scope_verification(
-        _mysql_context().alert,
-        {"data": {"warnings": []}},
-    )
-    assert opaque[0] == "unknown"
-    assert unrelated_empty_list[0] == "unknown"
-
-
 @pytest.mark.asyncio
 async def test_prometheus_stops_after_target_discovery_for_unmonitored_database(
     monkeypatch: pytest.MonkeyPatch,
@@ -700,7 +707,17 @@ async def test_prometheus_stops_after_target_discovery_for_unmonitored_database(
         lambda *_args, **_kwargs: _AsyncContext((object(), object())),
     )
     monkeypatch.setattr(prometheus_harness_module, "ClientSession", _TargetAwareSession)
-    model = _SequenceModel(["get_targets"], arguments=[{}])
+    model = _SequenceModel(
+        ["get_targets", "finish_prometheus_investigation"],
+        arguments=[
+            {},
+            {
+                "monitoring_scope_status": "out_of_scope",
+                "reason": "目标清单仅包含 OceanBase，告警数据库为 MySQL。",
+                "monitored_database_engines": ["oceanbase"],
+            },
+        ],
+    )
     client = PrometheusMCPClient(
         _target_aware_settings(),
         model,
@@ -710,7 +727,8 @@ async def test_prometheus_stops_after_target_discovery_for_unmonitored_database(
     result = await client.collect_alert_window(_mysql_context())
 
     assert _TargetAwareSession.calls == [("get_targets", {})]
-    assert model.available_tools == [{"get_targets"}]
+    assert model.available_tools[0] == {"get_targets"}
+    assert "finish_prometheus_investigation" in model.available_tools[1]
     assert result.monitoring_scope_status == "out_of_scope"
     assert result.monitored_database_engines == ("oceanbase",)
     assert result.termination_reason == "database_not_monitored"
@@ -723,7 +741,35 @@ async def test_prometheus_queries_metrics_only_after_target_discovery_matches_da
 ) -> None:
     _TargetAwareSession.calls = []
     _TargetAwareSession.results = [
+        {
+            "structuredContent": {
+                "status": "success",
+                "data": {"activeTargets": []},
+            }
+        },
         _oceanbase_target_result(),
+        {
+            "structuredContent": {
+                "status": "success",
+                "data": {
+                    "metrics": [
+                        "ob_data_disk_usage_percent",
+                        "obproxy_request_count",
+                    ]
+                },
+            }
+        },
+        {
+            "structuredContent": {
+                "status": "success",
+                "data": {
+                    "ob_data_disk_usage_percent": {
+                        "help": "OceanBase server data disk usage percent",
+                        "type": "gauge",
+                    }
+                },
+            }
+        },
         {
             "structuredContent": {
                 "status": "success",
@@ -732,9 +778,9 @@ async def test_prometheus_queries_metrics_only_after_target_discovery_matches_da
                     "result": [
                         {
                             "metric": {
-                                "__name__": "ob_sysstat_cpu_usage",
-                                "job": "oceanbase",
-                                "cluster": "oceanbase-prod",
+                                "__name__": "ob_data_disk_usage_percent",
+                                "job": "ocp-agent:62889/metrics/ob/basic",
+                                "cluster": "sc_store_prod",
                             },
                             "values": [[1786067700, "91"]],
                         }
@@ -750,25 +796,98 @@ async def test_prometheus_queries_metrics_only_after_target_discovery_matches_da
     )
     monkeypatch.setattr(prometheus_harness_module, "ClientSession", _TargetAwareSession)
     model = _SequenceModel(
-        ["get_targets", "execute_range_query", "finish_prometheus_investigation"],
-        arguments=[{}, {"query": 'ob_sysstat_cpu_usage{cluster="oceanbase-prod"}'}, {}],
+        [
+            "get_targets",
+            "get_targets",
+            "list_metrics",
+            "get_metric_metadata",
+            "execute_range_query",
+            "finish_prometheus_investigation",
+        ],
+        arguments=[
+            {
+                "state": "active",
+                "scrape_pool": "oceanbase",
+                "limit": 100,
+                "offset": 0,
+            },
+            {"state": "active", "limit": 100, "offset": 0},
+            {"filter_pattern": "ob|ocp"},
+            {"metric": "ob_data_disk_usage_percent"},
+            {
+                "query": 'ob_data_disk_usage_percent{cluster="sc_store_prod"}',
+                "monitoring_scope_reason": (
+                    "ocp_sd 来自 OCP Prometheus 服务发现，目标同时包含 /metrics/ob/basic、"
+                    "/metrics/obproxy 和 OceanBase 数据盘指标，支持 OceanBase 归属。"
+                ),
+                "monitored_database_engines": ["oceanbase"],
+                "monitoring_target_identifiers": ["ocp_sd", "/metrics/ob/basic", "obproxy"],
+            },
+            {},
+        ],
     )
     client = PrometheusMCPClient(
         _target_aware_settings(),
         model,
-        max_agent_steps=4,
+        max_agent_steps=7,
     )
 
     result = await client.collect_alert_window(_oceanbase_context())
 
     assert [name for name, _arguments in _TargetAwareSession.calls] == [
         "get_targets",
+        "get_targets",
+        "list_metrics",
+        "get_metric_metadata",
         "execute_range_query",
     ]
+    assert _TargetAwareSession.calls[0] == (
+        "get_targets",
+        {"state": "active", "scrape_pool": "oceanbase", "limit": 100, "offset": 0},
+    )
     assert model.available_tools[0] == {"get_targets"}
-    assert "get_targets" not in model.available_tools[1]
-    assert model.available_tools[1] == {"execute_range_query"}
+    assert model.available_tools[1] == {
+        "execute_range_query",
+        "finish_prometheus_investigation",
+        "get_metric_metadata",
+        "get_targets",
+        "list_metrics",
+    }
+    assert model.available_tools[4] == {
+        "execute_range_query",
+        "finish_prometheus_investigation",
+    }
+    range_definition = next(
+        item
+        for item in model.tool_definitions[4]
+        if item["function"]["name"] == "execute_range_query"
+    )
+    scope_finish_definition = next(
+        item
+        for item in model.tool_definitions[4]
+        if item["function"]["name"] == "finish_prometheus_investigation"
+    )
+    assert {
+        "monitoring_scope_reason",
+        "monitored_database_engines",
+        "monitoring_target_identifiers",
+    } <= set(range_definition["function"]["parameters"]["required"])
+    assert scope_finish_definition["function"]["parameters"]["properties"][
+        "monitoring_scope_status"
+    ]["enum"] == ["out_of_scope", "unknown"]
+    assert _TargetAwareSession.calls[-1][1] == {
+        "query": 'ob_data_disk_usage_percent{cluster="sc_store_prod"}',
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+    }
     assert result.monitoring_scope_status == "in_scope"
+    assert result.monitoring_scope_reason and "obproxy" in result.monitoring_scope_reason
+    assert result.monitored_database_engines == ("oceanbase",)
+    assert result.monitoring_target_identifiers == (
+        "ocp_sd",
+        "/metrics/ob/basic",
+        "obproxy",
+    )
     assert result.has_monitoring_data is True
     assert result.finished_by_model is True
 

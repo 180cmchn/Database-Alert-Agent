@@ -515,11 +515,15 @@ MCP Host。
 实时 Schema；可选 `schemaSha256` 不匹配时整个工具 fail closed。
 
 配置 `target_discovery` 后，每次调查首轮只向模型开放该能力；当前配置将 `get_targets` 用作目标发现
-工具。Host 从返回的目标标签中识别数据库类型和目标标识，并与规范化告警数据库比较：`in_scope` 才
-继续开放 `catalog` 和 `range_query`；`out_of_scope` 返回 `SKIPPED`，明确说明告警数据库未纳入当前
-监控范围；无法可靠识别告警数据库或目标清单时返回 `NO_DATA` 和 `monitoring_scope_unknown`。三种
-结果都会保留 `monitoring_scope_status`、原因、识别到的数据库类型和有界目标标识。目标发现结果只是
-覆盖范围上下文，不能支持或反驳本次告警根因。
+工具。首轮返回后，Agent 可按实际 Schema 继续调用 `get_targets`、`list_metrics`、
+`get_metric_metadata` 等本地授权的只读发现工具，综合目标标签、服务发现 URL、抓取路径、job、指标名
+和元数据判断数据库归属。例如 `ocp_sd` 名称本身不是结论，但 OCP 服务发现、`/metrics/ob/*` 与
+`obproxy` 等多项返回可以共同支持 OceanBase 归属。筛选后的空目标页不能单独证明数据库未受监控。
+Agent 判断 `in_scope` 后，在首个 `range_query` 中一并提交范围理由、识别出的数据库类型和有界目标
+标识；判断 `out_of_scope` 或 `unknown` 时则通过结构化结束动作提交结论及理由。`out_of_scope` 返回
+`SKIPPED`，`unknown` 返回 `NO_DATA`。Host 仍负责只读授权、调用预算、Schema 校验和范围查询时间窗，
+不用硬编码字符串规则替代 Agent 的语义判断。范围发现结果只是覆盖上下文，不能支持或反驳本次告警
+根因。
 
 SSE 空闲读取期限使用外层 Prometheus 工具期限，避免模型规划期间沿用单次 MCP 读取的 60 秒期限而
 提前断流。模型看到的每个工具说明会附加 Host 审核后的 `target_discovery`、`catalog` 或
