@@ -52,10 +52,11 @@ def enforce_post_evidence_root_cause_policy(
     alert: NormalizedAlert | None = None,
     investigation_memory: InvestigationMemory | None = None,
 ) -> Recommendation:
-    """Normalize a completed analysis to SUPPORT or the fixed no-cause result.
+    """Apply mechanical evidence gates to the main Agent's completed conclusion.
 
-    Historical status values remain deserializable, but they are never accepted as
-    output from the strict post-collection analysis phase.
+    This host policy never infers causality. Historical status values remain
+    deserializable, but they are never accepted as output from the strict
+    post-collection analysis phase.
     """
 
     evidence_by_id = {str(item.id): item for item in evidence}
@@ -71,7 +72,7 @@ def enforce_post_evidence_root_cause_policy(
             root_cause.cause
         ):
             continue
-        if not root_cause.cause.strip() or root_cause.status != RootCauseStatus.SUPPORT:
+        if not root_cause.cause.strip() or root_cause.status != RootCauseStatus.SUPPORTED:
             continue
         if alert_reason and root_cause.cause.strip().casefold() == alert_reason:
             continue
@@ -87,7 +88,7 @@ def enforce_post_evidence_root_cause_policy(
             root_cause.model_copy(
                 update={
                     "hypothesis_id": None,
-                    "status": RootCauseStatus.SUPPORT,
+                    "status": RootCauseStatus.SUPPORTED,
                     "evidence_refs": qualified_refs,
                     "verified": True,
                     "next_probe": None,
@@ -141,9 +142,9 @@ class RuleConclusionValidator:
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
             live_successful_refs: set[str] = set()
-            if root_cause.status != RootCauseStatus.SUPPORT:
+            if root_cause.status != RootCauseStatus.SUPPORTED:
                 issues.append(
-                    f"根因 #{index}（{cause_label}）状态必须为 SUPPORT，"
+                    f"根因 #{index}（{cause_label}）状态必须为 SUPPORTED，"
                     f"不能使用历史状态 {root_cause.status.value}"
                 )
                 has_supported_cause = False
@@ -174,18 +175,22 @@ class RuleConclusionValidator:
                     )
                 elif record.structured_data.get("root_cause_eligible") is False:
                     issues.append(
-                        f"根因 #{index}（{cause_label}）引用了明确标记为不能支持"
-                        f"根因的证据：{evidence_ref}"
+                        f"根因 #{index}（{cause_label}）引用了未通过宿主完整性、"
+                        f"来源绑定或可追溯性机械门禁的证据：{evidence_ref}"
                     )
 
             if not live_successful_refs:
-                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据")
+                issues.append(
+                    f"SUPPORTED 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据"
+                )
                 has_supported_cause = False
             if not root_cause.verified:
-                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）必须标记 verified=true")
+                issues.append(
+                    f"SUPPORTED 根因 #{index}（{cause_label}）必须标记 verified=true"
+                )
                 has_supported_cause = False
             if root_cause.next_probe is not None:
-                issues.append(f"SUPPORT 根因 #{index}（{cause_label}）不得提供 next_probe")
+                issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）不得提供 next_probe")
 
         evidence_sufficient = has_supported_cause and bool(recommendation.root_causes)
         manual_matched = recommendation.manual_matched

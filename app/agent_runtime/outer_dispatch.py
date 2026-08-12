@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid5
 
 from app.agent_runtime.contracts import (
+    ArtifactRef,
     InvocationError,
     ToolInvocation,
     ToolInvocationStatus,
@@ -28,11 +29,13 @@ from app.domain.ports import (
     AlertRepository,
     RunLeaseConflict,
     ToolInvocationConflict,
+    ToolResultAnalyzer,
 )
 
 OUTER_EVIDENCE_RESULT_CONTRACT = "outer-evidence-record/v1"
 _DISPATCH_ID_VERSION = "outer-tool-dispatch/v1"
 _EVIDENCE_ID_VERSION = "outer-tool-evidence/v1"
+_RAW_RESULT_ARTIFACT_VERSION = "raw-tool-result/v1"
 _INFLIGHT_POLL_INTERVAL_SECONDS = 0.05
 
 
@@ -79,10 +82,16 @@ class DurableOuterToolDispatcher:
         repository: AlertRepository,
         executor: OuterToolExecutor,
         *,
+        result_analyzer: ToolResultAnalyzer | None = None,
+        analysis_threshold_chars: int = 12_000,
         fault_hook: OuterDispatchFaultHook | None = None,
     ) -> None:
+        if analysis_threshold_chars < 1:
+            raise ValueError("tool result analysis threshold must be positive")
         self.repository = repository
         self.executor = executor
+        self.result_analyzer = result_analyzer
+        self.analysis_threshold_chars = analysis_threshold_chars
         self.fault_hook = fault_hook
 
     async def execute(
@@ -184,6 +193,10 @@ class DurableOuterToolDispatcher:
     @staticmethod
     def build_evidence_id(invocation_id: UUID) -> UUID:
         return uuid5(invocation_id, _EVIDENCE_ID_VERSION)
+
+    @staticmethod
+    def build_raw_result_artifact_id(invocation_id: UUID) -> UUID:
+        return uuid5(invocation_id, _RAW_RESULT_ARTIFACT_VERSION)
 
     async def _load_or_create(
         self,
@@ -440,7 +453,22 @@ class DurableOuterToolDispatcher:
             started,
             evidence,
         )
-        completed = self._terminal_invocation(started, evidence)
+        artifact_ref = await self._persist_raw_result(
+            invocation=started,
+            evidence=evidence,
+            lease_owner=lease_owner,
+            fencing_token=fencing_token,
+        )
+        evidence = await self._project_large_result(
+            evidence,
+            request=request,
+            artifact_ref=artifact_ref,
+        )
+        completed = self._terminal_invocation(
+            started,
+            evidence,
+            artifact_ref=artifact_ref,
+        )
         try:
             await self.repository.update_tool_invocation(
                 completed,
@@ -669,7 +697,165 @@ class DurableOuterToolDispatcher:
                 "terminal outer invocation evidence provenance does not match"
             )
         self._validate_evidence_status(invocation, evidence)
+        if invocation.artifact_ref is not None:
+            stored = await self.repository.get_agent_artifact(
+                str(invocation.artifact_ref.artifact_id)
+            )
+            if stored is None or stored[0] != invocation.artifact_ref:
+                raise OuterDispatchError(
+                    "terminal outer invocation raw-result artifact is missing or corrupt"
+                )
+            source_artifact = evidence.structured_data.get("source_artifact")
+            if source_artifact is not None:
+                try:
+                    projected_ref = ArtifactRef.model_validate(source_artifact)
+                except Exception as exc:
+                    raise OuterDispatchError(
+                        "terminal outer invocation has an invalid artifact reference"
+                    ) from exc
+                if projected_ref != invocation.artifact_ref:
+                    raise OuterDispatchError(
+                        "terminal evidence artifact provenance does not match invocation"
+                    )
         return evidence
+
+    async def _persist_raw_result(
+        self,
+        *,
+        invocation: ToolInvocation,
+        evidence: EvidenceRecord,
+        lease_owner: str,
+        fencing_token: int,
+    ) -> ArtifactRef:
+        artifact_id = self.build_raw_result_artifact_id(invocation.invocation_id)
+        artifact = ArtifactRef(
+            artifact_id=artifact_id,
+            kind="raw_tool_result",
+            media_type="application/json",
+            uri=f"agent-artifact://{artifact_id}",
+            metadata={
+                "contract": _RAW_RESULT_ARTIFACT_VERSION,
+                "tool_name": invocation.tool_name,
+                "source_system": invocation.provider,
+                "sanitized": True,
+                "read_only": invocation.tool_read_only,
+            },
+        )
+        return await self.repository.save_agent_artifact(
+            str(invocation.run_id),
+            artifact,
+            evidence.model_dump(mode="json"),
+            invocation_id=str(invocation.invocation_id),
+            lease_owner=lease_owner,
+            fencing_token=fencing_token,
+        )
+
+    async def _project_large_result(
+        self,
+        evidence: EvidenceRecord,
+        *,
+        request: ToolExecutionRequest,
+        artifact_ref: ArtifactRef,
+    ) -> EvidenceRecord:
+        raw_result = evidence.model_dump(mode="json")
+        serialized = json.dumps(
+            raw_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if (
+            self.result_analyzer is None
+            or len(serialized) < self.analysis_threshold_chars
+        ):
+            return evidence
+
+        try:
+            analysis = await self.result_analyzer.analyze(
+                tool_name=evidence.tool_name,
+                source_system=evidence.source_system,
+                request=request.parameters,
+                raw_result=raw_result,
+                artifact=artifact_ref,
+            )
+            if (
+                analysis.source_artifact_id != artifact_ref.artifact_id
+                or analysis.source_sha256 != artifact_ref.sha256
+            ):
+                raise OuterDispatchError(
+                    "tool-result analysis provenance does not match its raw artifact"
+                )
+            provider_partial = evidence.structured_data.get("partial") is True
+            provider_ineligible = (
+                evidence.structured_data.get("root_cause_eligible") is False
+            )
+            result_usable_by_main_agent = (
+                evidence.status == ToolStatus.SUCCESS
+                and analysis.analysis_usable
+                and analysis.source_coverage_complete
+                and not provider_partial
+                and not provider_ineligible
+            )
+            projected_data: dict[str, Any] = {
+                "analysis_status": "completed",
+                "tool_result_analysis": analysis.model_dump(mode="json"),
+                "source_artifact": artifact_ref.model_dump(mode="json"),
+                # Mechanical completeness gate only. The main Agent alone decides
+                # whether these facts, combined with other evidence, imply a cause.
+                "root_cause_eligible": result_usable_by_main_agent,
+            }
+            for key in (
+                "query_completed",
+                "partial",
+                "allow_followup_dispatch",
+                "termination_reason",
+                "termination_error_type",
+                "reason_code",
+                "root_cause_ineligible_reason",
+            ):
+                if key in evidence.structured_data:
+                    projected_data[key] = evidence.structured_data[key]
+            if not analysis.analysis_usable:
+                projected_data["root_cause_ineligible_reason"] = (
+                    "independent_tool_result_analysis_unusable"
+                )
+            elif not result_usable_by_main_agent and not projected_data.get(
+                "root_cause_ineligible_reason"
+            ):
+                projected_data["root_cause_ineligible_reason"] = (
+                    "tool_result_incomplete_or_unusable"
+                )
+            return evidence.model_copy(
+                update={
+                    "summary": analysis.summary,
+                    "structured_data": projected_data,
+                    "truncated": False,
+                }
+            )
+        except Exception as exc:
+            request_id = getattr(exc, "request_id", None)
+            error_data: dict[str, Any] = {
+                "analysis_status": "failed",
+                "analysis_error_type": type(exc).__name__,
+                "source_artifact": artifact_ref.model_dump(mode="json"),
+                "root_cause_eligible": False,
+                "root_cause_ineligible_reason": (
+                    "independent_tool_result_analysis_failed"
+                ),
+            }
+            if isinstance(request_id, str) and request_id:
+                error_data["analysis_request_id"] = sanitize_text(request_id)[:512]
+            return evidence.model_copy(
+                update={
+                    "summary": (
+                        f"调查工具 {evidence.tool_name} 已返回完整结果，但独立分析会话失败，"
+                        "该结果不能用于根因判断。"
+                    ),
+                    "structured_data": error_data,
+                    "truncated": False,
+                }
+            )
 
     @classmethod
     def _normalize_request(cls, request: ToolExecutionRequest) -> ToolExecutionRequest:
@@ -874,6 +1060,8 @@ class DurableOuterToolDispatcher:
     def _terminal_invocation(
         invocation: ToolInvocation,
         evidence: EvidenceRecord,
+        *,
+        artifact_ref: ArtifactRef | None = None,
     ) -> ToolInvocation:
         status_by_evidence = {
             ToolStatus.SUCCESS: ToolInvocationStatus.SUCCEEDED,
@@ -896,6 +1084,7 @@ class DurableOuterToolDispatcher:
             status=status,
             completed_at=max(datetime.now(UTC), invocation.started_at or datetime.now(UTC)),
             error=error,
+            artifact_ref=artifact_ref,
         )
 
     @staticmethod

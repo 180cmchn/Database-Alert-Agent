@@ -368,6 +368,79 @@ async def test_flashduty_poller_rejects_silently_incomplete_pagination() -> None
         await poller.run_once(now=1000)
 
 
+@pytest.mark.asyncio
+async def test_flashduty_poller_runtime_switch_starts_and_stops_background_task() -> None:
+    disabled = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=False,
+        flashduty_poll_channel_ids=[7],
+    )
+    enabled = disabled.model_copy(update={"flashduty_polling_enabled": True})
+    loop_started = asyncio.Event()
+    loop_cancelled = asyncio.Event()
+
+    class IdleClient:
+        pass
+
+    poller = FlashDutyAlertPoller(
+        disabled,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        ManualAnalysisScheduler(),
+        IdleClient(),  # type: ignore[arg-type]
+    )
+
+    async def controlled_loop() -> None:
+        loop_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            raise
+
+    poller._loop = controlled_loop  # type: ignore[method-assign]
+
+    await poller.start()
+    assert poller._task is None
+
+    await poller.sync_settings(enabled)
+    await asyncio.wait_for(loop_started.wait(), timeout=1)
+    assert poller.enabled is True
+    assert poller._task is not None
+
+    await poller.sync_settings(disabled)
+    await asyncio.wait_for(loop_cancelled.wait(), timeout=1)
+    assert poller.enabled is False
+    assert poller._task is None
+
+
+@pytest.mark.asyncio
+async def test_flashduty_poller_disabled_switch_prevents_manual_loop_iteration() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=False,
+        flashduty_poll_channel_ids=[7],
+    )
+
+    class ClientThatMustNotRun:
+        async def list_alerts(self, **payload):  # type: ignore[no-untyped-def]
+            raise AssertionError(f"disabled polling called FlashDuty with {payload}")
+
+    poller = FlashDutyAlertPoller(
+        settings,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        ManualAnalysisScheduler(),
+        ClientThatMustNotRun(),  # type: ignore[arg-type]
+    )
+
+    assert await poller.run_once(now=1000) == 0
+
+
 def test_flashduty_poller_keeps_start_to_start_interval() -> None:
     assert _remaining_poll_delay(300, started_at=100.0, finished_at=125.0) == 275.0
     assert _remaining_poll_delay(300, started_at=100.0, finished_at=450.0) == 0.0

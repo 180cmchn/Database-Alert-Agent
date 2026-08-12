@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from uuid import uuid5
 
 from app.adapters.external_knowledge import (
     ExternalKnowledgeClient,
@@ -13,10 +14,12 @@ from app.adapters.external_knowledge import (
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.agent_runtime.outer_dispatch import DurableOuterToolDispatcher
 from app.agents.state import AgentState
-from app.application.sanitization import sanitize
+from app.application.sanitization import sanitize, sanitize_alert
 from app.application.validation import enforce_post_evidence_root_cause_policy
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import (
+    INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AdvisorMetadata,
     AlertStatus,
     EvidenceRecord,
@@ -24,21 +27,23 @@ from app.domain.models import (
     InvestigationContext,
     InvestigationRun,
     InvestigationStage,
+    NormalizedAlert,
     ProgressRecord,
     Recommendation,
     RunbookExcerpt,
     RunStatus,
-    ToolExecutionRequest,
     ToolStatus,
     ValidationKind,
     ValidationRecord,
 )
 from app.domain.ports import (
     AIAdvisor,
+    AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
     InvestigationStrategyProvider,
     RunbookProvider,
+    ToolResultAnalyzer,
 )
 from app.investigations.models import InvestigationMemory
 
@@ -63,7 +68,10 @@ class NodeContext:
         conclusion_validator: ConclusionValidator,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
+        tool_result_analyzer: ToolResultAnalyzer | None = None,
+        tool_result_analysis_threshold_chars: int = 12_000,
         strategy_provider: InvestigationStrategyProvider,
+        alert_detail_enricher: AlertDetailEnricher | None = None,
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
@@ -78,7 +86,10 @@ class NodeContext:
         self.conclusion_validator = conclusion_validator
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
+        self.tool_result_analyzer = tool_result_analyzer
+        self.tool_result_analysis_threshold_chars = tool_result_analysis_threshold_chars
         self.strategy_provider = strategy_provider
+        self.alert_detail_enricher = alert_detail_enricher
         self.runbook_limit = runbook_limit
         self.external_knowledge_client = external_knowledge_client
         self.external_knowledge_limit = external_knowledge_limit
@@ -86,6 +97,187 @@ class NodeContext:
         self.knowledge_sources = (
             knowledge_sources if knowledge_sources is not None else ["local_pdf"]
         )
+
+
+async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
+    """Load authoritative alert detail before knowledge and tool decisions."""
+
+    alert = state.alert
+    run = state.run
+    if not alert or not run:
+        return {"error": "Missing run or alert in alert detail node"}
+    if alert.source.casefold() != "flashduty":
+        return {}
+
+    evidence_id = uuid5(
+        run.id,
+        f"flashduty-alert-info-evidence-v1:{alert.external_id}",
+    )
+    existing_evidence = next((item for item in state.evidence if item.id == evidence_id), None)
+    stored_for_run = state.stored_alert
+    if existing_evidence is None:
+        stored_for_run = await ctx.repository.get(state.alert_id, run_id=str(run.id))
+        if stored_for_run is not None:
+            existing_evidence = next(
+                (
+                    item
+                    for item in stored_for_run.evidence_records
+                    if item.id == evidence_id
+                    and item.tool_name == "flashduty_alert_info"
+                    and item.source_system == "flashduty_alert_detail"
+                ),
+                None,
+            )
+    if existing_evidence is not None:
+        detail_data = existing_evidence.structured_data
+        if (
+            existing_evidence.status != ToolStatus.SUCCESS
+            or detail_data.get("read_only") is not True
+            or detail_data.get("partial") is not False
+            or detail_data.get("authoritative_source") != "/alert/info"
+            or not isinstance(detail_data.get("alert_detail"), dict)
+        ):
+            raise RuntimeError("Persisted FlashDuty alert detail evidence is invalid")
+        replay_alert = NormalizedAlert.model_validate(detail_data["alert_detail"]).model_copy(
+            update={
+                "raw_payload": {
+                    "flashduty_alert_info": detail_data.get("flashduty_alert_info"),
+                }
+            }
+        )
+        if (
+            replay_alert.id != alert.id
+            or replay_alert.external_id != alert.external_id
+            or replay_alert.source.casefold() != "flashduty"
+        ):
+            raise RuntimeError("Persisted FlashDuty alert detail identity does not match")
+        existing_progress = next(
+            (
+                item
+                for item in (stored_for_run.progress if stored_for_run is not None else [])
+                if item.details.get("flashduty_detail_status") == "loaded"
+            ),
+            None,
+        )
+        return {
+            "alert": replay_alert,
+            "stored_alert": (
+                state.stored_alert.model_copy(update={"alert": replay_alert})
+                if state.stored_alert is not None
+                else stored_for_run
+            ),
+            "evidence": [] if existing_evidence in state.evidence else [existing_evidence],
+            "progress": (
+                []
+                if existing_progress is None or existing_progress in state.progress
+                else [existing_progress]
+            ),
+        }
+
+    database = alert.database
+    baseline = alert.model_copy(
+        update={
+            "database": (
+                database.model_copy(update={"host": None, "port": None})
+                if database is not None
+                else None
+            )
+        }
+    )
+    # Clear any endpoint persisted by an older release before attempting the
+    # authoritative read. A failed detail lookup must never leave stale host or
+    # port data available to later retries or operators.
+    await ctx.repository.update_alert(
+        state.alert_id,
+        baseline,
+        run_id=str(run.id),
+        **_lease_fence(run),
+    )
+
+    enricher = ctx.alert_detail_enricher
+    if enricher is None:
+        raise RuntimeError(
+            "FlashDuty alert detail is required before knowledge matching and MCP selection"
+        )
+    if getattr(enricher, "read_only", None) is not True:
+        raise RuntimeError(
+            "FlashDuty alert detail enricher must explicitly declare read_only=true"
+        )
+    try:
+        enriched = sanitize_alert(
+            preprocess_normalized_alert(await enricher.enrich(baseline))
+        )
+    except Exception as exc:
+        logger.warning(
+            "flashduty_alert_detail_unavailable alert_id=%s error=%s: %s",
+            alert.external_id,
+            type(exc).__name__,
+            sanitize(str(exc)),
+        )
+        raise RuntimeError(
+            "FlashDuty alert detail is unavailable; investigation cannot continue"
+        ) from exc
+
+    await ctx.repository.update_alert(
+        state.alert_id,
+        enriched,
+        run_id=str(run.id),
+        **_lease_fence(run),
+    )
+    detail_evidence = EvidenceRecord(
+        id=evidence_id,
+        run_id=run.id,
+        tool_name="flashduty_alert_info",
+        source_system="flashduty_alert_detail",
+        status=ToolStatus.SUCCESS,
+        request={
+            "operation": "alert_info",
+            "alert_id": enriched.external_id,
+            "read_only": True,
+        },
+        summary="已获取权威 FlashDuty 告警详情；该记录仅陈述告警事实，不代表根因结论。",
+        structured_data={
+            "read_only": True,
+            "partial": False,
+            "authoritative_source": "/alert/info",
+            "flashduty_alert_info": enriched.raw_payload.get("flashduty_alert_info"),
+            "alert_detail": enriched.model_dump(mode="json", exclude={"raw_payload"}),
+        },
+        started_at=run.created_at,
+        collected_at=run.created_at,
+    )
+    await ctx.repository.save_evidence(
+        state.alert_id,
+        detail_evidence,
+        **_lease_fence(run),
+    )
+    progress = ProgressRecord(
+        run_id=run.id,
+        stage=InvestigationStage.RECEIVED,
+        message=(
+            "已获取 FlashDuty 告警详情。"
+        ),
+        details={
+            "flashduty_detail_status": "loaded",
+            "read_only": True,
+        },
+    )
+    await ctx.repository.append_progress(
+        state.alert_id,
+        progress,
+        **_lease_fence(run),
+    )
+    stored_alert = state.stored_alert
+    return {
+        "alert": enriched,
+        "stored_alert": (
+            stored_alert.model_copy(update={"alert": enriched})
+            if stored_alert is not None
+            else None
+        ),
+        "evidence": [detail_evidence],
+        "progress": [progress],
+    }
 
 
 async def fingerprint_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
@@ -302,7 +494,12 @@ async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str,
     if not run or not alert:
         return {"error": "Missing run or alert in strategy selection node"}
 
-    strategy = await ctx.strategy_provider.select(alert, runbooks)
+    strategy = await ctx.strategy_provider.select(
+        alert,
+        runbooks,
+        state.external_knowledge,
+        state.knowledge_match_summary,
+    )
     await ctx.repository.update_run(
         str(run.id),
         strategy_id=strategy.strategy_id,
@@ -371,7 +568,12 @@ async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, A
         fencing_token=run.fencing_token,
         investigation_memory={},
     )
-    dispatcher = DurableOuterToolDispatcher(ctx.repository, ctx.tool_executor)
+    dispatcher = DurableOuterToolDispatcher(
+        ctx.repository,
+        ctx.tool_executor,
+        result_analyzer=ctx.tool_result_analyzer,
+        analysis_threshold_chars=ctx.tool_result_analysis_threshold_chars,
+    )
 
     for request in pending_requests:
         result = await dispatcher.execute(
@@ -569,18 +771,6 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         None,
     )
 
-    required_failures = _required_tool_failures(strategy.tool_plan, evidence)
-    if required_failures:
-        rule_validation = rule_validation.model_copy(
-            update={
-                "evidence_sufficient": False,
-                "metadata": {
-                    **rule_validation.metadata,
-                    "required_tool_failures": required_failures,
-                    "evidence_gap": (f"必需调查工具未成功：{', '.join(required_failures)}"),
-                },
-            }
-        )
     host_inconclusive_reasons = _host_inconclusive_reasons(state)
     if host_inconclusive_reasons:
         rule_validation = rule_validation.model_copy(
@@ -685,7 +875,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     validation_passed = state.validation_passed
     evidence_sufficient = state.evidence_sufficient
     advisor_degraded = state.advisor_degraded
-    shadow_enabled = state.shadow_enabled
     error = state.error
     host_inconclusive_reasons = _host_inconclusive_reasons(state)
 
@@ -703,7 +892,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     passed = (
         validation_passed
         and evidence_sufficient
-        and not shadow_enabled
         and not advisor_degraded
         and not host_inconclusive_reasons
     )
@@ -714,12 +902,12 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     if not passed and recommendation:
         recommendation = recommendation.model_copy(
             update={
-                "confidence": min(recommendation.confidence, 0.5),
-                "analysis_mode": "shadow" if shadow_enabled else "assist",
+                "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
+                "likely_causes": [],
+                "root_causes": [],
+                "confidence": 0,
             }
         )
-    elif recommendation:
-        recommendation = recommendation.model_copy(update={"analysis_mode": "assist"})
 
     await _update_progress(
         ctx.repository,
@@ -743,27 +931,12 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 details={
                     "validation_passed": validation_passed,
                     "evidence_sufficient": evidence_sufficient,
-                    "shadow_enabled": shadow_enabled,
                     "advisor_degraded": advisor_degraded,
                     "host_inconclusive_reasons": host_inconclusive_reasons,
                 },
             )
         ],
     }
-
-
-def _required_tool_failures(
-    requests: list[ToolExecutionRequest], evidence: list[EvidenceRecord]
-) -> list[str]:
-    """Get list of required tools that failed."""
-    statuses: dict[str, list[ToolStatus]] = {}
-    for item in evidence:
-        statuses.setdefault(item.tool_name, []).append(item.status)
-    return [
-        request.tool_name
-        for request in requests
-        if request.required and ToolStatus.SUCCESS not in statuses.get(request.tool_name, [])
-    ]
 
 
 def _host_inconclusive_reasons(state: AgentState) -> list[str]:

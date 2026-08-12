@@ -25,6 +25,7 @@ from app.domain.models import (
     StoredAlert,
     ToolExecutionRequest,
     ToolExecutionResult,
+    ToolResultAnalysis,
     ValidationRecord,
 )
 
@@ -99,6 +100,14 @@ class AlertSourceAdapter(Protocol):
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert: ...
 
 
+class AlertDetailEnricher(Protocol):
+    """Load the authoritative detail view used by an investigation."""
+
+    read_only: bool
+
+    async def enrich(self, alert: NormalizedAlert) -> NormalizedAlert: ...
+
+
 class RunbookProvider(Protocol):
     async def search(self, alert: NormalizedAlert, limit: int = 5) -> list[RunbookExcerpt]: ...
 
@@ -123,6 +132,23 @@ class AIAdvisor(Protocol):
         investigation_memory: InvestigationMemory | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]: ...
 
+
+class ToolResultAnalyzer(Protocol):
+    """Project a complete sanitized result into traceable facts and anomalies.
+
+    This child-session boundary does not authorize causal or root-cause decisions.
+    """
+
+    async def analyze(
+        self,
+        *,
+        tool_name: str,
+        source_system: str,
+        request: dict[str, Any],
+        raw_result: dict[str, Any],
+        artifact: ArtifactRef,
+    ) -> ToolResultAnalysis: ...
+
 class ManagementNotifier(Protocol):
     async def send(self, event: AnalysisResultEvent) -> str | None: ...
 
@@ -134,6 +160,9 @@ class InvestigationTool(Protocol):
     @property
     def source_system(self) -> str: ...
 
+    @property
+    def read_only(self) -> bool: ...
+
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
     ) -> tuple[str, dict[str, Any]] | ToolExecutionResult: ...
@@ -141,7 +170,11 @@ class InvestigationTool(Protocol):
 
 class InvestigationStrategyProvider(Protocol):
     async def select(
-        self, alert: NormalizedAlert, runbooks: list[RunbookExcerpt] | None = None
+        self,
+        alert: NormalizedAlert,
+        runbooks: list[RunbookExcerpt] | None = None,
+        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
+        knowledge_match_summary: str = "",
     ) -> InvestigationStrategy: ...
 
 
@@ -175,6 +208,16 @@ class AlertRepository(Protocol):
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int: ...
 
     async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]: ...
+
+    async def update_alert(
+        self,
+        alert_id: str,
+        alert: NormalizedAlert,
+        *,
+        run_id: str,
+        lease_owner: str,
+        fencing_token: int,
+    ) -> None: ...
 
     async def set_status(self, alert_id: str, status: AlertStatus) -> None: ...
 

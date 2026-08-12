@@ -32,6 +32,7 @@ from app.adapters.prometheus_mcp import (
     PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS,
     PROMETHEUS_MCP_PROMPT_VERSION,
     PROMETHEUS_MCP_SERVER_NAME,
+    PrometheusMCPCallResult,
     PrometheusMCPClient,
     PrometheusMCPConfigurationError,
     PrometheusMCPError,
@@ -92,6 +93,7 @@ class PrometheusHarnessState:
     monitoring_scope_reason: str | None = None
     monitored_database_engines: list[str] = field(default_factory=list)
     monitoring_target_identifiers: list[str] = field(default_factory=list)
+    raw_call_results: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -105,6 +107,21 @@ _RETRYABLE_INVOCATION_ERROR_CODES = {
     "TimeoutError",
     "recovered_unknown_outcome",
 }
+
+
+def _no_redirect_http_client(
+    headers: dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    """Build the SSE transport client without forwarding credentials on redirects."""
+
+    return httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        follow_redirects=False,
+    )
 
 
 class _PrometheusSSETransportError(PrometheusMCPProtocolError):
@@ -214,7 +231,7 @@ class PrometheusSSEMCPToolSession:
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
-        return self.client.result_payload(raw_result)
+        return self.client.call_result(raw_result)
 
     async def close(self) -> None:
         if self._closed:
@@ -266,6 +283,7 @@ class PrometheusSSEMCPConnector:
                     headers=self.client.headers,
                     timeout=self.client.timeout_seconds,
                     sse_read_timeout=self.client.sse_read_timeout_seconds,
+                    httpx_client_factory=_no_redirect_http_client,
                 )
             )
             session = await stack.enter_async_context(
@@ -634,6 +652,12 @@ class PrometheusHarnessScenario:
         result: Any,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
         updated = deepcopy(state)
+        if not isinstance(result, PrometheusMCPCallResult):
+            raise PrometheusMCPProtocolError(
+                "Prometheus Harness received a result without its raw MCP envelope"
+            )
+        updated.raw_call_results.append(deepcopy(result.raw_call_result))
+        result = result.payload
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
         policy = self.authorized_policies[call.tool_name]
@@ -688,7 +712,7 @@ class PrometheusHarnessScenario:
                         "root_cause_ineligible_reason": (
                             "target_mismatch" if target_mismatch else "no_observation"
                         ),
-                        "result": self.client.evidence_visible_payload(result),
+                        "result": sanitize(result),
                     }
                 )
             if target_mismatch:
@@ -750,7 +774,7 @@ class PrometheusHarnessScenario:
                         else "auxiliary_result"
                     )
                 ),
-                "result": self.client.evidence_visible_payload(result),
+                "result": sanitize(result),
             }
             updated.responses.append(response)
             model_payload = result
@@ -852,7 +876,7 @@ class PrometheusHarnessScenario:
             "monitoring_scope_status": "investigating",
             "root_cause_eligible": False,
             "root_cause_ineligible_reason": "monitoring_scope_discovery",
-            "result": self.client.evidence_visible_payload(result),
+            "result": sanitize(result),
         }
         updated.responses.append(response)
         updated.tool_attempts.append(
@@ -921,6 +945,9 @@ class PrometheusHarnessScenario:
         status: ToolInvocationStatus,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
         updated = deepcopy(state)
+        raw_call_result = error.details.get("raw_call_result")
+        if isinstance(raw_call_result, dict):
+            updated.raw_call_results.append(deepcopy(raw_call_result))
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
         capability = str(call.metadata.get("capability") or "unknown")
@@ -1439,6 +1466,7 @@ async def collect_prometheus_with_harness(
         monitoring_scope_reason=state.monitoring_scope_reason,
         monitored_database_engines=tuple(state.monitored_database_engines),
         monitoring_target_identifiers=tuple(state.monitoring_target_identifiers),
+        raw_call_results=tuple(deepcopy(state.raw_call_results)),
     )
 
 

@@ -361,7 +361,7 @@ export function AlertDetailPage() {
           <div className="recommendation-hero">
             <div className="recommendation-mark"><BrainCircuit size={27} /></div>
             <div className="recommendation-copy">
-              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.analysis_mode === "shadow" && <span className="manual-proof"><Eye size={13} /> 影子分析</span>}{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 本地 PDF 命中</span>}{recommendation.external_knowledge_matches.length > 0 && <span className="manual-proof"><ExternalLink size={13} /> 外部知识命中</span>}</div>
+              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 本地 PDF 命中</span>}{recommendation.external_knowledge_matches.length > 0 && <span className="manual-proof"><ExternalLink size={13} /> 外部知识命中</span>}</div>
               <h2>{recommendation.summary}</h2>
               <div className="recommendation-meta">
                 <span><Gauge size={15} /> 置信度 <strong>{formatPercent(recommendation.confidence)}</strong></span>
@@ -634,10 +634,6 @@ export function AlertDetailPage() {
                       <div>
                         <dt>校验</dt>
                         <dd>{run.config_snapshot.validation_enabled ? "启用" : "禁用"}</dd>
-                      </div>
-                      <div>
-                        <dt>影子模式</dt>
-                        <dd>{run.config_snapshot.shadow_enabled ? "启用" : "禁用"}</dd>
                       </div>
                       <div>
                         <dt>AI Fallback</dt>

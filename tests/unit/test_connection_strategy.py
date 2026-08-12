@@ -9,6 +9,8 @@ from app.domain.models import INCONCLUSIVE_ROOT_CAUSE_SUMMARY, AlertStatus
 
 
 class RecordingTool:
+    read_only = True
+
     def __init__(self, name: str, calls: list[tuple[str, dict]]) -> None:
         self.name = name
         self.source_system = "test_diagnostics"
@@ -41,7 +43,7 @@ def make_settings(tmp_path: Path, name: str) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> None:
+async def test_connection_alert_does_not_trigger_hard_coded_tools(tmp_path: Path) -> None:
     calls: list[tuple[str, dict]] = []
     registry = InvestigationToolRegistry(
         [
@@ -67,15 +69,11 @@ async def test_connection_strategy_collects_live_evidence(tmp_path: Path) -> Non
         },
     )
 
-    # The collected metrics describe the alert symptom but do not establish a
-    # causal mechanism, so the strict post-collection result stays empty.
+    # Registered non-MCP tools are not selected by alert-type branches. MCP
+    # relevance selection is driven only by the declarative catalog bindings.
     assert result.status == AlertStatus.INCONCLUSIVE
-    assert [name for name, _ in calls] == ["query_metrics"]
-    assert all(parameters["environment"] == "production" for _, parameters in calls)
-    parameters_by_tool = dict(calls)
-    assert parameters_by_tool["query_metrics"]["ds_name"] == "prod-prom"
-    assert parameters_by_tool["query_metrics"]["expr"] == "mysql_threads_connected"
-    assert all(item.status.value == "SUCCESS" for item in result.evidence_records)
+    assert calls == []
+    assert result.evidence_records == []
     assert all(item.passed for item in result.validations)
     assert all(not item.evidence_sufficient for item in result.validations)
     assert result.recommendation is not None

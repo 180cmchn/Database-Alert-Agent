@@ -619,7 +619,7 @@ def _identifier_filter_text(value: str) -> str:
 
 def _alert_filter_blobs(alert: NormalizedAlert) -> tuple[str, str, str]:
     values, assignments = _flatten_alert_filter_text(
-        alert.model_dump(mode="json")
+        alert.model_dump(mode="json", exclude={"raw_payload"})
     )
     value_blob = _normalized_filter_text("\n".join(values))
     condition_blob = _normalized_filter_text("\n".join([*values, *assignments]))

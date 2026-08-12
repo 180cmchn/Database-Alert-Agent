@@ -10,6 +10,7 @@ import pytest
 
 from app.adapters.flashduty import (
     FlashDutyAlertContextTool,
+    FlashDutyAlertDetailEnricher,
     FlashDutyAlertSourceAdapter,
     FlashDutyAPIError,
     FlashDutyChangesTool,
@@ -347,10 +348,13 @@ def test_flashduty_alert_adapter_normalizes_alert_info_envelope() -> None:
 
 def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> None:
     payload = flashduty_alert_payload()
+    payload["data"]["alarm_host"] = "pg-prod-01"
+    payload["data"]["alarm_port"] = "5432"
     payload["data"]["labels"] = {
         "env": "prd",
         "app_type": "PostgreSQL",
-        "alarm_host": "pg-prod-01",
+        "alarm_host": "ignored-label-host",
+        "alarm_port": "15432",
         "db_name": "orders",
         "promql": "pg_stat_activity_count",
         "logql": '{service="postgres"} |= "deadlock"',
@@ -358,13 +362,16 @@ def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> No
         "threshold": "90",
     }
 
-    alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize(payload)
+    alert = FlashDutyAlertSourceAdapter({"production": ["prd"]}).normalize_detail(payload)
 
     assert alert.database is not None
     assert alert.database.engine == "postgresql"
     assert alert.database.instance == "pg-prod-01"
     assert alert.database.host == "pg-prod-01"
+    assert alert.database.port == 5432
     assert alert.database.database == "orders"
+    assert "alarm_host" not in alert.labels
+    assert "alarm_port" not in alert.labels
     assert alert.attributes["flashduty_target_locator"] == "pg-prod-01"
     assert alert.attributes["flashduty_target_kind"] == "postgres"
     assert alert.attributes["flashduty_metrics"] == {
@@ -375,6 +382,73 @@ def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> No
     }
     assert alert.features["observed_value"] == "95"
     assert alert.features["threshold"] == "90"
+
+
+def test_flashduty_poll_item_cannot_define_database_endpoint() -> None:
+    payload = flashduty_alert_payload()
+    payload["data"]["title"] = "MySQL/mysql_slow_query/db-list:3307"
+    payload["data"]["labels"].update(
+        {
+            "alarm_host": "db-list",
+            "alarm_port": "3307",
+            "host": "generic-host",
+            "host_ip": "192.0.2.10",
+        }
+    )
+
+    alert = FlashDutyAlertSourceAdapter().normalize(payload)
+
+    assert alert.database is not None
+    assert alert.database.host is None
+    assert alert.database.port is None
+    assert not ({"alarm_host", "alarm_port", "host", "host_ip"} & alert.labels.keys())
+
+
+@pytest.mark.asyncio
+async def test_flashduty_detail_enricher_preserves_identity_and_detail_endpoint() -> None:
+    polled = flashduty_alert_payload()
+    polled["data"]["title"] = "MySQL/mysql_slow_query/list-host:3307"
+    polled["data"]["labels"].update(
+        {"alarm_host": "list-host", "alarm_port": "3307"}
+    )
+    adapter = FlashDutyAlertSourceAdapter()
+    alert = adapter.normalize(polled)
+    local_id = alert.id
+
+    class DetailClient:
+        async def alert_info(self, alert_id: str) -> FlashDutyResponse:
+            assert alert_id == ALERT_ID
+            detail = flashduty_alert_payload()["data"]
+            detail["alarm_host"] = "detail-host"
+            detail["alarm_port"] = "3306"
+            return FlashDutyResponse(request_id="req-detail", data=detail)
+
+    enriched = await FlashDutyAlertDetailEnricher(  # type: ignore[arg-type]
+        DetailClient(), adapter
+    ).enrich(alert)
+
+    assert enriched.id == local_id
+    assert enriched.database is not None
+    assert enriched.database.host == "detail-host"
+    assert enriched.database.port == 3306
+    assert enriched.attributes["flashduty_detail_loaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_flashduty_detail_enricher_rejects_identity_mismatch() -> None:
+    adapter = FlashDutyAlertSourceAdapter()
+    alert = adapter.normalize(flashduty_alert_payload())
+
+    class MismatchedClient:
+        async def alert_info(self, _alert_id: str) -> FlashDutyResponse:
+            detail = flashduty_alert_payload()["data"]
+            detail["alert_id"] = "1234567890abcdef12345678"
+            return FlashDutyResponse(request_id="req-detail", data=detail)
+
+    with pytest.raises(Exception, match="identity does not match"):
+        await FlashDutyAlertDetailEnricher(  # type: ignore[arg-type]
+            MismatchedClient(), adapter
+        ).enrich(alert)
 
 
 def test_flashduty_alert_adapter_removes_slow_query_filter_note() -> None:
@@ -742,7 +816,7 @@ async def test_unavailable_monitor_target_is_skipped_as_missing_capability() -> 
 
 
 @pytest.mark.asyncio
-async def test_default_strategy_omits_unproductive_flashduty_probes() -> None:
+async def test_default_strategy_does_not_create_fixed_flashduty_probes() -> None:
     strategy = await DefaultInvestigationStrategyProvider(
         available_tools=[
             "alert_context",
@@ -752,8 +826,8 @@ async def test_default_strategy_omits_unproductive_flashduty_probes() -> None:
         ]
     ).select(make_context().alert)
 
-    tool_names = [item.tool_name for item in strategy.tool_plan]
-    assert tool_names == ["alert_context", "query_similar_incidents"]
+    assert strategy.tool_plan == []
+    assert strategy.strategy_id == "agent-selected-mcp-v1"
 
 
 def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
@@ -778,7 +852,7 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     assert normalized.source == "flashduty"
     assert isinstance(runtime.service.tool_registry.get("query_metrics"), FlashDutyDataSourceTool)
     assert isinstance(runtime.service.tool_registry.get("query_changes"), FlashDutyChangesTool)
-    assert runtime.service.strategy_provider.external_tool_timeout_seconds == 120  # type: ignore[attr-defined]
+    assert runtime.service.strategy_provider.mcp_bindings == ()  # type: ignore[attr-defined]
 
 
 def test_factory_disables_unaudited_flashduty_capabilities_by_default(

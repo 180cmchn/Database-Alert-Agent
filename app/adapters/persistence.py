@@ -208,29 +208,7 @@ def _bounded_invocation_result(result: Mapping[str, Any]) -> dict[str, Any]:
         separators=(",", ":"),
         default=str,
     )
-    safe = json.loads(serialized)
-    if len(serialized) <= INVOCATION_RESULT_MAX_CHARS:
-        return safe
-
-    controls = {
-        key: safe[key]
-        for key in _INVOCATION_RESULT_CONTROL_KEYS
-        if key in safe
-    }
-    bounded: dict[str, Any] = {
-        **controls,
-        "result_truncated": True,
-        "original_char_count": len(serialized),
-        "preview": "",
-    }
-    overhead = len(json.dumps(bounded, ensure_ascii=False, default=str))
-    bounded["preview"] = serialized[: max(INVOCATION_RESULT_MAX_CHARS - overhead, 0)]
-    while bounded["preview"]:
-        bounded_size = len(json.dumps(bounded, ensure_ascii=False, default=str))
-        if bounded_size <= INVOCATION_RESULT_MAX_CHARS:
-            break
-        bounded["preview"] = bounded["preview"][: -(bounded_size - INVOCATION_RESULT_MAX_CHARS)]
-    return bounded
+    return json.loads(serialized)
 
 
 def _safe_agent_event_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -317,16 +295,6 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 DATABASE_SCHEMA_REVISION = "0013"
 AGENT_EVENT_PAYLOAD_MAX_CHARS = 12_000
-INVOCATION_RESULT_MAX_CHARS = 12_000
-_INVOCATION_RESULT_CONTROL_KEYS = (
-    "status",
-    "query_completed",
-    "root_cause_eligible",
-    "root_cause_ineligible_reason",
-    "partial",
-    "termination_reason",
-    "termination_error_type",
-)
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -813,6 +781,39 @@ class SQLAlchemyAlertRepository:
                 return await self._to_stored(session, existing), False
             await session.refresh(row)
             return await self._to_stored(session, row), True
+
+    async def update_alert(
+        self,
+        alert_id: str,
+        alert: NormalizedAlert,
+        *,
+        run_id: str,
+        lease_owner: str,
+        fencing_token: int,
+    ) -> None:
+        """Replace the normalized alert while holding the active run lease."""
+
+        if str(alert.id) != alert_id:
+            raise ValueError("updated alert identity does not match alert_id")
+        async with self.session_factory() as session:
+            row = await _lock_alert_row(session, alert_id)
+            if row is None:
+                raise RunLeaseConflict(run_id, "alert does not exist")
+            run_row = await _require_active_run_lease(
+                session,
+                run_id,
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
+            )
+            if run_row.alert_id != alert_id:
+                raise RunLeaseConflict(
+                    run_id, "run does not belong to the requested alert"
+                )
+            if row.source != alert.source or row.external_id != alert.external_id:
+                raise ValueError("updated alert source identity cannot change")
+            row.alert_json = alert.model_dump(mode="json")
+            row.updated_at = _utc_now()
+            await session.commit()
 
     async def list_by_status(self, statuses: set[AlertStatus]) -> list[StoredAlert]:
         async with self.session_factory() as session:

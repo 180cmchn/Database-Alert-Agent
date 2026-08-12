@@ -4,19 +4,28 @@ from uuid import uuid4
 import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
-from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.adapters.investigation import (
+    DefaultInvestigationStrategyProvider,
+    InvestigationToolRegistry,
+    MCPToolBinding,
+    ToolExecutor,
+)
 from app.domain.models import (
+    ExternalKnowledgeExcerpt,
     InvestigationContext,
     InvestigationStrategy,
+    RunbookExcerpt,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolStatus,
 )
+from app.domain.tool_calling import MCPServerSelection
 
 
 class SuccessfulTool:
     name = "successful"
     source_system = "test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "evidence collected", {"value": 42}
@@ -25,6 +34,7 @@ class SuccessfulTool:
 class SlowTool:
     name = "slow"
     source_system = "test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         await asyncio.sleep(0.05)
@@ -34,6 +44,7 @@ class SlowTool:
 class FailingTool:
     name = "failing"
     source_system = "test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         raise RuntimeError("backend unavailable")
@@ -42,6 +53,7 @@ class FailingTool:
 class NoDataTool:
     name = "no_data"
     source_system = "test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return ToolExecutionResult(
@@ -60,6 +72,7 @@ class PermissionDeniedError(RuntimeError):
 class PermissionDeniedTool:
     name = "permission_denied"
     source_system = "test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         raise PermissionDeniedError("not allowed")
@@ -68,6 +81,7 @@ class PermissionDeniedTool:
 class LargeControlledTool:
     name = "large_controlled"
     source_system = "archery_mcp"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence", {
@@ -87,6 +101,7 @@ class LargeControlledTool:
 class LargeUnqualifiedTool:
     name = "large_unqualified"
     source_system = "live_test_system"
+    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence without eligibility", {"sample": "x" * 3000}
@@ -97,6 +112,7 @@ class SchemaBoundTool:
     source_system = "test_system"
     capability = "lookup_by_service"
     policy_version = "test-policy-v2"
+    read_only = True
     input_schema = {
         "type": "object",
         "properties": {"service": {"type": "string", "minLength": 1}},
@@ -134,6 +150,118 @@ def make_context() -> InvestigationContext:
     return InvestigationContext(run_id=uuid4(), alert=alert, strategy=strategy)
 
 
+class StaticMCPSelector:
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self.names = names
+        self.calls: list[dict[str, object]] = []
+
+    async def select_mcp_servers(self, **payload):  # type: ignore[no-untyped-def]
+        self.calls.append(payload)
+        return MCPServerSelection(server_names=self.names)
+
+
+@pytest.mark.asyncio
+async def test_strategy_model_can_select_zero_relevant_mcp_servers() -> None:
+    selector = StaticMCPSelector(())
+    provider = DefaultInvestigationStrategyProvider(
+        model=selector,
+        mcp_bindings=[
+            MCPToolBinding(
+                server_name="archery",
+                tool_name="query_archery_slow_logs",
+                role="slow log agent",
+                purpose="query slow query logs",
+                timeout_seconds=60,
+            )
+        ],
+        available_tools=["query_archery_slow_logs"],
+    )
+
+    strategy = await provider.select(make_context().alert)
+
+    assert strategy.tool_plan == []
+    assert selector.calls[0]["candidates"] == [
+        {
+            "name": "archery",
+            "role": "slow log agent",
+            "purpose": "query slow query logs",
+            "read_only": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strategy_selection_receives_local_and_external_knowledge() -> None:
+    selector = StaticMCPSelector(())
+    provider = DefaultInvestigationStrategyProvider(
+        model=selector,
+        mcp_bindings=[MCPToolBinding("archery", "archery_tool", "role", "logs", 120)],
+        available_tools=["archery_tool"],
+    )
+    runbook = RunbookExcerpt(
+        runbook_id="pdf-1",
+        title="Slow query PDF",
+        content="PDF root cause guidance",
+    )
+    external = ExternalKnowledgeExcerpt(
+        knowledge_id="external-1",
+        title="External slow query note",
+        content="External handling guidance",
+        source_uri="https://knowledge.example.test/items/1",
+        score=0.9,
+        raw_score=0.9,
+    )
+
+    await provider.select(
+        make_context().alert,
+        [runbook],
+        [external],
+        "知识匹配结果：本地 PDF 和外部知识库均命中。",
+    )
+
+    payload = selector.calls[0]
+    assert [item["source"] for item in payload["knowledge_matches"]] == [
+        "local_pdf",
+        "external_knowledge",
+    ]
+    assert payload["knowledge_matches"][0]["match"]["runbook_id"] == "pdf-1"
+    assert payload["knowledge_matches"][1]["match"]["knowledge_id"] == "external-1"
+    assert "均命中" in payload["knowledge_match_summary"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_model_can_select_multiple_optional_mcp_servers() -> None:
+    selector = StaticMCPSelector(("prometheus", "archery"))
+    provider = DefaultInvestigationStrategyProvider(
+        model=selector,
+        mcp_bindings=[
+            MCPToolBinding("archery", "archery_tool", "log role", "logs", 120),
+            MCPToolBinding("prometheus", "prometheus_tool", "metric role", "metrics", 180),
+        ],
+        available_tools=["archery_tool", "prometheus_tool"],
+    )
+
+    strategy = await provider.select(make_context().alert)
+
+    assert [request.tool_name for request in strategy.tool_plan] == [
+        "prometheus_tool",
+        "archery_tool",
+    ]
+    assert all(request.required is False for request in strategy.tool_plan)
+
+
+@pytest.mark.asyncio
+async def test_strategy_rejects_model_selected_server_outside_catalog() -> None:
+    provider = DefaultInvestigationStrategyProvider(
+        model=StaticMCPSelector(("invented",)),
+        mcp_bindings=[MCPToolBinding("archery", "archery_tool", "role", "logs", 120)],
+        available_tools=["archery_tool"],
+    )
+
+    with pytest.raises(ValueError, match="outside the configured catalog"):
+        await provider.select(make_context().alert)
+
+
 @pytest.mark.asyncio
 async def test_tool_executor_returns_success() -> None:
     executor = ToolExecutor(InvestigationToolRegistry([SuccessfulTool()]))
@@ -151,25 +279,18 @@ async def test_tool_executor_returns_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_executor_preserves_decision_fields_when_result_is_truncated() -> None:
-    executor = ToolExecutor(
-        InvestigationToolRegistry([LargeControlledTool()]),
-        max_result_chars=800,
-    )
+async def test_tool_executor_keeps_complete_provider_result() -> None:
+    executor = ToolExecutor(InvestigationToolRegistry([LargeControlledTool()]))
 
     record = await executor.execute(
         ToolExecutionRequest(tool_name="large_controlled"),
         make_context(),
     )
 
-    assert record.truncated is True
+    assert record.truncated is False
     assert record.structured_data["query_completed"] is True
-    assert record.structured_data["root_cause_eligible"] is False
-    assert (
-        record.structured_data["root_cause_ineligible_reason"]
-        == "evidence_payload_truncated"
-    )
-    assert record.structured_data["eligible_before_truncation"] is True
+    assert record.structured_data["root_cause_eligible"] is True
+    assert record.structured_data["root_cause_ineligible_reason"] == ""
     assert record.structured_data["partial"] is True
     assert record.structured_data["allow_followup_dispatch"] is False
     assert (
@@ -184,28 +305,24 @@ async def test_tool_executor_preserves_decision_fields_when_result_is_truncated(
     )
     assert "instance_identity_verification" not in record.structured_data
     assert "analysis_usable" not in record.structured_data
+    assert record.structured_data["result"]["sample"] == "x" * 3000
     assert record.is_root_cause_support_eligible() is False
 
 
 @pytest.mark.asyncio
-async def test_truncated_evidence_without_explicit_eligibility_fails_closed() -> None:
-    executor = ToolExecutor(
-        InvestigationToolRegistry([LargeUnqualifiedTool()]),
-        max_result_chars=200,
-    )
+async def test_complete_result_does_not_invent_root_cause_ineligibility() -> None:
+    executor = ToolExecutor(InvestigationToolRegistry([LargeUnqualifiedTool()]))
 
     record = await executor.execute(
         ToolExecutionRequest(tool_name="large_unqualified"),
         make_context(),
     )
 
-    assert record.truncated is True
-    assert record.structured_data["root_cause_eligible"] is False
-    assert (
-        record.structured_data["root_cause_ineligible_reason"]
-        == "evidence_payload_truncated"
-    )
-    assert record.is_root_cause_support_eligible() is False
+    assert record.truncated is False
+    assert record.structured_data["sample"] == "x" * 3000
+    assert "root_cause_eligible" not in record.structured_data
+    assert "root_cause_ineligible_reason" not in record.structured_data
+    assert record.is_root_cause_support_eligible() is True
 
 
 @pytest.mark.asyncio
@@ -312,6 +429,17 @@ def test_registry_exposes_versioned_tool_contracts() -> None:
     assert spec.policy_version == "test-policy-v2"
     assert spec.schema_version.startswith("sha256:")
     assert spec.input_schema["required"] == ["service"]
+
+
+def test_registry_rejects_missing_read_only_declaration() -> None:
+    class UndeclaredTool:
+        name = "undeclared"
+        source_system = "test_system"
+
+    registry = InvestigationToolRegistry([UndeclaredTool()])  # type: ignore[list-item]
+
+    with pytest.raises(TypeError, match="explicitly declare read_only"):
+        registry.available_specs()
 
 
 @pytest.mark.asyncio

@@ -110,7 +110,6 @@ export function SettingsPage() {
         react_max_dynamic_turns: settings.react_max_dynamic_turns,
         archery_mcp_max_agent_steps: numberField(form, "archery_mcp_max_agent_steps"),
         validation_enabled: form.get("validation_enabled") === "on",
-        shadow_enabled: form.get("shadow_enabled") === "on",
         runbook_limit: numberField(form, "runbook_limit"),
         scheduler_workers: numberField(form, "scheduler_workers"),
         knowledge_sources: knowledgeSources,
@@ -193,7 +192,7 @@ export function SettingsPage() {
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
 
-        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty API 轮询" description="仅通过 FlashDuty Open API 拉取告警；APP Key 和协作空间范围由部署环境的 .env 管理，轮询开关、间隔和回看范围可在此页运行时调整。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured ? "yes" : "no"}`}><ShieldCheck size={13} />{settings.flashduty_enabled ? (settings.flashduty_app_key_configured ? "只读轮询已启用" : "APP Key 未配置") : "未启用"}</span>}>
+        <SectionCard eyebrow="ALERT SOURCE" title="FlashDuty API 轮询" description="仅通过 FlashDuty Open API 拉取告警；APP Key 和协作空间范围由部署环境的 .env 管理，轮询开关、间隔和回看范围可在此页运行时调整。" action={<span className={`configured-chip ${settings.flashduty_enabled && settings.flashduty_app_key_configured && flashdutyPollingEnabled ? "yes" : "no"}`}><ShieldCheck size={13} />{!settings.flashduty_enabled ? "数据源未启用" : !settings.flashduty_app_key_configured ? "APP Key 未配置" : flashdutyPollingEnabled ? "自动轮询中" : "自动轮询已关闭"}</span>}>
           <div className="switch-stack">
             <label className="switch-row"><span><RefreshCw size={17} /><span><strong>启用轮询</strong><small>开启后自动按间隔拉取协作空间告警</small></span></span><input name="flashduty_polling_enabled" type="checkbox" checked={flashdutyPollingEnabled} onChange={(event) => setFlashdutyPollingEnabled(event.target.checked)} disabled={!settings.flashduty_enabled} /><i /></label>
           </div>
@@ -226,7 +225,6 @@ export function SettingsPage() {
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>历史动态规划配置</strong><small>仅用于读取旧配置快照，当前分析流程不使用</small></span></span><input type="checkbox" checked={settings.react_enabled} disabled /><i /></label>
             <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则校验与同一配置模型的独立验收轮次</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
             <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，并以结论不充分结束</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>启用影子运行</strong><small>执行完整分析但固定以结论不充分结束，不作为已完成生产结论</small></span></span><input name="shadow_enabled" type="checkbox" defaultChecked={settings.shadow_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>

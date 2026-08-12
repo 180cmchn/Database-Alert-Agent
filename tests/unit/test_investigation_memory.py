@@ -205,7 +205,7 @@ def test_alert_platform_evidence_cannot_support_a_root_cause() -> None:
     assert result.status == RootCauseStatus.UNKNOWN
 
 
-def test_truncated_success_requires_explicit_root_cause_eligibility() -> None:
+def test_truncated_success_requires_complete_data_eligibility() -> None:
     hypothesis = make_hypothesis()
     truncated = make_evidence(truncated=True)
     eligible = make_evidence(truncated=True, root_cause_eligible=True)

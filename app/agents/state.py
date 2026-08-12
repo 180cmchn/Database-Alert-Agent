@@ -101,7 +101,6 @@ class AgentState(BaseModel):
 
     # Configuration
     validation_enabled: bool = True
-    shadow_enabled: bool = False
     ai_fallback_enabled: bool = True
     knowledge_sources: list[str] = Field(default_factory=lambda: ["local_pdf"])
 
@@ -114,7 +113,6 @@ def create_initial_state(
     *,
     max_dynamic_turns: int = 0,
     validation_enabled: bool = True,
-    shadow_enabled: bool = False,
     ai_fallback_enabled: bool = True,
     knowledge_sources: list[str] | None = None,
 ) -> AgentState:
@@ -127,7 +125,6 @@ def create_initial_state(
         run: The investigation run
         max_dynamic_turns: Maximum dynamic tool selection turns
         validation_enabled: Whether to enable validation
-        shadow_enabled: Whether shadow mode is enabled
         ai_fallback_enabled: Whether AI fallback is enabled
         knowledge_sources: Which knowledge sources to use for matching
 
@@ -145,7 +142,6 @@ def create_initial_state(
         max_dynamic_turns=max_dynamic_turns,
         dynamic_turns_remaining=max_dynamic_turns,
         validation_enabled=validation_enabled,
-        shadow_enabled=shadow_enabled,
         ai_fallback_enabled=ai_fallback_enabled,
         knowledge_sources=(
             knowledge_sources if knowledge_sources is not None else ["local_pdf"]

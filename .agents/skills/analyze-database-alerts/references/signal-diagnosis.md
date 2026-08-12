@@ -48,9 +48,15 @@ Prefer evidence that is:
 1. collected during the alert window;
 2. scoped to the affected database object or node;
 3. produced by the affected system;
-4. successful and untruncated;
+4. successful and complete, or represented by a traceable fact/anomaly/limitation projection from a
+   complete hash-bound result artifact;
 5. directly relevant to the normalized alert signal.
 
 During collection, record temporal order without interpreting it. After all selected collection is
 terminal, the analysis phase may establish a causal mechanism only when the complete evidence
 supports it. Otherwise return no root cause.
+
+A child Agent that projects a large result performs no causal reasoning: it must not propose a root
+cause or classify facts as supporting or contradicting one. Only the main Agent can combine evidence
+across sources and decide causality. A `root_cause_eligible` field, when retained, is only a mechanical
+Host integrity/provenance/completeness gate and never proof of a causal relationship.

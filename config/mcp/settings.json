@@ -1,15 +1,29 @@
 {
   "mcpServers": {
     "archery": {
+      "readOnly": true,
       "url": "${ARCHERY_MCP_URL}",
       "headers": {
         "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
+      },
+      "prompts": {
+        "role": "prompts/archery/role.md",
+        "purpose": "prompts/archery/purpose.md",
+        "workflow": "prompts/archery/workflow.md",
+        "safety": "prompts/archery/safety.md"
       }
     },
     "prometheus": {
+      "readOnly": true,
       "url": "${PROMETHEUS_MCP_SSE_URL}",
-      "headers": {
+      "optionalHeaders": {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
+      },
+      "prompts": {
+        "role": "prompts/prometheus/role.md",
+        "purpose": "prompts/prometheus/purpose.md",
+        "workflow": "prompts/prometheus/workflow.md",
+        "safety": "prompts/prometheus/safety.md"
       },
       "toolPolicies": {
         "health_check": {

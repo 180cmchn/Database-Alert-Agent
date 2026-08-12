@@ -17,8 +17,8 @@ import type { StoredAlert } from "../types/api";
 type WeComView = "overview" | "root-cause" | "recovery-advice";
 
 const rootCauseLabels = {
-  SUPPORT: "实时证据已支持",
-  SUPPORTED: "已有实时证据支持",
+  SUPPORT: "历史结果：实时证据已支持",
+  SUPPORTED: "实时证据已支持",
   CONTRADICTED: "历史结果：已被实时证据反驳",
   UNKNOWN: "证据不足",
 } as const;

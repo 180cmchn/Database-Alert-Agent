@@ -133,6 +133,15 @@ _TARGET_KIND_BY_ENGINE: Final[Mapping[str, str]] = {
     "postgresql": "postgres",
     "mongodb": "mongodb",
 }
+_ENDPOINT_LABEL_KEYS: Final = {
+    "alarm_host",
+    "alarm_port",
+    "alert_host",
+    "alert_port",
+    "host",
+    "host_ip",
+    "port",
+}
 
 
 def _first_nonempty(*values: Any) -> str | None:
@@ -143,6 +152,20 @@ def _first_nonempty(*values: Any) -> str | None:
         if normalized:
             return normalized
     return None
+
+
+def _alarm_port(value: Any) -> int | None:
+    """Return a valid TCP port without coercing arbitrary numeric values."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    else:
+        return None
+    return port if 1 <= port <= 65_535 else None
 
 
 def _database_engine_from_labels(
@@ -450,6 +473,21 @@ class FlashDutyAlertSourceAdapter:
         self._canonical = CanonicalAlertSourceAdapter(environment_aliases)
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert:
+        """Normalize a polled alert without trusting it as endpoint detail."""
+
+        return self._normalize(payload, authoritative_detail=False)
+
+    def normalize_detail(self, payload: dict[str, Any]) -> NormalizedAlert:
+        """Normalize `/alert/info`; only this view may define host and port."""
+
+        return self._normalize(payload, authoritative_detail=True)
+
+    def _normalize(
+        self,
+        payload: dict[str, Any],
+        *,
+        authoritative_detail: bool,
+    ) -> NormalizedAlert:
         request_id: str | None = None
         item: Any = payload
         if isinstance(payload.get("error"), dict):
@@ -491,6 +529,11 @@ class FlashDutyAlertSourceAdapter:
         if not isinstance(raw_labels, dict):
             raise InvalidAlertPayloadError("FlashDuty labels must be an object")
         labels = {str(key): str(value) for key, value in raw_labels.items()}
+        canonical_labels = {
+            key: value
+            for key, value in labels.items()
+            if key not in _ENDPOINT_LABEL_KEYS
+        }
         incident = item.get("incident") if isinstance(item.get("incident"), dict) else {}
         incident_id = incident.get("incident_id") or item.get("incident_id")
         if incident_id is not None and (
@@ -508,16 +551,17 @@ class FlashDutyAlertSourceAdapter:
             item.get("data_source_type"),
         )
         database_engine = _database_engine_from_labels(labels, resource_type)
-        database_host = _first_nonempty(
-            labels.get("host"),
-            labels.get("alarm_host"),
-            labels.get("host_ip"),
+        database_host = (
+            _first_nonempty(item.get("alarm_host")) if authoritative_detail else None
+        )
+        database_port = (
+            _alarm_port(item.get("alarm_port")) if authoritative_detail else None
         )
         database_instance = _first_nonempty(
             labels.get("instance"),
             labels.get("resource"),
-            database_host,
             labels.get("resource_name"),
+            database_host,
         )
         database_values = {
             "engine": database_engine,
@@ -529,6 +573,7 @@ class FlashDutyAlertSourceAdapter:
                 labels.get("schema"),
             ),
             "host": database_host,
+            "port": database_port,
         }
         database = (
             DatabaseTarget(**database_values)
@@ -610,10 +655,8 @@ class FlashDutyAlertSourceAdapter:
                 "observed_value": labels.get("value"),
                 "threshold": labels.get("threshold"),
                 "alarm_content": labels.get("alarm_content"),
-                "alarm_host": labels.get("alarm_host"),
-                "host_ip": labels.get("host_ip"),
             },
-            "labels": labels,
+            "labels": canonical_labels,
             "attributes": attributes,
         }
         normalized = self._canonical.normalize(mapped)
@@ -635,6 +678,47 @@ class FlashDutyAlertSourceAdapter:
                 "raw_severity": raw_severity,
                 "incident_fingerprint": fingerprint,
                 "raw_payload": payload,
+            }
+        )
+
+
+class FlashDutyAlertDetailEnricher:
+    """Load and normalize the authoritative read-only FlashDuty alert detail."""
+
+    read_only = True
+
+    def __init__(
+        self,
+        client: FlashDutyClient,
+        adapter: FlashDutyAlertSourceAdapter,
+    ) -> None:
+        self.client = client
+        self.adapter = adapter
+
+    async def enrich(self, alert: NormalizedAlert) -> NormalizedAlert:
+        if alert.source.casefold() != self.adapter.source:
+            return alert
+        response = await self.client.alert_info(alert.external_id)
+        detail = self.adapter.normalize_detail(
+            {"request_id": response.request_id, "data": response.data}
+        )
+        if detail.external_id != alert.external_id:
+            raise InvalidAlertPayloadError(
+                "FlashDuty alert detail identity does not match the stored alert"
+            )
+        attributes = {**alert.attributes, **detail.attributes}
+        initial_request_id = alert.attributes.get("flashduty_request_id")
+        if initial_request_id and initial_request_id != response.request_id:
+            attributes["flashduty_ingest_request_id"] = initial_request_id
+        attributes["flashduty_detail_loaded"] = True
+        return detail.model_copy(
+            update={
+                "id": alert.id,
+                "attributes": attributes,
+                "raw_payload": {
+                    "flashduty_alert_info": detail.raw_payload,
+                    "flashduty_ingested_alert": alert.raw_payload,
+                },
             }
         )
 
@@ -665,6 +749,7 @@ def _flashduty_identifier(alert: NormalizedAlert, name: str) -> str | None:
 class FlashDutyAlertContextTool:
     name = "alert_context"
     source_system = "alert_platform"
+    read_only = True
 
     def __init__(self, client: FlashDutyClient, *, item_limit: int = 20) -> None:
         self.client = client
@@ -745,6 +830,7 @@ class FlashDutyAlertContextTool:
 class FlashDutySimilarIncidentsTool:
     name = "query_similar_incidents"
     source_system = "alert_platform"
+    read_only = True
 
     def __init__(self, client: FlashDutyClient) -> None:
         self.client = client
@@ -779,6 +865,7 @@ class FlashDutySimilarIncidentsTool:
 class FlashDutyChangesTool:
     name = "query_changes"
     source_system = "alert_platform"
+    read_only = True
 
     def __init__(
         self,
@@ -858,6 +945,7 @@ def _merged_query_config(
 
 class FlashDutyDataSourceTool:
     source_system = "flashduty_monitors"
+    read_only = True
 
     def __init__(
         self,
@@ -1116,6 +1204,7 @@ def _is_read_only_tool_name(name: str) -> bool:
 class FlashDutyDatabaseDiagnosticsTool:
     name = "query_database_diagnostics"
     source_system = "flashduty_monitors"
+    read_only = True
 
     def __init__(self, client: FlashDutyClient) -> None:
         self.client = client

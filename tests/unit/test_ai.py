@@ -58,9 +58,9 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
     assert "知识匹配和全部实时证据采集已经结束后工作" in ai_module.SYSTEM_PROMPT
     assert "必须一次性完整审阅这些输入之后才分析根因" in ai_module.SYSTEM_PROMPT
     assert "不得构造或展示待验证原因、假设" in ai_module.SYSTEM_PROMPT
-    assert "status 必须为 SUPPORT" in ai_module.SYSTEM_PROMPT
+    assert "status 必须为 SUPPORTED" in ai_module.SYSTEM_PROMPT
     assert "现有结果无法得出根因" in ai_module.SYSTEM_PROMPT
-    assert "不得为新结果使用 SUPPORTED、UNKNOWN 或 CONTRADICTED" in (
+    assert "不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED" in (
         ai_module.SYSTEM_PROMPT
     )
     assert not hasattr(ai_module.OpenAICompatibleAdvisor, "choose_next_tool")
@@ -68,9 +68,21 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
 
 
 def test_prompts_treat_partial_success_as_descriptive_missing_evidence() -> None:
-    assert "截断或部分结果只是证据缺失" in ai_module.SYSTEM_PROMPT
+    assert "NO_DATA 或部分结果只是证据缺失" in ai_module.SYSTEM_PROMPT
+    assert "只能把完整原始返回转换为可追溯的结构化事实、异常与限制" in (
+        ai_module.SYSTEM_PROMPT
+    )
+    assert "不得提出、选择或判断根因" in ai_module.SYSTEM_PROMPT
+    assert "只有你这个主 Agent" in ai_module.SYSTEM_PROMPT
+    assert "宿主依据状态、完整性、来源绑定和可追溯性设置的机械接纳门禁" in (
+        ai_module.SYSTEM_PROMPT
+    )
     assert "structured_data.partial 不为 true" in ai_module.SYSTEM_PROMPT
     assert "partial" in ai_module.VALIDATION_PROMPT
+    assert "大结果子 Agent 只能提供可追溯的结构化事实、异常与限制" in (
+        ai_module.VALIDATION_PROMPT
+    )
+    assert "不是因果结论" in ai_module.VALIDATION_PROMPT
     assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
 
 

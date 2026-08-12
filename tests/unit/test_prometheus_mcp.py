@@ -41,8 +41,13 @@ from app.domain.models import (
     ToolStatus,
 )
 from app.domain.tool_calling import MCPModelToolCall
+from app.mcp_catalog import MCPPromptBundle, load_mcp_catalog
 
 ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROMETHEUS_PROMPTS = load_mcp_catalog(
+    PROJECT_ROOT / "config/mcp/settings.json"
+).require("prometheus").prompts
 _FAKE_RANGE_POLICY = PrometheusMCPToolPolicy(
     name="arbitrary_monitoring_tool",
     capability="range_query",
@@ -50,6 +55,21 @@ _FAKE_RANGE_POLICY = PrometheusMCPToolPolicy(
     end_argument_path=("end",),
     timestamp_encoding="rfc3339",
 )
+
+
+def _write_prompt_files(
+    directory: Path,
+    server_name: str,
+    prompts: MCPPromptBundle = PROMETHEUS_PROMPTS,
+) -> dict[str, str]:
+    prompt_directory = directory / "prompts" / server_name
+    prompt_directory.mkdir(parents=True, exist_ok=True)
+    references: dict[str, str] = {}
+    for prompt_name in ("role", "purpose", "workflow", "safety"):
+        path = prompt_directory / f"{prompt_name}.md"
+        path.write_text(getattr(prompts, prompt_name), encoding="utf-8")
+        references[prompt_name] = str(path.relative_to(directory))
+    return references
 
 
 def _server_settings(
@@ -60,6 +80,7 @@ def _server_settings(
     return PrometheusMCPServerSettings(
         url="https://prometheus.example.test/sse",
         headers=headers or {},
+        prompts=PROMETHEUS_PROMPTS,
         tool_policies=tool_policies,
     )
 
@@ -149,21 +170,45 @@ def _mysql_slow_context() -> InvestigationContext:
     )
 
 
+def test_prometheus_target_uses_canonical_database_endpoint_only() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(update={"port": 3306}),
+            "labels": {
+                "instance": "label-instance",
+                "alarm_host": "wrong-host",
+                "alarm_port": "3307",
+            },
+        }
+    )
+
+    target = PrometheusMCPClient.monitoring_target_context(alert)
+
+    assert target["host"] == "mysql-17"
+    assert target["port"] == 3306
+    assert target["endpoint"] == "mysql-17:3306"
+    assert target["instance_candidates"] == ["mysql-17:3306", "mysql-17"]
+
+
 def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_secret(
     tmp_path: Path,
 ) -> None:
     settings_path = tmp_path / "settings.json"
+    prompts = _write_prompt_files(tmp_path, "prometheus")
     settings_path.write_text(
         json.dumps(
             {
                 "mcpServers": {
                     "prometheus": {
+                        "readOnly": True,
                         "url": "${PROMETHEUS_MCP_SSE_URL}",
-                        "headers": {
+                        "optionalHeaders": {
                             "${PROMETHEUS_MCP_API_KEY_HEADER}": (
                                 "${PROMETHEUS_MCP_API_KEY}"
                             )
                         },
+                        "prompts": prompts,
                         "toolPolicies": {
                             "get_targets": {
                                 "capability": "target_discovery",
@@ -195,6 +240,7 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
 
     assert resolved.url == "https://prometheus.example.test/sse"
     assert resolved.headers == {"X-API-Key": "test-prometheus-secret"}
+    assert resolved.prompts == PROMETHEUS_PROMPTS
     assert resolved.tool_policies == (
         PrometheusMCPToolPolicy(
             name="get_targets",
@@ -213,21 +259,24 @@ def test_prometheus_mcp_settings_resolve_header_placeholder_without_persisting_s
     assert "test-prometheus-secret" not in settings_path.read_text(encoding="utf-8")
 
 
-def test_prometheus_mcp_settings_omit_optional_auth_header_when_key_is_empty(
+def test_prometheus_mcp_settings_reject_half_configured_optional_auth_header(
     tmp_path: Path,
 ) -> None:
     settings_path = tmp_path / "settings.json"
+    prompts = _write_prompt_files(tmp_path, "prometheus")
     settings_path.write_text(
         json.dumps(
             {
                 "mcpServers": {
                     "prometheus": {
+                        "readOnly": True,
                         "url": "${PROMETHEUS_MCP_SSE_URL}",
-                        "headers": {
+                        "optionalHeaders": {
                             "${PROMETHEUS_MCP_API_KEY_HEADER}": (
                                 "${PROMETHEUS_MCP_API_KEY}"
                             )
                         },
+                        "prompts": prompts,
                     }
                 }
             }
@@ -235,16 +284,95 @@ def test_prometheus_mcp_settings_omit_optional_auth_header_when_key_is_empty(
         encoding="utf-8",
     )
 
-    resolved = load_prometheus_mcp_server_settings(
-        settings_path,
-        environment={
-            "PROMETHEUS_MCP_SSE_URL": "https://prometheus.example.test/sse",
-            "PROMETHEUS_MCP_API_KEY_HEADER": "Authorization",
-            "PROMETHEUS_MCP_API_KEY": "",
-        },
-    )
+    with pytest.raises(
+        PrometheusMCPConfigurationError,
+        match=r"optional header name and value .*must both be configured",
+    ):
+        load_prometheus_mcp_server_settings(
+            settings_path,
+            environment={
+                "PROMETHEUS_MCP_SSE_URL": "https://prometheus.example.test/sse",
+                "PROMETHEUS_MCP_API_KEY_HEADER": "Authorization",
+                "PROMETHEUS_MCP_API_KEY": "",
+            },
+        )
 
-    assert resolved.headers == {}
+
+@pytest.mark.asyncio
+async def test_prometheus_prompt_file_update_changes_actual_model_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    first_prompts = MCPPromptBundle(
+        role="prometheus-role-from-file",
+        purpose="prometheus-purpose-from-file",
+        workflow="prometheus-workflow-v1-from-file",
+        safety="read_only: true\nprometheus-safety-from-file",
+    )
+    prompt_references = _write_prompt_files(
+        tmp_path,
+        "prometheus",
+        first_prompts,
+    )
+    settings_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "prometheus": {
+                        "readOnly": True,
+                        "url": "${PROMETHEUS_MCP_SSE_URL}",
+                        "headers": {},
+                        "prompts": prompt_references,
+                        "toolPolicies": {
+                            "arbitrary_monitoring_tool": {
+                                "capability": "range_query",
+                                "startArgument": "start",
+                                "endArgument": "end",
+                                "timestampEncoding": "rfc3339",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _FakeSession)
+
+    async def capture_system_message() -> str:
+        _FakeSession.calls = []
+        model = _SequenceModel(
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"],
+            arguments=[{"query": "up"}, {}],
+        )
+        client = PrometheusMCPClient.from_settings(
+            settings_path,
+            model,
+            environment={
+                "PROMETHEUS_MCP_SSE_URL": "https://prometheus.example.test/sse"
+            },
+            max_agent_steps=1,
+        )
+        await client.collect_alert_window(_context())
+        return str(model.messages[0][0]["content"])
+
+    first_message = await capture_system_message()
+    workflow_path = tmp_path / prompt_references["workflow"]
+    workflow_path.write_text("prometheus-workflow-v2-from-file", encoding="utf-8")
+    second_message = await capture_system_message()
+
+    assert "[role]\nprometheus-role-from-file" in second_message
+    assert "[purpose]\nprometheus-purpose-from-file" in second_message
+    assert "[safety]\nread_only: true\nprometheus-safety-from-file" in second_message
+    assert "prometheus-workflow-v1-from-file" in first_message
+    assert "prometheus-workflow-v1-from-file" not in second_message
+    assert "[workflow]\nprometheus-workflow-v2-from-file" in second_message
 
 
 def test_prometheus_settings_are_deployment_only_but_call_budget_is_runtime_editable() -> None:
@@ -278,6 +406,50 @@ def test_prometheus_mcp_is_enabled_without_an_api_key() -> None:
         "Prometheus MCP configuration is incomplete" in issue
         for issue in settings.readiness_issues()
     )
+
+
+@pytest.mark.parametrize(
+    ("header", "api_key", "missing_setting"),
+    [
+        ("Authorization", "", "PROMETHEUS_MCP_API_KEY"),
+        ("", "secret", "PROMETHEUS_MCP_API_KEY_HEADER"),
+    ],
+)
+def test_prometheus_mcp_readiness_rejects_half_configured_authentication(
+    header: str,
+    api_key: str,
+    missing_setting: str,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        prometheus_mcp_sse_url="https://prometheus.example.test/sse",
+        prometheus_mcp_api_key_header=header,
+        prometheus_mcp_api_key=api_key,
+    )
+
+    issue = next(
+        item
+        for item in settings.readiness_issues()
+        if "Prometheus MCP authentication is incomplete" in item
+    )
+    assert "PROMETHEUS_MCP_API_KEY_HEADER" in issue
+    assert "PROMETHEUS_MCP_API_KEY" in issue
+    assert missing_setting in issue
+    assert "both be configured or both be empty" in issue
+
+
+def test_prometheus_mcp_readiness_reports_header_only_configuration() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        prometheus_mcp_api_key_header="Authorization",
+    )
+
+    issues = settings.readiness_issues()
+
+    assert any("Prometheus MCP authentication is incomplete" in item for item in issues)
+    assert any("PROMETHEUS_MCP_SSE_URL" in item for item in issues)
 
 
 def test_prometheus_mcp_rejects_business_error_with_successful_protocol_envelope() -> None:
@@ -362,6 +534,43 @@ def test_prometheus_mcp_decodes_json_observation_from_text_content() -> None:
     assert has_monitoring_observation(payload) is True
 
 
+def test_prometheus_call_result_keeps_complete_envelope_with_structured_payload() -> None:
+    raw_result = type(
+        "ToolResult",
+        (),
+        {
+            "model_dump": lambda _self, **kwargs: {
+                "_meta": {
+                    "trace_id": "trace-1",
+                    "api_key": "must-not-survive",
+                    "by_alias": kwargs.get("by_alias"),
+                },
+                "content": [
+                    {"type": "text", "text": "human-readable monitoring result"}
+                ],
+                "structuredContent": {"series": [{"value": 42}]},
+                "isError": False,
+            }
+        },
+    )()
+
+    result = PrometheusMCPClient.call_result(raw_result)
+
+    assert result.payload == {"series": [{"value": 42}]}
+    assert result.raw_call_result == {
+        "_meta": {
+            "trace_id": "trace-1",
+            "api_key": "***REDACTED***",
+            "by_alias": True,
+        },
+        "content": [
+            {"type": "text", "text": "human-readable monitoring result"}
+        ],
+        "structuredContent": {"series": [{"value": 42}]},
+        "isError": False,
+    }
+
+
 def test_prometheus_mcp_range_contract_uses_timestamps_only_to_reject_mismatch() -> None:
     in_window = {
         "data": {
@@ -433,6 +642,7 @@ class _FakeTool:
         return {
             "name": "arbitrary_monitoring_tool",
             "description": "Server-defined monitoring query",
+            "annotations": {"readOnlyHint": True},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -687,8 +897,60 @@ def test_prometheus_local_policy_rejects_unknown_and_destructive_tools() -> None
             ]
         )
 
+    for tool_annotations in ({}, {"readOnlyHint": False}):
+        with pytest.raises(PrometheusMCPConfigurationError, match="no tool authorized"):
+            client.authorized_model_tools(
+                [
+                    {
+                        "name": "arbitrary_monitoring_tool",
+                        "inputSchema": schema,
+                        "annotations": tool_annotations,
+                    }
+                ]
+            )
+
+    second_policy = PrometheusMCPToolPolicy(
+        name="second_monitoring_tool",
+        capability="range_query",
+        start_argument_path=("start",),
+        end_argument_path=("end",),
+        timestamp_encoding="rfc3339",
+    )
+    mixed_client = PrometheusMCPClient(
+        _server_settings(tool_policies=(_FAKE_RANGE_POLICY, second_policy)),
+        _SequenceModel(["arbitrary_monitoring_tool"]),
+    )
+    for unsafe_annotations in (
+        {},
+        {"readOnlyHint": True, "destructiveHint": True},
+    ):
+        with pytest.raises(
+            PrometheusMCPConfigurationError,
+            match="read-only contract failed for: second_monitoring_tool",
+        ):
+            mixed_client.authorized_model_tools(
+                [
+                    {
+                        "name": "arbitrary_monitoring_tool",
+                        "inputSchema": schema,
+                        "annotations": {"readOnlyHint": True},
+                    },
+                    {
+                        "name": "second_monitoring_tool",
+                        "inputSchema": schema,
+                        "annotations": unsafe_annotations,
+                    },
+                ]
+            )
+
     converted, _ = client.authorized_model_tools(
-        [{"name": "arbitrary_monitoring_tool", "inputSchema": schema}]
+        [
+            {
+                "name": "arbitrary_monitoring_tool",
+                "inputSchema": schema,
+                "annotations": {"readOnlyHint": True},
+            }
+        ]
     )
     description = converted[0]["function"]["description"]
     assert "capability=range_query" in description
@@ -1363,6 +1625,7 @@ async def test_prometheus_stops_when_catalog_has_no_slow_query_metric(
         PrometheusMCPServerSettings(
             url="https://prometheus.example.test/sse",
             headers={},
+            prompts=PROMETHEUS_PROMPTS,
             tool_policies=(
                 PrometheusMCPToolPolicy(
                     name="execute_range_query",
@@ -1561,13 +1824,16 @@ def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
     tmp_path: Path,
 ) -> None:
     settings_path = tmp_path / "settings.json"
+    prompts = _write_prompt_files(tmp_path, "prometheus")
     settings_path.write_text(
         json.dumps(
             {
                 "mcpServers": {
                     "prometheus": {
+                        "readOnly": True,
                         "url": "${PROMETHEUS_MCP_SSE_URL}",
                         "headers": {},
+                        "prompts": prompts,
                         "toolPolicies": {
                             "arbitrary_monitoring_tool": {
                                 "capability": "range_query",
@@ -1590,7 +1856,6 @@ def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
         mcp_settings_path=settings_path,
         prometheus_mcp_sse_url="https://prometheus.example.test/sse",
         prometheus_mcp_tool_timeout_seconds=777,
-        tool_max_result_chars=4_321,
     )
 
     tool = factory_module._build_prometheus_mcp_tool(
@@ -1600,7 +1865,6 @@ def test_prometheus_factory_uses_outer_tool_timeout_for_sse_idle_timeout(
 
     assert tool is not None
     assert tool.client.sse_read_timeout_seconds == 777
-    assert tool.max_evidence_chars == 4_321
 
 
 @pytest.mark.asyncio
@@ -1729,6 +1993,13 @@ async def test_prometheus_client_returns_standard_mcp_error_text_to_model(
 
     assert len(_SequencedSession.calls) == 2
     assert len(result.responses) == 1
+    assert result.raw_call_results == (
+        {
+            "isError": True,
+            "content": [{"type": "text", "text": "invalid range selector"}],
+        },
+        {"structuredContent": {"series": [{"value": 7}]}},
+    )
     assert [item["outcome"] for item in result.tool_attempts] == [
         "tool_error",
         "observation",
@@ -1939,7 +2210,7 @@ async def test_prometheus_client_keeps_completed_response_when_sse_close_fails(
 
 
 @pytest.mark.asyncio
-async def test_prometheus_large_observation_remains_finishable_after_evidence_truncation(
+async def test_prometheus_large_observation_is_preserved_and_remains_finishable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeSession.calls = []
@@ -1974,7 +2245,58 @@ async def test_prometheus_large_observation_remains_finishable_after_evidence_tr
     assert result.finished_by_model is True
     assert result.has_monitoring_data is True
     assert result.responses[0]["window_verification"] == "exact"
-    assert result.responses[0]["result"]["result_truncated_for_evidence"] is True
+    values = result.responses[0]["result"]["series"][0]["values"]
+    assert values[1][1] == "x" * 30_000
+
+
+@pytest.mark.asyncio
+async def test_prometheus_evidence_record_keeps_untruncated_raw_call_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_content = "raw-prometheus-content:" + ("x" * 250_000)
+    raw_call_result = {
+        "_meta": {"trace_id": "trace-large-result"},
+        "content": [{"type": "text", "text": large_content}],
+        "structuredContent": {
+            "series": [
+                {
+                    "metric": {"job": "mysql"},
+                    "values": [[1786067700, "1"], [1786068000, "2"]],
+                }
+            ]
+        },
+        "isError": False,
+    }
+    _FakeSession.calls = []
+    _FakeSession.result = raw_call_result
+    monkeypatch.setattr(
+        prometheus_harness_module,
+        "sse_client",
+        lambda *_args, **_kwargs: _AsyncContext((object(), object())),
+    )
+    monkeypatch.setattr(prometheus_harness_module, "ClientSession", _FakeSession)
+    client = PrometheusMCPClient(
+        _server_settings(),
+        _SequenceModel(
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"]
+        ),
+        max_agent_steps=2,
+    )
+    executor = ToolExecutor(
+        InvestigationToolRegistry([PrometheusMCPEvidenceTool(client)])
+    )
+
+    record = await executor.execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _context(),
+    )
+
+    assert record.status == ToolStatus.SUCCESS
+    assert record.truncated is False
+    assert record.structured_data["raw_call_results"] == [raw_call_result]
+    preserved = record.structured_data["raw_call_results"][0]["content"][0]["text"]
+    assert preserved == large_content
+    assert len(preserved) == len(large_content)
 
 
 class _RecordingPrometheusClient:
@@ -2109,8 +2431,7 @@ async def test_prometheus_evidence_at_budget_is_success_only_when_monitoring_res
 
 
 @pytest.mark.asyncio
-async def test_prometheus_no_data_trace_avoids_outer_executor_blind_truncation() -> None:
-    max_result_chars = 12_000
+async def test_prometheus_no_data_trace_preserves_complete_results() -> None:
     tool_attempts: list[dict[str, Any]] = []
     responses: list[dict[str, Any]] = []
     for index in range(8):
@@ -2188,14 +2509,8 @@ async def test_prometheus_no_data_trace_avoids_outer_executor_blind_truncation()
         tool_attempts=tuple(tool_attempts),
         termination_reason="call_limit_reached",
     )
-    tool = PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
-        _RecordingPrometheusClient(result),
-        max_evidence_chars=max_result_chars,
-    )
-    executor = ToolExecutor(
-        InvestigationToolRegistry([tool]),
-        max_result_chars=max_result_chars,
-    )
+    tool = PrometheusMCPEvidenceTool(_RecordingPrometheusClient(result))  # type: ignore[arg-type]
+    executor = ToolExecutor(InvestigationToolRegistry([tool]))
 
     record = await executor.execute(
         ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
@@ -2205,33 +2520,14 @@ async def test_prometheus_no_data_trace_avoids_outer_executor_blind_truncation()
     serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
     assert record.status == ToolStatus.NO_DATA
     assert record.truncated is False
-    assert len(serialized) < max_result_chars
+    assert len(serialized) > 12_000
     assert record.structured_data["schema_version"] == "prometheus-evidence-v2"
     assert record.structured_data["root_cause_eligible"] is False
     assert record.structured_data["root_cause_ineligible_reason"] != ("evidence_payload_truncated")
     assert record.structured_data["catalog_inventory"]["metric_count"] == 3
-    assert record.structured_data["semantic_compression"]["source_tool_attempt_count"] == 8
-    assert "prometheus.invalid" not in serialized
-
-    minimum_tool = PrometheusMCPEvidenceTool(  # type: ignore[arg-type]
-        _RecordingPrometheusClient(result),
-        max_evidence_chars=1_000,
-    )
-    minimum_record = await ToolExecutor(
-        InvestigationToolRegistry([minimum_tool]),
-        max_result_chars=1_000,
-    ).execute(
-        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
-        _mysql_slow_context(),
-    )
-    minimum_serialized = json.dumps(
-        minimum_record.structured_data,
-        ensure_ascii=False,
-        default=str,
-    )
-    assert minimum_record.truncated is False
-    assert len(minimum_serialized) < 1_000
-    assert minimum_record.structured_data["root_cause_eligible"] is False
+    assert len(record.structured_data["tool_attempts"]) == 8
+    assert len(record.structured_data["monitoring_results"]) == 8
+    assert "prometheus.invalid" in serialized
 
 
 @pytest.mark.asyncio
@@ -2346,12 +2642,10 @@ async def test_prometheus_catalog_and_empty_series_are_not_root_cause_evidence()
 
 
 @pytest.mark.asyncio
-async def test_strategy_adds_prometheus_to_every_alert_when_available() -> None:
+async def test_strategy_does_not_add_prometheus_without_agent_selection() -> None:
     strategy = await DefaultInvestigationStrategyProvider(
         available_tools=["alert_context", PROMETHEUS_METRICS_TOOL_NAME],
         prometheus_tool_timeout_seconds=321,
     ).select(_context().alert)
 
-    requests = {item.tool_name: item for item in strategy.tool_plan}
-    assert requests[PROMETHEUS_METRICS_TOOL_NAME].required is True
-    assert requests[PROMETHEUS_METRICS_TOOL_NAME].timeout_seconds == 321
+    assert strategy.tool_plan == []

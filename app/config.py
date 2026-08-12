@@ -36,7 +36,6 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "react_enabled",
         "react_max_dynamic_turns",
         "validation_enabled",
-        "shadow_enabled",
         "knowledge_sources",
         "scheduler_workers",
         "flashduty_polling_enabled",
@@ -164,7 +163,7 @@ class Settings(BaseSettings):
     # authentication material must not be changed through the admin API.
     prometheus_mcp_sse_url: str = ""
     prometheus_mcp_api_key: str = Field(default="", repr=False)
-    prometheus_mcp_api_key_header: str = "Authorization"
+    prometheus_mcp_api_key_header: str = ""
     prometheus_mcp_max_agent_steps: int = Field(default=8, ge=1, le=100)
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
@@ -198,7 +197,11 @@ class Settings(BaseSettings):
     # the in-memory scheduler and the Kafka consumer before future work starts.
     scheduler_workers: int = Field(default=1, ge=1, le=16)
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
-    tool_max_result_chars: int = Field(default=12000, ge=1000, le=100000)
+    # Complete tool output is always persisted. This threshold only decides when
+    # an isolated model session should project a result for the main Agent.
+    tool_result_analysis_threshold_chars: int = Field(
+        default=12_000, ge=1_000, le=10_000_000
+    )
     # Retention runs only at the configured weekly calendar slot; startup never
     # triggers an immediate cleanup.
     alert_retention_enabled: bool = True
@@ -206,8 +209,6 @@ class Settings(BaseSettings):
     react_enabled: bool = False
     react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
     validation_enabled: bool = True
-    shadow_enabled: bool = False
-    production_gate_approved: bool = False
 
     @field_validator(
         "ai_provider",
@@ -485,39 +486,46 @@ class Settings(BaseSettings):
                 issues.append(
                     "Archery MCP requires an openai_compatible model with tool calling"
                 )
-        if self.prometheus_mcp_sse_url.strip() or self.prometheus_mcp_api_key.strip():
-            required_prometheus_settings = {
-                "PROMETHEUS_MCP_SSE_URL": self.prometheus_mcp_sse_url,
-            }
-            missing_prometheus_settings = [
-                name
-                for name, value in required_prometheus_settings.items()
-                if not value.strip()
-            ]
-            if missing_prometheus_settings:
+        prometheus_url_configured = bool(self.prometheus_mcp_sse_url.strip())
+        prometheus_header_configured = bool(
+            self.prometheus_mcp_api_key_header.strip()
+        )
+        prometheus_key_configured = bool(self.prometheus_mcp_api_key.strip())
+        if any(
+            (
+                prometheus_url_configured,
+                prometheus_header_configured,
+                prometheus_key_configured,
+            )
+        ):
+            prometheus_auth_complete = (
+                prometheus_header_configured == prometheus_key_configured
+            )
+            if not prometheus_auth_complete:
+                issues.append(
+                    "Prometheus MCP authentication is incomplete; "
+                    "PROMETHEUS_MCP_API_KEY_HEADER and PROMETHEUS_MCP_API_KEY must "
+                    "both be configured or both be empty"
+                )
+            if not prometheus_url_configured:
                 issues.append(
                     "Prometheus MCP configuration is incomplete; missing: "
-                    + ", ".join(missing_prometheus_settings)
+                    "PROMETHEUS_MCP_SSE_URL"
                 )
-            elif not self.mcp_settings_path.is_file():
-                issues.append(f"MCP settings file does not exist: {self.mcp_settings_path}")
-            elif self.ai_provider != "openai_compatible":
-                issues.append(
-                    "Prometheus MCP requires an openai_compatible model with tool calling"
-                )
+            elif prometheus_auth_complete:
+                if not self.mcp_settings_path.is_file():
+                    issues.append(
+                        f"MCP settings file does not exist: {self.mcp_settings_path}"
+                    )
+                elif self.ai_provider != "openai_compatible":
+                    issues.append(
+                        "Prometheus MCP requires an openai_compatible model with tool "
+                        "calling"
+                    )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
-        if (
-            self.app_env.lower() in {"production", "prod"}
-            and not self.shadow_enabled
-            and not self.production_gate_approved
-        ):
-            issues.append(
-                "PRODUCTION_GATE_APPROVED must be true before disabling shadow mode "
-                "in production"
-            )
         if "local_pdf" in self.knowledge_sources:
             if not self.runbook_pdf_dir.exists():
                 issues.append(

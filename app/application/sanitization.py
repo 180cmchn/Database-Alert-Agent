@@ -30,13 +30,37 @@ _INLINE_SECRET = re.compile(
 def sanitize_text(value: str | None) -> str:
     if value is None:
         return ""
-    value = _AUTHORIZATION_HEADER.sub(
-        lambda match: f"{match.group(1)}={REDACTED}", value
-    )
-    value = _URL_QUERY_SECRET.sub(rf"\1{REDACTED}", value)
-    value = _URI_CREDENTIAL.sub(r"\1***REDACTED***\3", value)
-    value = _BEARER.sub("Bearer ***REDACTED***", value)
-    return _INLINE_SECRET.sub(lambda match: f"{match.group(1)}={REDACTED}", value)
+    folded = value.casefold()
+    if "authorization" in folded:
+        value = _AUTHORIZATION_HEADER.sub(
+            lambda match: f"{match.group(1)}={REDACTED}", value
+        )
+    if ("?" in value or "&" in value) and "=" in value:
+        value = _URL_QUERY_SECRET.sub(rf"\1{REDACTED}", value)
+    if "://" in value and "@" in value:
+        value = _URI_CREDENTIAL.sub(r"\1***REDACTED***\3", value)
+    if "bearer " in folded:
+        value = _BEARER.sub("Bearer ***REDACTED***", value)
+    if any(
+        marker in folded
+        for marker in (
+            "password",
+            "passwd",
+            "pwd",
+            "token",
+            "api_key",
+            "api-key",
+            "apikey",
+            "client_secret",
+            "client-secret",
+            "clientsecret",
+            "secret",
+        )
+    ):
+        value = _INLINE_SECRET.sub(
+            lambda match: f"{match.group(1)}={REDACTED}", value
+        )
+    return value
 
 
 def sanitize(value: Any, key: str | None = None) -> Any:

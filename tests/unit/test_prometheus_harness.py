@@ -41,9 +41,14 @@ from app.domain.models import (
 )
 from app.domain.ports import RunLeaseConflict
 from app.domain.tool_calling import MCPModelToolCall
+from app.mcp_catalog import load_mcp_catalog
 from app.mcp_runtime import RepositoryMCPCheckpointStore
 
 _ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROMETHEUS_PROMPTS = load_mcp_catalog(
+    PROJECT_ROOT / "config/mcp/settings.json"
+).require("prometheus").prompts
 
 
 class _AsyncContext:
@@ -166,6 +171,7 @@ def _client(
         PrometheusMCPServerSettings(
             url="https://prometheus.example.test/sse",
             headers={},
+            prompts=PROMETHEUS_PROMPTS,
             tool_policies=(
                 PrometheusMCPToolPolicy(
                     name="query_range",
@@ -233,6 +239,34 @@ def _fake_transport(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *_args, **_kwargs: _AsyncContext((object(), object())),
     )
     monkeypatch.setattr(prometheus_harness_module, "ClientSession", _HarnessSession)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_sse_transport_disables_http_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def recording_sse_client(*_args: Any, **kwargs: Any) -> _AsyncContext:
+        captured.update(kwargs)
+        return _AsyncContext((object(), object()))
+
+    monkeypatch.setattr(prometheus_harness_module, "sse_client", recording_sse_client)
+    connector = prometheus_harness_module.PrometheusSSEMCPConnector(
+        _client(_SequenceModel([]))
+    )
+
+    session = await connector.open_session()
+    factory = captured["httpx_client_factory"]
+    client = factory(
+        headers={"X-API-Key": "secret"},
+        timeout=httpx.Timeout(10),
+    )
+    try:
+        assert client.follow_redirects is False
+    finally:
+        await client.aclose()
+        await session.close()
 
 
 @pytest.mark.asyncio

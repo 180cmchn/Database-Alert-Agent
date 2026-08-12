@@ -16,6 +16,7 @@ from app.agent_runtime.langgraph_checkpoint import RepositoryLangGraphCheckpoint
 from app.agents.nodes import (
     NodeContext,
     advise_node,
+    enrich_alert_node,
     execute_tools_node,
     fingerprint_node,
     report_node,
@@ -26,16 +27,19 @@ from app.agents.nodes import (
 from app.agents.state import AgentState
 from app.domain.ports import (
     AIAdvisor,
+    AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
     InvestigationStrategyProvider,
     RunbookProvider,
+    ToolResultAnalyzer,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # Node names for the graph
+NODE_ENRICH_ALERT = "enrich_alert"
 NODE_FINGERPRINT = "fingerprint"
 NODE_RUNBOOK = "runbook"
 NODE_STRATEGY = "strategy"
@@ -54,7 +58,7 @@ def build_investigation_graph(
 
     The graph implements the following flow:
 
-    START -> fingerprint -> runbook -> strategy -> execute_tools
+    START -> enrich_alert -> fingerprint -> runbook -> strategy -> execute_tools
           -> advise -> validate -> report -> END
 
     Knowledge retrieval and every planned read-only collection finish before
@@ -71,6 +75,7 @@ def build_investigation_graph(
 
     # Add nodes - use partial to bind context while preserving async function signature
     # partial keeps the async nature intact, unlike lambda which returns a coroutine object
+    graph.add_node(NODE_ENRICH_ALERT, partial(enrich_alert_node, ctx=ctx))
     graph.add_node(NODE_FINGERPRINT, partial(fingerprint_node, ctx=ctx))
     graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
     graph.add_node(NODE_STRATEGY, partial(select_strategy_node, ctx=ctx))
@@ -80,9 +85,10 @@ def build_investigation_graph(
     graph.add_node(NODE_REPORT, partial(report_node, ctx=ctx))
 
     # Set entry point
-    graph.set_entry_point(NODE_FINGERPRINT)
+    graph.set_entry_point(NODE_ENRICH_ALERT)
 
     # Add linear edges
+    graph.add_edge(NODE_ENRICH_ALERT, NODE_FINGERPRINT)
     graph.add_edge(NODE_FINGERPRINT, NODE_RUNBOOK)
     graph.add_edge(NODE_RUNBOOK, NODE_STRATEGY)
     graph.add_edge(NODE_STRATEGY, NODE_EXECUTE_TOOLS)
@@ -112,7 +118,10 @@ class InvestigationAgent:
         conclusion_validator: ConclusionValidator,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
+        tool_result_analyzer: ToolResultAnalyzer | None = None,
+        tool_result_analysis_threshold_chars: int = 12_000,
         strategy_provider: InvestigationStrategyProvider,
+        alert_detail_enricher: AlertDetailEnricher | None = None,
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
@@ -147,7 +156,10 @@ class InvestigationAgent:
             conclusion_validator=conclusion_validator,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
+            tool_result_analyzer=tool_result_analyzer,
+            tool_result_analysis_threshold_chars=tool_result_analysis_threshold_chars,
             strategy_provider=strategy_provider,
+            alert_detail_enricher=alert_detail_enricher,
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
             external_knowledge_limit=external_knowledge_limit,

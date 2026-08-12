@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -86,6 +85,56 @@ async def _create_run(
     )
     assert run is not None
     return run.id
+
+
+@pytest.mark.asyncio
+async def test_update_alert_requires_active_run_lease(tmp_path: Path) -> None:
+    repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "update-alert.db"))
+    await repository.initialize()
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "external_id": "detail-enrichment",
+            "severity": "WARNING",
+            "title": "Database alert",
+            "reason": "slow_query",
+            "database": {"engine": "mysql"},
+        }
+    )
+    stored, _ = await repository.create_or_get(alert)
+    run = await repository.create_run(str(alert.id), "detail-worker", 300)
+    assert run is not None
+    enriched = alert.model_copy(
+        update={
+            "database": alert.database.model_copy(
+                update={"host": "detail-host", "port": 3306}
+            )
+        }
+    )
+
+    with pytest.raises(RunLeaseConflict):
+        await repository.update_alert(
+            str(alert.id),
+            enriched,
+            run_id=str(run.id),
+            lease_owner="stale-worker",
+            fencing_token=run.fencing_token,
+        )
+
+    await repository.update_alert(
+        str(alert.id),
+        enriched,
+        run_id=str(run.id),
+        lease_owner="detail-worker",
+        fencing_token=run.fencing_token,
+    )
+    updated = await repository.get(str(alert.id))
+    assert updated is not None
+    assert updated.alert.database is not None
+    assert updated.alert.database.host == "detail-host"
+    assert updated.alert.database.port == 3306
+    assert stored.alert.database is not None
+    assert stored.alert.database.host is None
+    await repository.close()
 
 
 @pytest.mark.asyncio
@@ -885,10 +934,10 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
     assert await reopened.get_tool_invocation(str(invocation.invocation_id)) == failed
     result_summary = await reopened.get_tool_invocation_result(str(invocation.invocation_id))
     assert result_summary is not None
-    assert result_summary["result_truncated"] is True
+    assert result_summary["status"] == "failed"
     assert "result-secret" not in str(result_summary)
     assert REDACTED in str(result_summary)
-    assert len(json.dumps(result_summary, ensure_ascii=False)) <= 12_000
+    assert result_summary["diagnostic"] == "x" * 20_000
 
     artifact = ArtifactRef(
         kind="mcp_response",

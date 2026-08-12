@@ -34,6 +34,8 @@ from app.domain.models import (
     InvestigationContext,
     InvestigationStrategy,
     ToolExecutionRequest,
+    ToolResultAnalysis,
+    ToolResultObservation,
     ToolStatus,
 )
 from app.domain.ports import ToolInvocationConflict
@@ -49,9 +51,11 @@ class RecordingExecutor:
         outcomes: Sequence[dict[str, object]] | None = None,
         *,
         source_system: str = "test_host",
+        status: ToolStatus = ToolStatus.SUCCESS,
     ) -> None:
         self.outcomes = list(outcomes or [{}])
         self.source_system = source_system
+        self.status = status
         self.calls: list[ToolExecutionRequest] = []
         self.contexts: list[InvestigationContext] = []
 
@@ -68,10 +72,41 @@ class RecordingExecutor:
             run_id=context.run_id,
             tool_name=request.tool_name,
             source_system=self.source_system,
-            status=ToolStatus.SUCCESS,
+            status=self.status,
             request=request.parameters,
             summary="collected",
             structured_data=structured_data,
+        )
+
+
+class RecordingResultAnalyzer:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.calls: list[dict[str, object]] = []
+
+    async def analyze(self, **payload):  # type: ignore[no-untyped-def]
+        self.calls.append(payload)
+        if self.failure is not None:
+            raise self.failure
+        artifact = payload["artifact"]
+        assert artifact.sha256 is not None
+        return ToolResultAnalysis(
+            summary="独立会话已从完整结果中提取可核验事实。",
+            observations=[
+                ToolResultObservation(
+                    statement="工具返回了完整的大结果。",
+                    source_paths=["/structured_data/payload"],
+                )
+            ],
+            anomalies=[],
+            limitations=[],
+            analysis_usable=True,
+            source_coverage_complete=True,
+            source_artifact_id=artifact.artifact_id,
+            source_sha256=artifact.sha256,
+            provider="fake",
+            model="tool-result-test",
+            prompt_version="tool-result-analysis-test-v1",
         )
 
 
@@ -880,6 +915,196 @@ async def test_terminal_result_backfills_evidence_without_handler_replay(
     assert result is not None
     assert result["contract"] == OUTER_EVIDENCE_RESULT_CONTRACT
     assert result["evidence_record"]["structured_data"]["payload"] == "x" * 13_000
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_large_result_is_artifacted_and_projected_by_isolated_analyzer(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "large-analysis.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-large-analysis")
+    executor = RecordingExecutor([{"payload": "x" * 20_000}])
+    analyzer = RecordingResultAnalyzer()
+    dispatcher = DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=analyzer,
+        analysis_threshold_chars=1_000,
+    )
+
+    evidence = await dispatcher.execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+    replayed = await dispatcher.execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert replayed == evidence
+    assert len(executor.calls) == 1
+    assert len(analyzer.calls) == 1
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.truncated is False
+    assert evidence.structured_data["analysis_status"] == "completed"
+    assert "x" * 1_000 not in str(evidence.structured_data)
+    rows = await _invocation_rows(repository, str(context.run_id))
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    assert stored[1]["structured_data"]["payload"] == "x" * 20_000
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_large_result_analysis_failure_keeps_artifact_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "analysis-failed.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-analysis-failed")
+    analyzer = RecordingResultAnalyzer(failure=RuntimeError("provider unavailable"))
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        RecordingExecutor([{"payload": "x" * 20_000}]),
+        result_analyzer=analyzer,
+        analysis_threshold_chars=1_000,
+    ).execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert evidence.status == ToolStatus.SUCCESS
+    assert evidence.structured_data["analysis_status"] == "failed"
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.is_root_cause_support_eligible() is False
+    rows = await _invocation_rows(repository, str(context.run_id))
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    assert stored[1]["structured_data"]["payload"] == "x" * 20_000
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_large_result_analysis_cannot_override_provider_partial_decision(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "provider-partial.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-provider-partial")
+    analyzer = RecordingResultAnalyzer()
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        RecordingExecutor(
+            [
+                {
+                    "payload": "x" * 20_000,
+                    "partial": True,
+                    "allow_followup_dispatch": False,
+                    "root_cause_eligible": False,
+                    "root_cause_ineligible_reason": "provider_partial_result",
+                }
+            ]
+        ),
+        result_analyzer=analyzer,
+        analysis_threshold_chars=1_000,
+    ).execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert evidence.structured_data["analysis_status"] == "completed"
+    assert evidence.structured_data["partial"] is True
+    assert evidence.structured_data["allow_followup_dispatch"] is False
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert (
+        evidence.structured_data["tool_result_analysis"]["source_coverage_complete"]
+        is True
+    )
+    assert (
+        evidence.structured_data["root_cause_ineligible_reason"]
+        == "provider_partial_result"
+    )
+    assert evidence.is_root_cause_support_eligible() is False
+    await repository.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [ToolStatus.SKIPPED, ToolStatus.FAILED, ToolStatus.TIMEOUT],
+)
+async def test_large_non_success_result_is_projected_without_changing_status(
+    tmp_path: Path,
+    status: ToolStatus,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        _sqlite_url(tmp_path / f"large-{status.value.casefold()}.db")
+    )
+    await repository.initialize()
+    alert_id, context = await _context(
+        repository,
+        external_id=f"outer-large-{status.value.casefold()}",
+    )
+    analyzer = RecordingResultAnalyzer()
+    executor = RecordingExecutor(
+        [
+            {
+                "payload": "x" * 20_000,
+                "reason_code": "database_not_monitored",
+                "root_cause_eligible": False,
+                "root_cause_ineligible_reason": "database_not_monitored",
+            }
+        ],
+        status=status,
+    )
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=analyzer,
+        analysis_threshold_chars=1_000,
+    ).execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert len(analyzer.calls) == 1
+    assert evidence.status == status
+    assert evidence.structured_data["analysis_status"] == "completed"
+    assert evidence.structured_data["reason_code"] == "database_not_monitored"
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.is_root_cause_support_eligible() is False
+    assert "x" * 1_000 not in str(evidence.structured_data)
+    rows = await _invocation_rows(repository, str(context.run_id))
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    assert stored[1]["structured_data"]["payload"] == "x" * 20_000
     await repository.close()
 
 

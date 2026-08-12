@@ -1,9 +1,10 @@
 """Explicit, replayable memory for evidence-driven investigations.
 
-The functions in this module deliberately do not perform semantic inference. A
-planner or evaluator may describe how one evidence record relates to a
-hypothesis, while these functions enforce whether that record is eligible to
-change the hypothesis' tri-state assessment.
+The functions in this module deliberately do not perform semantic inference. Only
+the main Agent may describe how evidence relates to a causal hypothesis. A child
+Agent that projects a large raw tool result may emit traceable facts, anomalies,
+and limitations, but never a causal relation. These functions only enforce the
+Host's mechanical gates before a main-Agent assessment can change tri-state state.
 """
 
 from __future__ import annotations
@@ -233,10 +234,13 @@ def is_terminal_probe_attempt(evidence: EvidenceRecord) -> bool:
 
 
 def is_qualified_live_evidence(evidence: EvidenceRecord) -> bool:
-    """Return whether a complete record may establish causal truth.
+    """Return whether a record passes the Host's mechanical evidence gate.
 
-    Partial success is missing causal evidence even when a provider sets
-    ``root_cause_eligible=true`` or disables another outer dispatch.
+    Passing this check does not establish, support, or contradict a cause. The main
+    Agent still owns that semantic judgment. ``root_cause_eligible`` is retained as
+    a legacy host-gate field for integrity, provenance, and completeness only.
+    Partial success fails the gate even when a provider sets it true or disables
+    another outer dispatch.
     """
 
     return evidence.is_root_cause_support_eligible()
@@ -247,7 +251,7 @@ def _effective_assessment(
     assessment: EvidenceAssessment,
     hypothesis: Hypothesis | None = None,
 ) -> EvidenceAssessment:
-    """Apply the Host's evidence gate to a model-proposed relation."""
+    """Apply the Host gate to a relation proposed only by the main Agent."""
 
     if assessment.relation == EvidenceRelation.INCONCLUSIVE:
         return assessment
@@ -286,11 +290,13 @@ def apply_evidence(
     evidence: EvidenceRecord,
     assessment: EvidenceAssessment,
 ) -> Hypothesis:
-    """Return a hypothesis updated by one eligible live evidence record.
+    """Apply a main-Agent relation after the record passes mechanical gates.
 
     Failed, skipped, timed-out, empty, stale, alert-platform, or otherwise
-    ineligible records are missing evidence. They never support or contradict a
-    causal mechanism, irrespective of the supplied semantic relation.
+    ineligible records are missing evidence. They never update a causal mechanism,
+    irrespective of the supplied semantic relation. A passing record is not causal
+    by itself; the supplied relation must come from the main Agent, never a child
+    artifact-projection Agent.
     """
 
     if assessment.hypothesis_id != hypothesis.hypothesis_id:

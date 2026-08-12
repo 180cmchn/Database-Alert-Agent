@@ -226,12 +226,10 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
             "http_scheduler": "manual",
             "kafka_enabled": False,
             "wecom_webhook_url": "",
-            "shadow_enabled": True,
-            "production_gate_approved": False,
             "react_enabled": False,
             "validation_enabled": True,
             "flashduty_context_item_limit": min(live_settings.flashduty_context_item_limit, 5),
-            "tool_max_result_chars": 100_000,
+            "tool_result_analysis_threshold_chars": 100_000,
         }
     )
     client, alert_id, list_request_id = await _latest_alert_in_channels(
@@ -248,12 +246,11 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
         await runtime.repository.close()  # type: ignore[attr-defined]
 
     assert isinstance(runtime.service.notifier, LogManagementNotifier)
-    assert result.status == AlertStatus.INCONCLUSIVE
+    assert result.status in {AlertStatus.COMPLETED, AlertStatus.INCONCLUSIVE}
     assert result.error is None
     assert result.advisor_metadata is not None
     assert result.advisor_metadata.request_id
     assert result.recommendation is not None
-    assert result.recommendation.analysis_mode == "shadow"
     context_evidence = next(
         item for item in result.evidence_records if item.tool_name == "alert_context"
     )

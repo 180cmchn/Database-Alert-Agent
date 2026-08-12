@@ -2,11 +2,15 @@
 
 本项目只负责一条告警分析链路：
 
-1. 通过 FlashDuty 只读 Open API 定时轮询指定协作空间的告警并规范化；告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
-2. 按运行时选择检索本地 PDF 和/或外部 KnowledgePack，完成精排、阈值过滤和拒识。
-3. 先完成知识匹配和全部只读实时证据/MCP 日志采集，再由 AI Agent 一次性分析根因和只读建议。
-4. 本地 PDF 与外部知识库同级作为知识依据，并统一列在 AI 分析之前。
-5. 将每个等级的最终 AI 分析结果发送到企业微信群机器人。
+1. 通过 FlashDuty 只读 Open API 轮询指定协作空间；自动轮询由 `FLASHDUTY_POLLING_ENABLED`
+   显式控制且默认关闭。告警按 `source + alert_id` 去重入库，只有新告警会自动进入分析队列。
+2. 分析首步调用 `/alert/info` 获取权威告警详情；详情中的数据库、`alarm_host`、`alarm_port` 和
+   `occurred_at` 会同时参与知识匹配、MCP 选择和后续查询。host、port 不从告警标题推断或补全。
+3. 按运行时选择检索本地 PDF 和/或外部 KnowledgePack，完成精排、阈值过滤和拒识。
+4. Agent 根据声明式 MCP 目录中的角色和作用自主选择零个或多个相关 MCP，并在各 MCP 会话中根据
+   实际返回继续执行只读取证；不存在按告警类型硬编码的必调 MCP。
+5. 全部知识匹配和实时证据采集结束后，由 AI Agent 一次性分析根因和只读恢复建议，再发送到企业
+   微信群机器人。告警等级固定为 `CRITICAL`、`WARNING`、`INFO`。
 
 
 ## 架构
@@ -14,18 +18,19 @@
 项目采用 **LangGraph** 框架构建告警调查工作流。调查图定义了清晰的节点和边，实现可观测、可调试的分析链路：
 
 ```text
-START → fingerprint → runbook → strategy → execute_tools
-      → advise → validate → report → END
+START → enrich_alert → fingerprint → runbook → strategy
+      → execute_tools → advise → validate → report → END
 ```
 
 **节点说明：**
 
 | 节点 | 功能 |
 | --- | --- |
+| `enrich_alert` | 调用 FlashDuty `/alert/info` 富化权威告警详情，并清除非详情来源的 host、port |
 | `fingerprint` | 生成稳定告警指纹，用于去重和调查关联 |
-| `runbook` | 并行检索所选本地 PDF 与外部知识来源，并执行阈值拒识 |
-| `strategy` | 根据告警目标、信号和时间窗生成只读采集计划，不生成根因假设 |
-| `execute_tools` | 完整执行计划中的调查工具并保存原始证据 |
+| `runbook` | 使用富化后的详情并行检索所选本地 PDF 与外部知识来源，并执行阈值拒识 |
+| `strategy` | 根据完整告警和 MCP 的角色、作用选择零个或多个只读 MCP，不生成根因假设 |
+| `execute_tools` | 执行 Agent 选择的 MCP 调查，并保存完整脱敏结果、artifact 和证据 |
 | `advise` | 所有采集终态后，AI 根据知识与实时证据一次性分析根因 |
 | `validate` | 规则校验 + 独立结论验收 |
 | `report` | 生成最终报告，更新状态 |
@@ -34,7 +39,7 @@ START → fingerprint → runbook → strategy → execute_tools
 
 使用 `AgentState` (Pydantic BaseModel) 在节点间传递状态，支持：
 - 告警信息、运行记录、证据列表
-- 验证、影子分析、AI 降级等配置
+- 验证、AI 降级等配置
 
 `react_enabled` 与 `react_max_dynamic_turns` 暂时保留为旧配置兼容字段，新运行不再进入动态根因
 规划循环。MCP 子 Harness 仍可在单个计划任务内部执行有界的目标发现、Schema 发现和多步只读查询，
@@ -65,8 +70,9 @@ START → fingerprint → runbook → strategy → execute_tools
   checkpoint、invocation、artifact 或最终运行状态。
 
 每个计划任务由外层 durable dispatcher 负责幂等执行；MCP 子 Harness 会在返回终态前按只读与重试
-策略完成受控重试。Archery 和 Prometheus 的一个计划任务可包含内部多步调用，但外层 Agent 不会根据
-中间结果追加根因驱动探针。下表列出对外证据状态和 durable invocation 的保守终态语义：
+策略完成受控重试。Agent 可在一个已选择的 MCP 会话内查看上一步返回并继续选择下一项只读工具，
+直至取得足够数据、确认不适用或耗尽受控预算；这些步骤只采集事实，不生成根因假设。下表列出对外
+证据状态和 durable invocation 的保守终态语义：
 
 | 状态 | 语义 | 根因判定用途 |
 | --- | --- | --- |
@@ -79,26 +85,28 @@ START → fingerprint → runbook → strategy → execute_tools
 | `CANCELLED` | 调用因租约丢失、运行终止或取消信号而停止 | 缺失证据，不能得出根因 |
 
 `partial=true` 表示本次调查未完整结束；即使其中保留了部分成功观测，整条 partial 证据也只能用于
-描述与审计，不能据此得出根因。未返回、被截断或失败的部分同样是证据缺口。计划调用沿用策略中
-该工具的 `timeout_seconds` 和 `required`，不会把多步 MCP Host 重新压缩到固定 10 秒。
+描述与审计，不能据此得出根因。未返回或失败的部分同样是证据缺口。Agent 选择出的 MCP 请求均为
+可选取证项，`required=false`；未选择某个 MCP、目标未在该 MCP 中配置，或单个 MCP 返回 `NO_DATA`，
+都不会作为全局失败门控。
 
 ## 数据流
 
 ```text
-FlashDuty /alert/list（定时轮询）
-             ↓
-按协作空间过滤、alert_id 去重、规范化与异步入队
-                                  ↓
-三等级规范化与脱敏
-          ↓
-所选知识来源并行检索：本地 PDF 结构化匹配 + 外部 KnowledgePack 向量检索
-          ↓
-LangGraph 调查图：fingerprint → runbook → strategy
-          → execute_tools → advise → validate → report
-          ↓
-结构化原因与有序依据
-          ↓
-企业微信群机器人
+FlashDuty /alert/list（由显式开关控制轮询）
+                    ↓
+按协作空间过滤，以 source + alert_id 去重入库，仅新告警异步入队
+                    ↓
+FlashDuty /alert/info 详情富化与三等级规范化、脱敏
+                    ↓
+所选知识来源并行检索：本地 PDF + 外部 KnowledgePack
+                    ↓
+Agent 根据完整告警及 MCP 角色、作用选择零个或多个 MCP
+                    ↓
+各 MCP 独立会话按外置工作流迭代采集完整只读证据
+                    ↓
+大结果保存 artifact，并由独立模型会话生成可追溯投影
+                    ↓
+advise → validate → report → 企业微信群机器人
 ```
 
 企业微信群机器人 Webhook 是**出站发送地址**，只用于发送分析结果。FlashDuty 告警由本服务通过 Open API 主动轮询，不提供任何 FlashDuty 入站 Webhook。企微发送执行有界重试；服务不会查询是否送达，也不会因发送失败改写已经完成的分析状态。
@@ -243,8 +251,6 @@ AI_MAX_TOKENS=16384
 AI_TIMEOUT_SECONDS=300
 AI_FALLBACK_ENABLED=true
 SCHEDULER_WORKERS=1
-SHADOW_ENABLED=true
-PRODUCTION_GATE_APPROVED=false
 
 WECOM_ENABLED=true
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
@@ -280,7 +286,7 @@ FLASHDUTY_APP_KEY=replace-me
 FLASHDUTY_TIMEOUT_SECONDS=40
 FLASHDUTY_MAX_RETRIES=2
 FLASHDUTY_CONTEXT_ITEM_LIMIT=20
-FLASHDUTY_POLLING_ENABLED=true
+FLASHDUTY_POLLING_ENABLED=false
 FLASHDUTY_POLL_INTERVAL_SECONDS=300
 FLASHDUTY_POLL_LOOKBACK_SECONDS=900
 # 必填：仅轮询这些协作空间
@@ -295,6 +301,9 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 
 `FLASHDUTY_APP_KEY` 是部署级秘密值，不可通过管理 API 修改或读取。Base URL 固定为官方 HTTPS Endpoint，客户端禁止跟随重定向，错误和证据中不会保留 APP Key。建议在 FlashDuty 中为此项目创建最小权限的独立只读 APP Key。
 
+`FLASHDUTY_POLLING_ENABLED` 默认 `false`，可在 `.env`、Agent 设置页或
+`PATCH /api/v1/admin/settings` 中控制。关闭时不会启动后台轮询任务；手动接入和重新分析能力不受影响。
+
 ### FlashDuty API 轮询配置
 
 完整的配置、去重语义、排障和安全检查见 [FlashDuty Open API 轮询接入](docs/flashduty-polling/README.md)。
@@ -302,16 +311,20 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 1. 在 `.env` 设置 `FLASHDUTY_ENABLED=true`、最小权限的 `FLASHDUTY_APP_KEY` 和 `FLASHDUTY_POLLING_ENABLED=true`。
 2. 设置 `FLASHDUTY_POLL_CHANNEL_IDS=[<协作空间数字 ID>]`；此项在启用轮询时必填，避免拉取 APP Key 可访问的全部空间。
 3. 使用 `FLASHDUTY_POLL_INTERVAL_SECONDS` 配置轮询间隔（当前最小 300 秒），使用 `FLASHDUTY_POLL_LOOKBACK_SECONDS` 配置重叠回看窗口；启用轮询时，回看窗口不得小于轮询间隔。
-4. 每轮以开始轮询的当前时间为窗口终点，按 `start_time` 回看完整配置窗口；轮询器先穷尽 `/alert/list` 游标分页，再以 `source + alert_id` 幂等入库。重复的 `alert_id` 不会创建第二个分析任务，系统也不会因同一告警后续状态更新而重复分析。
+4. 每轮以开始轮询的当前时间为窗口终点，按 `start_time` 回看完整配置窗口；轮询器先穷尽 `/alert/list` 游标分页，再以 `source + alert_id` 幂等入库。新告警入库后立即加入分析队列；重复的 `alert_id` 不会创建第二个分析任务，系统也不会因同一告警后续状态更新而重复分析。
 5. 服务只需出站访问 FlashDuty HTTPS API，不需要 Endpoint、Nginx 入站反代、回调证书或 Webhook Token。
 
-启用后：
+分析开始后：
 
-- `alert_context` 读取告警详情、原始事件、告警动态，以及关联故障的详情、时间线和告警；
-- 有 `incident_id` 时，默认追加 `query_similar_incidents`；历史故障只作为调查线索，不会单独支撑“已验证根因”；
-- `query_changes` 不再作为基础采集项；只有显式设置 `FLASHDUTY_CHANGES_ENABLED=true` 后才注册该适配器，且必须由告警目标、信号和时间窗明确选择；
-- 所有 `/monit/*` 工具默认关闭。只有只读能力审计确认存在数据源或监控对象工具后，才设置 `FLASHDUTY_MONITORS_ENABLED=true`；`query_database_diagnostics` 不再由基础工作流自动调用；
-- 外部调用成功但业务记录为空时保存为 `NO_DATA`，未注册、未配置或目标未暴露能力时保存为 `SKIPPED`，两者都不能作为 `SUCCESS` 实时证据。
+- `enrich_alert` 首先读取 `/alert/info`，富化后的详情进入后续知识检索、MCP 选择和 MCP 会话；
+- 数据库 host、port 只使用详情中的 `alarm_host`、`alarm_port`。详情不可用或字段缺失时保持为空，
+  不会从 `/alert/list` 摘要、标题或其它文本推断和补全；
+- 告警事件、动态、关联故障、变更和 Monitors 都是可选只读上下文，不会因为接口存在就成为每条
+  告警的固定必调项；历史故障只能作为调查线索，不能单独支撑根因；
+- `query_changes` 仅在 `FLASHDUTY_CHANGES_ENABLED=true` 时注册，所有 `/monit/*` 工具仅在
+  `FLASHDUTY_MONITORS_ENABLED=true` 且通过只读能力审计后注册；
+- 外部调用成功但业务记录为空时保存为 `NO_DATA`，未注册、未配置或目标未暴露能力时保存为
+  `SKIPPED`。两者都不能伪装成 `SUCCESS`，也不会单独否决其它可用证据。
 
 项目使用的上游接口均已按官方 OpenAPI 重新核对：
 
@@ -326,7 +339,8 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 | 原始只读查询 | `/monit/query/rows` |
 | 数据库监控对象 | `/monit/targets`、`/monit/tools/catalog`、`/monit/tools/invoke`（额外限制只读工具名） |
 
-核心告警详情成功、部分事件流或故障时间线失败时，`alert_context` 会保存已取得的数据及失败类型并继续分析，避免单个辅助接口暂时不可用导致整条 AI 流程失败。
+核心告警详情成功、部分辅助接口失败时，已取得的数据及失败类型会保留并继续分析，避免单个辅助
+接口暂时不可用导致整条 AI 流程失败。
 
 `FLASHDUTY_POLL_CHANNEL_IDS` 只约束告警和变更的协作空间范围；FlashDuty 的 Monitors 数据源、监控对象与工具目录是账户级能力，不能仅凭协作空间 ID 推定存在。启用 Monitors 前必须先确认 `/monit/datasource/list` 或 `/monit/targets` 有对象，并对目标调用 `/monit/tools/catalog` 验证实际工具目录；接口存在不等于目标 Agent 已暴露工具。
 
@@ -338,11 +352,6 @@ FLASHDUTY_LOGS_DS_TYPE=loki
 FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生了什么”，不能单独证明数据库根因。
 只有 Monitors 指标、日志、原始只读查询或 monit-agent 数据库诊断等非告警平台的本次完整
 `SUCCESS` 证据，才可在全部采集结束后参与根因分析。
-
-影子模式仍执行完整检索、调查、建议和校验链路，但最终状态固定为 `INCONCLUSIVE`，建议
-标记为 `analysis_mode=shadow`。生产准入验证完成前，建议保持开启。
-生产环境只有在部署侧显式设置 `PRODUCTION_GATE_APPROVED=true` 后才允许关闭影子模式；该开关
-不属于管理 API 可在线修改的配置。
 
 企微消息使用 `template_card`，主体展示告警标题、级别、主机、数据库、环境、服务和外部 ID，
 底部固定两项操作：
@@ -356,277 +365,158 @@ FlashDuty 告警详情、事件、动态和故障上下文主要描述“发生�
 群机器人 Webhook 只负责出站通知，不具备按钮事件回调和原卡片更新能力。若需要完全原生的卡片
 内联交互，需切换到企业自建应用消息并增加回调验签与卡片更新接口。
 
-## Archery 慢查询实时证据
+## 声明式 MCP 接入
 
-慢查询告警的计数口径来自“在五分钟内统计慢查询、超过 500 个触发”：它定义统计窗口和阈值，
-例如 646 个是本次告警提供的观测值。“（已排除 N 个数据库管理平台采集数据用 SQL）”只是附带的
-SQL 过滤说明，不是计数口径或候选根因，也不用于把观测值重新计算成其它数值。系统会在知识匹配、
-调查规划和 AI 分析前递归删除该注释；原始 `raw_payload` 仍完整保存用于审计。历史告警重新分析时
-也会执行同样的预处理，避免旧记录再次把过滤说明带入根因判断。
+MCP 目录由 [`config/mcp/settings.json`](config/mcp/settings.json) 统一加载。配置成功且明确只读的 server 会以
+不含 URL、请求头和密钥的候选信息提供给 Agent；Agent 根据富化后的 FlashDuty 告警详情、知识匹配结果
+以及每个 MCP 的角色和作用，自主选择零个或多个相关 MCP。选择结果没有 provider 固定分支，生成的
+取证任务均为 `required=false`。进入某个 MCP 后，独立会话可根据每轮真实结果再次调用该 MCP 的其它
+只读工具。
 
-当规范化后的告警标题包含独立的 `slow_query` 标识符时（忽略大小写，但不匹配
-`slow_queryable` 等更长标识符），调查策略会新增一个必需的
-`query_archery_slow_logs` 取证任务。项目自身作为 MCP Host，加载
-[`config/mcp/settings.json`](config/mcp/settings.json) 中的 Archery 连接配置，在同一个
-Streamable HTTP 会话中完成初始化、工具发现和确定性登录，再把项目批准的只读工具及其 MCP
-Schema 以 function tools 交给当前 AI 模型。模型每轮自主选择一个下一步只读探针。慢查询取证
-由 Host 独占调用 `ensure_login_gymJPA`；模型可见的受控工具集为：
+每个 MCP 条目必须满足以下契约：
 
-- `list_resource_groups_gymJPA`；
-- `list_instances_gymJPA`；
-- `list_instance_databases_gymJPA`；
-- `list_db_tables_gymJPA`；
-- `list_table_columns_gymJPA`；
-- `sql_query_gymJPA`。
+- 显式声明 `"readOnly": true`；缺失或为 `false` 时启动配置校验直接失败；
+- `url`、必需请求头值和密钥只能写成完整的 `${ENVIRONMENT_VARIABLE}` 引用，真实值仅放在
+  `.env` 或部署环境中；
+- 分别引用 `role.md`、`purpose.md`、`workflow.md`、`safety.md` 四个非空 UTF-8 文件；
+- `safety.md` 必须声明 `read_only: true`，运行时也会独立校验工具只读属性，不能只依赖提示词；
+- 对需要 Host 绑定参数的 provider，可额外声明 `toolPolicies`，例如目标发现、指标目录及范围查询
+  的起止参数；通用 MCP 只会向模型暴露远端明确标注为只读且非破坏性的工具。
 
-Host 给模型的用户提示包含 MCP 地址、规范化告警中的实例名、主机、端口、数据库名等目标线索、
-告警时间窗、推荐的实例映射链路和最多返回行数。部署配置不再固定查询实例和数据库。模型根据
-告警上下文、工具实时 Schema 与资源发现结果自主确定目标，并决定是否查询资源组、实例、数据库、
-表和字段。
-每个 MCP 结果经脱敏和长度限制后回传给下一轮模型调用；SQL 语法和只读元数据探针等非鉴权错误
-也会以脱敏、截断后的诊断回填，模型可据此调整参数或改走其它只读路径。认证、权限和安全错误仍
-立即终止。Archery 登录由 Host 在模型调查前确定性执行，登录工具不进入模型可见工具集，登录结果
-以 Host 控制事件而不是伪造的 `assistant tool_call` 写入上下文，因此不占远端 MCP 调用预算。每轮
-结果会分别明确远端调用和模型决策的已用、剩余数。模型选择失败时 Host 会把脱敏错误、剩余预算和
-严格单工具调用要求作为 repair feedback，再做一次有限重试。若兼容 API 仍返回纯文本而非工具
-调用，诊断会保留脱敏后的 `finish_reason`、文本长度和截断预览。每条告警的一次分析运行最多向
-Archery MCP 发送 `ARCHERY_MCP_MAX_AGENT_STEPS` 个模型选择的工具调用；首次会话、重连、checkpoint
-恢复和受控重试共享该总预算。默认值为 12，给元数据链路后的样例探针和只读重试保留空间。MCP
-返回的工具中可能包含
-`apply_query_permission_gymJPA` 等会产生外部状态变更的
-工具；这些工具不会进入模型可见的工具列表。
+新增 MCP 时按以下步骤操作：
 
-MCP 服务端仍是工具 Schema 和业务错误的来源；Host 只额外负责不能交给模型自律的控制面：认证、
-只读工具范围、单条 `SELECT/WITH` 安全检查、精确告警窗口和结果上限。写 SQL 或多语句在网络请求前
-被拒绝并回填模型；其它只读参数由 MCP 服务端验证，真实错误会回填模型以便修正。成功执行慢日志
-表查询后，Host 判断它是否已形成告警窗口证据：最终查询必须精确使用 Host 给出的两个时间边界，
-支持 Unix 秒/毫秒、UTC ISO、`FROM_UNIXTIME` 和 `to_timestamp` 等受控表达形式，并显式包含不超过
-20 的 `LIMIT`；对于 `mysql_slow_query_review_history`，还必须包含 `hostname_max` 等值条件，并允许
-用 `ts_min < window_end AND ts_max >= window_start` 表达聚合慢查询记录与告警窗口重叠。
-无 `WHERE` 的 `LIMIT 1` 样例、仅字段探测、仅端点条件或仅时间条件都作为成功的辅助探针回传模型，
-不会被提前当成最终证据。完成判断发生在只读 MCP 调用返回之后；模型仍可在剩余预算内基于真实
-结果继续调用或重试。提示词要求模型仅使用本次
-慢查询取证需要的只读工具，并优先按 `alert_host/alert_port → t_instance_member.f_instance_id →
-sql_instance.host:port → mysql_slow_query_review_history.hostname_max` 的链路查询。表和字段发现是
-可选的恢复手段，不再是 Host 侧前置条件。提示词中的目标时间窗由规范化告警的 `occurred_at` 和
-部署窗口计算，默认是告警发生前 5 分钟。调用 `sql_query_gymJPA` 会直接向后端提交查询，不存在
-预览确认步骤。
+1. 在 `config/mcp/settings.json` 的 `mcpServers` 中与 `archery`、`prometheus` 同级追加配置。
+2. 在 `config/mcp/prompts/<provider>/` 创建 `role.md`、`purpose.md`、`workflow.md` 和
+   `safety.md`，用提示词说明角色、作用、完整取证流程及只读边界。
+3. 在 `.env` 或部署环境中提供配置引用的 URL 和 KEY，不把真实连接信息提交到仓库。
+4. 重启 API 与 Worker。Agent 会读取新的角色、作用并参与 MCP 相关性选择；通用只读 MCP 不需要新增
+   告警类型策略分支或 provider 专用工具名。
 
-Host 会记录已经完成的 `t_instance_member` 和 `sql_instance` 元数据阶段，后续重复查询会在发送到
-MCP 前被拒绝且不消耗远端预算。目标端点解析完成并进入最后 4 次远端额度后，剩余调用只允许用于
-慢日志字段、`information_schema.statistics` 索引探针和完整的最终窗口查询；资源枚举、目标漂移和
-重复实例归属查询都会被拒绝。最终 history 查询若包含 `ORDER BY`，只能按真实 `ts_min` 排序，不能
-按 `Query_time`、`Rows_examined` 等诊断值触发大范围 filesort。
-
-最终慢日志查询成功并返回日志内容后，结果直接作为当前告警窗口的实时证据，不再对告警端点和
-`hostname_max` 结果端点追加 `t_instance_member.f_instance_id` 查询，也不生成 `MATCHED`、
-`MISMATCHED`、`UNVERIFIED` 或 `analysis_usable` 等归属状态。AI 分析和独立验收提示词明确禁止
-比较告警标题端点与 `hostname_max` 的 IP/端口字面值，不能因二者不同而弃用证据，也不能在结论中
-提出或描述额外的实例归属核验。查询成功但明确返回 0 行或无法解析行数时记录为 `NO_DATA`，保留
-查询事实，但不能用于支持具体根因。
-
-查询结果以 `source_system=archery_mcp` 的实时 `EvidenceRecord` 保存并传给 Agent。若 Archery
-以“SQL 查询已执行 / 执行的SQL / 结果”文本包裹返回数据，Host 会拆出其中的实际 SQL 和结果
-JSON，核对实际 SQL 是否与模型提交内容一致，并记录查询使用的实例 ID、时间字段和返回行数。
-若 Archery 的内层包裹 JSON 因字符上限不完整，Host 会逐项恢复截断点之前完整闭合的日志行，
-丢弃最后一条不完整行，并同时保留文本中明确报告的总行数；位置数组没有列名时，只有 Archery
-回显 SQL 与请求完全一致才会从已核对 SQL 投影恢复列名。进入通用执行器前，Host 再把完整日志行
-压缩为包含时间、库/用户、`checksum`、SQL 样本和诊断数值的小型 JSON，并按字符预算只移除完整的
-尾部行；因此正常路径不会触发通用执行器盲切。只有摘要中仍完整可解析的日志行才能支持具体根因。
-空结果会明确显示为 0 行且不会误报为可能截断。证据会记录由告警上下文与 MCP 资源发现共同
-确定的实例 ID 和数据库名；结果可用于当前告警排查，但慢查询记录本身不能单独证明根因。
-提示词要求最终查询和 `sql_query` 的 `limit_num` 都不得超过 20；即使 MCP 返回更多已解析行，
-Host 也只保留前 20 行。回传给模型的单次结果文本最多保留 24,000 字符。
-若 `mysql_slow_query_review_history` 查询被 Archery 超时 KILL，或返回 MySQL 的
-`Query execution was interrupted, maximum statement execution time exceeded`，Host 将其作为缺失证据回传模型，
-明确禁止原样重试或盲目添加 `FORCE INDEX`。模型可通过只读 `SELECT` 查询
-`information_schema.statistics`；`SHOW INDEX` 仍不在 Host 的 `SELECT/WITH` 安全边界内。若真实
-联合索引以 `hostname_max, ts_min` 开头，恢复查询优先同时使用 `hostname_max = ...`、
-`ts_min >= window_start` 和 `ts_min < window_end` 的半开窗口，并减少投影字段。Host 不会自动改写
-模型 SQL。若超时后只剩一次远端额度，该额度直接保留给有界 history 恢复查询，不再允许索引探针。
-history 字段已经发现但查询未完成时，诊断返回“等待 history 查询成功”；若轨迹中存在 history
-超时，则返回更具体的“等待优化后的 history 查询”，不再误报“等待 history 表字段”。
-
-传输失败、登录确认失败、鉴权失败、超时、MCP 标准错误或不可恢复的 Archery 业务错误形成失败
-证据；模型连续选择失败、预算耗尽或未形成最终窗口查询时形成带调用轨迹的 `NO_DATA` 证据。SQL
-工具错误的脱敏类型和详情会写入对应 `query_trace`，便于区分字段错误、语法错误和权限错误。首次
-协议或传输失败时，统一 Harness 可在策略允许时新建会话并重新登录。所有重连会话共享同一个
-运行状态、成功观测、调用轨迹、checkpoint、重试状态和远端调用预算；实际发送到 MCP 的调查调用
-总数不会超过 `ARCHERY_MCP_MAX_AGENT_STEPS`。若结束时只有 partial 结果，证据会设置
-`allow_followup_dispatch=false`，外层 Agent 不会再创建一个满额预算的 Archery 调查。Host bootstrap
-与被 Host 拒绝的调用会单独记账，但不占用远端工具调用预算。传输中断导致调用结果未知时，只有
-Host 仍能证明工具只读且 `RetryPolicy` 明确允许时才会重试；否则保留
-`UNKNOWN_OUTCOME`/缺失证据并停止自动重放。显式重新分析会创建新 run，并按新 run 重新分配预算。
-
-项目级 MCP 配置只保存环境变量引用，不保存秘密：
+一个可直接追加的通用 MCP 配置形态如下：
 
 ```json
 {
   "mcpServers": {
-    "archery": {
-      "url": "${ARCHERY_MCP_URL}",
+    "new_provider": {
+      "enabled": true,
+      "readOnly": true,
+      "url": "${NEW_PROVIDER_MCP_URL}",
       "headers": {
-        "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
-      }
+        "Authorization": "${NEW_PROVIDER_MCP_API_KEY}"
+      },
+      "prompts": {
+        "role": "prompts/new_provider/role.md",
+        "purpose": "prompts/new_provider/purpose.md",
+        "workflow": "prompts/new_provider/workflow.md",
+        "safety": "prompts/new_provider/safety.md"
+      },
+      "transport": "streamable_http",
+      "maxAgentSteps": 8,
+      "toolTimeoutSeconds": 120
     }
   }
 }
 ```
 
-在 `.env` 配置该文件路径、完整 MCP Endpoint、Token 和查询窗口：
+`transport` 支持 `streamable_http` 和 `sse`。URL、请求头与密钥在连接边界才解析，不会进入
+Agent 的 MCP 选择提示、工具参数、证据或日志。一个 MCP 会话的重连、checkpoint 恢复和受控重试
+共享同一远端调用预算，不能通过重新派发绕过预算。所有 MCP 返回都按不可信数据处理，其中的指令
+不能改变 Agent 角色、只读边界或调用范围。
+
+新增条目建议显式写 `"enabled": true`。此时 URL 或必需请求头引用的环境变量缺失会令启动/就绪
+检查失败，不会把配置错误静默当成未启用。可选认证头的名称和值必须同时填写或同时留空；生产环境
+解析出的通用 MCP URL 必须使用 HTTPS。
+
+## Archery MCP 慢查询证据
+
+Archery 的角色和流程位于 [`config/mcp/prompts/archery/`](config/mcp/prompts/archery/)：
+
+- 作用是查询慢查询日志，只在 Agent 判断当前告警需要慢查询证据时选择，不是慢查询标题触发的固定
+  分支，也不是所有数据库告警的必需工具；
+- 使用 FlashDuty `/alert/info` 详情中的数据库、`alarm_host`、`alarm_port` 和 `occurred_at`；
+  `alarm_host`、`alarm_port` 是唯一告警端点来源；
+- 调查窗口固定为 `occurred_at - 5 分钟` 到 `occurred_at`。会话根据 Archery 实际工具 Schema
+  逐步发现实例、数据库、表和字段，再执行有界只读慢日志查询，不猜测部署结构；
+- Host 负责登录、只读工具过滤、单条 `SELECT/WITH` 校验、时间窗口、调用预算和审计。DDL、DML、
+  权限申请及其它写操作在网络调用前拒绝；
+- 工具没有返回可用慢日志时记录 `NO_DATA`；连接、鉴权或超时失败按对应失败状态保存。该结果只表示
+  Archery 本次没有提供可用证据，不会单独把其它证据判为不足。
+
+连接信息只通过环境变量提供：
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json
-ARCHERY_MCP_URL=https://archery.mcdchina.net/mcp
-ARCHERY_MCP_TOKEN=archery_replace-with-your-token
+ARCHERY_MCP_URL=https://archery.example.internal/mcp
+ARCHERY_MCP_TOKEN=replace-with-your-token
 ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
 ARCHERY_MCP_MAX_AGENT_STEPS=12
 ARCHERY_MCP_TIMEOUT_SECONDS=60
 ARCHERY_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
-URL、Token 和窗口都是部署级配置，不能通过管理 API 修改；Agent 最大步骤数以环境变量为部署
-默认值，也可通过 Runtime Settings 动态调整。启用 Archery MCP 时必须提供 URL
-和 Token，`MCP_SETTINGS_PATH` 指向的文件也必须存在。实例和数据库目标从每条规范化告警中提取，
-再由模型调用 MCP 资源发现工具解析，不读取固定目标配置。当前认证方式是
-`X-Archery-Token`，不要配置 `Authorization: Bearer`，也不要使用旧版的
-`X-Archery-Username` 和 `X-Archery-Password`。Token 只通过每个 MCP HTTP 请求的
-`X-Archery-Token` 请求头发送，不写入工具参数、证据或日志；客户端不跟随 HTTP 重定向。生产
-环境要求 HTTPS。为兼容现有 Archery MCP 部署，Token 也可从 `ARCHERY_MCP_HTTP_API_KEY` 或
-`ARCHERY_TOKEN` 读取；新配置建议使用 `ARCHERY_MCP_TOKEN`。所配置的
-`openai_compatible` 模型和网关必须支持 Chat Completions function/tool calling；仅把
-`settings.json` 放进仓库不会让远端模型自动获得 MCP，实际加载配置和转发工具调用的是本服务的
-MCP Host。
+当前认证值仅通过 `X-Archery-Token` 请求头发送。生产环境应使用 HTTPS 和最小权限只读凭据。
 
-## Prometheus SSE MCP 监控证据
+## Prometheus MCP 监控指标证据
 
-配置 Prometheus MCP 后，`strategy` 节点会把必需的 `query_prometheus_metrics` 加入每条告警的
-调查计划，结果按普通实时证据经过 `execute_tools → advise → validate` 处理。服务以 SSE transport
-连接 [`config/mcp/settings.json`](config/mcp/settings.json) 的 `prometheus` 条目并动态读取远端
-`tools/list` Schema。只有同时出现在本地 `toolPolicies` 和远端工具清单、且未声明为破坏性或非只读
-的工具会暴露给 AI Agent；调用前还会再次校验授权。模型负责选择指标和查询语义，Host 负责只读
-工具边界、固定参数和时间窗，不依赖提示词自律。
+Prometheus 的角色和流程位于
+[`config/mcp/prompts/prometheus/`](config/mcp/prompts/prometheus/)。它只在 Agent 判断当前告警
+需要指标证据时选择，工作流是：
 
-`toolPolicies` 的 `target_discovery` 能力用于发现当前 Prometheus 配置的数据库监控目标，`catalog`
-只用于目录、标签和辅助探针；`range_query` 必须声明同一对象中的 `startArgument`、`endArgument` 及
-`rfc3339`、`unix_seconds` 或 `unix_millis` 编码。Host 在发网前覆盖这两个参数为
-`occurred_at - 5 分钟` 到 `occurred_at`，并将模型参数和实际参数分别留痕。
-只有本地授权的 `range_query` 返回真实观测后才有根因支持资格；样本时间戳可因越界否决资格，但
-即时查询中偶然落入窗口的单点时间戳不能把未知工具升级为范围证据。策略配置的参数路径必须存在于
-实时 Schema；可选 `schemaSha256` 不匹配时整个工具 fail closed。
+1. 先调用目标发现、服务发现、标签、指标目录或元数据工具，确认该 Prometheus MCP 实际配置了哪些
+   数据库及数据库目标的监控指标；目标发现结果本身不是根因证据。
+2. 使用 FlashDuty 详情中的数据库身份、`alarm_host` 和 `alarm_port` 匹配已发现目标，不从标题
+   推断端点。
+3. 若告警数据库在监控范围内，选择与告警信号相关的指标，并使用 `range_query` 查询
+   `[occurred_at - 5 分钟, occurred_at]`；Host 会覆盖并校验真实起止参数及告警目标。
+4. 若告警数据库不在已确认的监控范围内，停止范围查询，返回
+   `reason_code=database_not_monitored` 和“Prometheus MCP 中没有配置告警数据库对应的监控信息”。
+   这表示该 MCP 不适用于当前目标，不是全局证据不足。
+5. 若无法确认覆盖范围或范围查询没有样本，明确返回 `NO_DATA`，不得虚构目标、指标或监控值。
 
-配置 `target_discovery` 后，每次调查首轮只向模型开放该能力；当前配置将 `get_targets` 用作目标发现
-工具。首轮返回后，Agent 可按实际 Schema 继续调用 `get_targets`、`list_metrics`、
-`get_metric_metadata` 等本地授权的只读发现工具，综合目标标签、服务发现 URL、抓取路径、job、指标名
-和元数据判断数据库归属。例如 `ocp_sd` 名称本身不是结论，但 OCP 服务发现、`/metrics/ob/*` 与
-`obproxy` 等多项返回可以共同支持 OceanBase 归属。筛选后的空目标页不能单独证明数据库未受监控。
-Agent 判断 `in_scope` 后，在首个 `range_query` 中一并提交范围理由、识别出的数据库类型和有界目标
-标识；判断 `out_of_scope` 或 `unknown` 时则通过结构化结束动作提交结论及理由。`out_of_scope` 返回
-`SKIPPED`，`unknown` 返回 `NO_DATA`。Host 仍负责只读授权、调用预算、Schema 校验和范围查询时间窗，
-不用硬编码字符串规则替代 Agent 的语义判断。范围发现结果只是覆盖上下文，不能支持或反驳本次告警
-根因。
+当前 `toolPolicies` 只向模型开放经过本地授权并与远端 Schema 一致的目标发现、目录和范围查询能力。
+只有告警目标与五分钟窗口匹配的实际范围样本才有资格参与根因分析。OceanBase 等已配置目标可正常
+查询；未配置的 MySQL 或其它数据库告警不会被错误地当作 Prometheus 调用失败，也不会否决来自其它
+MCP 的合格证据。
 
-SSE 空闲读取期限使用外层 Prometheus 工具期限，避免模型规划期间沿用单次 MCP 读取的 60 秒期限而
-提前断流。模型看到的每个工具说明会附加 Host 审核后的 `target_discovery`、`catalog` 或
-`range_query` 能力；首轮和每轮结果都包含远端调用的已用、上限与剩余次数。取得合格范围观测后
-模型可主动结束调查；尚无可用观测时由 Host 根据监控覆盖范围、目录相关性、空查询次数和目标归属
-决定是否继续，模型不能靠提前结束掩盖缺失证据。
-
-当尚无合格范围观测且远端预算只剩两次时，Host 会暂时隐藏 `catalog` 工具，为 `range_query` 保留两次
-探针机会；在此之前不限制真实 MCP 所需的指标、标签或标签值发现链路。
-同一工具和参数只要已经完成远端执行，即使返回目录或空结果，也不会再次请求远端；同一失败调用
-最多允许重试一次。工具错误、空结果和目录结果会分别给出下一步提示，避免模型反复枚举或原样重试。
-Host 不会把只共享数据库引擎前缀的目录指标视为告警信号相关指标。例如慢查询告警的目录中只有
-`mysql_output_*` 而没有同时表达 `slow/query` 语义的指标时，在已有一次空范围查询且两次目录额度用尽后，
-调查以 `NO_DISCRIMINATING_EVIDENCE` 提前结束。三次不同范围查询均无样本，或两次修正后的范围查询仍
-明确返回其它目标，也使用相同的提前停止语义，不再消耗完默认八次远端预算。
-工具选择失败时，第二次模型请求会带上脱敏的错误类型、错误详情、可用工具及剩余预算；连续两次
-仍未形成工具调用时返回带两次安全诊断的 `NO_DATA`，而不是丢失调查轨迹。
-统一 Harness 中每条告警的一次分析运行，其远端调用总数由
-`PROMETHEUS_MCP_MAX_AGENT_STEPS` 控制（默认 `8`，范围 `1–100`）；首次会话、重连、checkpoint 恢复
-和受控重试共享该总预算。模型决策另有有限上限以避免反复提前结束或重复选择。达到远端调用上限时：
-
-- 已取得至少一条包含样本、序列或数值的可解析监控返回：保留为 `SUCCESS` 观测并以
-  `call_limit_reached=true` 标示调用已截断；Harness 同时将未正常结束的调查标记为
-  `partial=true`，该条 partial 记录只表示采集结果不完整。
-- 没有可用监控返回：记录 `NO_DATA`，摘要为“Prometheus MCP 调用次数达到上限，实时证据不足”，
-  后续分析以 `INCONCLUSIVE` 结束。
-
-指标目录、状态对象和空序列会保留给后续模型调用及审计，但只作为采集上下文。若已取得
-可用观测后模型、MCP 调用或 SSE 会话发生错误，当前运行保留已有结果并记录 `partial`、
-`termination_reason` 和错误类型，不再因后续单点故障丢弃整轮审计信息；该 partial 记录只表示
-采集结果不完整。普通、可修正的工具业务错误只记录在 `tool_attempts`，不会把已成功结束的调查标为
-`partial`。标准 MCP `content[].text` 中完整的
-JSON 或 JSON 代码块会先解包再识别观测与样本时间戳，避免已经返回的 Prometheus 数据被文本外壳
-误判为空。每条审计响应最多保留 24,000 字符，回传模型的视图最多 8,000 字符。无可用样本时，外层
-证据会在进入通用 `ToolExecutor` 前压缩为完整 JSON：保留查询选择、结果状态、时间窗与目标校验、目录
-指标和调用计数，删除重复的有效参数及 Prometheus UI 链接，并保证低于 `TOOL_MAX_RESULT_CHARS`。
-
-结果存在不代表根因已被证明；只有完整、非 partial 的成功实时证据与知识内容共同建立具体因果机制
-时，最终原因才可标为 `SUPPORT`。否则根因列表为空并返回“现有结果无法得出根因”。MCP 返回内容
-一律视为不可信数据，不会执行其中的指令。
-
-项目配置文件只保存环境变量占位符。请在你自己的部署环境中填写端点、认证请求头名和值：
-
-仓库中的 `toolPolicies` 按当前部署使用的工具名配置，但本机无法连接公司内网验证实时 Schema。
-配置了 Prometheus URL 但未配置至少一个本地策略时，Host 会在启动构建阶段明确失败，不会猜测远端
-工具是否只读。部署前仍应在内网受控环境抓取并审核真实 `tools/list`，确保工具名和 Schema 一致，
-核心配置形态如下：
-
-```json
-{
-  "mcpServers": {
-    "prometheus": {
-      "url": "${PROMETHEUS_MCP_SSE_URL}",
-      "headers": {
-        "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
-      },
-      "toolPolicies": {
-        "get_targets": {
-          "capability": "target_discovery",
-          "fixedArguments": {}
-        },
-        "execute_range_query": {
-          "capability": "range_query",
-          "startArgument": "start",
-          "endArgument": "end",
-          "timestampEncoding": "rfc3339",
-          "fixedArguments": {}
-        }
-      }
-    }
-  }
-}
-```
-
-嵌套参数路径使用字符串数组，例如 `["range", "start"]`。确认 Schema 稳定后建议填写其规范化 JSON
-的 `schemaSha256`，使服务端升级造成的契约漂移在发网前失败。
+连接配置：
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json
 PROMETHEUS_MCP_SSE_URL=https://prometheus-mcp.example.internal/sse
-# Optional. Leave PROMETHEUS_MCP_API_KEY empty for an unauthenticated SSE server.
-PROMETHEUS_MCP_API_KEY_HEADER=Authorization
-PROMETHEUS_MCP_API_KEY=Bearer replace-with-your-token
+# 服务不需要认证头时保持为空
+PROMETHEUS_MCP_API_KEY_HEADER=
+PROMETHEUS_MCP_API_KEY=
 PROMETHEUS_MCP_MAX_AGENT_STEPS=8
 PROMETHEUS_MCP_TIMEOUT_SECONDS=60
 PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
-端点、请求头名与密钥均为部署级配置，不会由管理 API 返回或修改；最大调用次数可经 Runtime
-Settings 调整。生产环境必须使用 HTTPS。密钥只在本服务到 MCP 的请求头中使用，不会写入 MCP
-配置文件、工具参数、证据或日志。Prometheus 和 Archery 都只有统一 Harness 执行路径；不存在运行时
-legacy/canary 分支。Harness 在所有重连和恢复尝试之间保留成功观测、调用轨迹、checkpoint 与同一个
-远端调用预算，因此每条告警的一次分析运行总调用数不会超过各 Provider 的 `MCP_MAX_AGENT_STEPS`。
-Harness 返回 partial 结果时会设置
-`allow_followup_dispatch=false`，外层 Agent 不会通过新的逻辑派发重置预算。传输中断造成结果未知时，
-只有本地策略仍确认工具只读、场景显式授权且 `RetryPolicy` 尚有额度，才会在新会话中重试原查询；
-写工具和未授权工具不会使用该例外。
+## 完整工具结果与独立分析会话
 
-当前开发机未连接公司内网，Archery MCP 和 Prometheus MCP 均未做真实 Host 连通、鉴权、Schema 或
-超时行为测试。发布时应先在受控 worker 审核 Prometheus 的真实 `tools/list` 与本地 `toolPolicies`
-是否一致，并验证两套 Host 的 timeout、reconnect、no-data、预算消耗和 checkpoint 恢复事件，再通过
-部署批次逐步扩大范围。回滚应回退应用版本；已产生的 run、checkpoint 和审计事件继续保留。
+MCP 已返回的原始结果不会再按字符、行数或字段二次截断，也不存在通用字符结果上限。每次调用的
+完整脱敏结果都保存为 `raw_tool_result` artifact，并持久化字节大小和
+SHA-256；主 Agent 使用的证据会引用该 artifact。
+
+`TOOL_RESULT_ANALYSIS_THRESHOLD_CHARS` 只决定何时启动一个与根因分析隔离的独立应用模型会话，
+不是 MCP 返回值或 artifact 的字符上限：
+
+```dotenv
+TOOL_RESULT_ANALYSIS_THRESHOLD_CHARS=12000
+```
+
+当完整结果达到阈值时，独立子 Agent 会话读取完整脱敏 artifact；结果超过单次模型上下文时，宿主按
+JSON Pointer 和字符串字符偏移无损分片，再通过分层独立会话汇总。子 Agent 只输出结构化摘要、事实、
+异常和限制，不得判断根因，也不得判断某项事实支持或反驳某个原因；因果判断只属于汇总全部证据的
+主 Agent。每条事实和异常必须以 JSON Pointer 指向原始结果中的真实路径，并同时绑定 artifact ID 与
+SHA-256；来源路径不存在、越过因果职责边界、投影不可用或来源摘要不匹配时校验失败。主 Agent 只接收
+这份可追溯投影，不会因为上下文长度手工裁剪原始日志或指标。
+
+若独立分析会话失败，完整 artifact 和失败审计仍保留，但该结果标记为不能参与根因判断。未选择 MCP、
+目标未配置、单个 `NO_DATA` 或独立会话失败都只影响对应证据；最终
+`evidence_sufficient` 由实际根因引用的相关、完整、可用实时证据决定。
+
+当前开发机未连接公司内网，Archery MCP 和 Prometheus MCP 的真实连通、鉴权及超时应在工作机验证；
+本地测试出现连接超时不代表上述选择、配置或结果处理逻辑失败。
 
 ## 本地运行
 
@@ -739,19 +629,21 @@ curl -X POST http://localhost:8000/api/v1/alerts/canonical/analyze \
 Agent 必须先完成知识匹配和全部实时证据/MCP 日志采集，采集期间不得创建、评估、存储或引用根因
 假设，也不得因为某个原因看似成立而提前结束采集。所有计划任务终态后只做一次根因分析：
 
-- 能由知识与合格实时证据建立因果机制时，返回根因，状态固定为 `SUPPORT`，设置
+- 能由知识与合格实时证据建立因果机制时，返回根因，状态固定为 `SUPPORTED`，设置
   `verified=true` 并引用实时证据 ID；
 - 不能建立根因时，`root_causes=[]`、`likely_causes=[]`，`summary` 固定为
   `现有结果无法得出根因`，最终状态为 `INCONCLUSIVE`。
 
-新运行不得使用 `SUPPORTED`、`UNKNOWN` 或 `CONTRADICTED`，不得输出暂定原因、被排除原因或
+新运行不得使用 `SUPPORT`、`UNKNOWN` 或 `CONTRADICTED`，不得输出暂定原因、被排除原因或
 `next_probe`。这些旧枚举仅用于读取历史持久化结果。手册中的原因和历史事故案例只用于解释采集
 结果，不能在采集前转成本次告警的候选根因。
 
 校验记录把两个维度分开保存：`passed` 只表示分析契约诚实、可追溯且安全，
 `evidence_sufficient` 表示实时证据是否足以完成根因判断。固定的空根因结果可以通过诚实性和安全
 契约，但 `evidence_sufficient=false`，最终状态仍为 `INCONCLUSIVE`。只有每个根因均为
-`SUPPORT`、引用合格实时证据，且规则校验和 Agent 校验均通过时，才允许进入 `COMPLETED`。
+`SUPPORTED`、引用合格实时证据，且规则校验和 Agent 校验均通过时，才允许进入 `COMPLETED`。
+未选择的 MCP、告警目标未在某个 MCP 中配置，或某个相关 MCP 返回 `NO_DATA`，均不会单独否决
+其他可用证据。`evidence_sufficient` 只由最终根因实际引用的相关、可用实时证据决定。
 
 ## 离线评测与生产准入
 
@@ -781,7 +673,7 @@ Agent 必须先完成知识匹配和全部实时证据/MCP 日志采集，采集
 数据集位于 `evaluation/datasets/`，门槛位于 `policies/production-gates.json`。准入不再要求两个
 数据集各凑 100 条或逐条修改审核状态，而是要求当前所有有效“手册 × 告警类型”、所有已抽取原因
 都被最新自动样本覆盖，且召回、拒识、章节和原因指标达到阈值。自动样本只证明摄取与检索回归，
-不会被描述成独立的真实效果验证；真实准确率仍通过影子运行和按时间隔离的历史样本统计。
+不会被描述成独立的真实效果验证；真实准确率仍通过按时间隔离的历史样本和生产结果统计。
 
 ## 验证
 
@@ -831,7 +723,7 @@ Remove-Item Env:FLASHDUTY_TEST_CHANNEL_IDS
 
 未设置 `RUN_LIVE_TESTS=1` 时不会访问外部服务。Live 测试读取真实 `.env`，验证模型结构化响应
 和请求 ID；FlashDuty 测试使用 `channel_ids` 将 `/alert/list` 限定到指定协作空间，从最近 30 天
-告警中自动选择最新一条，再验证告警/事件/动态/关联故障的请求 ID 及完整影子分析链路。端到端
+告警中自动选择最新一条，再验证告警/事件/动态/关联故障的请求 ID 及完整分析链路。端到端
 用例会强制使用日志通知器，不会向企业微信发送消息。AI 客户端保持 TLS 证书校验并使用操作系统信任库，
 因此 Windows `CurrentUser`/`LocalMachine` 证书库中已受信任的内部 CA 可用于模型网关；HTTPX 仍会读取
 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 等进程环境变量。

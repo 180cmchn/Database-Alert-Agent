@@ -1,22 +1,439 @@
 import asyncio
 from pathlib import Path
+from uuid import uuid5
 
 import pytest
 
 from app.adapters.ai import FakeAIAdvisor
 from app.adapters.investigation import InvestigationToolRegistry
 from app.adapters.notification import LogManagementNotifier
+from app.agents.nodes import enrich_alert_node
+from app.agents.state import AgentState
 from app.application.factory import apply_runtime_settings, build_runtime
+from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.config import Settings
 from app.domain.errors import AdvisorError, AnalysisFailedError
 from app.domain.models import (
+    AdvisorMetadata,
     AlertStatus,
+    AnalysisBasis,
+    AnalysisBasisSource,
+    DatabaseTarget,
     InvestigationStage,
     InvestigationStrategy,
+    Recommendation,
+    RecommendationStep,
+    RootCauseAssessment,
+    RootCauseStatus,
     RunStatus,
     ToolExecutionRequest,
     ToolStatus,
 )
+
+
+@pytest.mark.asyncio
+async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: Path) -> None:
+    events: list[str] = []
+    seen_hosts: list[str | None] = []
+
+    class DetailEnricher:
+        read_only = True
+
+        async def enrich(self, alert):  # type: ignore[no-untyped-def]
+            events.append("DETAIL")
+            return alert.model_copy(
+                update={
+                    "database": DatabaseTarget(
+                        engine="mysql",
+                        instance="orders-primary",
+                        host="detail-host",
+                        port=3306,
+                    ),
+                    "raw_payload": {
+                        "flashduty_alert_info": {
+                            "alert_id": alert.external_id,
+                            "alarm_host": "detail-host",
+                            "alarm_port": 3306,
+                        },
+                        "flashduty_ingested_alert": alert.raw_payload,
+                    },
+                }
+            )
+
+    class RecordingRunbookProvider:
+        async def search(self, alert, limit=5):  # type: ignore[no-untyped-def]
+            events.append("KNOWLEDGE")
+            seen_hosts.append(alert.database.host if alert.database else None)
+            return []
+
+    class EmptyRunbookStore:
+        async def search(self, _alert, limit=5):  # type: ignore[no-untyped-def]
+            return []
+
+        async def list(self):  # type: ignore[no-untyped-def]
+            return []
+
+        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("not used")
+
+    class RecordingStrategy:
+        async def select(
+            self,
+            alert,
+            runbooks=None,
+            external_knowledge=None,
+            knowledge_match_summary="",
+        ):  # type: ignore[no-untyped-def]
+            events.append("MCP_SELECTION")
+            seen_hosts.append(alert.database.host if alert.database else None)
+            return InvestigationStrategy(
+                strategy_id="detail-first",
+                title="Detail first",
+                description="Use the enriched target.",
+                tool_plan=[ToolExecutionRequest(tool_name="detail_probe")],
+            )
+
+    class RecordingTool:
+        name = "detail_probe"
+        source_system = "test_mcp"
+        read_only = True
+        input_schema = {"type": "object", "additionalProperties": False}
+
+        async def execute(self, request, context):  # type: ignore[no-untyped-def]
+            events.append("MCP_CALL")
+            seen_hosts.append(
+                context.alert.database.host if context.alert.database else None
+            )
+            return "detail endpoint observed", {"root_cause_eligible": False}
+
+    provider = RecordingRunbookProvider()
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        runbook_provider=provider,
+        runbook_store=EmptyRunbookStore(),
+        strategy_provider=RecordingStrategy(),
+        tool_registry=InvestigationToolRegistry([RecordingTool()]),
+    )
+    runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "flashduty",
+        {
+            "request_id": "req-list",
+            "data": {
+                "alert_id": "663a1b2c3d4e5f6789abcdef",
+                "title": "MySQL/mysql_slow_query/title-host:3307",
+                "alert_severity": "Warning",
+                "alert_key": "slow_query",
+                "start_time": 1712650000,
+                "labels": {
+                    "engine": "mysql",
+                    "alarm_host": "list-host",
+                    "alarm_port": "3307",
+                },
+            },
+        },
+    )
+
+    assert events[:4] == ["DETAIL", "KNOWLEDGE", "MCP_SELECTION", "MCP_CALL"]
+    assert seen_hosts == ["detail-host", "detail-host", "detail-host"]
+    assert result.alert.database is not None
+    assert result.alert.database.host == "detail-host"
+    assert result.alert.database.port == 3306
+    assert result.latest_run is not None
+    detail_evidence = next(
+        item for item in result.evidence_records if item.tool_name == "flashduty_alert_info"
+    )
+    assert detail_evidence.id == uuid5(
+        result.latest_run.id,
+        "flashduty-alert-info-evidence-v1:663a1b2c3d4e5f6789abcdef",
+    )
+    assert detail_evidence.source_system == "flashduty_alert_detail"
+    assert detail_evidence.status == ToolStatus.SUCCESS
+    assert detail_evidence.request["read_only"] is True
+    assert detail_evidence.structured_data["read_only"] is True
+    assert detail_evidence.structured_data["partial"] is False
+    assert detail_evidence.structured_data["flashduty_alert_info"] is not None
+    assert detail_evidence.structured_data["alert_detail"]["database"] == {
+        "engine": "mysql",
+        "instance": "orders-primary",
+        "database": None,
+        "host": "detail-host",
+        "port": 3306,
+    }
+    assert detail_evidence.is_root_cause_support_eligible() is True
+
+    detail_progress_count = sum(
+        item.details.get("flashduty_detail_status") == "loaded" for item in result.progress
+    )
+    replay = await enrich_alert_node(
+        AgentState(
+            alert_id=str(result.alert.id),
+            alert=result.alert.model_copy(
+                update={
+                    "database": result.alert.database.model_copy(
+                        update={"host": None, "port": None}
+                    )
+                }
+            ),
+            stored_alert=result,
+            run=result.latest_run,
+        ),
+        runtime.service.agent.ctx,
+    )
+    assert events.count("DETAIL") == 1
+    assert replay["evidence"] == [detail_evidence]
+    assert replay["alert"].database.host == "detail-host"
+    assert replay["alert"].database.port == 3306
+    assert replay["alert"].raw_payload["flashduty_alert_info"] == {
+        "alert_id": "663a1b2c3d4e5f6789abcdef",
+        "alarm_host": "detail-host",
+        "alarm_port": 3306,
+    }
+    after_replay = await runtime.repository.get(
+        str(result.alert.id), run_id=str(result.latest_run.id)
+    )
+    assert after_replay is not None
+    assert after_replay.evidence_records == result.evidence_records
+    assert (
+        sum(
+            item.details.get("flashduty_detail_status") == "loaded"
+            for item in after_replay.progress
+        )
+        == detail_progress_count
+    )
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root_cause(
+    tmp_path: Path,
+) -> None:
+    class DetailEnricher:
+        read_only = True
+
+        async def enrich(self, alert):  # type: ignore[no-untyped-def]
+            return alert.model_copy(
+                update={
+                    "database": DatabaseTarget(
+                        engine="mysql",
+                        instance="orders-primary",
+                        host="detail-host",
+                        port=3306,
+                    ),
+                    "features": {
+                        **alert.features,
+                        "observed_value": 100,
+                        "threshold": 80,
+                    },
+                }
+            )
+
+    class EmptyStrategy:
+        async def select(
+            self,
+            alert,
+            runbooks=None,
+            external_knowledge=None,
+            knowledge_match_summary="",
+        ):  # type: ignore[no-untyped-def]
+            return InvestigationStrategy(
+                strategy_id="zero-mcp",
+                title="No MCP needed",
+                description="Use the authoritative alert detail facts.",
+                tool_plan=[],
+            )
+
+    class DetailEvidenceAdvisor:
+        async def advise(
+            self,
+            alert,
+            runbooks,
+            evidence=None,
+            external_knowledge=None,
+            knowledge_match_summary="",
+            strategy=None,
+            investigation_memory=None,
+        ):  # type: ignore[no-untyped-def]
+            del runbooks, external_knowledge, strategy, investigation_memory
+            detail = next(
+                item for item in evidence or [] if item.tool_name == "flashduty_alert_info"
+            )
+            assert detail.structured_data["alert_detail"]["reason"] == alert.reason
+            cause = "连接需求突增使当前连接数超过配置容量"
+            assert cause != alert.reason
+            return (
+                Recommendation(
+                    summary=cause,
+                    knowledge_match_summary=knowledge_match_summary,
+                    likely_causes=[cause],
+                    analysis_bases=[
+                        AnalysisBasis(
+                            source=AnalysisBasisSource.AI,
+                            statement="结合权威告警详情中的当前值和阈值判断。",
+                        )
+                    ],
+                    steps=[
+                        RecommendationStep(
+                            order=1,
+                            action="只读核对连接来源与连接池使用情况。",
+                        )
+                    ],
+                    risks=[],
+                    confidence=0.9,
+                    manual_matched=False,
+                    root_causes=[
+                        RootCauseAssessment(
+                            cause=cause,
+                            status=RootCauseStatus.SUPPORTED,
+                            evidence_refs=[str(detail.id)],
+                            confidence=0.9,
+                            verified=True,
+                        )
+                    ],
+                ),
+                AdvisorMetadata(
+                    provider="test",
+                    model="detail-evidence-advisor",
+                    prompt_version="test-v1",
+                ),
+            )
+
+    class EmptyRunbookStore:
+        async def list(self):  # type: ignore[no-untyped-def]
+            return []
+
+        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("not used")
+
+    runtime = build_runtime(
+        settings_for(tmp_path).model_copy(update={"validation_enabled": False}),
+        advisor=DetailEvidenceAdvisor(),
+        runbook_provider=EmptyRunbookStore(),
+        runbook_store=EmptyRunbookStore(),
+        strategy_provider=EmptyStrategy(),
+    )
+    runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "flashduty",
+        {
+            "request_id": "req-zero-mcp",
+            "data": {
+                "alert_id": "773a1b2c3d4e5f6789abcdef",
+                "title": "MySQL connections high",
+                "alert_severity": "Warning",
+                "alert_key": "connections_high",
+                "start_time": 1712650000,
+                "labels": {"engine": "mysql"},
+            },
+        },
+    )
+
+    assert result.status == AlertStatus.COMPLETED
+    assert result.recommendation is not None
+    assert result.recommendation.root_causes[0].cause != result.alert.reason
+    assert [item.tool_name for item in result.evidence_records] == [
+        "flashduty_alert_info"
+    ]
+    detail_evidence = result.evidence_records[0]
+    reason_only = result.recommendation.model_copy(
+        update={
+            "summary": result.alert.reason,
+            "likely_causes": [result.alert.reason],
+            "root_causes": [
+                RootCauseAssessment(
+                    cause=result.alert.reason,
+                    status=RootCauseStatus.SUPPORTED,
+                    evidence_refs=[str(detail_evidence.id)],
+                    confidence=0.9,
+                    verified=True,
+                )
+            ],
+        }
+    )
+    rejected = enforce_post_evidence_root_cause_policy(
+        reason_only,
+        [detail_evidence],
+        result.alert,
+    )
+    assert rejected.root_causes == []
+    assert rejected.likely_causes == []
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [None, False, True])
+async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
+    tmp_path: Path,
+    read_only: bool | None,
+) -> None:
+    calls: list[str] = []
+
+    class UnusableDetailEnricher:
+        async def enrich(self, _alert):  # type: ignore[no-untyped-def]
+            calls.append("DETAIL")
+            raise RuntimeError("detail unavailable")
+
+    class RecordingRunbookProvider:
+        async def search(self, _alert, limit=5):  # type: ignore[no-untyped-def]
+            calls.append("KNOWLEDGE")
+            return []
+
+    class EmptyRunbookStore:
+        async def list(self):  # type: ignore[no-untyped-def]
+            return []
+
+        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("not used")
+
+    class RecordingStrategy:
+        async def select(
+            self,
+            _alert,
+            runbooks=None,
+            external_knowledge=None,
+            knowledge_match_summary="",
+        ):  # type: ignore[no-untyped-def]
+            calls.append("MCP_SELECTION")
+            raise AssertionError("MCP selection must not run without alert detail")
+
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        runbook_provider=RecordingRunbookProvider(),
+        runbook_store=EmptyRunbookStore(),
+        strategy_provider=RecordingStrategy(),
+    )
+    enricher = UnusableDetailEnricher()
+    if read_only is not None:
+        enricher.read_only = read_only  # type: ignore[attr-defined]
+    runtime.service.agent.ctx.alert_detail_enricher = enricher  # type: ignore[assignment]
+    await runtime.repository.initialize()
+
+    with pytest.raises(AnalysisFailedError, match="FlashDuty alert detail"):
+        await runtime.service.analyze(
+            "flashduty",
+            {
+                "request_id": "req-list",
+                "data": {
+                    "alert_id": f"663a1b2c3d4e5f6789abcde{int(bool(read_only))}",
+                    "title": "MySQL/mysql_slow_query/list-host:3307",
+                    "alert_severity": "Warning",
+                    "alert_key": "slow_query",
+                    "start_time": 1712650000,
+                    "labels": {
+                        "engine": "mysql",
+                        "alarm_host": "list-host",
+                        "alarm_port": "3307",
+                    },
+                },
+            },
+        )
+
+    assert calls == (["DETAIL"] if read_only is True else [])
+    await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 class RecordingNotifier(LogManagementNotifier):
@@ -113,6 +530,7 @@ class FlakyAdvisor(FakeAIAdvisor):
 class FlakyRetryableMCPTool:
     name = "retryable_mcp_probe"
     source_system = "test_mcp"
+    read_only = True
 
     def __init__(self) -> None:
         self.calls: list[ToolExecutionRequest] = []
@@ -127,6 +545,7 @@ class FlakyRetryableMCPTool:
 class PartialRetryableMCPTool:
     name = "partial_mcp_probe"
     source_system = "test_mcp"
+    read_only = True
 
     def __init__(self) -> None:
         self.calls: list[ToolExecutionRequest] = []
@@ -145,6 +564,7 @@ class PartialRetryableMCPTool:
 class RecordingMCPStyleTool:
     name = "mcp_style_probe"
     source_system = "test_mcp"
+    read_only = True
 
     def __init__(self, events: list[str] | None = None) -> None:
         self.calls: list[ToolExecutionRequest] = []
@@ -160,7 +580,13 @@ class RecordingMCPStyleTool:
 
 
 class RetryableMCPStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
         return InvestigationStrategy(
             strategy_id="retryable-mcp-strategy",
             title="Retryable MCP strategy",
@@ -177,7 +603,13 @@ class RetryableMCPStrategy:
 
 
 class PartialMCPStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
         return InvestigationStrategy(
             strategy_id="partial-mcp-strategy",
             title="Partial MCP strategy",
@@ -194,7 +626,13 @@ class PartialMCPStrategy:
 
 
 class LongTimeoutMCPStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
         return InvestigationStrategy(
             strategy_id="long-timeout-mcp-strategy",
             title="Long timeout MCP strategy",
@@ -212,13 +650,27 @@ class LongTimeoutMCPStrategy:
 
 
 class NoReactMCPStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
-        strategy = await LongTimeoutMCPStrategy().select(alert, runbooks)
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
+        strategy = await LongTimeoutMCPStrategy().select(
+            alert, runbooks, external_knowledge, knowledge_match_summary
+        )
         return strategy.model_copy(update={"max_dynamic_turns": 0})
 
 
 class TwoPhaseCollectionStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
         return InvestigationStrategy(
             strategy_id="two-phase-collection",
             title="Two planned read-only collections",
@@ -237,7 +689,13 @@ class TwoPhaseCollectionStrategy:
 
 
 class RequiredToolStrategy:
-    async def select(self, alert, runbooks=None):  # type: ignore[no-untyped-def]
+    async def select(
+        self,
+        alert,
+        runbooks=None,
+        external_knowledge=None,
+        knowledge_match_summary="",
+    ):  # type: ignore[no-untyped-def]
         return InvestigationStrategy(
             strategy_id="custom-required-tool",
             title="Custom required tool",
@@ -310,7 +768,7 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
 
     assert events == ["ADVISOR", f"RESULT:{severity}"]
     assert advisor.calls == 1
-    assert advisor.evidence_tool_names == ["alert_context"]
+    assert advisor.evidence_tool_names == []
     assert first.alert.id == second.alert.id
     assert first.status == AlertStatus.INCONCLUSIVE
     assert all(item.passed for item in first.validations)
@@ -397,34 +855,6 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
     assert result.status == AlertStatus.INCONCLUSIVE
     assert advisor.calls == 2
     assert events == ["RESULT:CRITICAL"]
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_is_always_inconclusive(tmp_path: Path) -> None:
-    settings = settings_for(tmp_path).model_copy(update={"shadow_enabled": True})
-    runtime = build_runtime(settings)
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "shadow-warning",
-            "severity": "WARNING",
-            "title": "Unknown warning",
-            "reason": "unknown_warning",
-        },
-    )
-
-    assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.analysis_mode == "shadow"
-    # The notification step appends a REPORTING progress record after the
-    # INCONCLUSIVE record. Find the shadow progress record explicitly.
-    shadow_records = [
-        record for record in result.progress if record.details.get("shadow_enabled") is True
-    ]
-    assert shadow_records, "expected a progress record with shadow_enabled=True"
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -697,8 +1127,8 @@ async def test_explicit_target_runs_baseline_but_keeps_unknown_cause_inconclusiv
         for item in result.progress
         if "tool_count" in item.details and "analysis_deferred" in item.details
     )
-    assert strategy_progress.details == {"tool_count": 1, "analysis_deferred": True}
-    assert [item.tool_name for item in result.evidence_records] == ["alert_context"]
+    assert strategy_progress.details == {"tool_count": 0, "analysis_deferred": True}
+    assert result.evidence_records == []
     assert result.status == AlertStatus.INCONCLUSIVE
     assert result.recommendation is not None
     assert result.recommendation.root_causes == []
@@ -906,7 +1336,7 @@ async def test_legacy_react_settings_keep_only_planned_collection(
         },
     )
 
-    assert [item.tool_name for item in result.evidence_records] == ["alert_context"]
+    assert result.evidence_records == []
     react_progress = [
         item for item in result.progress if item.details.get("event") == "react_decision"
     ]
@@ -919,7 +1349,9 @@ async def test_legacy_react_settings_keep_only_planned_collection(
 
 
 @pytest.mark.asyncio
-async def test_required_tool_failure_comes_from_selected_strategy(tmp_path: Path) -> None:
+async def test_unavailable_selected_tool_does_not_create_global_required_failure(
+    tmp_path: Path,
+) -> None:
     runtime = build_runtime(
         settings_for(tmp_path),
         strategy_provider=RequiredToolStrategy(),
@@ -940,7 +1372,7 @@ async def test_required_tool_failure_comes_from_selected_strategy(tmp_path: Path
     assert result.status == AlertStatus.INCONCLUSIVE
     assert result.validations[0].passed is True
     assert result.validations[0].evidence_sufficient is False
-    assert result.validations[0].metadata["required_tool_failures"] == ["custom_required_probe"]
+    assert "required_tool_failures" not in result.validations[0].metadata
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

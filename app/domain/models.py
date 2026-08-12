@@ -58,6 +58,74 @@ class ToolStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class ToolResultSourceSpan(BaseModel):
+    """Exact character interval cited from one string-valued JSON Pointer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    character_start: int = Field(ge=0)
+    character_end: int = Field(gt=0)
+    character_total: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> ToolResultSourceSpan:
+        if not self.path.startswith("/"):
+            raise ValueError("tool result source span path must be a JSON Pointer")
+        if self.character_end <= self.character_start:
+            raise ValueError("tool result source span must have a non-empty interval")
+        if self.character_end > self.character_total:
+            raise ValueError("tool result source span exceeds the source string")
+        return self
+
+
+class ToolResultObservation(BaseModel):
+    """One source-grounded fact extracted from a complete tool result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str = Field(min_length=1, max_length=4000)
+    source_paths: list[str] = Field(min_length=1, max_length=50)
+    source_spans: list[ToolResultSourceSpan] = Field(default_factory=list)
+
+    @field_validator("source_paths")
+    @classmethod
+    def validate_json_pointers(cls, value: list[str]) -> list[str]:
+        if any(not item.startswith("/") for item in value):
+            raise ValueError("tool result source paths must be JSON Pointers")
+        return value
+
+
+class ToolResultAnalysis(BaseModel):
+    """Traceable fact projection produced by an independent tool-result session.
+
+    The child session never decides causality. ``source_coverage_complete`` is set
+    by the host only after every lossless source partition has been processed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=4000)
+    observations: list[ToolResultObservation] = Field(default_factory=list)
+    anomalies: list[ToolResultObservation] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    analysis_usable: bool
+    source_coverage_complete: bool
+    source_artifact_id: UUID
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider: str = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
+    request_id: str | None = Field(default=None, max_length=512)
+    prompt_version: str = Field(min_length=1, max_length=128)
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_usability(self) -> ToolResultAnalysis:
+        if self.analysis_usable and not (self.observations or self.anomalies):
+            raise ValueError("a usable tool-result analysis requires facts or anomalies")
+        return self
+
+
 class ValidationKind(StrEnum):
     RULE = "RULE"
     AGENT = "AGENT"
@@ -76,9 +144,9 @@ class ExecutionClass(StrEnum):
 
 
 class RootCauseStatus(StrEnum):
+    # Retained only so recommendations written before the result-contract
+    # migration remain deserializable. New analyses emit SUPPORTED.
     SUPPORT = "SUPPORT"
-    # Historical values remain readable for persisted recommendations. New
-    # analyses may only emit SUPPORT.
     SUPPORTED = "SUPPORTED"
     CONTRADICTED = "CONTRADICTED"
     UNKNOWN = "UNKNOWN"
@@ -91,6 +159,7 @@ class DatabaseTarget(BaseModel):
     instance: str | None = None
     database: str | None = None
     host: str | None = None
+    port: int | None = Field(default=None, ge=1, le=65_535)
 
 
 class NormalizedAlert(BaseModel):
@@ -286,10 +355,6 @@ class RootCauseAssessment(BaseModel):
 
     @model_validator(mode="after")
     def validate_verified_status(self) -> RootCauseAssessment:
-        if self.verified and self.status == RootCauseStatus.UNKNOWN:
-            # Backward compatibility for persisted v2 recommendations. New model
-            # responses are explicitly instructed to provide the tri-state status.
-            self.status = RootCauseStatus.SUPPORTED
         if self.verified and self.status == RootCauseStatus.CONTRADICTED:
             raise ValueError("verified root cause must have status=SUPPORTED")
         if self.verified and not self.evidence_refs:
@@ -309,7 +374,6 @@ class Recommendation(BaseModel):
     runbook_references: list[RunbookReference] = Field(default_factory=list)
     external_knowledge_matches: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
-    analysis_mode: Literal["assist", "shadow"] = "assist"
 
 
 class ToolExecutionRequest(BaseModel):
@@ -381,12 +445,11 @@ class EvidenceRecord(BaseModel):
     truncated: bool = False
 
     def is_root_cause_support_eligible(self) -> bool:
-        """Return whether this complete live record may decide a root cause.
+        """Return whether this usable live record may decide a root cause.
 
-        A partial result remains useful as collected monitoring context, but it
-        cannot support or contradict a causal mechanism. Dispatch completion
-        (for example ``allow_followup_dispatch=false``) is deliberately not an
-        evidence-quality override.
+        A legacy truncated record is usable only after a complete-data analysis
+        explicitly marks it eligible. Providers can reject any record with
+        ``partial=true`` or ``root_cause_eligible=false``.
         """
 
         return (
@@ -461,7 +524,6 @@ class AnalysisConfigSnapshot(BaseModel):
     react_enabled: bool = False
     react_max_dynamic_turns: int = 0
     validation_enabled: bool = True
-    shadow_enabled: bool = False
     ai_fallback_enabled: bool = True
     ai_model: str = ""
     ai_provider: str = "openai_compatible"

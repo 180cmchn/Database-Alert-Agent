@@ -42,12 +42,14 @@ from app.domain.models import (
 )
 from app.domain.ports import (
     AIAdvisor,
+    AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
     InvestigationStrategyProvider,
     ManagementNotifier,
     RunbookProvider,
     RunLeaseConflict,
+    ToolResultAnalyzer,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,8 +71,11 @@ class AlertAnalysisService:
         notifier: ManagementNotifier,
         repository: AlertRepository,
         strategy_provider: InvestigationStrategyProvider,
+        alert_detail_enricher: AlertDetailEnricher | None = None,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
+        tool_result_analyzer: ToolResultAnalyzer | None = None,
+        tool_result_analysis_threshold_chars: int = 12_000,
         rule_validator: ConclusionValidator,
         conclusion_validator: ConclusionValidator,
         fallback_advisor: AIAdvisor | None = None,
@@ -79,7 +84,6 @@ class AlertAnalysisService:
         lease_heartbeat_interval_seconds: float | None = None,
         react_enabled: bool = False,
         validation_enabled: bool = True,
-        shadow_enabled: bool = False,
         ai_fallback_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
         max_dynamic_turns: int = 0,
@@ -97,8 +101,11 @@ class AlertAnalysisService:
         self.notifier = notifier
         self.repository = repository
         self.strategy_provider = strategy_provider
+        self.alert_detail_enricher = alert_detail_enricher
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
+        self.tool_result_analyzer = tool_result_analyzer
+        self.tool_result_analysis_threshold_chars = tool_result_analysis_threshold_chars
         self.rule_validator = rule_validator
         self.conclusion_validator = conclusion_validator
         self.fallback_advisor = fallback_advisor
@@ -107,7 +114,6 @@ class AlertAnalysisService:
         self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
         self.react_enabled = react_enabled
         self.validation_enabled = validation_enabled
-        self.shadow_enabled = shadow_enabled
         self.ai_fallback_enabled = ai_fallback_enabled
         self.alert_sanitizer = alert_sanitizer
         self.max_dynamic_turns = max_dynamic_turns
@@ -135,7 +141,10 @@ class AlertAnalysisService:
             conclusion_validator=conclusion_validator,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
+            tool_result_analyzer=tool_result_analyzer,
+            tool_result_analysis_threshold_chars=tool_result_analysis_threshold_chars,
             strategy_provider=strategy_provider,
+            alert_detail_enricher=alert_detail_enricher,
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
             external_knowledge_limit=external_knowledge_limit,
@@ -276,7 +285,6 @@ class AlertAnalysisService:
                 else 0
             ),
             validation_enabled=run_snapshot.validation_enabled,
-            shadow_enabled=run_snapshot.shadow_enabled,
             ai_fallback_enabled=run_snapshot.ai_fallback_enabled,
             knowledge_sources=run_snapshot.knowledge_sources,
         )
@@ -362,8 +370,6 @@ class AlertAnalysisService:
         if final_state.recommendation and final_state.alert:
             if final_state.status == AlertStatus.COMPLETED:
                 message = "数据库告警分析已完成。"
-            elif final_state.recommendation.analysis_mode == "shadow":
-                message = "数据库告警影子分析已结束，结论不充分。"
             else:
                 message = "数据库告警分析已结束，结论不充分。"
             await self._send_analysis_result(
@@ -439,7 +445,6 @@ class AlertAnalysisService:
             details = {
                 "validation_passed": final_state.validation_passed,
                 "evidence_sufficient": final_state.evidence_sufficient,
-                "shadow_enabled": final_state.shadow_enabled,
                 "advisor_degraded": final_state.advisor_degraded,
             }
         await self.repository.finalize_run(
@@ -521,7 +526,12 @@ class AlertAnalysisService:
         retirement_task = self._retirement_task
         if retirement_task is not None and retirement_task is not asyncio.current_task():
             await retirement_task
-        adapters = [*self._retired_adapters, self.advisor, self.conclusion_validator]
+        adapters = [
+            *self._retired_adapters,
+            self.advisor,
+            self.conclusion_validator,
+            self.tool_result_analyzer,
+        ]
         self._retired_adapters = []
         self._retired_adapter_ids.clear()
         await self._close_adapters(adapters)
@@ -612,7 +622,6 @@ class AlertAnalysisService:
             react_enabled=self.react_enabled,
             react_max_dynamic_turns=self.max_dynamic_turns,
             validation_enabled=self.validation_enabled,
-            shadow_enabled=self.shadow_enabled,
             ai_fallback_enabled=self.ai_fallback_enabled,
             ai_model=getattr(self.advisor, "model", ""),
             ai_provider=(

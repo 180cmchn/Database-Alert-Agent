@@ -145,7 +145,8 @@ export interface RootCauseAssessment {
   cause: string;
   hypothesis_id?: string | null;
   cause_id?: string | null;
-  status: "SUPPORT" | "SUPPORTED" | "CONTRADICTED" | "UNKNOWN";
+  // SUPPORT is accepted only when rendering recommendations persisted by older releases.
+  status: "SUPPORTED" | "CONTRADICTED" | "UNKNOWN" | "SUPPORT";
   evidence_refs: string[];
   confidence: number;
   verified: boolean;
@@ -164,7 +165,6 @@ export interface Recommendation {
   runbook_references: RunbookReference[];
   external_knowledge_matches: ExternalKnowledgeExcerpt[];
   root_causes: RootCauseAssessment[];
-  analysis_mode: "assist" | "shadow";
 }
 
 export interface ProgressRecord {
@@ -217,7 +217,6 @@ export interface AnalysisConfigSnapshot {
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
-  shadow_enabled: boolean;
   ai_fallback_enabled: boolean;
   ai_model: string;
   ai_provider: string;
@@ -347,8 +346,6 @@ export interface AdminSettings {
   react_enabled: boolean;
   react_max_dynamic_turns: number;
   validation_enabled: boolean;
-  shadow_enabled: boolean;
-  production_gate_approved: boolean;
   ai_api_key_configured: boolean;
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
@@ -391,7 +388,6 @@ export interface AdminSettingsPatch {
   react_enabled?: boolean;
   react_max_dynamic_turns?: number;
   validation_enabled?: boolean;
-  shadow_enabled?: boolean;
   ai_api_key?: string;
   knowledge_sources?: string[];
   flashduty_polling_enabled?: boolean;

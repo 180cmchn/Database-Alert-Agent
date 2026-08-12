@@ -10,6 +10,7 @@ from pypdf.generic import DictionaryObject, NameObject, StreamObject
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.pdf_runbooks import (
     LocalPDFRunbookLibrary,
+    _alert_filter_blobs,
     alert_type_directory_name,
     derive_runbook_alert_type,
     derive_runbook_alert_types,
@@ -63,6 +64,27 @@ requires_repository_annotations = pytest.mark.skipif(
     not _repository_annotations_available(),
     reason="external runbook corpus PDFs and annotation index are not installed",
 )
+
+
+def test_runbook_filtering_excludes_raw_alert_payload() -> None:
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "external_id": "raw-payload-filter",
+            "severity": "WARNING",
+            "title": "Database latency",
+            "reason": "latency",
+        }
+    ).model_copy(
+        update={
+            "raw_payload": {
+                "raw_payload_only_marker": "must-not-affect-runbook-matching"
+            }
+        }
+    )
+
+    blobs = _alert_filter_blobs(alert)
+
+    assert all("must-not-affect-runbook-matching" not in blob for blob in blobs)
 
 
 def _write_text_pdf(path: Path, text: str) -> None:

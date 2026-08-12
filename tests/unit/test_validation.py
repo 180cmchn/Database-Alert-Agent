@@ -76,14 +76,14 @@ def make_live_evidence(
     )
 
 
-def test_post_evidence_policy_keeps_only_support_with_eligible_live_evidence() -> None:
+def test_post_evidence_policy_keeps_only_supported_with_eligible_live_evidence() -> None:
     evidence = make_live_evidence()
     recommendation = make_recommendation(
         summary="实时证据表明长事务持续占用连接槽位。",
         root_causes=[
             RootCauseAssessment(
                 cause="长事务持续占用连接槽位，导致可用连接耗尽。",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id), str(evidence.id)],
                 confidence=0.9,
                 verified=False,
@@ -102,7 +102,7 @@ def test_post_evidence_policy_keeps_only_support_with_eligible_live_evidence() -
     assert [item.cause for item in result.root_causes] == [
         "长事务持续占用连接槽位，导致可用连接耗尽。"
     ]
-    assert result.root_causes[0].status == RootCauseStatus.SUPPORT
+    assert result.root_causes[0].status == RootCauseStatus.SUPPORTED
     assert result.root_causes[0].verified is True
     assert result.root_causes[0].evidence_refs == [str(evidence.id)]
     assert result.root_causes[0].hypothesis_id is None
@@ -113,7 +113,7 @@ def test_post_evidence_policy_keeps_only_support_with_eligible_live_evidence() -
 @pytest.mark.parametrize(
     "status",
     [
-        RootCauseStatus.SUPPORTED,
+        RootCauseStatus.SUPPORT,
         RootCauseStatus.UNKNOWN,
         RootCauseStatus.CONTRADICTED,
     ],
@@ -129,7 +129,7 @@ def test_post_evidence_policy_rejects_historical_statuses_for_new_results(
                 cause="连接池泄漏。",
                 status=status,
                 evidence_refs=[str(evidence.id)],
-                verified=status == RootCauseStatus.SUPPORTED,
+                verified=status == RootCauseStatus.SUPPORT,
                 next_probe=("查询连接来源。" if status == RootCauseStatus.UNKNOWN else None),
             )
         ],
@@ -158,7 +158,6 @@ def test_post_evidence_policy_rejects_historical_statuses_for_new_results(
             False,
         ),
         (ToolStatus.SUCCESS, {}, "alert_platform", False),
-        (ToolStatus.SUCCESS, {}, "database_diagnostics", True),
     ],
 )
 def test_post_evidence_policy_returns_fixed_no_cause_for_ineligible_evidence(
@@ -178,7 +177,7 @@ def test_post_evidence_policy_returns_fixed_no_cause_for_ineligible_evidence(
         root_causes=[
             RootCauseAssessment(
                 cause="长事务导致连接耗尽。",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id)],
                 verified=True,
             )
@@ -192,6 +191,54 @@ def test_post_evidence_policy_returns_fixed_no_cause_for_ineligible_evidence(
     assert result.likely_causes == []
 
 
+def test_post_evidence_policy_accepts_truncated_record_after_complete_fact_projection() -> None:
+    evidence = make_live_evidence(
+        truncated=True,
+        structured_data={"root_cause_eligible": True, "analyzed_from_complete_raw": True},
+    )
+    recommendation = make_recommendation(
+        summary="完整分析结果表明长事务导致连接耗尽。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
+
+    assert result.root_causes[0].status == RootCauseStatus.SUPPORTED
+    assert result.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+
+
+def test_host_eligibility_gate_does_not_create_a_root_cause() -> None:
+    evidence = make_live_evidence(
+        structured_data={"root_cause_eligible": True, "analyzed_from_complete_raw": True}
+    )
+    recommendation = make_recommendation(summary="子 Agent 仅返回结构化事实。")
+
+    result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
+
+    assert result.root_causes == []
+    assert result.likely_causes == []
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+
+
+def test_verified_unknown_status_is_not_silently_promoted() -> None:
+    evidence = make_live_evidence()
+    cause = RootCauseAssessment(
+        cause="旧模型返回未决原因。",
+        status=RootCauseStatus.UNKNOWN,
+        evidence_refs=[str(evidence.id)],
+        verified=True,
+    )
+
+    assert cause.status == RootCauseStatus.UNKNOWN
+
+
 def test_post_evidence_policy_does_not_promote_alert_reason_to_root_cause() -> None:
     alert = make_alert()
     evidence = make_live_evidence()
@@ -200,7 +247,7 @@ def test_post_evidence_policy_does_not_promote_alert_reason_to_root_cause() -> N
         root_causes=[
             RootCauseAssessment(
                 cause=alert.reason,
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id)],
                 verified=True,
             )
@@ -234,7 +281,7 @@ def test_post_evidence_policy_drops_filtered_management_sql_cause() -> None:
         root_causes=[
             RootCauseAssessment(
                 cause="本次告警完全由数据库管理平台采集 SQL 造成",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id)],
                 verified=True,
             )
@@ -289,7 +336,7 @@ async def test_rule_validator_rejects_empty_cause_with_noncanonical_summary() ->
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_accepts_support_with_live_evidence() -> None:
+async def test_rule_validator_accepts_supported_with_live_evidence() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
     evidence = make_live_evidence()
@@ -298,7 +345,7 @@ async def test_rule_validator_accepts_support_with_live_evidence() -> None:
         root_causes=[
             RootCauseAssessment(
                 cause="长事务持续占用连接槽位，导致可用连接耗尽。",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id)],
                 confidence=0.9,
                 verified=True,
@@ -320,10 +367,49 @@ async def test_rule_validator_accepts_support_with_live_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unrelated_no_data_does_not_invalidate_supported_relevant_evidence() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    relevant = make_live_evidence()
+    target_not_configured = make_live_evidence(
+        status=ToolStatus.NO_DATA,
+        source_system="prometheus_mcp",
+        structured_data={
+            "reason_code": "target_not_configured",
+            "target_configured": False,
+        },
+    )
+    recommendation = make_recommendation(
+        summary="慢查询证据确认长事务持续占用连接槽位。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(relevant.id)],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [relevant, target_not_configured],
+        [],
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is True
+    assert result.issues == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
     [
-        RootCauseStatus.SUPPORTED,
+        RootCauseStatus.SUPPORT,
         RootCauseStatus.UNKNOWN,
         RootCauseStatus.CONTRADICTED,
     ],
@@ -341,7 +427,7 @@ async def test_rule_validator_rejects_historical_status_in_new_result(
                 cause="连接池泄漏。",
                 status=status,
                 evidence_refs=[str(evidence.id)],
-                verified=status == RootCauseStatus.SUPPORTED,
+                verified=status == RootCauseStatus.SUPPORT,
                 next_probe=("查询连接来源。" if status == RootCauseStatus.UNKNOWN else None),
             )
         ],
@@ -357,7 +443,7 @@ async def test_rule_validator_rejects_historical_status_in_new_result(
 
     assert result.passed is False
     assert result.evidence_sufficient is False
-    assert any("状态必须为 SUPPORT" in issue for issue in result.issues)
+    assert any("状态必须为 SUPPORTED" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
@@ -370,7 +456,7 @@ async def test_rule_validator_rejects_missing_partial_or_ineligible_support() ->
         root_causes=[
             RootCauseAssessment(
                 cause="长事务导致连接耗尽。",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(partial.id)],
                 verified=True,
             )
@@ -402,7 +488,7 @@ async def test_rule_validator_rejects_hypothesis_binding_in_new_result() -> None
             RootCauseAssessment(
                 cause="长事务导致连接耗尽。",
                 hypothesis_id="legacy-hypothesis",
-                status=RootCauseStatus.SUPPORT,
+                status=RootCauseStatus.SUPPORTED,
                 evidence_refs=[str(evidence.id)],
                 verified=True,
             )

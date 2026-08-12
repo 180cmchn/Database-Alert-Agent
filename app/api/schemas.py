@@ -114,7 +114,6 @@ class RuntimeSettingsPatch(BaseModel):
     react_enabled: bool | None = None
     react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
     validation_enabled: bool | None = None
-    shadow_enabled: bool | None = None
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
     scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
@@ -148,8 +147,6 @@ class RuntimeSettingsResponse(BaseModel):
     react_enabled: bool
     react_max_dynamic_turns: int
     validation_enabled: bool
-    shadow_enabled: bool
-    production_gate_approved: bool
     runbook_limit: int
     scheduler_workers: int
     runbook_match_min_confidence: float
@@ -201,8 +198,6 @@ class RuntimeSettingsResponse(BaseModel):
             react_enabled=settings.react_enabled,
             react_max_dynamic_turns=settings.react_max_dynamic_turns,
             validation_enabled=settings.validation_enabled,
-            shadow_enabled=settings.shadow_enabled,
-            production_gate_approved=settings.production_gate_approved,
             runbook_limit=settings.runbook_limit,
             scheduler_workers=settings.scheduler_workers,
             runbook_match_min_confidence=settings.runbook_match_min_confidence,

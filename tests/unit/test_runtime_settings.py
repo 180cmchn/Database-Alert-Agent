@@ -13,6 +13,7 @@ from app.application.admin import (
     RuntimeSettingsConflictError,
     RuntimeSettingsManager,
 )
+from app.application.factory import _mcp_environment
 from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings
 from tests.pdf_fixtures import create_tikv_runbook_pdf
 
@@ -57,6 +58,8 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
                 "scheduler_workers": 4,
                 "archery_mcp_max_agent_steps": 18,
                 "database_url": "sqlite+aiosqlite:///must-not-be-used.db",
+                "shadow_enabled": True,
+                "production_gate_approved": True,
             }
         ),
         encoding="utf-8",
@@ -77,6 +80,8 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
     assert settings.scheduler_workers == 4
     assert settings.archery_mcp_max_agent_steps == 18
     assert settings.database_url == "sqlite+aiosqlite:///bootstrap.db"
+    assert not hasattr(settings, "shadow_enabled")
+    assert not hasattr(settings, "production_gate_approved")
 
 
 def test_cors_origins_accept_csv_and_production_urls_require_https(
@@ -301,6 +306,31 @@ def test_flashduty_polling_requires_a_collaboration_space_scope() -> None:
     )
 
 
+def test_generic_mcp_environment_is_loaded_from_dotenv_without_entering_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        "NEW_MCP_URL=https://mcp.example.test/sse\n"
+        "NEW_MCP_API_KEY=dotenv-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEW_MCP_API_KEY", "process-secret")
+    settings = Settings(
+        ai_provider="fake",
+        knowledge_sources=["external_knowledge"],
+    )
+
+    environment = _mcp_environment(settings)
+
+    assert environment["NEW_MCP_URL"] == "https://mcp.example.test/sse"
+    assert environment["NEW_MCP_API_KEY"] == "process-secret"
+    assert "new_mcp_url" not in settings.model_dump()
+    assert "new_mcp_api_key" not in settings.model_dump()
+
+
 def test_flashduty_unaudited_capabilities_are_disabled_and_deployment_only() -> None:
     settings = Settings(_env_file=None, ai_provider="fake")
 
@@ -508,7 +538,6 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         ai_model="configured-test-model",
         ai_base_url="https://models.example.test/v1",
         admin_api_token="configured-admin-token",
-        production_gate_approved=True,
         wecom_enabled=True,
         wecom_page_base_url="https://alerts.example.test",
         runbook_pdf_dir=runbooks,
@@ -551,6 +580,10 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["archery_mcp_max_agent_steps"] == 12
+    assert "shadow_enabled" not in body
+    assert "production_gate_approved" not in body
+    assert "shadow_enabled" not in RUNTIME_SETTINGS_KEYS
+    assert "production_gate_approved" not in RUNTIME_SETTINGS_KEYS
     assert "prometheus_mcp_use_shared_harness" not in body
     assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS
@@ -670,27 +703,3 @@ def test_runtime_settings_response_does_not_leak_external_knowledge_api_key(
     changed_response = RuntimeSettingsResponse.from_settings(changed_url, revision="1" * 16)
     assert changed_response.external_knowledge_api_key_configured is False
     assert any("must be re-entered" in issue for issue in changed_response.issues)
-
-
-def test_production_requires_gate_approval_before_shadow_mode_is_disabled(
-    tmp_path: Path,
-) -> None:
-    runbooks = tmp_path / "runbooks"
-    create_tikv_runbook_pdf(runbooks)
-    base = {
-        "_env_file": None,
-        "app_env": "production",
-        "ai_provider": "openai_compatible",
-        "ai_api_key": "configured-test-key",
-        "ai_model": "configured-test-model",
-        "ai_base_url": "https://models.example.test/v1",
-        "admin_api_token": "configured-admin-token",
-        "wecom_webhook_url": ("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key"),
-        "runbook_pdf_dir": runbooks,
-    }
-
-    blocked = Settings(**base, shadow_enabled=False, production_gate_approved=False)
-    shadow = Settings(**base, shadow_enabled=True, production_gate_approved=False)
-
-    assert any("PRODUCTION_GATE_APPROVED" in issue for issue in blocked.readiness_issues())
-    assert not any("PRODUCTION_GATE_APPROVED" in issue for issue in shadow.readiness_issues())

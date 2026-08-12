@@ -3,23 +3,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from app.adapters.archery_mcp import (
-    ARCHERY_SLOW_LOG_TOOL_NAME,
-    is_slow_query_alert_title,
-)
-from app.adapters.prometheus_mcp import PROMETHEUS_METRICS_TOOL_NAME
 from app.agent_runtime.contracts import RetryPolicy, ToolRisk, ToolSpec
 from app.application.sanitization import sanitize
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.models import (
     EvidenceRecord,
+    ExternalKnowledgeExcerpt,
     InvestigationContext,
     InvestigationStrategy,
     NormalizedAlert,
@@ -29,19 +26,7 @@ from app.domain.models import (
     ToolStatus,
 )
 from app.domain.ports import InvestigationTool
-
-_TRUNCATION_CONTROL_KEYS = (
-    "query_completed",
-    "root_cause_eligible",
-    "root_cause_ineligible_reason",
-    "call_limit_reached",
-    "partial",
-    "allow_followup_dispatch",
-    "termination_reason",
-    "termination_error_type",
-    "mcp_session_attempts",
-    "reconnect_error_type",
-)
+from app.domain.tool_calling import MCPServerSelectionModel
 
 
 class InvestigationToolRegistry:
@@ -93,6 +78,14 @@ class InvestigationToolRegistry:
         if isinstance(declared, ToolSpec):
             return declared
 
+        if not hasattr(tool, "read_only"):
+            raise TypeError(
+                f"Tool {tool.name} must explicitly declare read_only before registration"
+            )
+        read_only = tool.read_only
+        if type(read_only) is not bool:
+            raise TypeError(f"Tool {tool.name} read_only must be a boolean")
+
         schema = getattr(
             tool,
             "input_schema",
@@ -111,7 +104,7 @@ class InvestigationToolRegistry:
             provider=tool.source_system,
             capability=str(getattr(tool, "capability", tool.name)),
             input_schema=schema,
-            read_only=bool(getattr(tool, "read_only", True)),
+            read_only=read_only,
             risk=ToolRisk(str(getattr(tool, "risk", ToolRisk.LOW)).upper()),
             policy_version=str(getattr(tool, "policy_version", "legacy-read-only-v1")),
             schema_version=(
@@ -160,12 +153,10 @@ class ToolExecutor:
     def __init__(
         self,
         registry: InvestigationToolRegistry,
-        max_result_chars: int = 12000,
         *,
         policy: InvestigationToolPolicy | None = None,
     ) -> None:
         self.registry = registry
-        self.max_result_chars = max_result_chars
         self.policy = policy or InvestigationToolPolicy(registry)
 
     async def execute(
@@ -218,10 +209,6 @@ class ToolExecutor:
                     "Tools must raise an exception for FAILED/TIMEOUT outcomes"
                 )
             safe_data = sanitize(structured_data)
-            serialized = json.dumps(safe_data, ensure_ascii=False, default=str)
-            truncated = len(serialized) > self.max_result_chars
-            if truncated:
-                safe_data = self._truncate_structured_data(safe_data, serialized)
             return self._record(
                 request,
                 context,
@@ -229,7 +216,6 @@ class ToolExecutor:
                 status=status,
                 summary=str(sanitize(summary))[:2000],
                 structured_data=safe_data,
-                truncated=truncated,
                 started_at=started_at,
                 started=started,
             )
@@ -258,35 +244,6 @@ class ToolExecutor:
                 started_at=started_at,
                 started=started,
             )
-
-    def _truncate_structured_data(
-        self,
-        safe_data: Any,
-        serialized: str,
-    ) -> dict[str, Any]:
-        """Keep decision-critical fields outside the bounded diagnostic preview."""
-
-        preserved: dict[str, Any] = {}
-        if isinstance(safe_data, dict):
-            preserved.update(
-                (key, safe_data[key])
-                for key in _TRUNCATION_CONTROL_KEYS
-                if key in safe_data
-            )
-
-        if preserved.get("root_cause_eligible") is True:
-            preserved["eligible_before_truncation"] = True
-        preserved["root_cause_eligible"] = False
-        preserved["root_cause_ineligible_reason"] = "evidence_payload_truncated"
-
-        preserved["original_char_count"] = len(serialized)
-        preview_container = {**preserved, "truncated_preview": ""}
-        preview_overhead = len(
-            json.dumps(preview_container, ensure_ascii=False, default=str)
-        )
-        preview_limit = max(self.max_result_chars - preview_overhead, 0)
-        preserved["truncated_preview"] = serialized[:preview_limit]
-        return preserved
 
     @staticmethod
     def _failure_data(exc: Exception) -> dict[str, Any]:
@@ -385,277 +342,116 @@ class UnavailableExternalTool:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MCPToolBinding:
+    """Map one secret-free catalog entry to its registered outer tool."""
+
+    server_name: str
+    tool_name: str
+    role: str
+    purpose: str
+    timeout_seconds: float
+    read_only: bool = True
+
+
 class DefaultInvestigationStrategyProvider:
+    """Let the configured model select zero or more relevant MCP servers.
+
+    The name remains stable for callers that inject the default provider, but
+    there are no alert-type or provider-specific strategy branches here.
+    """
+
     def __init__(
         self,
         max_dynamic_turns: int = 0,
         *,
-        alert_context_timeout_seconds: float = 15,
-        external_tool_timeout_seconds: float = 45,
-        archery_tool_timeout_seconds: float = 780,
-        prometheus_tool_timeout_seconds: float = 780,
+        model: MCPServerSelectionModel | None = None,
+        mcp_bindings: list[MCPToolBinding] | None = None,
         available_tools: list[str] | None = None,
-        metrics_ds_name: str = "",
-        logs_ds_name: str = "",
-        logs_ds_type: str = "loki",
+        **legacy_options: Any,
     ) -> None:
+        # Legacy keyword arguments are accepted so rolling runtime updates do
+        # not fail while API and worker processes run different code versions.
+        del legacy_options
         self.max_dynamic_turns = max_dynamic_turns
-        self.alert_context_timeout_seconds = alert_context_timeout_seconds
-        self.external_tool_timeout_seconds = external_tool_timeout_seconds
-        self.archery_tool_timeout_seconds = archery_tool_timeout_seconds
-        self.prometheus_tool_timeout_seconds = prometheus_tool_timeout_seconds
-        self.available_tools = set(
-            ["alert_context"] if available_tools is None else available_tools
+        self.model = model
+        available = set(available_tools or [])
+        self.mcp_bindings = tuple(
+            binding
+            for binding in (mcp_bindings or [])
+            if binding.tool_name in available and binding.read_only is True
         )
-        self.metrics_ds_name = metrics_ds_name.strip()
-        self.logs_ds_name = logs_ds_name.strip()
-        self.logs_ds_type = logs_ds_type.strip()
 
     async def select(
-        self, alert: NormalizedAlert, runbooks: list[RunbookExcerpt] | None = None
+        self,
+        alert: NormalizedAlert,
+        runbooks: list[RunbookExcerpt] | None = None,
+        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
+        knowledge_match_summary: str = "",
     ) -> InvestigationStrategy:
         runbooks = runbooks or []
-        diagnostics = self._diagnostics_for_text(
-            " ".join(
-                [
-                    alert.alert_type,
-                    alert.alert_name,
-                    alert.title,
-                    alert.reason,
+        external_knowledge = external_knowledge or []
+        selected_names: tuple[str, ...] = ()
+        if self.mcp_bindings:
+            if self.model is None:
+                raise RuntimeError(
+                    "Configured MCP servers require a model that supports relevance selection"
+                )
+            selection = await self.model.select_mcp_servers(
+                alert=preprocess_normalized_alert(alert).model_dump(
+                    mode="json", exclude={"raw_payload"}
+                ),
+                knowledge_matches=[
+                    {
+                        "source": "local_pdf",
+                        "match": item.model_dump(mode="json"),
+                    }
+                    for item in runbooks
                 ]
+                + [
+                    {
+                        "source": "external_knowledge",
+                        "match": item.model_dump(mode="json"),
+                    }
+                    for item in external_knowledge
+                ],
+                knowledge_match_summary=knowledge_match_summary,
+                candidates=[
+                    {
+                        "name": binding.server_name,
+                        "role": binding.role,
+                        "purpose": binding.purpose,
+                        "read_only": binding.read_only,
+                    }
+                    for binding in self.mcp_bindings
+                ],
             )
-        )
-        tool_plan = self._base_tool_plan(alert, diagnostics)
+            configured_names = {binding.server_name for binding in self.mcp_bindings}
+            unknown = set(selection.server_names) - configured_names
+            if unknown:
+                raise ValueError(
+                    "MCP selector returned servers outside the configured catalog: "
+                    + ", ".join(sorted(unknown))
+                )
+            selected_names = tuple(dict.fromkeys(selection.server_names))
 
-        connection_alert = alert.alert_type.casefold() in {
-            "connection_exhausted",
-            "too_many_connections",
-        }
-        slow_query_alert = is_slow_query_alert_title(alert.title)
+        by_name = {binding.server_name: binding for binding in self.mcp_bindings}
+        tool_plan = [
+            ToolExecutionRequest(
+                tool_name=by_name[name].tool_name,
+                objective=by_name[name].purpose,
+                required=False,
+                timeout_seconds=by_name[name].timeout_seconds,
+            )
+            for name in selected_names
+        ]
         return InvestigationStrategy(
-            strategy_id=(
-                "database-connection-exhausted-v2"
-                if connection_alert
-                else (
-                    "database-excessive-slow-query-v1"
-                    if slow_query_alert
-                    else "generic-alert-investigation-v2"
-                )
-            ),
-            title=(
-                "数据库连接数耗尽调查策略"
-                if connection_alert
-                else (
-                    "慢查询过多实时取证策略"
-                    if slow_query_alert
-                    else "通用告警调查策略"
-                )
-            ),
-            description=(
-                "根据告警目标、信号和时间窗执行预定义只读采集；"
-                "采集阶段不生成或评估根因。"
-            ),
+            strategy_id="agent-selected-mcp-v1",
+            title="Agent 自主 MCP 调查",
+            description="Agent 根据 MCP 角色和作用选择零个或多个相关只读 MCP。",
             tool_plan=tool_plan,
             max_dynamic_turns=0,
         )
-
-    def _base_tool_plan(
-        self, alert: NormalizedAlert, diagnostics: list[str]
-    ) -> list[ToolExecutionRequest]:
-        requests: list[ToolExecutionRequest] = []
-        if "alert_context" in self.available_tools:
-            requests.append(
-                ToolExecutionRequest(
-                    tool_name="alert_context",
-                    required=True,
-                    timeout_seconds=self.alert_context_timeout_seconds,
-                )
-            )
-
-        if is_slow_query_alert_title(alert.title):
-            requests.append(
-                ToolExecutionRequest(
-                    tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
-                    required=True,
-                    timeout_seconds=self.archery_tool_timeout_seconds,
-                )
-            )
-
-        if PROMETHEUS_METRICS_TOOL_NAME in self.available_tools:
-            requests.append(
-                ToolExecutionRequest(
-                    tool_name=PROMETHEUS_METRICS_TOOL_NAME,
-                    required=True,
-                    timeout_seconds=self.prometheus_tool_timeout_seconds,
-                )
-            )
-
-        for tool_name in (
-            "query_metrics",
-            "query_logs",
-            "query_similar_incidents",
-        ):
-            if tool_name not in self.available_tools:
-                continue
-            parameters = self._parameters_for_tool(
-                tool_name,
-                alert,
-                " ".join(diagnostics),
-            )
-            if parameters is None:
-                continue
-            requests.append(
-                ToolExecutionRequest(
-                    tool_name=tool_name,
-                    parameters=parameters,
-                    required=False,
-                    timeout_seconds=self.external_tool_timeout_seconds,
-                )
-            )
-        return requests
-
-    def _parameters_for_tool(
-        self, tool_name: str, alert: NormalizedAlert, objective: str
-    ) -> dict[str, Any] | None:
-        if tool_name == ARCHERY_SLOW_LOG_TOOL_NAME:
-            if not is_slow_query_alert_title(alert.title):
-                return None
-            return {}
-
-        if tool_name == "query_database_diagnostics":
-            target_locator = (
-                alert.attributes.get("flashduty_target_locator")
-                or (alert.database.instance if alert.database else None)
-                or (alert.database.host if alert.database else None)
-            )
-            if not isinstance(target_locator, str) or not target_locator.strip():
-                return None
-            parameters: dict[str, Any] = {
-                "target_locator": target_locator.strip(),
-                "diagnostics": self._diagnostics_for_text(objective),
-                **self._alert_context_parameters(alert),
-            }
-            target_kind = alert.attributes.get("flashduty_target_kind")
-            if isinstance(target_kind, str) and target_kind.strip():
-                parameters["target_kind"] = target_kind.strip()
-            return parameters
-
-        if tool_name == "query_metrics":
-            config = self._query_config(
-                alert,
-                "metrics",
-                defaults={
-                    "ds_type": "prometheus",
-                    "ds_name": self.metrics_ds_name,
-                },
-            )
-            expression = config.get("expr") or config.get("query_expr")
-            if not expression and alert.metric_name and re.fullmatch(
-                r"[A-Za-z_:][A-Za-z0-9_:]*", alert.metric_name
-            ):
-                expression = alert.metric_name
-            if (
-                not isinstance(expression, str)
-                or not expression.strip()
-                or not str(config.get("ds_name") or "").strip()
-            ):
-                return None
-            return {
-                **config,
-                "ds_type": "prometheus",
-                "expr": expression.strip(),
-                **self._alert_context_parameters(alert),
-            }
-
-        if tool_name == "query_logs":
-            config = self._query_config(
-                alert,
-                "logs",
-                defaults={
-                    "ds_type": self.logs_ds_type,
-                    "ds_name": self.logs_ds_name,
-                },
-            )
-            expression = config.get("expr") or config.get("query_expr")
-            if (
-                not isinstance(expression, str)
-                or not expression.strip()
-                or not str(config.get("ds_name") or "").strip()
-            ):
-                return None
-            return {
-                **config,
-                "expr": expression.strip(),
-                **self._alert_context_parameters(alert),
-            }
-
-        if tool_name in {"query_trace", "query_endpoint_errors"}:
-            suffix = "trace" if tool_name == "query_trace" else "endpoint_errors"
-            config = self._query_config(alert, suffix)
-            expression = config.get("expr") or config.get("query_expr")
-            if not all(
-                isinstance(config.get(key), str) and str(config[key]).strip()
-                for key in ("ds_type", "ds_name")
-            ) or not isinstance(expression, str) or not expression.strip():
-                return None
-            return {
-                **config,
-                "expr": expression.strip(),
-                **self._alert_context_parameters(alert),
-            }
-
-        if tool_name == "query_similar_incidents":
-            incident_id = alert.attributes.get("flashduty_incident_id")
-            return (
-                self._alert_context_parameters(alert)
-                if isinstance(incident_id, str) and incident_id
-                else None
-            )
-
-        if tool_name == "query_changes":
-            return {
-                "window_seconds": 1800,
-                "limit": 20,
-                **self._alert_context_parameters(alert),
-            }
-
-        return {}
-
-    @staticmethod
-    def _query_config(
-        alert: NormalizedAlert,
-        suffix: str,
-        *,
-        defaults: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        config = dict(defaults or {})
-        alert_config = alert.attributes.get(f"flashduty_{suffix}")
-        if isinstance(alert_config, dict):
-            config.update(alert_config)
-        return config
-
-    @staticmethod
-    def _alert_context_parameters(alert: NormalizedAlert) -> dict[str, Any]:
-        return {
-            "environment": alert.environment,
-            "service_name": alert.service_name,
-            "instance": alert.database.instance if alert.database else None,
-        }
-
-    @staticmethod
-    def _diagnostics_for_text(value: str) -> list[str]:
-        lowered = value.casefold()
-        diagnostics: list[str] = []
-        families = (
-            (("connection", "连接", "session", "会话"), "connection_sources"),
-            (("long", "慢查询", "长事务"), "long_sessions"),
-            (("lock", "deadlock", "锁", "阻塞"), "locks"),
-            (("replica", "replication", "slave", "lag", "复制", "同步"), "replication"),
-        )
-        for terms, diagnostic in families:
-            if any(term in lowered for term in terms):
-                diagnostics.append(diagnostic)
-        return diagnostics or ["overview"]
 
 
 def build_default_tool_registry() -> InvestigationToolRegistry:
@@ -671,10 +467,6 @@ def build_default_tool_registry() -> InvestigationToolRegistry:
             UnavailableExternalTool(
                 "query_database_diagnostics", "database_management_platform"
             ),
-            UnavailableExternalTool(
-                ARCHERY_SLOW_LOG_TOOL_NAME, "archery_mcp"
-            ),
-            UnavailableExternalTool(PROMETHEUS_METRICS_TOOL_NAME, "prometheus_mcp"),
             UnavailableExternalTool("query_changes", "alert_platform"),
             UnavailableExternalTool("query_similar_incidents", "alert_platform"),
         ]
