@@ -162,7 +162,9 @@ class ScriptedPlanner:
         *,
         messages: list[dict[str, Any]],
         tools: list[ToolSpec],
+        reasoning_callback: Any | None = None,
     ) -> AgentAction | dict[str, Any] | None:
+        del reasoning_callback
         self.requests.append(
             PlannerRequest(
                 messages=deepcopy(messages),

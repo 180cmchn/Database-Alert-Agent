@@ -12,7 +12,7 @@ const CORE_STAGES: InvestigationStage[] = [
   "REPORTING",
 ];
 
-const finalStages: InvestigationStage[] = ["COMPLETED", "INCONCLUSIVE", "FAILED"];
+const finalStages: InvestigationStage[] = ["COMPLETED", "INCONCLUSIVE", "FAILED", "CANCELLED"];
 
 export function StageTimeline({
   currentStage,
@@ -35,7 +35,7 @@ export function StageTimeline({
       {stages.map((stage, index) => {
         const record = progressByStage.get(stage);
         const isTerminal = finalStages.includes(stage);
-        const isFailed = stage === "FAILED";
+        const isFailed = stage === "FAILED" || stage === "CANCELLED";
         const isInconclusive = stage === "INCONCLUSIVE";
         const isCurrent = stage === currentStage;
         const isDone = Boolean(record) || isTerminal || (currentIndex >= 0 && index < currentIndex);

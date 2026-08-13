@@ -1,6 +1,7 @@
 import {
   AlertOctagon,
   ArrowLeft,
+  Ban,
   BookCheck,
   Bot,
   BrainCircuit,
@@ -26,6 +27,7 @@ import {
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
+import { AgentTrace } from "../components/AgentTrace";
 import {
   EmptyState,
   ErrorState,
@@ -39,6 +41,11 @@ import {
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
 import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
+import {
+  canRequestRunCancellation,
+  isRunCancellationPending,
+  shouldPollAlertDetail,
+} from "../lib/investigationRun";
 import type {
   AnalysisBasis,
   AlertStatus,
@@ -47,12 +54,13 @@ import type {
 } from "../types/api";
 
 const activeStatuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING"];
-const terminalStages = ["COMPLETED", "INCONCLUSIVE", "FAILED"];
+const terminalStages = ["COMPLETED", "INCONCLUSIVE", "FAILED", "CANCELLED"];
 const runStatusLabel: Record<InvestigationRun["status"], string> = {
   RUNNING: "运行中",
   COMPLETED: "已完成",
   INCONCLUSIVE: "结论不充分",
   FAILED: "失败",
+  CANCELLED: "已取消",
 };
 
 function basisLabel(source: AnalysisBasis["source"]): string {
@@ -81,6 +89,8 @@ export function AlertDetailPage() {
   const [unlockToken, setUnlockToken] = useState("");
   const [reanalyzing, setReanalyzing] = useState(false);
   const [reanalyzeError, setReanalyzeError] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState("");
 
   const load = useCallback(async (silent = false) => {
     if (silent) setRefreshing(true);
@@ -125,14 +135,20 @@ export function AlertDetailPage() {
       || !terminalStages.includes(currentStage)),
   );
   const latestRunIsActive = record?.latest_run?.status === "RUNNING";
+  const latestRunCancellationPending = isRunCancellationPending(record?.latest_run);
+  const shouldPollDetail = shouldPollAlertDetail(selectedRun, record?.latest_run);
 
   useEffect(() => {
-    if (!record || !isTracking) return;
+    if (!latestRunIsActive) setCancelNotice("");
+  }, [latestRunIsActive]);
+
+  useEffect(() => {
+    if (!shouldPollDetail) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void load(true);
     }, 2_500);
     return () => window.clearInterval(timer);
-  }, [isTracking, load, record]);
+  }, [load, shouldPollDetail]);
   const runbookSearchFinished = useMemo(
     () => Boolean(record?.progress.some((item) => [
       "INVESTIGATING",
@@ -142,6 +158,7 @@ export function AlertDetailPage() {
       "COMPLETED",
       "INCONCLUSIVE",
       "FAILED",
+      "CANCELLED",
     ].includes(item.stage))),
     [record],
   );
@@ -176,6 +193,27 @@ export function AlertDetailPage() {
       }
     } finally {
       setReanalyzing(false);
+    }
+  }
+
+  async function handleCancelLatestRun() {
+    const latestRun = record?.latest_run;
+    if (!token || !latestRun || !canRequestRunCancellation(latestRun)) return;
+    setCancelling(true);
+    setReanalyzeError("");
+    setCancelNotice("");
+    try {
+      await api.cancelRun(alertId, latestRun.id, token);
+      setCancelNotice("取消请求已接受，正在等待当前分析安全结束。");
+      await load(true);
+    } catch (cancelError) {
+      if (cancelError instanceof ApiError && [401, 403].includes(cancelError.status)) {
+        setReanalyzeError("管理员令牌无效或已过期，请锁定后重新输入。");
+      } else {
+        setReanalyzeError(cancelError instanceof Error ? cancelError.message : "取消分析失败");
+      }
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -253,7 +291,7 @@ export function AlertDetailPage() {
         <SectionCard
           eyebrow="LIVE WORKFLOW"
           title="Agent 排查轨迹"
-          description={`第 ${selectedRun?.attempt || 1} 次执行 · ${selectedRun?.strategy_id || "等待选择策略"}`}
+          description={`第 ${selectedRun?.attempt || 1} 次执行 · 主 Agent ReAct`}
         >
           <StageTimeline currentStage={currentStage} progress={record.progress} />
         </SectionCard>
@@ -289,6 +327,17 @@ export function AlertDetailPage() {
         </SectionCard>
 
       </section>
+
+      {selectedRun && (
+        <SectionCard
+          eyebrow="AGENT TRACE"
+          title="实时思考与调用轨迹"
+          description="按实际发生顺序追加展示模型返回、工具动作与观察结果"
+          action={isActive ? <span className="live-trace-indicator"><Radio size={13} className="pulse" /> LIVE</span> : undefined}
+        >
+          <AgentTrace alertId={alertId} runId={selectedRun.id} active={isActive} />
+        </SectionCard>
+      )}
 
       {recommendation?.external_knowledge_matches.length ? (
         <SectionCard
@@ -419,13 +468,13 @@ export function AlertDetailPage() {
           <div className="waiting-panel large">
             <Bot size={29} />
             <strong>{isActive ? "Agent 正在形成处理建议" : !record.selected_run_result_available ? "历史 AI 建议不可恢复" : "本次分析未生成建议"}</strong>
-            <span>{isActive ? "建议将在证据采集与独立校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
+            <span>{isActive ? "建议将在证据采集与确定性契约校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
           </div>
         </SectionCard>
       )}
 
       <section className="detail-grid audit-grid">
-        <SectionCard eyebrow="VALIDATION" title="独立校验" description="规则与 Agent 验收分别判断分析契约和实时证据是否充分">
+        <SectionCard eyebrow="VALIDATION" title="结果契约校验" description="程序只核对结构、引用与来源资格，不重新判断根因">
           {record.validations.length ? (
             <div className="validation-list">
               {record.validations.map((validation) => {
@@ -442,7 +491,7 @@ export function AlertDetailPage() {
                 return (
                   <article key={validation.id} className={state}>
                     <span>{state === "rejected" ? <XCircle size={18} /> : state === "needs-evidence" ? <CircleAlert size={18} /> : <FileCheck2 size={18} />}</span>
-                    <div><strong>{validation.kind === "RULE" ? "确定性规则校验" : "独立 Agent 校验"}</strong><p>{detail}</p></div>
+                    <div><strong>{validation.kind === "RULE" ? "确定性契约校验" : "历史 Agent 校验"}</strong><p>{detail}</p></div>
                     <b>{state === "rejected" ? "REJECT" : state === "needs-evidence" ? "PASS · INCONCLUSIVE" : "PASS · EVIDENCE"}</b>
                   </article>
                 );
@@ -477,6 +526,11 @@ export function AlertDetailPage() {
                 {reanalyzeError}
               </div>
             )}
+            {(cancelNotice || latestRunCancellationPending) && (
+              <div className="form-success">
+                <Check size={16} /> {cancelNotice || "取消请求已接受，正在等待当前分析安全结束。"}
+              </div>
+            )}
             <div className="reanalyze-panel">
               <div className="reanalyze-info">
                 <Lightbulb size={20} />
@@ -503,19 +557,35 @@ export function AlertDetailPage() {
                   )}
                 </button>
                 {latestRunIsActive && (
-                  <button
-                    className="button secondary"
-                    type="button"
-                    onClick={() => handleReanalyze(true)}
-                    disabled={reanalyzing}
-                    title="强制终止当前运行并重新分析"
-                  >
-                    {reanalyzing ? (
-                      "正在启动..."
-                    ) : (
-                      <><RefreshCw size={15} /> 强制重新分析</>
-                    )}
-                  </button>
+                  <>
+                    <button
+                      className="button danger"
+                      type="button"
+                      onClick={() => void handleCancelLatestRun()}
+                      disabled={reanalyzing || cancelling || latestRunCancellationPending}
+                    >
+                      <Ban size={15} /> {
+                        cancelling
+                          ? "正在请求取消..."
+                          : latestRunCancellationPending
+                            ? "正在等待分析结束"
+                            : "取消当前分析"
+                      }
+                    </button>
+                    <button
+                      className="button secondary"
+                      type="button"
+                      onClick={() => handleReanalyze(true)}
+                      disabled={reanalyzing || cancelling || latestRunCancellationPending}
+                      title="创建新的分析运行"
+                    >
+                      {reanalyzing ? (
+                        "正在启动..."
+                      ) : (
+                        <><RefreshCw size={15} /> 强制重新分析</>
+                      )}
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -623,17 +693,12 @@ export function AlertDetailPage() {
                         <dd>{formatPercent(run.config_snapshot.external_knowledge_min_relevance)}</dd>
                       </div>
                       <div>
-                        <dt>历史动态规划配置</dt>
-                        <dd>
-                          {run.config_snapshot.react_enabled
-                            ? `旧值启用（最多 ${run.config_snapshot.react_max_dynamic_turns} 轮）`
-                            : "旧值禁用"}
-                          ，当前流程不使用
-                        </dd>
+                        <dt>ReAct 最大轮次</dt>
+                        <dd>{run.config_snapshot.react_max_rounds}</dd>
                       </div>
                       <div>
-                        <dt>校验</dt>
-                        <dd>{run.config_snapshot.validation_enabled ? "启用" : "禁用"}</dd>
+                        <dt>整次分析超时</dt>
+                        <dd>{run.config_snapshot.analysis_timeout_seconds} 秒</dd>
                       </div>
                       <div>
                         <dt>AI Fallback</dt>
@@ -651,7 +716,6 @@ export function AlertDetailPage() {
                 )}
                 <div className="run-meta">
                   <span>Run ID: {compactId(run.id)}</span>
-                  {run.strategy_id && <span>策略: {run.strategy_id}</span>}
                 </div>
               </article>
             ))}

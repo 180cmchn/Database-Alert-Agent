@@ -4,7 +4,9 @@ import type {
   AlertAccepted,
   AlertListResponse,
   AlertStatus,
+  AgentTraceResponse,
   ApiProblem,
+  CancelRunResponse,
   CanonicalAlertPayload,
   DashboardSummary,
   ReanalyzeRequest,
@@ -104,6 +106,11 @@ export const api = {
       `/api/v1/alerts/${encodeURIComponent(alertId)}${queryString({ run_id: runId || undefined })}`,
     ),
 
+  getAgentTrace: (alertId: string, runId: string, afterSequence = 0) =>
+    request<AgentTraceResponse>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}/runs/${encodeURIComponent(runId)}/trace${queryString({ after_sequence: afterSequence })}`,
+    ),
+
   createAlert: (payload: CanonicalAlertPayload) =>
     request<AlertAccepted>("/api/v1/alerts/canonical/analyze", {
       method: "POST",
@@ -114,6 +121,13 @@ export const api = {
     request<ReanalyzeResponse>(
       `/api/v1/alerts/${encodeURIComponent(alertId)}/reanalyze`,
       { method: "POST", body: JSON.stringify(payload) },
+      token,
+    ),
+
+  cancelRun: (alertId: string, runId: string, token: string) =>
+    request<CancelRunResponse>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" },
       token,
     ),
 

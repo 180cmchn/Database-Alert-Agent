@@ -27,15 +27,11 @@ from app.domain.models import (
 
 
 class FlashDutyError(RuntimeError):
-    """Base error for the read-only FlashDuty integration."""
+    """Base error for the FlashDuty integration."""
 
 
 class FlashDutyConfigurationError(FlashDutyError):
     """The alert or deployment is missing data required for a read query."""
-
-
-class FlashDutyReadOnlyViolation(FlashDutyError):
-    """A caller attempted to use an operation outside the read-only allowlist."""
 
 
 class FlashDutyAPIError(FlashDutyError):
@@ -71,9 +67,9 @@ class _ReadOperation:
     path: str
 
 
-# FlashDuty query endpoints mostly use POST.  The allowlist is semantic rather
-# than HTTP-verb based: no create/update/delete/ack/resolve operation can pass it.
-READ_ONLY_OPERATIONS: Final[Mapping[str, _ReadOperation]] = {
+# FlashDuty query endpoints mostly use POST. This table maps the operations used
+# by this integration to their documented transport routes.
+FLASHDUTY_OPERATIONS: Final[Mapping[str, _ReadOperation]] = {
     "incident_list": _ReadOperation("POST", "/incident/list"),
     "incident_info": _ReadOperation("POST", "/incident/info"),
     "incident_list_by_ids": _ReadOperation("POST", "/incident/list-by-ids"),
@@ -107,13 +103,6 @@ _SUPPORTED_ROW_DATA_SOURCES = {
     "oracle",
     "clickhouse",
 }
-_SQL_DATA_SOURCES = {"mysql", "postgres", "oracle", "clickhouse"}
-_SQL_READ_PREFIX = re.compile(r"^(select|show|describe|desc|explain)\b", re.IGNORECASE)
-_SQL_MUTATION = re.compile(
-    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|merge|"
-    r"call|execute|copy|vacuum|set|reset)\b",
-    re.IGNORECASE,
-)
 _DATABASE_ENGINE_ALIASES: Final[Mapping[str, str]] = {
     "mysql": "mysql",
     "mariadb": "mysql",
@@ -189,7 +178,7 @@ def _database_engine_from_labels(
 
 
 class FlashDutyClient:
-    """Minimal client for the project's explicitly approved read-only operations."""
+    """Minimal client for the FlashDuty operations used by this project."""
 
     def __init__(
         self,
@@ -211,15 +200,18 @@ class FlashDutyClient:
         self._sleep = sleep
 
     async def call(
-        self, operation: str, payload: Mapping[str, Any] | None = None
+        self,
+        operation: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        retry_until_cancelled: bool = True,
     ) -> FlashDutyResponse:
-        spec = READ_ONLY_OPERATIONS.get(operation)
+        spec = FLASHDUTY_OPERATIONS.get(operation)
         if spec is None:
-            raise FlashDutyReadOnlyViolation(
-                f"Operation {operation!r} is not in the FlashDuty read-only allowlist"
+            raise FlashDutyConfigurationError(
+                f"Unsupported FlashDuty operation: {operation!r}"
             )
         request_payload = dict(payload or {})
-        self._validate_read_only_payload(operation, request_payload)
 
         async with httpx.AsyncClient(
             base_url=self.base_url,
@@ -229,7 +221,8 @@ class FlashDutyClient:
             headers={"Accept": "application/json", "Content-Type": "application/json"},
         ) as client:
             response: httpx.Response | None = None
-            for attempt in range(self.max_retries + 1):
+            attempt = 0
+            while True:
                 try:
                     response = await client.request(
                         spec.method,
@@ -238,14 +231,16 @@ class FlashDutyClient:
                         json=request_payload,
                     )
                 except httpx.TransportError as exc:
-                    if attempt >= self.max_retries:
+                    if not retry_until_cancelled and attempt >= self.max_retries:
                         raise FlashDutyAPIError(type(exc).__name__, code="NetworkError") from exc
-                    await self._sleep(min(2**attempt, 10))
+                    await self._sleep(min(2 ** min(attempt, 4), 10))
+                    attempt += 1
                     continue
 
                 if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < self.max_retries:
+                    if retry_until_cancelled or attempt < self.max_retries:
                         await self._sleep(self._retry_delay(response, attempt))
+                        attempt += 1
                         continue
                 break
 
@@ -254,29 +249,12 @@ class FlashDutyClient:
         return self._decode_response(response)
 
     @staticmethod
-    def _validate_read_only_payload(operation: str, payload: Mapping[str, Any]) -> None:
-        if operation == "monit_query_rows":
-            ds_type = payload.get("ds_type")
-            expression = payload.get("expr")
-            if isinstance(ds_type, str) and isinstance(expression, str):
-                _validate_read_only_expression(ds_type, expression, payload.get("args"))
-        if operation != "monit_tools_invoke":
-            return
-        tools = payload.get("tools")
-        if not isinstance(tools, list):
-            return
-        for item in tools:
-            name = item.get("tool") if isinstance(item, dict) else None
-            if isinstance(name, str) and not _is_read_only_tool_name(name):
-                raise FlashDutyReadOnlyViolation(f"monit-agent tool is not read-only: {name}")
-
-    @staticmethod
     def _retry_delay(response: httpx.Response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After", "")
         try:
             return min(max(float(retry_after), 0), 10)
         except ValueError:
-            return min(2**attempt, 10)
+            return min(2 ** min(attempt, 4), 10)
 
     def _decode_response(self, response: httpx.Response) -> FlashDutyResponse:
         try:
@@ -376,7 +354,10 @@ class FlashDutyClient:
             payload["integration_ids"] = integration_ids
         if is_active is not None:
             payload["is_active"] = is_active
-        return await self.call("alert_list", payload)
+        # Polling has its own overlapping scan cycle, so it yields after the
+        # configured finite retries. Analysis-time calls keep retrying until the
+        # owning run reaches its timeout or receives a cancellation request.
+        return await self.call("alert_list", payload, retry_until_cancelled=False)
 
     async def alert_events(self, alert_id: str, *, limit: int = 20) -> FlashDutyResponse:
         _require_object_id(alert_id, "alert_id")
@@ -444,24 +425,6 @@ class FlashDutyClient:
 def _require_object_id(value: str, field: str) -> None:
     if not _OBJECT_ID.fullmatch(value):
         raise FlashDutyConfigurationError(f"{field} must be a 24-character ObjectID")
-
-
-def _validate_read_only_expression(ds_type: str, expression: str, args: Any = None) -> None:
-    is_sql = ds_type in _SQL_DATA_SOURCES or (
-        ds_type == "elasticsearch" and isinstance(args, dict) and args.get("es.type") == "sql"
-    )
-    if not is_sql:
-        return
-    statement = expression.strip()
-    without_terminal_semicolon = statement[:-1].rstrip() if statement.endswith(";") else statement
-    if ";" in without_terminal_semicolon:
-        raise FlashDutyReadOnlyViolation("Multiple SQL statements are not allowed")
-    if not _SQL_READ_PREFIX.match(without_terminal_semicolon) or _SQL_MUTATION.search(
-        without_terminal_semicolon
-    ):
-        raise FlashDutyReadOnlyViolation(
-            "FlashDuty SQL diagnostics allow SELECT/SHOW/DESCRIBE/EXPLAIN only"
-        )
 
 
 class FlashDutyAlertSourceAdapter:
@@ -552,11 +515,18 @@ class FlashDutyAlertSourceAdapter:
         )
         database_engine = _database_engine_from_labels(labels, resource_type)
         database_host = (
-            _first_nonempty(item.get("alarm_host")) if authoritative_detail else None
+            _first_nonempty(labels.get("alarm_host"), item.get("alarm_host"))
+            if authoritative_detail
+            else None
         )
-        database_port = (
-            _alarm_port(item.get("alarm_port")) if authoritative_detail else None
-        )
+        database_port = None
+        if authoritative_detail:
+            label_alarm_port = _first_nonempty(labels.get("alarm_port"))
+            database_port = (
+                _alarm_port(label_alarm_port)
+                if label_alarm_port is not None
+                else _alarm_port(item.get("alarm_port"))
+            )
         database_instance = _first_nonempty(
             labels.get("instance"),
             labels.get("resource"),
@@ -1046,7 +1016,6 @@ class FlashDutyDataSourceTool:
         for key in ("delay_seconds", "args", "account_id"):
             if key in config:
                 payload[key] = config[key]
-        _validate_read_only_expression(ds_type, payload["expr"], payload.get("args"))
         response = await self.client.query_rows(payload)
         if not isinstance(response.data, list):
             raise FlashDutyAPIError(
@@ -1075,132 +1044,7 @@ _DIAGNOSTIC_TERMS: Final[Mapping[str, set[str]]] = {
     "replication": {"replication", "replica", "slave", "lag"},
     "overview": {"overview", "health", "status"},
 }
-_MONIT_TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 _TARGET_LOCATOR = re.compile(r"^(?!.*\|)[\x21-\x7e]{1,256}$")
-_CAMEL_CASE_BOUNDARY = re.compile(
-    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
-)
-_MUTATING_TOOL_TOKENS: Final[set[str]] = {
-    "ack",
-    "acknowledge",
-    "alter",
-    "apply",
-    "cancel",
-    "close",
-    "create",
-    "delete",
-    "disable",
-    "drop",
-    "enable",
-    "execute",
-    "failover",
-    "flush",
-    "grant",
-    "insert",
-    "kill",
-    "modify",
-    "pause",
-    "promote",
-    "purge",
-    "reboot",
-    "rebuild",
-    "reload",
-    "remove",
-    "repair",
-    "replace",
-    "reset",
-    "resolve",
-    "restart",
-    "resume",
-    "revoke",
-    "rotate",
-    "set",
-    "shutdown",
-    "start",
-    "stop",
-    "switch",
-    "switchover",
-    "terminate",
-    "truncate",
-    "update",
-    "upgrade",
-    "write",
-}
-_MUTATING_TOOL_FRAGMENTS: Final[tuple[str, ...]] = tuple(
-    sorted(
-        (token for token in _MUTATING_TOOL_TOKENS if len(token) >= 4),
-        key=len,
-        reverse=True,
-    )
-)
-_READ_ONLY_TOOL_TOKENS: Final[set[str]] = {
-    "check",
-    "compare",
-    "connections",
-    "deadlocks",
-    "describe",
-    "diagnose",
-    "diagnostics",
-    "explain",
-    "fetch",
-    "get",
-    "health",
-    "info",
-    "inspect",
-    "lag",
-    "list",
-    "locks",
-    "logs",
-    "metrics",
-    "observe",
-    "overview",
-    "ping",
-    "processlist",
-    "query",
-    "read",
-    "replica",
-    "replication",
-    "report",
-    "sessions",
-    "show",
-    "snapshot",
-    "sources",
-    "statistics",
-    "stats",
-    "status",
-    "summary",
-    "variables",
-    "version",
-}
-
-
-def _tool_name_tokens(name: str) -> tuple[str, ...]:
-    if not _MONIT_TOOL_NAME.fullmatch(name):
-        return ()
-    expanded = _CAMEL_CASE_BOUNDARY.sub(" ", name)
-    return tuple(
-        item for item in re.split(r"[^A-Za-z0-9]+", expanded.casefold()) if item
-    )
-
-
-def _has_mutating_tool_token(tokens: tuple[str, ...]) -> bool:
-    for token in tokens:
-        if token in _MUTATING_TOOL_TOKENS:
-            return True
-        if token.startswith("set"):
-            return True
-        if any(fragment in token for fragment in _MUTATING_TOOL_FRAGMENTS):
-            return True
-    return False
-
-
-def _is_read_only_tool_name(name: str) -> bool:
-    tokens = _tool_name_tokens(name)
-    return bool(tokens) and not _has_mutating_tool_token(tokens) and bool(
-        set(tokens).intersection(_READ_ONLY_TOOL_TOKENS)
-    )
-
-
 class FlashDutyDatabaseDiagnosticsTool:
     name = "query_database_diagnostics"
     source_system = "flashduty_monitors"
@@ -1290,10 +1134,10 @@ class FlashDutyDatabaseDiagnosticsTool:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
                 summary=(
-                    "未执行 FlashDuty 数据库诊断：工具目录中没有匹配的只读工具。"
+                    "未执行 FlashDuty 数据库诊断：工具目录中没有匹配的工具。"
                 ),
                 structured_data={
-                    "reason_code": "no_compatible_read_only_tool",
+                    "reason_code": "no_compatible_tool",
                     "catalog_request_id": catalog.request_id,
                     "target_request_ids": target_request_ids,
                 },
@@ -1342,7 +1186,7 @@ class FlashDutyDatabaseDiagnosticsTool:
         ]
         summary = (
             "；".join(summaries)[:2000]
-            or f"FlashDuty Monitors 成功执行 {len(successful)} 个只读诊断工具。"
+            or f"FlashDuty Monitors 成功执行 {len(successful)} 个诊断工具。"
         )
         structured_data = {
             "catalog_request_id": catalog.request_id,
@@ -1498,8 +1342,6 @@ class FlashDutyDatabaseDiagnosticsTool:
                     raise FlashDutyConfigurationError(
                         f"Requested monit-agent tool is unavailable: {name}"
                     )
-                if not _is_read_only_tool_name(name):
-                    raise FlashDutyReadOnlyViolation(f"monit-agent tool is not read-only: {name}")
                 if not isinstance(params, dict):
                     raise FlashDutyConfigurationError("tool params must be an object")
                 calls.append({"tool": name, "params": params})
@@ -1515,8 +1357,6 @@ class FlashDutyDatabaseDiagnosticsTool:
 
         ranked: list[tuple[int, str]] = []
         for name, metadata in available.items():
-            if not _is_read_only_tool_name(name):
-                continue
             input_schema = metadata.get("input_schema")
             if isinstance(input_schema, dict) and input_schema.get("required"):
                 continue

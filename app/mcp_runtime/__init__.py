@@ -1,4 +1,4 @@
-"""Provider-neutral MCP child-run harness."""
+"""Provider-neutral MCP investigation harness."""
 
 from app.mcp_runtime.contracts import (
     ArtifactStore,
@@ -6,7 +6,6 @@ from app.mcp_runtime.contracts import (
     DiscoveredMCPTool,
     Finish,
     HarnessObservation,
-    HostRejection,
     InvocationStore,
     MCPConnector,
     MCPHarnessResult,
@@ -15,6 +14,7 @@ from app.mcp_runtime.contracts import (
     MCPPlanner,
     MCPToolSession,
     PreparedCall,
+    RemoteResponseStore,
     RetryDirective,
     ScenarioTransition,
 )
@@ -42,7 +42,6 @@ __all__ = [
     "DiscoveredMCPTool",
     "Finish",
     "HarnessObservation",
-    "HostRejection",
     "InvocationStore",
     "MCPAgentHarnessRuntime",
     "MCPCheckpointDecodeError",
@@ -54,6 +53,7 @@ __all__ = [
     "MCPToolSession",
     "PlannerRequest",
     "PreparedCall",
+    "RemoteResponseStore",
     "ReplayCallFixture",
     "ReplayCallOutcome",
     "ReplayErrorFixture",

@@ -103,13 +103,10 @@ export function SettingsPage() {
         ai_base_url: String(form.get("ai_base_url")).trim(),
         ai_model: String(form.get("ai_model")).trim(),
         ai_timeout_seconds: numberField(form, "ai_timeout_seconds"),
-        ai_max_retries: numberField(form, "ai_max_retries"),
         ai_json_mode: form.get("ai_json_mode") === "on",
         ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
-        react_enabled: settings.react_enabled,
-        react_max_dynamic_turns: settings.react_max_dynamic_turns,
-        archery_mcp_max_agent_steps: numberField(form, "archery_mcp_max_agent_steps"),
-        validation_enabled: form.get("validation_enabled") === "on",
+        react_max_rounds: numberField(form, "react_max_rounds"),
+        analysis_timeout_seconds: numberField(form, "analysis_timeout_seconds"),
         runbook_limit: numberField(form, "runbook_limit"),
         scheduler_workers: numberField(form, "scheduler_workers"),
         knowledge_sources: knowledgeSources,
@@ -187,7 +184,6 @@ export function SettingsPage() {
             <label className="field span-2"><span>Base URL <b>*</b></span><input name="ai_base_url" type="url" defaultValue={settings.ai_base_url} required placeholder="https://api.openai.com/v1" /></label>
             <label className="field span-2"><span>API Key（只写） {selectedProvider === "openai_compatible" && !settings.ai_api_key_configured && <b>*</b>}</span><div className="secret-field"><input name="ai_api_key" type={showApiKey ? "text" : "password"} autoComplete="new-password" required={selectedProvider === "openai_compatible" && !settings.ai_api_key_configured} placeholder={settings.ai_api_key_configured ? "已配置 · 留空保持不变" : "输入新的 API Key"} /><button type="button" onClick={() => setShowApiKey((value) => !value)} aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
             <label className="field"><span>请求超时（秒）</span><input name="ai_timeout_seconds" type="number" min="1" max="600" step="1" required defaultValue={settings.ai_timeout_seconds} /></label>
-            <label className="field"><span>失败重试次数</span><input name="ai_max_retries" type="number" min="0" max="20" required defaultValue={settings.ai_max_retries} /></label>
           </div>
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>
@@ -220,16 +216,14 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        <SectionCard eyebrow="REASONING GUARDRAILS" title="推理与校验护栏" description="先完成知识匹配和只读事实采集，再统一分析根因。">
+        <SectionCard eyebrow="REACT" title="主 Agent 调查与校验" description="主 Agent 逐轮选择一个相关工具或结束调查，再统一分析根因；输出只经过程序侧契约校验，不会交给第二个模型裁决。">
           <div className="switch-stack">
-            <label className="switch-row"><span><Sparkles size={17} /><span><strong>历史动态规划配置</strong><small>仅用于读取旧配置快照，当前分析流程不使用</small></span></span><input type="checkbox" checked={settings.react_enabled} disabled /><i /></label>
-            <label className="switch-row"><span><ShieldCheck size={17} /><span><strong>启用独立结论校验</strong><small>建议输出前执行规则校验与同一配置模型的独立验收轮次</small></span></span><input name="validation_enabled" type="checkbox" defaultChecked={settings.validation_enabled} /><i /></label>
             <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，并以结论不充分结束</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>
-            <label className="field"><span>历史动态工具轮次（兼容字段）</span><input type="number" value={settings.react_max_dynamic_turns} readOnly /></label>
-            <label className="field"><span>Archery MCP 最大调用步数</span><input name="archery_mcp_max_agent_steps" type="number" min="1" max="100" required defaultValue={settings.archery_mcp_max_agent_steps} /></label>
+            <label className="field"><span>ReAct 最大轮次</span><input name="react_max_rounds" type="number" min="1" max="100" required defaultValue={settings.react_max_rounds} /></label>
+            <label className="field"><span>整次分析超时（秒）</span><input name="analysis_timeout_seconds" type="number" min="30" max="86400" required defaultValue={settings.analysis_timeout_seconds} /></label>
             <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>
           </div>
         </SectionCard>

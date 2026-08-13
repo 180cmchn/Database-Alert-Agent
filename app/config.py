@@ -26,23 +26,19 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_api_key",
         "ai_model",
         "ai_timeout_seconds",
-        "ai_max_retries",
         "ai_json_mode",
         "ai_fallback_enabled",
         "runbook_limit",
         "wecom_webhook_url",
         "wecom_page_base_url",
         "wecom_enabled",
-        "react_enabled",
-        "react_max_dynamic_turns",
-        "validation_enabled",
+        "react_max_rounds",
+        "analysis_timeout_seconds",
         "knowledge_sources",
         "scheduler_workers",
         "flashduty_polling_enabled",
         "flashduty_poll_interval_seconds",
         "flashduty_poll_lookback_seconds",
-        "archery_mcp_max_agent_steps",
-        "prometheus_mcp_max_agent_steps",
         "external_knowledge_api_key",
         "external_knowledge_api_key_base_url",
     }
@@ -78,6 +74,8 @@ class Settings(BaseSettings):
     # as 4096 do not end the response during the reasoning phase.
     ai_max_tokens: int = Field(default=16_384, ge=1024, le=131_072)
     ai_timeout_seconds: float = Field(default=300, gt=0)
+    # Legacy deployment compatibility for the offline PDF indexing command only.
+    # Online alert analysis deliberately ignores this finite retry setting.
     ai_max_retries: int = Field(default=2, ge=0)
     ai_json_mode: bool = True
     # Keep the investigation auditable when an OpenAI-compatible gateway is
@@ -134,8 +132,8 @@ class Settings(BaseSettings):
     flashduty_logs_ds_type: str = "loki"
 
     # Archery MCP is a deployment-only live evidence source. Its endpoint,
-    # X-Archery-Token, and query window stay outside RUNTIME_SETTINGS_KEYS so an
-    # admin caller cannot redirect traffic. Each query target comes from its alert.
+    # catalog-resolved credentials, and query window stay outside RUNTIME_SETTINGS_KEYS
+    # so an admin caller cannot redirect traffic. Each query target comes from its alert.
     mcp_settings_path: Path = Path("./config/mcp/settings.json")
     archery_mcp_url: str = ""
     archery_mcp_token: str = Field(
@@ -147,12 +145,7 @@ class Settings(BaseSettings):
             "ARCHERY_TOKEN",
         ),
     )
-    # Retained only so older deployment files remain loadable. Query targets are
-    # resolved from each alert through MCP discovery and these values are ignored.
-    archery_mcp_instance_ref: str = ""
-    archery_mcp_db_name: str = ""
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
-    archery_mcp_max_agent_steps: int = Field(default=12, ge=1, le=100)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     # A slow-query investigation is an agent loop, not one MCP request. Keep its
     # outer ToolExecutor deadline above a single MCP read timeout so the detail
@@ -164,7 +157,6 @@ class Settings(BaseSettings):
     prometheus_mcp_sse_url: str = ""
     prometheus_mcp_api_key: str = Field(default="", repr=False)
     prometheus_mcp_api_key_header: str = ""
-    prometheus_mcp_max_agent_steps: int = Field(default=8, ge=1, le=100)
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
 
@@ -175,7 +167,6 @@ class Settings(BaseSettings):
     external_knowledge_api_key: str = Field(default="", repr=False)
     external_knowledge_api_key_base_url: str = Field(default="", repr=False)
     external_knowledge_timeout_seconds: float = Field(default=30, gt=0)
-    external_knowledge_max_retries: int = Field(default=2, ge=0, le=5)
     external_knowledge_limit: int = Field(default=5, ge=1, le=20)
     external_knowledge_min_relevance: float = Field(default=0.60, ge=0, le=1)
 
@@ -197,17 +188,14 @@ class Settings(BaseSettings):
     # the in-memory scheduler and the Kafka consumer before future work starts.
     scheduler_workers: int = Field(default=1, ge=1, le=16)
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
-    # Complete tool output is always persisted. This threshold only decides when
-    # an isolated model session should project a result for the main Agent.
-    tool_result_analysis_threshold_chars: int = Field(
-        default=12_000, ge=1_000, le=10_000_000
-    )
     # Retention runs only at the configured weekly calendar slot; startup never
     # triggers an immediate cleanup.
     alert_retention_enabled: bool = True
     alert_retention_days: int = Field(default=7, ge=7, le=3650)
-    react_enabled: bool = False
-    react_max_dynamic_turns: int = Field(default=2, ge=0, le=10)
+    react_max_rounds: int = Field(default=8, ge=1, le=100)
+    analysis_timeout_seconds: int = Field(default=1800, ge=30, le=86_400)
+    # Historical compatibility only. New runs always apply deterministic contract
+    # validation and never invoke a second model-based conclusion validator.
     validation_enabled: bool = True
 
     @field_validator(
@@ -218,17 +206,6 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_mode(cls, value: str) -> str:
         return value.strip().lower()
-
-    @field_validator(
-        "archery_mcp_instance_ref",
-        "archery_mcp_db_name",
-    )
-    @classmethod
-    def normalize_archery_scope(cls, value: str) -> str:
-        value = value.strip()
-        if len(value) > 255 or any(ord(character) < 32 for character in value):
-            raise ValueError("Archery scope values must be printable and at most 255 chars")
-        return value
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod

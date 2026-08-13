@@ -15,8 +15,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
 from app.adapters.persistence import SQLAlchemyAlertRepository
+from app.agent_runtime.trace import trace_entry_from_event
 from app.api.schemas import (
+    AgentTraceResponse,
     AlertAccepted,
+    CancelRunResponse,
     FlashDutyPollAlertItem,
     FlashDutyPollResponse,
     ReanalyzeRequest,
@@ -55,7 +58,7 @@ from app.domain.models import (
     Severity,
     StoredAlert,
 )
-from app.domain.ports import AnalysisJobScheduler
+from app.domain.ports import AnalysisJobScheduler, RunCancellationConflict
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -301,6 +304,35 @@ def create_app(
         return await runtime.service.get(alert_id, run_id=run_id)
 
     @app.get(
+        "/api/v1/alerts/{alert_id}/runs/{run_id}/trace",
+        response_model=AgentTraceResponse,
+        tags=["alerts"],
+    )
+    async def get_agent_trace(
+        alert_id: str,
+        run_id: str,
+        after_sequence: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> AgentTraceResponse:
+        # This also verifies that the requested run belongs to the alert.
+        await runtime.service.get(alert_id, run_id=run_id)
+        events = await runtime.repository.list_agent_events(
+            run_id,
+            after_sequence=after_sequence,
+            limit=limit + 1,
+        )
+        has_more = len(events) > limit
+        page = events[:limit]
+        items = [item for event in page if (item := trace_entry_from_event(event))]
+        return AgentTraceResponse(
+            run_id=run_id,
+            after_sequence=after_sequence,
+            next_sequence=max((event.sequence for event in page), default=after_sequence),
+            has_more=has_more,
+            items=items,
+        )
+
+    @app.get(
         "/api/v1/admin/runbooks",
         response_model=RunbookListResponse,
         tags=["admin"],
@@ -460,6 +492,48 @@ def create_app(
             attempt=run.attempt,
             config_snapshot=config_snapshot,
             message=f"Re-analysis started with attempt {run.attempt}",
+        )
+
+    @app.post(
+        "/api/v1/alerts/{alert_id}/runs/{run_id}/cancel",
+        response_model=CancelRunResponse,
+        status_code=202,
+        tags=["alerts"],
+    )
+    async def cancel_analysis_run(
+        alert_id: str,
+        run_id: str,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> CancelRunResponse:
+        try:
+            run = await runtime.service.cancel_run(
+                alert_id,
+                run_id,
+                requested_by=actor,
+            )
+        except RunCancellationConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RUN_CANCELLATION_CONFLICT",
+                    "message": "Only a running analysis can be cancelled",
+                    "run_id": exc.run_id,
+                    "status": exc.status,
+                },
+            ) from exc
+        await audit_logger.record(
+            action="cancel",
+            target=f"alert:{alert_id}:run:{run_id}",
+            actor=actor,
+        )
+        if run.cancel_requested_at is None:
+            raise RuntimeError("cancelled run is missing cancel_requested_at")
+        return CancelRunResponse(
+            alert_id=run.alert_id,
+            run_id=run.id,
+            status=run.status,
+            cancel_requested_at=run.cancel_requested_at,
+            message="Analysis cancellation request accepted",
         )
 
     @app.post(

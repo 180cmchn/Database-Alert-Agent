@@ -16,8 +16,8 @@ from app.adapters.persistence import (
     SQLAlchemyAlertRepository,
     ToolInvocationRow,
 )
+from app.adapters.tool_result_analysis import DeterministicToolResultProcessor
 from app.agent_runtime.contracts import (
-    RetryPolicy,
     RunCheckpoint,
     RunManifest,
     ToolInvocationStatus,
@@ -32,7 +32,6 @@ from app.agent_runtime.outer_dispatch import (
 from app.domain.models import (
     EvidenceRecord,
     InvestigationContext,
-    InvestigationStrategy,
     ToolExecutionRequest,
     ToolResultAnalysis,
     ToolResultObservation,
@@ -79,7 +78,7 @@ class RecordingExecutor:
         )
 
 
-class RecordingResultAnalyzer:
+class RecordingResultProcessor:
     def __init__(self, *, failure: Exception | None = None) -> None:
         self.failure = failure
         self.calls: list[dict[str, object]] = []
@@ -91,7 +90,7 @@ class RecordingResultAnalyzer:
         artifact = payload["artifact"]
         assert artifact.sha256 is not None
         return ToolResultAnalysis(
-            summary="独立会话已从完整结果中提取可核验事实。",
+            summary="程序事实投影已从完整结果中提取可核验事实。",
             observations=[
                 ToolResultObservation(
                     statement="工具返回了完整的大结果。",
@@ -220,11 +219,6 @@ async def _context(
     return str(stored.alert.id), InvestigationContext(
         run_id=run.id,
         alert=alert,
-        strategy=InvestigationStrategy(
-            strategy_id="outer-dispatch-test",
-            title="test",
-            description="test",
-        ),
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
@@ -266,16 +260,14 @@ def _request(*, timeout_seconds: float = 30) -> ToolExecutionRequest:
     )
 
 
-def _spec(*, read_only: bool = True, max_attempts: int = 2) -> ToolSpec:
+def _spec() -> ToolSpec:
     return ToolSpec(
         name="test_probe",
         provider="test_host",
         capability="test.probe",
         input_schema={"type": "object", "additionalProperties": True},
-        read_only=read_only,
         policy_version="test-policy-v1",
         schema_version="test-schema-v1",
-        retry=RetryPolicy(max_attempts=max_attempts),
     )
 
 
@@ -402,7 +394,7 @@ async def test_expired_pending_dispatch_becomes_timeout_without_handler_call(
 
 
 @pytest.mark.asyncio
-async def test_new_fencing_epoch_allows_one_explicit_read_only_retry(
+async def test_new_fencing_epoch_marks_started_action_unknown_without_replay(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "started-retry.db"))
@@ -419,7 +411,7 @@ async def test_new_fencing_epoch_allows_one_explicit_read_only_retry(
             alert_id=alert_id,
             request=_request(),
             context=context,
-            tool_spec=_spec(read_only=True, max_attempts=2),
+            tool_spec=_spec(),
         )
     assert len(executor.calls) == 1
 
@@ -434,26 +426,25 @@ async def test_new_fencing_epoch_allows_one_explicit_read_only_retry(
         alert_id=alert_id,
         request=_request(),
         context=recovery_context,
-        tool_spec=_spec(read_only=True, max_attempts=2),
+        tool_spec=_spec(),
     )
     replayed = await dispatcher.execute(
         alert_id=alert_id,
         request=_request(),
         context=recovery_context,
-        tool_spec=_spec(read_only=True, max_attempts=2),
+        tool_spec=_spec(),
     )
 
     assert evidence == replayed
-    assert evidence.status == ToolStatus.SUCCESS
-    assert len(executor.calls) == 2
-    assert [item.outer_dispatch_attempt for item in executor.contexts] == [1, 2]
-    assert executor.contexts[0].outer_dispatch_id == executor.contexts[1].outer_dispatch_id
+    assert evidence.status == ToolStatus.FAILED
+    assert evidence.structured_data["reason_code"] == "unknown_outcome"
+    assert len(executor.calls) == 1
+    assert all(item.outer_dispatch_id is not None for item in executor.contexts)
     rows = await _invocation_rows(repository, str(context.run_id))
     assert [row.status for row in rows] == [
         ToolInvocationStatus.UNKNOWN_OUTCOME.value,
-        ToolInvocationStatus.SUCCEEDED.value,
     ]
-    assert len(rows) == 2
+    assert len(rows) == 1
     await repository.close()
 
 
@@ -476,7 +467,7 @@ async def test_same_epoch_recovers_started_only_after_persisted_deadline(
             alert_id=alert_id,
             request=request,
             context=context,
-            tool_spec=_spec(read_only=True, max_attempts=2),
+            tool_spec=_spec(),
         )
     await asyncio.sleep(0.06)
 
@@ -484,15 +475,15 @@ async def test_same_epoch_recovers_started_only_after_persisted_deadline(
         alert_id=alert_id,
         request=request,
         context=context,
-        tool_spec=_spec(read_only=True, max_attempts=2),
+        tool_spec=_spec(),
     )
 
-    assert evidence.status == ToolStatus.SUCCESS
-    assert len(executor.calls) == 2
+    assert evidence.status == ToolStatus.FAILED
+    assert evidence.structured_data["reason_code"] == "unknown_outcome"
+    assert len(executor.calls) == 1
     rows = await _invocation_rows(repository, str(context.run_id))
     assert [row.status for row in rows] == [
         ToolInvocationStatus.UNKNOWN_OUTCOME.value,
-        ToolInvocationStatus.SUCCEEDED.value,
     ]
     await repository.close()
 
@@ -507,7 +498,7 @@ async def test_late_same_epoch_result_cannot_overwrite_deadline_recovery(
     executor = RecordingExecutor()
     hold = HoldAfterHandler()
     request = _request(timeout_seconds=0.05)
-    tool_spec = _spec(read_only=False, max_attempts=1)
+    tool_spec = _spec()
 
     first_task = asyncio.create_task(
         DurableOuterToolDispatcher(
@@ -555,7 +546,7 @@ async def test_same_epoch_concurrent_dispatch_joins_inflight_invocation(
             alert_id=alert_id,
             request=_request(),
             context=context,
-            tool_spec=_spec(read_only=True, max_attempts=2),
+            tool_spec=_spec(),
         )
     )
     await executor.started.wait()
@@ -564,7 +555,7 @@ async def test_same_epoch_concurrent_dispatch_joins_inflight_invocation(
             alert_id=alert_id,
             request=_request(),
             context=context,
-            tool_spec=_spec(read_only=True, max_attempts=2),
+            tool_spec=_spec(),
         )
     )
     await asyncio.sleep(0.1)
@@ -747,20 +738,14 @@ async def test_terminal_recovery_rejects_tampered_evidence_provenance(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("read_only", "max_attempts"),
-    [(False, 2), (True, 1)],
-)
-async def test_started_recovery_without_host_retry_authorization_stays_unknown(
+async def test_unregistered_started_action_recovers_unknown_without_replay(
     tmp_path: Path,
-    read_only: bool,
-    max_attempts: int,
 ) -> None:
     repository = SQLAlchemyAlertRepository(
-        _sqlite_url(tmp_path / f"no-retry-{read_only}-{max_attempts}.db")
+        _sqlite_url(tmp_path / "unregistered-unknown.db")
     )
     await repository.initialize()
-    alert_id, context = await _context(repository, external_id=f"no-retry-{read_only}")
+    alert_id, context = await _context(repository, external_id="unregistered-unknown")
     executor = RecordingExecutor()
 
     with pytest.raises(RuntimeError, match="AFTER_HANDLER_RETURNED"):
@@ -772,7 +757,7 @@ async def test_started_recovery_without_host_retry_authorization_stays_unknown(
             alert_id=alert_id,
             request=_request(),
             context=context,
-            tool_spec=_spec(read_only=read_only, max_attempts=max_attempts),
+            tool_spec=None,
         )
     recovery_context = await _reclaim_context(
         repository,
@@ -783,7 +768,7 @@ async def test_started_recovery_without_host_retry_authorization_stays_unknown(
         alert_id=alert_id,
         request=_request(),
         context=recovery_context,
-        tool_spec=_spec(read_only=read_only, max_attempts=max_attempts),
+        tool_spec=None,
     )
 
     assert len(executor.calls) == 1
@@ -810,9 +795,9 @@ async def test_recovery_fails_closed_when_frozen_tool_contract_drifts(tmp_path: 
             alert_id=alert_id,
             request=_request(),
             context=context,
-            tool_spec=_spec(read_only=True, max_attempts=2),
+            tool_spec=_spec(),
         )
-    drifted = _spec(read_only=True, max_attempts=1).model_copy(
+    drifted = _spec().model_copy(
         update={"policy_version": "test-policy-v2"}
     )
 
@@ -834,36 +819,40 @@ async def test_second_started_recovery_never_creates_a_third_attempt(tmp_path: P
     alert_id, context = await _context(repository, external_id="outer-second-started")
     executor = RecordingExecutor()
 
+    with pytest.raises(RuntimeError, match="AFTER_HANDLER_RETURNED"):
+        await DurableOuterToolDispatcher(
+            repository,
+            executor,
+            fault_hook=CrashAt(OuterDispatchFaultPoint.AFTER_HANDLER_RETURNED),
+        ).execute(
+            alert_id=alert_id,
+            request=_request(),
+            context=context,
+            tool_spec=_spec(),
+        )
+
     active_context = context
-    for _attempt in range(2):
-        with pytest.raises(RuntimeError, match="AFTER_HANDLER_RETURNED"):
-            await DurableOuterToolDispatcher(
-                repository,
-                executor,
-                fault_hook=CrashAt(OuterDispatchFaultPoint.AFTER_HANDLER_RETURNED),
-            ).execute(
-                alert_id=alert_id,
-                request=_request(),
-                context=active_context,
-                tool_spec=_spec(read_only=True, max_attempts=20),
-            )
+    recovered: list[EvidenceRecord] = []
+    for _recovery in range(2):
         active_context = await _reclaim_context(
             repository,
             alert_id=alert_id,
             context=active_context,
         )
+        recovered.append(
+            await DurableOuterToolDispatcher(repository, executor).execute(
+                alert_id=alert_id,
+                request=_request(),
+                context=active_context,
+                tool_spec=_spec(),
+            )
+        )
 
-    evidence = await DurableOuterToolDispatcher(repository, executor).execute(
-        alert_id=alert_id,
-        request=_request(),
-        context=active_context,
-        tool_spec=_spec(read_only=True, max_attempts=20),
-    )
-
-    assert len(executor.calls) == 2
-    assert evidence.structured_data["reason_code"] == "unknown_outcome"
+    assert recovered[0] == recovered[1]
+    assert len(executor.calls) == 1
+    assert recovered[-1].structured_data["reason_code"] == "unknown_outcome"
     rows = await _invocation_rows(repository, str(context.run_id))
-    assert len(rows) == 2
+    assert len(rows) == 1
     assert {row.status for row in rows} == {ToolInvocationStatus.UNKNOWN_OUTCOME.value}
     await repository.close()
 
@@ -909,29 +898,37 @@ async def test_terminal_result_backfills_evidence_without_handler_replay(
     )
 
     assert len(executor.calls) == 1
-    assert evidence.structured_data["payload"] == "x" * 13_000
+    assert evidence.structured_data["processing_status"] == "unavailable"
+    assert "payload" not in evidence.structured_data
+    assert "source_artifact" not in evidence.structured_data
     rows = await _invocation_rows(repository, str(context.run_id))
     result = await repository.get_tool_invocation_result(rows[0].id)
     assert result is not None
     assert result["contract"] == OUTER_EVIDENCE_RESULT_CONTRACT
-    assert result["evidence_record"]["structured_data"]["payload"] == "x" * 13_000
+    assert "payload" not in result["evidence_record"]["structured_data"]
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    assert stored[1]["structured_data"]["payload"] == "x" * 13_000
     await repository.close()
 
 
 @pytest.mark.asyncio
-async def test_large_result_is_artifacted_and_projected_by_isolated_analyzer(
+async def test_result_is_artifacted_and_projected_by_program_processor(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "large-analysis.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-large-analysis")
     executor = RecordingExecutor([{"payload": "x" * 20_000}])
-    analyzer = RecordingResultAnalyzer()
+    processor = RecordingResultProcessor()
     dispatcher = DurableOuterToolDispatcher(
         repository,
         executor,
-        result_analyzer=analyzer,
-        analysis_threshold_chars=1_000,
+        result_analyzer=processor,
     )
 
     evidence = await dispatcher.execute(
@@ -949,14 +946,18 @@ async def test_large_result_is_artifacted_and_projected_by_isolated_analyzer(
 
     assert replayed == evidence
     assert len(executor.calls) == 1
-    assert len(analyzer.calls) == 1
+    assert len(processor.calls) == 1
     assert evidence.status == ToolStatus.SUCCESS
     assert evidence.truncated is False
-    assert evidence.structured_data["analysis_status"] == "completed"
+    assert evidence.structured_data["processing_status"] == "completed"
+    assert "source_artifact" not in evidence.structured_data
+    assert "source_artifact_id" not in evidence.structured_data["tool_result_analysis"]
+    assert "source_sha256" not in evidence.structured_data["tool_result_analysis"]
     assert "x" * 1_000 not in str(evidence.structured_data)
     rows = await _invocation_rows(repository, str(context.run_id))
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
+    assert invocation.artifact_ref.metadata["internal_only"] is True
     stored = await repository.get_agent_artifact(
         str(invocation.artifact_ref.artifact_id)
     )
@@ -966,19 +967,122 @@ async def test_large_result_is_artifacted_and_projected_by_isolated_analyzer(
 
 
 @pytest.mark.asyncio
-async def test_large_result_analysis_failure_keeps_artifact_and_fails_closed(
+async def test_small_result_is_always_projected_when_processor_is_configured(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "small-analysis.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-small-analysis")
+    processor = RecordingResultProcessor()
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        RecordingExecutor([{"payload": "small"}]),
+        result_analyzer=processor,
+    ).execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert len(processor.calls) == 1
+    assert evidence.structured_data["processing_status"] == "completed"
+    rows = await _invocation_rows(repository, str(context.run_id))
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    assert stored[1]["structured_data"]["payload"] == "small"
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_keeps_complete_raw_generic_result_out_of_main_context(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "raw-projection.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-raw-projection")
+    raw_text = "slow-log-line\n" * 2_000
+    outcome = {
+        "observations": [
+            {
+                "tool_name": "read_logs",
+                "response_ordinal": 1,
+                "decision_round": 1,
+                "projection": {
+                    "projection_type": "deterministic_fact_projection",
+                    "source_path": "/result",
+                    "source_sha256": "d" * 64,
+                    "source_json_chars": len(raw_text),
+                    "scalar_groups": [
+                        {
+                            "path_pattern": "/content",
+                            "value_count": 1,
+                            "samples": [
+                                {
+                                    "value": {
+                                        "excerpt": raw_text[:500],
+                                        "sha256": "e" * 64,
+                                        "total_chars": len(raw_text),
+                                    },
+                                    "source_path": "/content",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "is_error": False,
+                "has_data": True,
+            }
+        ],
+        "partial": False,
+        "root_cause_eligible": True,
+    }
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        RecordingExecutor([outcome]),
+        result_analyzer=DeterministicToolResultProcessor(),
+    ).execute(
+        alert_id=alert_id,
+        request=_request(),
+        context=context,
+        tool_spec=_spec(),
+    )
+
+    assert evidence.structured_data["processing_status"] == "completed"
+    assert raw_text not in evidence.model_dump_json()
+    assert "total_chars" in evidence.model_dump_json()
+    rows = await _invocation_rows(repository, str(context.run_id))
+    invocation = await repository.get_tool_invocation(rows[0].id)
+    assert invocation is not None and invocation.artifact_ref is not None
+    stored = await repository.get_agent_artifact(
+        str(invocation.artifact_ref.artifact_id)
+    )
+    assert stored is not None
+    stored_text = str(stored[1])
+    assert raw_text not in stored_text
+    assert "result" not in stored[1]["structured_data"]["observations"][0]
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_program_projection_failure_keeps_artifact_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "analysis-failed.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-analysis-failed")
-    analyzer = RecordingResultAnalyzer(failure=RuntimeError("provider unavailable"))
+    processor = RecordingResultProcessor(failure=RuntimeError("processor unavailable"))
 
     evidence = await DurableOuterToolDispatcher(
         repository,
         RecordingExecutor([{"payload": "x" * 20_000}]),
-        result_analyzer=analyzer,
-        analysis_threshold_chars=1_000,
+        result_analyzer=processor,
     ).execute(
         alert_id=alert_id,
         request=_request(),
@@ -987,7 +1091,7 @@ async def test_large_result_analysis_failure_keeps_artifact_and_fails_closed(
     )
 
     assert evidence.status == ToolStatus.SUCCESS
-    assert evidence.structured_data["analysis_status"] == "failed"
+    assert evidence.structured_data["processing_status"] == "failed"
     assert evidence.structured_data["root_cause_eligible"] is False
     assert evidence.is_root_cause_support_eligible() is False
     rows = await _invocation_rows(repository, str(context.run_id))
@@ -1002,13 +1106,13 @@ async def test_large_result_analysis_failure_keeps_artifact_and_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_large_result_analysis_cannot_override_provider_partial_decision(
+async def test_program_projection_ignores_provider_partial_sentinels(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "provider-partial.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-provider-partial")
-    analyzer = RecordingResultAnalyzer()
+    processor = RecordingResultProcessor()
 
     evidence = await DurableOuterToolDispatcher(
         repository,
@@ -1023,8 +1127,7 @@ async def test_large_result_analysis_cannot_override_provider_partial_decision(
                 }
             ]
         ),
-        result_analyzer=analyzer,
-        analysis_threshold_chars=1_000,
+        result_analyzer=processor,
     ).execute(
         alert_id=alert_id,
         request=_request(),
@@ -1032,19 +1135,16 @@ async def test_large_result_analysis_cannot_override_provider_partial_decision(
         tool_spec=_spec(),
     )
 
-    assert evidence.structured_data["analysis_status"] == "completed"
-    assert evidence.structured_data["partial"] is True
-    assert evidence.structured_data["allow_followup_dispatch"] is False
-    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.structured_data["processing_status"] == "completed"
+    assert "partial" not in evidence.structured_data
+    assert "allow_followup_dispatch" not in evidence.structured_data
+    assert evidence.structured_data["root_cause_eligible"] is True
     assert (
         evidence.structured_data["tool_result_analysis"]["source_coverage_complete"]
         is True
     )
-    assert (
-        evidence.structured_data["root_cause_ineligible_reason"]
-        == "provider_partial_result"
-    )
-    assert evidence.is_root_cause_support_eligible() is False
+    assert "root_cause_ineligible_reason" not in evidence.structured_data
+    assert evidence.is_root_cause_support_eligible() is True
     await repository.close()
 
 
@@ -1065,7 +1165,7 @@ async def test_large_non_success_result_is_projected_without_changing_status(
         repository,
         external_id=f"outer-large-{status.value.casefold()}",
     )
-    analyzer = RecordingResultAnalyzer()
+    processor = RecordingResultProcessor()
     executor = RecordingExecutor(
         [
             {
@@ -1081,8 +1181,7 @@ async def test_large_non_success_result_is_projected_without_changing_status(
     evidence = await DurableOuterToolDispatcher(
         repository,
         executor,
-        result_analyzer=analyzer,
-        analysis_threshold_chars=1_000,
+        result_analyzer=processor,
     ).execute(
         alert_id=alert_id,
         request=_request(),
@@ -1090,9 +1189,9 @@ async def test_large_non_success_result_is_projected_without_changing_status(
         tool_spec=_spec(),
     )
 
-    assert len(analyzer.calls) == 1
+    assert len(processor.calls) == 1
     assert evidence.status == status
-    assert evidence.structured_data["analysis_status"] == "completed"
+    assert evidence.structured_data["processing_status"] == "completed"
     assert evidence.structured_data["reason_code"] == "database_not_monitored"
     assert evidence.structured_data["root_cause_eligible"] is False
     assert evidence.is_root_cause_support_eligible() is False
@@ -1143,13 +1242,12 @@ async def test_partial_success_allocates_next_logical_dispatch_only_after_checkp
     assert second == replayed
     assert len(executor.calls) == 2
     assert executor.contexts[0].outer_dispatch_id != executor.contexts[1].outer_dispatch_id
-    assert [item.outer_dispatch_attempt for item in executor.contexts] == [1, 1]
     assert len(await _invocation_rows(repository, str(context.run_id))) == 2
     await repository.close()
 
 
 @pytest.mark.asyncio
-async def test_partial_success_can_explicitly_disable_followup_dispatch(
+async def test_provider_followup_hint_does_not_block_second_explicit_action(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "partial-terminal.db"))
@@ -1174,7 +1272,10 @@ async def test_partial_success_can_explicitly_disable_followup_dispatch(
         prior_evidence=[first],
     )
 
-    assert replayed == first
-    assert len(executor.calls) == 1
-    assert len(await _invocation_rows(repository, str(context.run_id))) == 1
+    assert replayed != first
+    assert "allow_followup_dispatch" not in replayed.structured_data
+    assert replayed.structured_data["processing_status"] == "unavailable"
+    assert len(executor.calls) == 2
+    assert executor.contexts[0].outer_dispatch_id != executor.contexts[1].outer_dispatch_id
+    assert len(await _invocation_rows(repository, str(context.run_id))) == 2
     await repository.close()

@@ -1,21 +1,18 @@
-"""Prometheus transport, planning, and scenario adapter for the shared Harness.
-
-Provider authorization and payload semantics come from the public policy/codec
-surface on ``PrometheusMCPClient`` so there is only one Host contract.
-"""
+"""Prometheus transport, planning, and scenario adapter for the shared Harness."""
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 import httpx
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
@@ -25,14 +22,9 @@ from mcp.client.sse import sse_client
 
 from app.adapters.prometheus_mcp import (
     _FINISH_TOOL_NAME,
-    _SCOPE_AUDIT_ARGUMENT_NAMES,
     PROMETHEUS_ALERT_WINDOW_SECONDS,
-    PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER,
-    PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS,
-    PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS,
     PROMETHEUS_MCP_PROMPT_VERSION,
     PROMETHEUS_MCP_SERVER_NAME,
-    PrometheusMCPCallResult,
     PrometheusMCPClient,
     PrometheusMCPConfigurationError,
     PrometheusMCPError,
@@ -40,31 +32,28 @@ from app.adapters.prometheus_mcp import (
     PrometheusMCPProtocolError,
     PrometheusMCPQueryResult,
     PrometheusMCPToolError,
-    PrometheusMCPToolPolicy,
     has_monitoring_observation,
 )
 from app.agent_runtime import (
     AgentEventKind,
+    ArtifactRef,
     BudgetLedger,
     BudgetLimits,
     InMemoryEventSink,
     RepositoryEventSink,
     RepositoryInvocationStore,
-    RetryPolicy,
     RuntimeStopReason,
     ToolInvocationStatus,
-    ToolRisk,
     ToolSpec,
 )
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.models import InvestigationContext
 from app.domain.ports import AlertRepository
-from app.domain.tool_calling import MCPModelToolCall
+from app.domain.tool_calling import MCPModelToolCall, ReasoningDeltaCallback
 from app.mcp_runtime import (
     DiscoveredMCPTool,
     Finish,
     HarnessObservation,
-    HostRejection,
     MCPAgentHarnessRuntime,
     PreparedCall,
     RepositoryMCPCheckpointStore,
@@ -77,6 +66,136 @@ from app.mcp_runtime import (
 @dataclass(frozen=True, slots=True)
 class PrometheusHarnessRuntimeDependencies:
     repository: AlertRepository
+
+
+_PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT = (
+    "prometheus-mcp-remote-response/v1"
+)
+
+
+class RepositoryPrometheusRemoteResponseStore:
+    """Persist every complete MCP response before Prometheus result processing."""
+
+    def __init__(
+        self,
+        repository: AlertRepository,
+        *,
+        outer_dispatch_id: UUID | None = None,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+    ) -> None:
+        if (lease_owner is None) != (fencing_token is None):
+            raise ValueError("lease_owner and fencing_token must be provided together")
+        self.repository = repository
+        self.outer_dispatch_id = outer_dispatch_id
+        self.lease_owner = lease_owner
+        self.fencing_token = fencing_token
+
+    @staticmethod
+    def artifact_id(invocation_id: UUID) -> UUID:
+        return uuid5(
+            invocation_id,
+            _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
+        )
+
+    async def save(
+        self,
+        *,
+        run_id: UUID,
+        invocation_id: UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+        response: Any,
+    ) -> None:
+        raw = (
+            response.model_dump(mode="json", by_alias=True)
+            if hasattr(response, "model_dump")
+            else response
+        )
+        content = {
+            "contract": _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
+            "provider": PROMETHEUS_MCP_SERVER_NAME,
+            "run_id": str(run_id),
+            "tool_name": tool_name,
+            "arguments": sanitize(arguments),
+            "response": sanitize(raw),
+        }
+        artifact_id = self.artifact_id(invocation_id)
+        artifact = ArtifactRef(
+            artifact_id=artifact_id,
+            kind="prometheus_mcp_remote_response",
+            media_type="application/json",
+            uri=f"agent-artifact://{artifact_id}",
+            metadata={
+                "contract": _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
+                "provider": PROMETHEUS_MCP_SERVER_NAME,
+                "run_id": str(run_id),
+                "tool_name": tool_name,
+                "invocation_id": str(invocation_id),
+                "outer_dispatch_id": (
+                    str(self.outer_dispatch_id)
+                    if self.outer_dispatch_id is not None
+                    else None
+                ),
+                "sanitized": True,
+                "internal_only": True,
+            },
+        )
+        await self.repository.save_agent_artifact(
+            str(run_id),
+            artifact,
+            content,
+            invocation_id=str(invocation_id),
+            lease_owner=self.lease_owner,
+            fencing_token=self.fencing_token,
+        )
+
+    async def load(
+        self,
+        *,
+        run_id: UUID,
+        invocation_id: UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> Any | None:
+        artifact_id = self.artifact_id(invocation_id)
+        stored = await self.repository.get_agent_artifact(str(artifact_id))
+        if stored is None:
+            return None
+        artifact, content = stored
+        expected_outer_dispatch_id = (
+            str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
+        )
+        metadata = artifact.metadata
+        if (
+            artifact.artifact_id != artifact_id
+            or artifact.kind != "prometheus_mcp_remote_response"
+            or artifact.media_type != "application/json"
+            or artifact.uri != f"agent-artifact://{artifact_id}"
+            or metadata.get("contract") != _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            or metadata.get("provider") != PROMETHEUS_MCP_SERVER_NAME
+            or metadata.get("run_id") != str(run_id)
+            or metadata.get("tool_name") != tool_name
+            or metadata.get("invocation_id") != str(invocation_id)
+            or metadata.get("outer_dispatch_id") != expected_outer_dispatch_id
+            or metadata.get("internal_only") is not True
+        ):
+            raise RuntimeError(
+                f"Prometheus remote-response artifact metadata is invalid: {artifact_id}"
+            )
+        if (
+            not isinstance(content, dict)
+            or content.get("contract") != _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            or content.get("provider") != PROMETHEUS_MCP_SERVER_NAME
+            or content.get("run_id") != str(run_id)
+            or content.get("tool_name") != tool_name
+            or content.get("arguments") != sanitize(arguments)
+            or "response" not in content
+        ):
+            raise RuntimeError(
+                f"Prometheus remote-response artifact content is invalid: {artifact_id}"
+            )
+        return deepcopy(content["response"])
 
 
 @dataclass(slots=True)
@@ -93,7 +212,6 @@ class PrometheusHarnessState:
     monitoring_scope_reason: str | None = None
     monitored_database_engines: list[str] = field(default_factory=list)
     monitoring_target_identifiers: list[str] = field(default_factory=list)
-    raw_call_results: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -101,12 +219,6 @@ class PrometheusHarnessState:
 
 
 _PROMETHEUS_SSE_TRANSPORT_ERROR_CODE = "prometheus_sse_transport_error"
-_RETRYABLE_INVOCATION_ERROR_CODES = {
-    _PROMETHEUS_SSE_TRANSPORT_ERROR_CODE,
-    "ConnectionError",
-    "TimeoutError",
-    "recovered_unknown_outcome",
-}
 
 
 def _no_redirect_http_client(
@@ -208,12 +320,27 @@ class PrometheusSSEMCPToolSession:
         try:
             raw_tools: list[Any] = []
             cursor: str | None = None
-            for _page in range(10):
-                response = await self._session.list_tools(cursor=cursor)
+            seen_cursors: set[str] = set()
+            first_page = True
+            while True:
+                response = (
+                    await self._session.list_tools()
+                    if first_page
+                    else await self._session.list_tools(cursor=cursor)
+                )
+                first_page = False
                 raw_tools.extend(response.tools)
-                cursor = getattr(response, "nextCursor", None)
-                if not cursor:
+                next_cursor = getattr(response, "nextCursor", None)
+                if next_cursor is None:
+                    next_cursor = getattr(response, "next_cursor", None)
+                if not next_cursor:
                     break
+                if not isinstance(next_cursor, str) or next_cursor in seen_cursors:
+                    raise PrometheusMCPProtocolError(
+                        "Prometheus MCP returned an invalid or repeated tool-list cursor"
+                    )
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
             if not raw_tools:
                 raise PrometheusMCPProtocolError("Prometheus MCP returned no tools")
         except BaseException as exc:
@@ -231,7 +358,7 @@ class PrometheusSSEMCPToolSession:
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
-        return self.client.call_result(raw_result)
+        return raw_result
 
     async def close(self) -> None:
         if self._closed:
@@ -248,12 +375,10 @@ class PrometheusSSEMCPToolSession:
             )
         name = raw.get("name")
         schema = raw.get("inputSchema") or raw.get("input_schema") or {"type": "object"}
-        annotations = raw.get("annotations") or {}
         if (
             not isinstance(name, str)
             or not name
             or not isinstance(schema, dict)
-            or not isinstance(annotations, dict)
         ):
             raise PrometheusMCPProtocolError(
                 "Prometheus MCP returned an invalid tool schema"
@@ -262,7 +387,6 @@ class PrometheusSSEMCPToolSession:
             name=name,
             description=str(raw.get("description") or f"Prometheus MCP tool {name}"),
             input_schema=deepcopy(schema),
-            annotations=deepcopy(annotations),
         )
 
 
@@ -326,6 +450,7 @@ class PrometheusHarnessPlanner:
     ) -> None:
         self.client = client
         self.scenario = scenario
+        self.last_reasoning_content: str | None = None
 
     @property
     def consecutive_errors(self) -> list[dict[str, Any]]:
@@ -336,14 +461,20 @@ class PrometheusHarnessPlanner:
         *,
         messages: list[dict[str, Any]],
         tools: list[ToolSpec],
+        reasoning_callback: ReasoningDeltaCallback | None = None,
     ) -> dict[str, Any]:
-        return await self._plan(messages=messages, tools=tools)
+        return await self._plan(
+            messages=messages,
+            tools=tools,
+            reasoning_callback=reasoning_callback,
+        )
 
     async def _plan(
         self,
         *,
         messages: list[dict[str, Any]],
         tools: list[ToolSpec],
+        reasoning_callback: ReasoningDeltaCallback | None = None,
     ) -> dict[str, Any]:
         state = self.scenario.current_state
         advertised_names = {tool.name for tool in tools}
@@ -354,16 +485,10 @@ class PrometheusHarnessPlanner:
         ]
         model_tools = self.client.model_tools_for_state(
             model_tool_list=model_tool_list,
-            authorized_policies=self.scenario.authorized_policies,
-            calls=state.executed_calls,
-            responses=state.responses,
-            alert=self.scenario.context.alert,
-            monitoring_scope_status=state.monitoring_scope_status,
         )
         model_messages = deepcopy(messages)
         model_messages.append(
             self.client.host_investigation_state_message(
-                authorized_policies=self.scenario.authorized_policies,
                 remote_calls_used=len(state.executed_calls),
                 monitoring_scope_status=state.monitoring_scope_status,
                 monitoring_scope_reason=state.monitoring_scope_reason,
@@ -381,13 +506,19 @@ class PrometheusHarnessPlanner:
                     ),
                 }
             )
-        if len(self.consecutive_errors) >= 2:
-            raise self._selection_error(model_tools, state)
+        self.last_reasoning_content = None
         try:
-            call = await self.client.model.request_mcp_tool_call(
-                messages=model_messages,
-                tools=model_tools,
-            )
+            model_kwargs = {"messages": model_messages, "tools": model_tools}
+            if reasoning_callback is not None and _accepts_keyword_argument(
+                self.client.model.request_mcp_tool_call,
+                "reasoning_callback",
+            ):
+                call = await self.client.model.request_mcp_tool_call(
+                    **model_kwargs,
+                    reasoning_callback=reasoning_callback,
+                )
+            else:
+                call = await self.client.model.request_mcp_tool_call(**model_kwargs)
             if not isinstance(call, MCPModelToolCall):
                 raise TypeError("MCP model did not return MCPModelToolCall")
         except Exception as exc:
@@ -399,89 +530,32 @@ class PrometheusHarnessPlanner:
             raise self._selection_error(model_tools, state) from exc
 
         self.consecutive_errors.clear()
+        reasoning_content = call.reasoning_content
+        self.last_reasoning_content = (
+            reasoning_content
+            if isinstance(reasoning_content, str) and reasoning_content.strip()
+            else None
+        )
         if call.name == _FINISH_TOOL_NAME:
-            if state.monitoring_scope_status == "investigating":
-                scope_status = call.arguments.get("monitoring_scope_status")
-                reason = call.arguments.get("reason")
-                if scope_status not in {"out_of_scope", "unknown"}:
-                    raise PrometheusMCPModelError(
-                        "Prometheus scope finish must declare out_of_scope or unknown"
-                    )
-                if not isinstance(reason, str) or not reason.strip():
-                    raise PrometheusMCPModelError(
-                        "Prometheus scope conclusion must include a non-empty reason"
-                    )
-                state.monitoring_scope_status = scope_status
-                state.monitoring_scope_reason = sanitize_text(reason)[:1000]
-                state.monitored_database_engines = self._string_list(
-                    call.arguments.get("monitored_database_engines"),
-                    limit=20,
-                )
-                state.monitoring_target_identifiers = self._string_list(
-                    call.arguments.get("monitoring_target_identifiers"),
-                    limit=100,
-                )
-                return {
-                    "action": "finish",
-                    "reason": RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE.value,
-                    "summary": state.monitoring_scope_reason,
-                }
+            self.scenario.record_finish(call.arguments)
+            reason = call.arguments.get("reason")
             return {
                 "action": "finish",
                 "reason": RuntimeStopReason.COMPLETED.value,
-                "summary": "Prometheus alert-window evidence collection is complete.",
+                "summary": (
+                    sanitize_text(reason)
+                    if isinstance(reason, str) and reason.strip()
+                    else "Prometheus alert-window evidence collection is complete."
+                ),
             }
-        policy = self.scenario.authorized_policies.get(call.name)
-        if (
-            state.monitoring_scope_status == "investigating"
-            and policy is not None
-            and policy.capability == "range_query"
-        ):
-            reason = call.arguments.get("monitoring_scope_reason")
-            engines = self._string_list(
-                call.arguments.get("monitored_database_engines"),
-                limit=20,
-            )
-            identifiers = self._string_list(
-                call.arguments.get("monitoring_target_identifiers"),
-                limit=100,
-            )
-            if not isinstance(reason, str) or not reason.strip():
-                raise PrometheusMCPModelError(
-                    "Prometheus in-scope range query must include monitoring_scope_reason"
-                )
-            if not engines or not identifiers:
-                raise PrometheusMCPModelError(
-                    "Prometheus in-scope range query must include database engines "
-                    "and target identifiers"
-                )
-            state.monitoring_scope_status = "in_scope"
-            state.monitoring_scope_reason = sanitize_text(reason)[:1000]
-            state.monitored_database_engines = engines
-            state.monitoring_target_identifiers = identifiers
         self.scenario.register_model_call(call)
-        capability = policy.capability if policy is not None else "unapproved"
         return {
             "action": "call_tool",
             "tool_name": call.name,
-            "objective": (
-                f"Collect read-only Prometheus {capability} evidence for the alert window."
-            ),
+            "objective": "Collect Prometheus evidence relevant to the alert.",
             "hypothesis_ids": [],
             "arguments": deepcopy(call.arguments),
         }
-
-    @staticmethod
-    def _string_list(value: Any, *, limit: int) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return list(
-            dict.fromkeys(
-                sanitize_text(item)[:500]
-                for item in value[:limit]
-                if isinstance(item, str) and item.strip()
-            )
-        )
 
     def _selection_error(
         self,
@@ -503,10 +577,6 @@ class PrometheusHarnessPlanner:
                     latest["error"] if len(self.consecutive_errors) > 1 else None
                 ),
                 "remote_calls_used": len(state.executed_calls),
-                "remote_call_limit": self.client.max_agent_steps,
-                "remote_calls_remaining": max(
-                    self.client.max_agent_steps - len(state.executed_calls), 0
-                ),
                 "available_tools": [
                     item.get("function", {}).get("name")
                     for item in model_tools
@@ -517,7 +587,7 @@ class PrometheusHarnessPlanner:
 
 
 class PrometheusHarnessScenario:
-    """Prometheus-specific Host policy and evidence semantics."""
+    """Persist Prometheus calls and deterministic observations without policy gates."""
 
     provider = PROMETHEUS_MCP_SERVER_NAME
 
@@ -533,7 +603,6 @@ class PrometheusHarnessScenario:
         self.context = context
         self.window_start = window_start
         self.window_end = window_end
-        self.authorized_policies: dict[str, PrometheusMCPToolPolicy] = {}
         self.model_tools: dict[str, dict[str, Any]] = {}
         self._pending_model_calls: list[MCPModelToolCall] = []
         self._state = PrometheusHarnessState(window_start, window_end)
@@ -544,6 +613,30 @@ class PrometheusHarnessScenario:
 
     def register_model_call(self, call: MCPModelToolCall) -> None:
         self._pending_model_calls.append(call)
+
+    def record_finish(self, arguments: Mapping[str, Any]) -> None:
+        """Mechanically retain the model's local finish declaration."""
+
+        status = arguments.get("monitoring_scope_status")
+        reason = arguments.get("reason")
+        engines = arguments.get("monitored_database_engines")
+        targets = arguments.get("monitoring_target_identifiers")
+        if isinstance(status, str) and status:
+            self._state.monitoring_scope_status = status
+        if isinstance(reason, str) and reason:
+            self._state.monitoring_scope_reason = sanitize_text(reason)
+        if isinstance(engines, list):
+            self._state.monitored_database_engines = [
+                sanitize_text(item)
+                for item in engines
+                if isinstance(item, str) and item.strip()
+            ]
+        if isinstance(targets, list):
+            self._state.monitoring_target_identifiers = [
+                sanitize_text(item)
+                for item in targets
+                if isinstance(item, str) and item.strip()
+            ]
 
     def restore_state(self, state: PrometheusHarnessState) -> None:
         self._state = state
@@ -570,31 +663,23 @@ class PrometheusHarnessScenario:
         return state
 
     def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
-        converted, authorized = self.client.authorized_model_tools(tools)
-        self.authorized_policies = dict(authorized)
+        converted = self.client.discovered_model_tools(tools)
         self.model_tools = {
             str(item["function"]["name"]): deepcopy(item) for item in converted
         }
         specs: list[ToolSpec] = []
-        for name, policy in sorted(authorized.items()):
+        for name in sorted(self.model_tools):
             model_tool = self.model_tools[name]["function"]
             schema = deepcopy(model_tool["parameters"])
             specs.append(
                 ToolSpec(
                     name=name,
                     provider=self.provider,
-                    capability=f"prometheus.{policy.capability}",
+                    capability="prometheus.remote_tool",
                     input_schema=schema,
-                    read_only=True,
-                    risk=ToolRisk.LOW,
-                    policy_version=self._policy_version(policy),
+                    policy_version=PROMETHEUS_MCP_PROMPT_VERSION,
                     schema_version=self._schema_version(schema),
                     timeout=self.client.timeout_seconds,
-                    retry=RetryPolicy(
-                        max_attempts=2,
-                        initial_backoff_seconds=0,
-                        retryable_error_codes=set(_RETRYABLE_INVOCATION_ERROR_CODES),
-                    ),
                 )
             )
         return specs
@@ -604,44 +689,20 @@ class PrometheusHarnessScenario:
         action: Any,
         *,
         state: PrometheusHarnessState,
-        catalog: dict[str, ToolSpec],
-    ) -> PreparedCall | HostRejection:
+    ) -> PreparedCall:
         self._state = state
         call = self._consume_model_call(action.tool_name, action.arguments)
-        policy = self.authorized_policies.get(action.tool_name)
-        if policy is None or action.tool_name not in catalog:
-            state.tool_attempts.append(
-                {
-                    "tool_name": action.tool_name,
-                    "model_arguments": sanitize(action.arguments),
-                    "outcome": "host_rejected_unauthorized",
-                }
-            )
-            return HostRejection(
-                code="tool_not_in_local_policy",
-                message="Prometheus tool is not authorized by local read-only policy.",
-                repair_hint="Choose one of the currently advertised Prometheus tools.",
-            )
-        effective_arguments = self.client.effective_arguments(
-            action.arguments,
-            policy=policy,
-            window_start=state.window_start,
-            window_end=state.window_end,
-        )
-        if policy.capability == "range_query":
-            for argument_name in _SCOPE_AUDIT_ARGUMENT_NAMES:
-                effective_arguments.pop(argument_name, None)
         return PreparedCall(
             tool_name=action.tool_name,
             objective=action.objective,
             hypothesis_ids=list(action.hypothesis_ids),
             model_arguments=deepcopy(action.arguments),
-            effective_arguments=effective_arguments,
+            effective_arguments=deepcopy(action.arguments),
             timeout_seconds=self.client.timeout_seconds,
             metadata={
                 "call_id": call.call_id,
                 "request_id": call.request_id,
-                "capability": policy.capability,
+                "capability": "remote_tool",
             },
         )
 
@@ -652,168 +713,39 @@ class PrometheusHarnessScenario:
         result: Any,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
         updated = deepcopy(state)
-        if not isinstance(result, PrometheusMCPCallResult):
-            raise PrometheusMCPProtocolError(
-                "Prometheus Harness received a result without its raw MCP envelope"
-            )
-        updated.raw_call_results.append(deepcopy(result.raw_call_result))
-        result = result.payload
+        decoded = self.client.call_result(result)
+        result = decoded.payload
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
-        policy = self.authorized_policies[call.tool_name]
-        if policy.capability == "target_discovery":
-            return self._on_target_discovery_result(
-                updated,
-                model_call,
-                call,
-                result,
-            )
         has_observation = has_monitoring_observation(result)
-        window_verification = self.client.window_verification(
-            policy=policy,
-            payload=result,
-            window_start=updated.window_start,
-            window_end=updated.window_end,
+        outcome = "no_data" if result is None else "result"
+        projected = self.client.project_model_observation(
+            result,
+            alert=self.context.alert,
         )
-        if policy.capability == "range_query":
-            target_verification, target_mismatch_reasons = (
-                self.client.target_verification(
-                    self.context.alert,
-                    result,
-                )
-            )
-        else:
-            target_verification, target_mismatch_reasons = "not_applicable", []
-        target_mismatch = target_verification == "mismatch"
-        usable_observation = (
-            has_observation
-            and window_verification == "exact"
-            and not target_mismatch
-        )
-        no_data = result is None or (
-            policy.capability == "range_query"
-            and (not has_observation or target_mismatch)
-        )
-        if no_data:
-            outcome = "target_mismatch" if target_mismatch else "no_data"
-            model_payload = result
-            if result is not None:
-                updated.responses.append(
-                    {
-                        "tool_name": call.tool_name,
-                        "model_arguments": sanitize(call.model_arguments),
-                        "arguments": sanitize(call.effective_arguments),
-                        "capability": policy.capability,
-                        "has_monitoring_observation": has_observation,
-                        "window_verification": window_verification,
-                        "target_verification": target_verification,
-                        "target_mismatch_reasons": target_mismatch_reasons,
-                        "root_cause_eligible": False,
-                        "root_cause_ineligible_reason": (
-                            "target_mismatch" if target_mismatch else "no_observation"
-                        ),
-                        "result": sanitize(result),
-                    }
-                )
-            if target_mismatch:
-                mismatch_count = 1 + sum(
-                    attempt.get("outcome") == "target_mismatch" for attempt in updated.tool_attempts
-                )
-                model_payload = {
-                    "tool_result": result,
-                    "host_target_verification": target_verification,
-                    "target_mismatch_reasons": target_mismatch_reasons,
-                    "instruction": (
-                        "该返回不属于required_target，不能作为告警证据；"
-                        + (
-                            "只允许修正指标或目标标签后重新执行range_query一次。"
-                            if mismatch_count < PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS
-                            else "已达到目标不匹配停止阈值，Host 将结束无效探测。"
-                        )
-                    ),
-                }
-                next_instruction = "返回目标与告警目标不一致；" + (
-                    "只再修正一次指标或标签并执行 range_query。"
-                    if mismatch_count < PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS
-                    else "Host 将以告警信号事实不足结束采集。"
-                )
-            else:
-                empty_count = 1 + sum(
-                    attempt.get("outcome") == "no_data" for attempt in updated.tool_attempts
-                )
-                next_instruction = "该调用已完成但没有数据；" + (
-                    "不要原样重试，只选择其它最相关的 range_query。"
-                    if empty_count < PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS
-                    else "已达到空范围查询停止阈值，Host 将结束无效探测。"
-                )
-            status = ToolInvocationStatus.NO_DATA
-        else:
-            outcome = (
-                "observation"
-                if usable_observation
-                else "unverified_window"
-                if has_observation
-                else "auxiliary_result"
-            )
-            response = {
-                "tool_name": call.tool_name,
-                "model_arguments": sanitize(call.model_arguments),
-                "arguments": sanitize(call.effective_arguments),
-                "capability": policy.capability,
-                "has_monitoring_observation": has_observation,
-                "window_verification": window_verification,
-                "target_verification": target_verification,
-                "target_mismatch_reasons": target_mismatch_reasons,
-                "root_cause_eligible": usable_observation,
-                "root_cause_ineligible_reason": (
-                    ""
-                    if usable_observation
-                    else (
-                        "unverified_window"
-                        if has_observation
-                        else "auxiliary_result"
-                    )
-                ),
-                "result": sanitize(result),
-            }
+        response = {
+            "tool_name": call.tool_name,
+            "model_arguments": sanitize(call.model_arguments),
+            "arguments": sanitize(call.effective_arguments),
+            "capability": "remote_tool",
+            "has_monitoring_observation": has_observation,
+            "root_cause_eligible": has_observation,
+            "root_cause_ineligible_reason": "" if has_observation else "no_observation",
+            "result": sanitize(result),
+        }
+        if result is not None:
             updated.responses.append(response)
-            model_payload = result
-            if has_observation and not usable_observation:
-                model_payload = {
-                    "tool_result": result,
-                    "host_window_verification": window_verification,
-                    "instruction": (
-                        "该返回尚不能证明属于required_window；请改用带精确起止参数的"
-                        "范围查询工具。"
-                    ),
-                }
-            if usable_observation:
-                next_instruction = (
-                    "已取得合格的告警窗口观测；告警信号所需事实已覆盖时结束采集，"
-                    "否则只再执行与告警目标、信号和时间窗直接相关的范围查询。"
-                )
-            elif policy.capability == "catalog":
-                next_instruction = (
-                    "目录结果不能作为实时证据；下一步使用 range_query，不要继续枚举完整目录。"
-                )
-            elif has_observation:
-                next_instruction = (
-                    "返回包含观测但时间窗未通过验证；改用其它 range_query 或修正查询语义。"
-                )
-            else:
-                next_instruction = (
-                    "该范围查询没有样本；修改指标、标签或聚合语义后再查询。"
-                )
-            status = ToolInvocationStatus.SUCCEEDED
+        status = (
+            ToolInvocationStatus.NO_DATA
+            if result is None
+            else ToolInvocationStatus.SUCCEEDED
+        )
         attempt = {
             "tool_name": call.tool_name,
             "model_arguments": sanitize(call.model_arguments),
             "arguments": sanitize(call.effective_arguments),
-            "capability": policy.capability,
+            "capability": "remote_tool",
             "outcome": outcome,
-            "window_verification": window_verification,
-            "target_verification": target_verification,
-            "target_mismatch_reasons": target_mismatch_reasons,
         }
         if status == ToolInvocationStatus.NO_DATA:
             attempt.update(
@@ -828,9 +760,7 @@ class PrometheusHarnessScenario:
             "tool_name": call.tool_name,
             "outcome": outcome,
             "has_monitoring_observation": has_observation,
-            "window_verification": window_verification,
-            "target_verification": target_verification,
-            "target_mismatch_reasons": target_mismatch_reasons,
+            "projection": deepcopy(projected),
         }
         if status == ToolInvocationStatus.NO_DATA:
             observation.update(
@@ -844,86 +774,15 @@ class PrometheusHarnessScenario:
             observation=observation,
             message=self.client.completed_tool_messages(
                 model_call,
-                model_payload,
+                projected,
                 host_control=self.client.host_control_feedback(
                     remote_calls_used=len(updated.executed_calls),
                     outcome=outcome,
-                    capability=policy.capability,
-                    instruction=next_instruction,
+                    capability="remote_tool",
+                    instruction="根据原始返回自主决定下一步，事实足够时调用结束工具。",
                 ),
             ),
             status=status,
-        )
-
-    def _on_target_discovery_result(
-        self,
-        updated: PrometheusHarnessState,
-        model_call: MCPModelToolCall,
-        call: PreparedCall,
-        result: Any,
-    ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
-        updated.monitoring_scope_status = "investigating"
-        updated.monitoring_scope_reason = None
-        outcome = "monitoring_scope_evidence_collected"
-        response = {
-            "tool_name": call.tool_name,
-            "model_arguments": sanitize(call.model_arguments),
-            "arguments": sanitize(call.effective_arguments),
-            "capability": "target_discovery",
-            "has_monitoring_observation": False,
-            "window_verification": "not_applicable",
-            "target_verification": "not_applicable",
-            "monitoring_scope_status": "investigating",
-            "root_cause_eligible": False,
-            "root_cause_ineligible_reason": "monitoring_scope_discovery",
-            "result": sanitize(result),
-        }
-        updated.responses.append(response)
-        updated.tool_attempts.append(
-            {
-                "tool_name": call.tool_name,
-                "model_arguments": sanitize(call.model_arguments),
-                "arguments": sanitize(call.effective_arguments),
-                "capability": "target_discovery",
-                "outcome": outcome,
-                "monitoring_scope_status": "investigating",
-                "evidence_disposition": "MISSING",
-                "is_contradiction": False,
-            }
-        )
-        self._state = updated
-        instruction = (
-            "结合目标标签、服务发现 URL、抓取路径、job、指标目录和元数据判断数据库监控归属。"
-            "证据支持范围内时，选择最相关的 range_query 并提交结构化范围依据；支持范围外或"
-            "证据仍不足时，调用 finish_prometheus_investigation。筛选后的空结果不能单独证明"
-            "数据库未受监控。"
-        )
-        invocation_status = (
-            ToolInvocationStatus.SUCCEEDED
-            if result is not None
-            else ToolInvocationStatus.NO_DATA
-        )
-        observation = {
-            "tool_name": call.tool_name,
-            "outcome": outcome,
-            "monitoring_scope_status": "investigating",
-            "evidence_disposition": "MISSING",
-            "is_contradiction": False,
-        }
-        return ScenarioTransition(
-            state=updated,
-            observation=observation,
-            message=self.client.completed_tool_messages(
-                model_call,
-                result,
-                host_control=self.client.host_control_feedback(
-                    remote_calls_used=len(updated.executed_calls),
-                    outcome=outcome,
-                    capability="target_discovery",
-                    instruction=instruction,
-                ),
-            ),
-            status=invocation_status,
         )
 
     def result_error_directive(
@@ -945,9 +804,6 @@ class PrometheusHarnessScenario:
         status: ToolInvocationStatus,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
         updated = deepcopy(state)
-        raw_call_result = error.details.get("raw_call_result")
-        if isinstance(raw_call_result, dict):
-            updated.raw_call_results.append(deepcopy(raw_call_result))
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
         capability = str(call.metadata.get("capability") or "unknown")
@@ -970,16 +826,11 @@ class PrometheusHarnessScenario:
         if not is_tool_error:
             updated.last_error_type = error.code
             updated.last_error_detail = detail
-        elif capability == "target_discovery":
-            updated.monitoring_scope_status = "unknown"
-            updated.monitoring_scope_reason = (
-                "Prometheus 目标发现工具执行失败，无法确认告警数据库是否受监控。"
-            )
         self._state = updated
         instruction = (
-            "根据实际错误修改参数，并选择最小的只读范围查询。"
+            "根据实际错误修改参数并选择下一步查询。"
             if is_tool_error
-            else "连接已中断；Host 将重连并仅对只读调用执行受控重试。"
+            else "连接已中断；Host 将在整次调查超时内重连。"
         )
         return ScenarioTransition(
             state=updated,
@@ -1058,105 +909,13 @@ class PrometheusHarnessScenario:
         observations: Sequence[HarnessObservation[dict[str, Any]]],
     ) -> Finish | None:
         del observations
-        inconclusive_reason = self.inconclusive_reason(state)
-        if inconclusive_reason is not None:
-            return Finish(
-                reason=RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE,
-                summary=inconclusive_reason,
-                requires_human=True,
-            )
-        if len(state.executed_calls) >= self.client.max_agent_steps:
-            return Finish(
-                reason=RuntimeStopReason.BUDGET_EXHAUSTED,
-                summary="Prometheus remote_tool_calls budget was exhausted.",
-                requires_human=not state.has_monitoring_data,
-            )
+        del state
         return None
 
     def inconclusive_reason(self, state: PrometheusHarnessState) -> str | None:
         if state.has_monitoring_data:
             return None
-        if state.monitoring_scope_status == "out_of_scope":
-            return state.monitoring_scope_reason or (
-                "告警数据库不在 Prometheus 当前配置的监控范围内，已跳过后续指标查询。"
-            )
-        if state.monitoring_scope_status == "unknown":
-            return state.monitoring_scope_reason or (
-                "无法确认告警数据库是否在 Prometheus 监控范围内，未继续执行指标查询。"
-            )
-        range_attempts = [
-            attempt for attempt in state.tool_attempts if attempt.get("capability") == "range_query"
-        ]
-        target_mismatches = sum(
-            attempt.get("outcome") == "target_mismatch" for attempt in range_attempts
-        )
-        if target_mismatches >= PROMETHEUS_MCP_MAX_TARGET_MISMATCH_CALLS:
-            return (
-                "Prometheus 已执行两次目标修正后的范围查询，但返回序列仍与告警目标不一致；"
-                "继续探测不能提供可归属的实时证据。"
-            )
-
-        catalog_calls = sum(
-            attempt.get("capability") == "catalog" for attempt in state.tool_attempts
-        )
-        missing_range_results = sum(
-            attempt.get("outcome") in {"no_data", "target_mismatch"} for attempt in range_attempts
-        )
-        if (
-            missing_range_results
-            and catalog_calls >= self.client.catalog_call_limit()
-            and self.client.catalog_metric_relevance(
-                self.context.alert,
-                state.responses,
-            )
-            == "irrelevant"
-        ):
-            return (
-                "Prometheus 指标目录中未发现与当前告警信号语义相关的指标；"
-                "继续查询仅共享数据库引擎前缀的指标不能补充告警信号事实。"
-            )
-
-        empty_ranges = sum(attempt.get("outcome") == "no_data" for attempt in range_attempts)
-        if empty_ranges >= PROMETHEUS_MCP_MAX_EMPTY_RANGE_CALLS:
-            return (
-                f"Prometheus 已执行 {empty_ranges} 次不同的告警窗口范围查询且均无样本；"
-                "继续猜测指标或标签不能补充完整的告警信号事实。"
-            )
-        return None
-
-    def validate_finish(
-        self,
-        state: PrometheusHarnessState,
-        observations: Sequence[HarnessObservation[dict[str, Any]]],
-        finish: Finish,
-    ) -> Finish | HostRejection:
-        del observations
-        self._state = state
-        if finish.reason in {
-            RuntimeStopReason.HUMAN_INPUT_REQUIRED,
-            RuntimeStopReason.AMBIGUOUS_TARGET,
-            RuntimeStopReason.NO_SAFE_ACTION,
-        }:
-            return finish
-        if (
-            finish.reason == RuntimeStopReason.NO_DISCRIMINATING_EVIDENCE
-            and state.monitoring_scope_status in {"out_of_scope", "unknown"}
-            and any(
-                attempt.get("capability") == "target_discovery"
-                for attempt in state.tool_attempts
-            )
-        ):
-            return finish
-        if state.has_monitoring_data:
-            return finish
-        return HostRejection(
-            code="finish_requires_exact_window_observation",
-            message=(
-                "Prometheus investigation cannot finish without an exact-window monitoring "
-                "observation."
-            ),
-            repair_hint="Call an approved range_query tool for the Host-bound alert window.",
-        )
+        return state.monitoring_scope_reason
 
     def _consume_model_call(
         self,
@@ -1198,24 +957,11 @@ class PrometheusHarnessScenario:
         )
         return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
 
-    @staticmethod
-    def _policy_version(policy: PrometheusMCPToolPolicy) -> str:
-        canonical = json.dumps(
-            asdict(policy),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        digest = sha256(canonical.encode("utf-8")).hexdigest()[:24]
-        return f"{PROMETHEUS_MCP_PROMPT_VERSION}:{digest}"
-
-
 async def collect_prometheus_with_harness(
     client: PrometheusMCPClient,
     context: InvestigationContext,
 ) -> PrometheusMCPQueryResult:
-    """Run one Prometheus child investigation and return the public result model."""
+    """Run one Prometheus MCP investigation and return the public result model."""
 
     occurred_at = context.alert.occurred_at
     if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
@@ -1233,6 +979,7 @@ async def collect_prometheus_with_harness(
     planner = PrometheusHarnessPlanner(client=client, scenario=scenario)
     event_sink = InMemoryEventSink()
     invocation_store = None
+    remote_response_store = None
     checkpoint_store = None
     runtime_dependencies = client.harness_runtime_dependencies
     if runtime_dependencies is not None:
@@ -1243,6 +990,11 @@ async def collect_prometheus_with_harness(
         }
         event_sink = RepositoryEventSink(repository, **lease)
         invocation_store = RepositoryInvocationStore(repository, **lease)
+        remote_response_store = RepositoryPrometheusRemoteResponseStore(
+            repository,
+            outer_dispatch_id=context.outer_dispatch_id,
+            **lease,
+        )
         manifest = await repository.get_run_manifest(str(context.run_id))
         if manifest is not None:
             checkpoint_store = RepositoryMCPCheckpointStore[
@@ -1255,16 +1007,14 @@ async def collect_prometheus_with_harness(
                 dispatch_id=context.outer_dispatch_id,
                 **lease,
             )
-    decision_limit = (
-        client.max_agent_steps * PROMETHEUS_MCP_DECISION_LIMIT_MULTIPLIER
-    )
     budget = BudgetLedger(
         BudgetLimits(
-            planner_requests=decision_limit * 2,
-            accepted_decisions=decision_limit,
-            remote_tool_calls=client.max_agent_steps,
-            host_bootstrap_calls=0,
-            session_attempts=2,
+            planner_requests=None,
+            accepted_decisions=None,
+            remote_tool_calls=None,
+            host_bootstrap_calls=None,
+            session_attempts=None,
+            wall_time_seconds=client.timeout_seconds,
         )
     )
     runtime = MCPAgentHarnessRuntime[
@@ -1279,6 +1029,7 @@ async def collect_prometheus_with_harness(
         budget=budget,
         checkpoint_hook=checkpoint_store,
         invocation_store=invocation_store,
+        remote_response_store=remote_response_store,
         planner_timeout_seconds=client.timeout_seconds,
         session_timeout_seconds=client.timeout_seconds,
     )
@@ -1287,10 +1038,6 @@ async def collect_prometheus_with_harness(
         if checkpoint_store is not None
         else None
     )
-    if context.outer_dispatch_attempt == 2 and checkpoint is None:
-        raise PrometheusMCPConfigurationError(
-            "Prometheus outer recovery attempt has no matching child checkpoint"
-        )
     if checkpoint is None:
         harness_result = await runtime.run(run_id=context.run_id)
     else:
@@ -1311,25 +1058,7 @@ async def collect_prometheus_with_harness(
     state_attempts = deque(deepcopy(state.tool_attempts))
     attempts: list[dict[str, Any]] = []
     for event in events:
-        if event.kind == AgentEventKind.HOST_REJECTED:
-            code = str(event.payload.get("code") or "host_rejected")
-            outcome = {
-                "duplicate_call": "host_rejected_duplicate",
-                "tool_not_approved": "host_rejected_unauthorized",
-                "tool_not_in_local_policy": "host_rejected_unauthorized",
-            }.get(code, f"host_rejected_{code}")
-            if state_attempts and state_attempts[0].get("outcome") == outcome:
-                attempts.append(state_attempts.popleft())
-            else:
-                attempts.append(
-                    {
-                        "outcome": outcome,
-                        "detail": sanitize_text(
-                            str(event.payload.get("message") or "")
-                        )[:500],
-                    }
-                )
-        elif event.kind in {
+        if event.kind in {
             AgentEventKind.TOOL_INVOCATION_FAILED,
             AgentEventKind.TOOL_INVOCATION_NO_DATA,
             AgentEventKind.TOOL_INVOCATION_SUCCEEDED,
@@ -1344,15 +1073,6 @@ async def collect_prometheus_with_harness(
     finished_by_model = (
         finish.model_requested
         and finish.reason == RuntimeStopReason.COMPLETED
-        and has_monitoring_data
-    )
-    model_failure = (
-        finish.reason == RuntimeStopReason.HUMAN_INPUT_REQUIRED
-        and bool(state.consecutive_model_errors)
-    )
-    call_limit_reached = (
-        finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED
-        and "remote_tool_calls" in finish.summary
     )
     if state.monitoring_scope_status == "out_of_scope":
         termination_reason = "database_not_monitored"
@@ -1360,16 +1080,8 @@ async def collect_prometheus_with_harness(
         termination_reason = "monitoring_scope_unknown"
     elif finished_by_model:
         termination_reason = "finished_by_model"
-    elif model_failure:
-        termination_reason = (
-            "model_error_after_partial_result"
-            if has_monitoring_data
-            else "model_error_no_result"
-        )
-    elif call_limit_reached:
-        termination_reason = "call_limit_reached"
     elif finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED:
-        termination_reason = "decision_limit_reached"
+        termination_reason = "budget_exhausted"
     elif finish.reason == RuntimeStopReason.DEADLINE_EXCEEDED:
         termination_reason = "deadline_exceeded"
     elif finish.reason == RuntimeStopReason.FAILED:
@@ -1383,44 +1095,14 @@ async def collect_prometheus_with_harness(
 
     termination_error_type: str | None = None
     termination_error_detail: str | None = None
-    if model_failure:
-        termination_error_type = PrometheusMCPModelError.__name__
-        termination_error_detail = sanitize_text(finish.summary)[:1000]
-        attempts.append(
-            {
-                "outcome": "model_selection_error",
-                "error_type": termination_error_type,
-                "detail": termination_error_detail,
-                "remote_calls_used": len(state.executed_calls),
-                "remote_calls_remaining": max(
-                    client.max_agent_steps - len(state.executed_calls), 0
-                ),
-                "evidence_disposition": "MISSING",
-                "is_contradiction": False,
-                "diagnostics": sanitize(
-                    {
-                        "errors": state.consecutive_model_errors,
-                        "first_error": (
-                            state.consecutive_model_errors[0]["error"]
-                            if state.consecutive_model_errors
-                            else None
-                        ),
-                        "second_error": (
-                            state.consecutive_model_errors[-1]["error"]
-                            if len(state.consecutive_model_errors) > 1
-                            else None
-                        ),
-                        "remote_calls_used": len(state.executed_calls),
-                        "remote_calls_remaining": max(
-                            client.max_agent_steps - len(state.executed_calls), 0
-                        ),
-                    }
-                ),
-            }
-        )
-    elif not finished_by_model:
+    if not finished_by_model:
         termination_error_type = state.last_error_type
         termination_error_detail = state.last_error_detail
+        if termination_error_type is None and state.consecutive_model_errors:
+            termination_error_type = PrometheusMCPModelError.__name__
+            termination_error_detail = sanitize_text(
+                state.consecutive_model_errors[-1]["error"]
+            )[:1000]
         if termination_error_type is None:
             failed_sessions = [
                 event
@@ -1444,7 +1126,6 @@ async def collect_prometheus_with_harness(
         model_request_ids=tuple(
             call.request_id for call in state.executed_calls if call.request_id
         ),
-        call_limit_reached=call_limit_reached,
         finished_by_model=finished_by_model,
         tool_attempts=tuple(attempts),
         termination_reason=termination_reason,
@@ -1466,7 +1147,6 @@ async def collect_prometheus_with_harness(
         monitoring_scope_reason=state.monitoring_scope_reason,
         monitored_database_engines=tuple(state.monitored_database_engines),
         monitoring_target_identifiers=tuple(state.monitoring_target_identifiers),
-        raw_call_results=tuple(deepcopy(state.raw_call_results)),
     )
 
 
@@ -1477,5 +1157,25 @@ __all__ = [
     "PrometheusHarnessState",
     "PrometheusSSEMCPConnector",
     "PrometheusSSEMCPToolSession",
+    "RepositoryPrometheusRemoteResponseStore",
     "collect_prometheus_with_harness",
 ]
+
+
+def _accepts_keyword_argument(callable_object: Any, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == keyword
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
+        for parameter in parameters
+    )

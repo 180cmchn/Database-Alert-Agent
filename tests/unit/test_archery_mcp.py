@@ -9,14 +9,12 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from app.adapters.ai import FakeAIAdvisor
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_mcp import (
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
-    ARCHERY_MCP_LOGIN_TOOL_NAME,
-    ARCHERY_MCP_MAX_AGENT_STEPS,
-    ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
     ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
@@ -26,8 +24,6 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPClient,
     ArcheryMCPProtocolError,
-    ArcheryMCPReadOnlyViolation,
-    ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
     ArcherySlowLogQueryResult,
     MCPServerSettings,
@@ -35,15 +31,16 @@ from app.adapters.archery_mcp import (
 )
 from app.adapters.investigation import (
     AlertContextTool,
-    DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
     ToolExecutor,
 )
 from app.application.factory import apply_runtime_settings, build_runtime
 from app.config import Settings
 from app.domain.models import (
+    AdvisorMetadata,
     InvestigationContext,
-    InvestigationStrategy,
+    InvestigationDecision,
+    InvestigationDecisionResult,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolStatus,
@@ -52,6 +49,8 @@ from app.domain.tool_calling import MCPModelToolCall
 from app.mcp_catalog import MCPPromptBundle, load_mcp_catalog
 
 TEST_INSTANCE_REF = "archery-metadata"
+ARCHERY_MCP_LOGIN_TOOL_NAME = "ensure_login_gymJPA"
+ARCHERY_MCP_QUERY_TOOL_NAME = "sql_query_gymJPA"
 TEST_INSTANCE_ID = 226
 TEST_RESOURCE_GROUP_ID = 10
 TEST_DB_NAME = "archery_data"
@@ -79,6 +78,7 @@ TEST_ALTERNATE_SLOW_LOG_QUERY = (
 TEST_HISTORY_TIME_CLAUSE = (
     "AND ts_min >= FROM_UNIXTIME(1784793300) AND ts_min <= FROM_UNIXTIME(1784793600) "
 )
+FINISH_TOOL_NAME = "finish_archery_investigation"
 
 
 def _write_prompt_files(
@@ -211,7 +211,11 @@ class PromptFollowingMCPModel:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> MCPModelToolCall:
-        name = self.sequence[len(self.calls)]
+        name = (
+            self.sequence[len(self.calls)]
+            if len(self.calls) < len(self.sequence)
+            else FINISH_TOOL_NAME
+        )
         available_names = {item["function"]["name"] for item in tools}
         assert name in available_names
         query_index = sum(item["name"] == ARCHERY_MCP_QUERY_TOOL_NAME for item in self.calls)
@@ -248,6 +252,9 @@ class PromptFollowingMCPModel:
                 "sql_content": query_sql,
                 "limit_num": 20,
             },
+            FINISH_TOOL_NAME: {
+                "reason": "Archery evidence collection is complete",
+            },
         }
         arguments = arguments_by_tool[name]
         self.calls.append(
@@ -270,7 +277,6 @@ def _client(
     transport: httpx.AsyncBaseTransport,
     *,
     model: PromptFollowingMCPModel | None = None,
-    max_agent_steps: int = ARCHERY_MCP_MAX_AGENT_STEPS,
 ) -> ArcheryMCPClient:
     return ArcheryMCPClient(
         MCPServerSettings(
@@ -279,9 +285,6 @@ def _client(
             prompts=ARCHERY_PROMPTS,
         ),
         model or PromptFollowingMCPModel(),
-        instance_ref=TEST_INSTANCE_REF,
-        db_name=TEST_DB_NAME,
-        max_agent_steps=max_agent_steps,
         transport=transport,
     )
 
@@ -296,7 +299,6 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
             {
                 "mcpServers": {
                     "archery": {
-                        "readOnly": True,
                         "url": "${ARCHERY_MCP_URL}",
                         "headers": {
                             "X-Archery-Token": "${ARCHERY_MCP_TOKEN}",
@@ -324,6 +326,41 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
 
 
+def test_archery_settings_accept_catalog_selected_authentication_header(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    prompts = _write_prompt_files(tmp_path, "archery")
+    settings_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "archery": {
+                        "url": "${ARCHERY_MCP_URL}",
+                        "headers": {
+                            "Authorization": "${ARCHERY_MCP_TOKEN}",
+                        },
+                        "prompts": prompts,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    server = load_mcp_server_settings(
+        settings_path,
+        server_name="archery",
+        environment={
+            "ARCHERY_MCP_URL": "https://archery.example.test/mcp",
+            "ARCHERY_MCP_TOKEN": "Bearer runtime-token",
+        },
+    )
+    client = ArcheryMCPClient(server, PromptFollowingMCPModel())
+
+    assert client.headers == {"Authorization": "Bearer runtime-token"}
+
+
 @pytest.mark.asyncio
 async def test_archery_prompt_file_update_changes_actual_model_messages(
     tmp_path: Path,
@@ -345,7 +382,6 @@ async def test_archery_prompt_file_update_changes_actual_model_messages(
             {
                 "mcpServers": {
                     "archery": {
-                        "readOnly": True,
                         "url": "${ARCHERY_MCP_URL}",
                         "headers": {
                             "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
@@ -370,7 +406,6 @@ async def test_archery_prompt_file_update_changes_actual_model_messages(
             settings_path,
             model,
             environment=environment,
-            max_agent_steps=1,
             transport=_archery_call_handler(
                 login_result={
                     "structuredContent": {"status": "ok"},
@@ -498,8 +533,9 @@ def _archery_call_handler(
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -> None:
+async def test_archery_mcp_returns_login_failure_as_observation_for_agent_decision() -> None:
     tool_calls: list[str] = []
+    model = PromptFollowingMCPModel(sequence=(ARCHERY_MCP_LOGIN_TOOL_NAME,))
     client = _client(
         _archery_call_handler(
             login_result={
@@ -519,19 +555,23 @@ async def test_archery_mcp_stops_before_select_when_login_confirmation_fails() -
                 "isError": False,
             },
             tool_calls=tool_calls,
-        )
+        ),
+        model=model,
     )
 
-    with pytest.raises(ArcheryMCPToolError, match="登录已过期"):
-        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
+    assert result.query_completed is False
+    assert len(model.calls) == 2
+    assert "登录已过期" in str(model.calls[1]["messages"])
+    assert "observation" in str(model.calls[1]["messages"])
 
 
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_queries_discovered_dynamic_slow_log_table() -> None:
+async def test_archery_mcp_treats_other_slow_log_tables_as_auxiliary_results() -> None:
     tool_calls: list[str] = []
     table_name = "mysql_slow_log"
     query_sql = (
@@ -565,47 +605,10 @@ async def test_archery_mcp_queries_discovered_dynamic_slow_log_table() -> None:
 
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert result.requested_sql == query_sql
-    assert result.table_name == table_name
-    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME, *DEFAULT_MODEL_TOOL_SEQUENCE]
-
-
-
-
-
-
-@pytest.mark.asyncio
-async def test_archery_mcp_limits_all_model_tool_calls_to_configured_budget() -> None:
-    tool_calls: list[str] = []
-    client = _client(
-        _archery_call_handler(
-            login_result={
-                "structuredContent": {"status": "ok"},
-                "isError": False,
-            },
-            query_result={
-                "structuredContent": {"status": "ok", "rows": []},
-                "isError": False,
-            },
-            tool_calls=tool_calls,
-        ),
-        max_agent_steps=2,
-    )
-
-    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
-
-    assert tool_calls == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
-        ARCHERY_MCP_INSTANCES_TOOL_NAME,
-    ]
     assert result.query_completed is False
-    assert result.diagnostics is not None
-    assert result.diagnostics["outcome"] == "evidence_insufficient"
-
-
-
-
+    assert result.requested_sql == ""
+    assert not hasattr(result, "raw_mcp_call_results")
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
 
 
 
@@ -680,7 +683,6 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=4,
     )
 
     result = await client.execute_slow_log_query(
@@ -691,14 +693,8 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
     assert result.query_completed is True
     assert result.requested_sql == recovered_sql
     assert query_sql_calls == [member_sql, instance_sql, timed_out_sql, recovered_sql]
-    timeout_feedback = model.calls[-1]["messages"][-1]["content"]
-    assert "当前告警窗口的日志事实仍不完整" in timeout_feedback
-    assert "information_schema.statistics" in timeout_feedback
-    assert "SHOW INDEX" in timeout_feedback
-    assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
-    assert "ts_min < FROM_UNIXTIME(1784793600)" in timeout_feedback
-    assert "不要原样重试" in timeout_feedback
-    assert "剩余1次" in timeout_feedback
+    timeout_feedback = model.calls[-2]["messages"][-1]["content"]
+    assert "查询超时被KILL，请优化SQL后执行" in timeout_feedback
 
 
 def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> None:
@@ -751,33 +747,16 @@ def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> No
     ) == "等待优化后的 history 查询"
 
 
-def test_archery_mcp_bounds_final_history_sort_and_identifies_index_probe() -> None:
-    expensive = (
-        "SELECT hostname_max, sample, ts_min, Query_time_sum "
-        "FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = 'db-1:3306' "
-        "AND ts_min >= FROM_UNIXTIME(1784793300) "
-        "AND ts_min < FROM_UNIXTIME(1784793600) "
-        "ORDER BY Query_time_sum DESC LIMIT 20"
+def test_archery_mcp_classifies_history_without_host_window_sort_or_limit_checks() -> None:
+    assert ArcheryMCPClient.is_history_result_query(
+        "SELECT hostname_max, sample FROM mysql_slow_query_review_history"
     )
-    bounded = expensive.replace("Query_time_sum DESC", "ts_min DESC")
-    index_probe = (
-        "SELECT index_name, seq_in_index, column_name "
-        "FROM information_schema.statistics "
-        "WHERE table_schema = 'archery' "
-        "AND table_name = 'mysql_slow_query_review_history' LIMIT 20"
+    assert ArcheryMCPClient.is_history_result_query(
+        "SELECT * FROM mysql_slow_query_review_history ORDER BY Query_time_sum DESC"
     )
-
-    assert "只能按真实ts_min字段排序" in (
-        ArcheryMCPClient.history_query_efficiency_issue(expensive) or ""
-    )
-    assert ArcheryMCPClient.history_query_efficiency_issue(bounded) is None
-    assert ArcheryMCPClient.is_history_index_probe(index_probe) is True
-    assert (
-        ArcheryMCPClient.is_history_index_probe(
-            "SELECT * FROM information_schema.tables"
-        )
-        is False
+    assert not ArcheryMCPClient.is_history_result_query(
+        "SELECT * FROM information_schema.statistics "
+        "WHERE table_name = 'mysql_slow_query_review_history'"
     )
 
 
@@ -858,7 +837,6 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
             tool_calls=tool_calls,
         ),
         model=model,
-        max_agent_steps=5,
     )
 
     result = await client.execute_slow_log_query(
@@ -873,7 +851,7 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
         ARCHERY_MCP_QUERY_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     )
-    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME, *result.model_tool_calls]
+    assert tool_calls == list(result.model_tool_calls)
     assert model.calls[0]["arguments"]["instance_id"] == wrong_mcp_instance_id
     assert model.calls[1]["arguments"]["instance_id"] == TEST_INSTANCE_ID
     assert any(
@@ -882,7 +860,7 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_direct_history_without_flashduty_endpoint_is_not_evidence() -> None:
+async def test_archery_mcp_forwards_history_without_flashduty_endpoint() -> None:
 
     tool_calls: list[str] = []
     query_sql_calls: list[str] = []
@@ -905,23 +883,19 @@ async def test_archery_mcp_direct_history_without_flashduty_endpoint_is_not_evid
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=5,
     )
 
     result = await client.execute_slow_log_query(
         TEST_ALERT_OCCURRED_AT,
         alert_context={"title": "MySQL/mysql_slow_query/100.84.97.113:3306"},
     )
-    assert result.query_completed is False
-    assert result.requested_sql == ""
-    assert tool_calls == [
-        ARCHERY_MCP_LOGIN_TOOL_NAME,
-        ARCHERY_MCP_QUERY_TOOL_NAME,
-    ]
+    assert result.query_completed is True
+    assert result.requested_sql == direct_history_sql
+    assert tool_calls == [ARCHERY_MCP_QUERY_TOOL_NAME]
     assert query_sql_calls == [direct_history_sql]
     assert result.metadata_resolution_tables == ()
     assert result.diagnostics is not None
-    assert "missing authoritative FlashDuty alert endpoint" in result.diagnostics["reason"]
+    assert result.diagnostics["alert_endpoint"] is None
 
 
 def test_archery_mcp_recognizes_member_id_in_real_multicolumn_projection() -> None:
@@ -951,7 +925,7 @@ def test_archery_mcp_recognizes_member_id_in_real_multicolumn_projection() -> No
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_title_endpoint_cannot_replace_flashduty_lineage() -> None:
+async def test_archery_mcp_does_not_parse_endpoint_from_title() -> None:
 
     query_sql_calls: list[str] = []
     title_endpoint = "100.84.97.113:3306"
@@ -974,7 +948,6 @@ async def test_archery_mcp_title_endpoint_cannot_replace_flashduty_lineage() -> 
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=5,
     )
 
     result = await client.execute_slow_log_query(
@@ -982,15 +955,15 @@ async def test_archery_mcp_title_endpoint_cannot_replace_flashduty_lineage() -> 
         alert_context={"title": f"MySQL/mysql_slow_query/{title_endpoint}"},
     )
 
-    assert result.query_completed is False
-    assert result.requested_sql == ""
+    assert result.query_completed is True
+    assert result.requested_sql == direct_history_sql
     assert query_sql_calls == [direct_history_sql]
     assert result.diagnostics is not None
-    assert "missing authoritative FlashDuty alert endpoint" in result.diagnostics["reason"]
+    assert result.diagnostics["alert_endpoint"] is None
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_history_without_resolved_lineage_cannot_complete() -> None:
+async def test_archery_mcp_does_not_host_reject_history_without_resolved_lineage() -> None:
 
     query_sql_calls: list[str] = []
     direct_history_sql = (
@@ -1010,7 +983,6 @@ async def test_archery_mcp_history_without_resolved_lineage_cannot_complete() ->
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=2,
     )
 
     result = await client.execute_slow_log_query(
@@ -1019,242 +991,90 @@ async def test_archery_mcp_history_without_resolved_lineage_cannot_complete() ->
     )
 
     assert query_sql_calls == [direct_history_sql]
-    assert result.query_completed is False
-    assert result.requested_sql == ""
+    assert result.query_completed is True
+    assert result.requested_sql == direct_history_sql
     assert result.diagnostics is not None
-    assert "missing t_instance_member -> sql_instance endpoint resolution" in (
-        result.diagnostics["reason"]
-    )
+    assert result.diagnostics["mcp_tool_call_count"] == 1
 
 
-def test_archery_mcp_history_completion_requires_endpoint_and_time_scope() -> None:
-    table = "mysql_slow_query_review_history"
-    unscoped = f"SELECT hostname_max, ts_min, ts_max FROM {table} LIMIT 1"
-    time_only = (
-        f"SELECT hostname_max, ts_min FROM {table} "
-        "WHERE ts_min >= FROM_UNIXTIME(1784793300) "
-        "AND ts_min <= FROM_UNIXTIME(1784793600) LIMIT 20"
-    )
-    host_only = f"SELECT hostname_max FROM {table} WHERE hostname_max = '10.23.45.67:3306' LIMIT 20"
-    scoped = (
-        f"SELECT hostname_max, ts_min FROM {table} "
-        "WHERE hostname_max = '10.23.45.67:3306' "
-        f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
+@pytest.mark.asyncio
+async def test_archery_mcp_forwards_unscoped_history_and_extra_arguments_unchanged() -> None:
+    history_sql = "SELECT hostname_max, sample FROM mysql_slow_query_review_history"
+    forwarded_arguments = {
+        "instance_id": TEST_INSTANCE_ID,
+        "db_name": TEST_DB_NAME,
+        "sql_content": history_sql,
+        "limit_num": 9_999,
+        "provider_extension": {"mode": "deployment-specific"},
+    }
+
+    class ExtendedArgumentsModel(PromptFollowingMCPModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            call = await super().request_mcp_tool_call(messages=messages, tools=tools)
+            if call.name != ARCHERY_MCP_QUERY_TOOL_NAME:
+                return call
+            self.calls[-1]["arguments"] = forwarded_arguments
+            return MCPModelToolCall(
+                call_id=call.call_id,
+                name=call.name,
+                arguments=forwarded_arguments,
+                request_id=call.request_id,
+            )
+
+    argument_calls: list[dict[str, Any]] = []
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result={
+                "structuredContent": {
+                    "status": "ok",
+                    "columns": ["hostname_max", "sample"],
+                    "rows": [["db-1:3306", "select 1"]],
+                },
+                "isError": False,
+            },
+            tool_calls=[],
+            query_argument_calls=argument_calls,
+        ),
+        model=ExtendedArgumentsModel(
+            sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,),
+            query_sqls=(history_sql,),
+        ),
     )
 
-    assert ArcheryMCPClient.slow_log_query_completion_issue(unscoped) == (
-        "缺少hostname_max等值查询条件；缺少告警时间范围条件"
-    )
-    assert ArcheryMCPClient.slow_log_query_completion_issue(time_only) == (
-        "缺少hostname_max等值查询条件"
-    )
-    assert ArcheryMCPClient.slow_log_query_completion_issue(host_only) == ("缺少告警时间范围条件")
-    assert ArcheryMCPClient.slow_log_query_completion_issue(scoped) is None
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+
+    assert argument_calls == [forwarded_arguments]
+    assert result.query_completed is True
+    assert result.requested_sql == history_sql
 
 
-def test_archery_mcp_runtime_completion_requires_exact_window_and_bounded_limit() -> None:
-    assert (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            TEST_SLOW_LOG_QUERY,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        is None
+@pytest.mark.asyncio
+async def test_archery_mcp_does_not_block_nonconforming_sql() -> None:
+    provider_specific_sql = "CALL provider_specific_diagnostic()"
+    argument_calls: list[dict[str, Any]] = []
+    client = _client(
+        _archery_call_handler(
+            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            query_result={"structuredContent": {"status": "ok"}, "isError": False},
+            tool_calls=[],
+            query_argument_calls=argument_calls,
+        ),
+        model=PromptFollowingMCPModel(
+            sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,),
+            query_sqls=(provider_specific_sql,),
+        ),
     )
 
-    history_overlap_window = (
-        "SELECT hostname_max, sample, ts_min, ts_max "
-        "FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = 'db-1:3306' "
-        "AND ts_min < FROM_UNIXTIME(1784793600) "
-        "AND ts_max >= FROM_UNIXTIME(1784793300) "
-        "ORDER BY ts_max DESC LIMIT 20"
-    )
-    assert (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            history_overlap_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        is None
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            history_overlap_window.replace("1784793300", "1784793299"),
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    wrong_window = TEST_SLOW_LOG_QUERY.replace("1784793300", "1784793299")
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            wrong_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    no_limit = TEST_SLOW_LOG_QUERY.rsplit(" limit 20", 1)[0]
-    assert "显式LIMIT" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            no_limit,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-    assert "LIMIT必须" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            TEST_SLOW_LOG_QUERY.replace("limit 20", "limit 21"),
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-    assert ArcheryMCPClient.slow_log_query_completion_issue(no_limit) is None
-
-    iso_window = (
-        "SELECT * FROM t_slowlog_info "
-        "WHERE f_insert_time >= '2026-07-23T07:55:00+00:00' "
-        "AND f_insert_time <= '2026-07-23T08:00:00+00:00' "
-        "LIMIT 20 OFFSET 0"
-    )
-    assert (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            iso_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        is None
-    )
-    assert ArcheryMCPClient._terminal_select_limit("SELECT 1 LIMIT 0, 20") == 20
-
-    commented_window = (
-        "SELECT * FROM t_slowlog_info WHERE 1 = 1 "
-        "/* f_insert_time >= FROM_UNIXTIME(1784793300) "
-        "AND f_insert_time <= FROM_UNIXTIME(1784793600) */ LIMIT 20"
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            commented_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    bypassed_window = TEST_SLOW_LOG_QUERY.replace(
-        "order by",
-        "or 1 = 1 order by",
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            bypassed_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    union_window = (
-        f"{TEST_SLOW_LOG_QUERY.rsplit(' limit 20', 1)[0]} "
-        "UNION ALL SELECT * FROM t_slowlog_info WHERE 1 = 1 LIMIT 20"
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            union_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    subquery_window = (
-        "SELECT * FROM mysql_slow_query_review_history "
-        "WHERE hostname_max = 'db-1:3306' AND EXISTS ("
-        "SELECT 1 FROM mysql_slow_query_review_history AS scoped "
-        "WHERE scoped.ts_min >= FROM_UNIXTIME(1784793300) "
-        "AND scoped.ts_min <= FROM_UNIXTIME(1784793600)) LIMIT 20"
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            subquery_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    negated_window = TEST_SLOW_LOG_QUERY.replace(
-        "where `f_insert_time` >=",
-        "where NOT (`f_insert_time` >=",
-    ).replace(
-        "order by",
-        ") order by",
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            negated_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-    expanded_window = TEST_SLOW_LOG_QUERY.replace(
-        "from_unixtime(1784793300)",
-        "from_unixtime(1784793300) - INTERVAL 1 DAY",
-    )
-    assert "精确告警时间窗口" in (
-        ArcheryMCPClient.slow_log_query_completion_issue(
-            expanded_window,
-            window_start=TEST_WINDOW_START,
-            window_end=TEST_WINDOW_END,
-        )
-        or ""
-    )
-
-
-@pytest.mark.parametrize(
-    ("sql", "accepted"),
-    [
-        ("SELECT 'delete; update' AS sample", True),
-        ("WITH sample AS (SELECT 1) SELECT * FROM sample", True),
-        ("DELETE FROM t_slowlog_info", False),
-        ("WITH sample AS (SELECT 1) DELETE FROM t_slowlog_info", False),
-        ("SELECT 1; UPDATE t_slowlog_info SET value = 1", False),
-        ("SELECT * FROM t_slowlog_info FOR UPDATE", False),
-        ("SELECT * FROM t_slowlog_info FOR SHARE", False),
-        ("SELECT GET_LOCK('maintenance', 1)", False),
-        ("SELECT RELEASE_LOCK('maintenance')", False),
-        ("SELECT SLEEP(30)", False),
-        ("SELECT @captured := 1", False),
-        ("SELECT 1 /*!50000 INTO OUTFILE '/tmp/result' */", False),
-        ("SELECT 1 /*M!50000 INTO OUTFILE '/tmp/result' */", False),
-        ("SELECT 1--1; DELETE FROM t_slowlog_info", False),
-        ("SELECT 1 -- read-only comment\n", True),
-    ],
-)
-def test_archery_mcp_only_accepts_one_read_only_select(sql: str, accepted: bool) -> None:
-    assert ArcheryMCPClient._is_single_read_only_select(sql) is accepted
-
-
-def test_archery_mcp_bounds_query_transport_arguments_before_network_call() -> None:
-    assert ArcheryMCPClient.query_call_rejection(
-        {
-            "sql_content": "SELECT 1",
-            "limit_num": 20,
-        }
-    ) is None
-    assert "limit_num" in (
-        ArcheryMCPClient.query_call_rejection(
-            {"sql_content": "SELECT 1", "limit_num": 21}
-        )
-        or ""
-    )
+    assert argument_calls[0]["sql_content"] == provider_specific_sql
+    assert result.query_completed is False
 
 
 @pytest.mark.asyncio
@@ -1325,7 +1145,6 @@ async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=7,
     )
 
     result = await client.execute_slow_log_query(
@@ -1338,19 +1157,14 @@ async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -
     assert result.query_completed is True
     assert result.payload["rows"] == []
     assert result.query_time_column == "ts_min"
-    probe_feedback = model.calls[-1]["messages"][-1]["content"]
-    assert "仍是辅助探针" in probe_feedback
-    assert "缺少hostname_max等值查询条件" in probe_feedback
-    assert "未使用Host提供的精确告警时间窗口" in probe_feedback
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_roundtrip_count"] == 5
+    assert result.diagnostics["mcp_roundtrip_count"] == 4
     assert "instance_identity_verification" not in result.diagnostics
-    assert result.diagnostics["query_trace"][2]["outcome"] == "probe_ok"
-    assert result.diagnostics["query_trace"][2]["completion"] == "probe"
+    assert result.diagnostics["query_trace"][2]["outcome"] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_guessed_endpoint_does_not_become_final_evidence() -> None:
+async def test_archery_mcp_forwards_history_with_model_selected_endpoint() -> None:
     alert_endpoint = "100.84.97.113:3306"
     slow_log_endpoint = "10.23.45.67:3306"
     history_sql = (
@@ -1379,7 +1193,6 @@ async def test_archery_mcp_guessed_endpoint_does_not_become_final_evidence() -> 
             query_sql_calls=query_sql_calls,
         ),
         model=model,
-        max_agent_steps=2,
     )
 
     result = await client.execute_slow_log_query(
@@ -1388,12 +1201,12 @@ async def test_archery_mcp_guessed_endpoint_does_not_become_final_evidence() -> 
     )
 
     assert query_sql_calls == [history_sql]
-    assert result.query_completed is False
-    assert result.payload["status"] == "evidence_insufficient"
+    assert result.query_completed is True
+    assert result.payload["status"] == "ok"
     assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_roundtrip_count"] == 2
-    assert "missing authoritative FlashDuty alert endpoint" in result.diagnostics["reason"]
+    assert result.diagnostics["mcp_roundtrip_count"] == 1
+    assert result.diagnostics["alert_endpoint"] is None
 
 
 @pytest.mark.parametrize("embedded_result_complete", [False, True])
@@ -1622,7 +1435,6 @@ async def test_archery_mcp_preserves_all_rows_returned_by_remote_service() -> No
             tool_calls=[],
         ),
         model=model,
-        max_agent_steps=3,
     )
 
     result = await client.execute_slow_log_query(
@@ -1654,10 +1466,9 @@ async def test_archery_mcp_preserves_all_rows_returned_by_remote_service() -> No
 
 
 class RecordingArcheryClient:
-    login_tool_name = ARCHERY_MCP_LOGIN_TOOL_NAME
-    query_tool_name = ARCHERY_MCP_QUERY_TOOL_NAME
     slow_log_time_column = TEST_TIME_COLUMN
     window_seconds = 300
+    prompts = ARCHERY_PROMPTS
 
     def __init__(
         self,
@@ -1729,12 +1540,13 @@ def _large_slow_query_row(index: int, *, sample_chars: int = 900) -> dict[str, A
     }
 
 
-def test_archery_outer_tool_declares_strict_empty_input_schema() -> None:
+def test_archery_outer_tool_accepts_extension_parameters_without_retry_metadata() -> None:
     assert ArcherySlowLogEvidenceTool.input_schema == {
         "type": "object",
         "properties": {},
-        "additionalProperties": False,
+        "additionalProperties": True,
     }
+    assert not hasattr(ArcherySlowLogEvidenceTool, "max_attempts")
 
 
 class FlakyRecordingArcheryClient(RecordingArcheryClient):
@@ -1811,11 +1623,6 @@ def _context(
     return InvestigationContext(
         run_id=uuid4(),
         alert=alert,
-        strategy=InvestigationStrategy(
-            strategy_id="test",
-            title="test",
-            description="test",
-        ),
     )
 
 
@@ -1843,13 +1650,19 @@ def test_archery_endpoint_requires_canonical_host_and_port() -> None:
         == "detail-host:3306"
     )
 @pytest.mark.asyncio
-async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters() -> None:
+async def test_archery_evidence_tool_ignores_parameters_and_uses_alert_detail_context() -> None:
     client = RecordingArcheryClient()
     tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
 
     outcome = await tool.execute(
         ToolExecutionRequest(
             tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
+            parameters={
+                "window_seconds": 86_400,
+                "host": "parameter-host.example",
+                "port": 65_535,
+                "occurred_at": "2099-01-01T00:00:00Z",
+            },
         ),
         _context(
             "database_latency",
@@ -1910,15 +1723,6 @@ async def test_archery_evidence_tool_derives_time_window_and_rejects_parameters(
     assert data["root_cause_eligible"] is False
     assert "实际执行 SQL 未核对" not in data["root_cause_ineligible_reason"]
     assert "可能截断" not in data["root_cause_ineligible_reason"]
-
-    with pytest.raises(ArcheryMCPReadOnlyViolation):
-        await tool.execute(
-            ToolExecutionRequest(
-                tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
-                parameters={"window_seconds": 86_400},
-            ),
-            _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306"),
-        )
     assert client.calls == 1
 
 
@@ -2010,7 +1814,6 @@ async def test_archery_evidence_preserves_complete_sanitized_result() -> None:
     parsed = json.loads(serialized)
     assert record.status == ToolStatus.SUCCESS
     assert record.truncated is False
-    assert len(serialized) > 50_000
     assert parsed["root_cause_eligible"] is True
     assert parsed["reported_row_count"] == 18
     assert parsed["included_row_count"] == 18
@@ -2025,8 +1828,9 @@ async def test_archery_evidence_preserves_complete_sanitized_result() -> None:
     assert first["Query_time_max"] == 18.25
     assert first["Rows_examined_sum"] == 1_000_000
     assert first["InnoDB_IO_r_wait_max"] == 0.75
-    assert parsed["raw_result"]["rows"] == rows
-    assert parsed["raw_result"]["opaque_diagnostics"] == "z" * 50_000
+    assert "raw_result" not in parsed
+    assert "raw_mcp_call_results" not in parsed
+    assert "opaque_diagnostics" not in serialized
 
 
 @pytest.mark.asyncio
@@ -2049,7 +1853,8 @@ async def test_archery_evidence_preserves_all_complete_rows() -> None:
     assert record.structured_data["included_row_count"] == 3
     assert record.structured_data["omitted_row_count"] == 0
     assert record.structured_data["rows"][0]["sample"] == rows[0]["sample"]
-    assert record.structured_data["raw_result"]["rows"] == rows
+    assert "raw_result" not in record.structured_data
+    assert "raw_mcp_call_results" not in record.structured_data
 
 
 @pytest.mark.asyncio
@@ -2075,7 +1880,8 @@ async def test_archery_evidence_preserves_one_oversized_sql_statement() -> None:
     assert record.structured_data["omitted_row_count"] == 0
     assert record.structured_data["root_cause_eligible"] is True
     assert summarized_row["sample"] == row["sample"]
-    assert record.structured_data["raw_result"]["rows"] == [row]
+    assert "raw_result" not in record.structured_data
+    assert "raw_mcp_call_results" not in record.structured_data
 
 
 @pytest.mark.asyncio
@@ -2107,22 +1913,6 @@ async def test_archery_reported_count_without_parsed_rows_is_no_data() -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_strategy_never_uses_title_to_force_archery_selection() -> None:
-    provider = DefaultInvestigationStrategyProvider(available_tools=["alert_context"])
-
-    strategy = await provider.select(
-        _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306").alert
-    )
-    other = await provider.select(
-        _context("慢查询过多", title="MySQL/mysql_slow_queryable_400/db-1:3306").alert
-    )
-
-    assert strategy.tool_plan == []
-    assert other.tool_plan == []
-    assert strategy.strategy_id == "agent-selected-mcp-v1"
-
-
 def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
@@ -2134,7 +1924,6 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
             {
                 "mcpServers": {
                     "archery": {
-                        "readOnly": True,
                         "url": "${ARCHERY_MCP_URL}",
                         "headers": {
                             "X-Archery-Token": "${ARCHERY_MCP_TOKEN}",
@@ -2161,32 +1950,13 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
 
 @pytest.mark.asyncio
 async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, real_model=True).model_copy(
-        update={
-            "archery_mcp_max_agent_steps": 18,
-        }
-    )
+    settings = _settings(tmp_path, real_model=True)
     runtime = build_runtime(settings)
 
     tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
 
     assert isinstance(tool, ArcherySlowLogEvidenceTool)
-    assert tool.client.instance_ref == ""
-    assert tool.client.db_name == ""
     assert tool.client.window_seconds == 300
-    assert tool.client.max_agent_steps == 18
-
-    apply_runtime_settings(
-        runtime,
-        settings.model_copy(
-            update={
-                "archery_mcp_max_agent_steps": 24,
-            }
-        ),
-    )
-    updated_tool = runtime.service.tool_registry.get(ARCHERY_SLOW_LOG_TOOL_NAME)
-    assert isinstance(updated_tool, ArcherySlowLogEvidenceTool)
-    assert updated_tool.client.max_agent_steps == 24
 
     apply_runtime_settings(
         runtime,
@@ -2207,9 +1977,38 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
 async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     tmp_path: Path,
 ) -> None:
+    class ArcherySelectingAdvisor(FakeAIAdvisor):
+        def __init__(self) -> None:
+            self.decision_count = 0
+
+        async def decide_investigation(self, **_kwargs: Any) -> InvestigationDecisionResult:
+            self.decision_count += 1
+            decision = (
+                InvestigationDecision(
+                    action="tool",
+                    tool_name=ARCHERY_SLOW_LOG_TOOL_NAME,
+                    objective="Collect the configured Archery slow-log evidence.",
+                )
+                if self.decision_count == 1
+                else InvestigationDecision(
+                    action="finish",
+                    reason="The selected Archery investigation is complete.",
+                )
+            )
+            return InvestigationDecisionResult(
+                decision=decision,
+                metadata=AdvisorMetadata(
+                    provider=self.provider,
+                    model=self.model,
+                    prompt_version=self.prompt_version,
+                    request_id=f"archery-react-{self.decision_count}",
+                ),
+            )
+
     client = RecordingArcheryClient()
     runtime = build_runtime(
         _settings(tmp_path),
+        advisor=ArcherySelectingAdvisor(),
         tool_registry=InvestigationToolRegistry(
             [
                 AlertContextTool(),
@@ -2244,14 +2043,20 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     assert evidence.status == ToolStatus.NO_DATA
     assert evidence.source_system == "archery_mcp"
     assert evidence.request == {}
-    assert evidence.structured_data["reported_row_count"] == 0
-    assert evidence.structured_data["included_row_count"] == 0
-    assert evidence.structured_data["rows"] == []
-    assert evidence.structured_data["actual_sql_verified"] is True
-    assert evidence.structured_data["target"]["instance_id"] == TEST_INSTANCE_ID
-    assert evidence.structured_data["query_window"]["start"] == (
-        TEST_WINDOW_START.isoformat()
-    )
+    assert evidence.structured_data["processing_status"] == "completed"
+    assert "source_artifact" not in evidence.structured_data
+    analysis = evidence.structured_data["tool_result_analysis"]
+    assert analysis["provider"] == "deterministic_host"
+    assert "source_artifact_id" not in analysis
+    assert "source_sha256" not in analysis
+    assert analysis["analysis_usable"] is False
+    assert analysis["source_coverage_complete"] is True
+    assert analysis["observations"][0]["source_paths"] == [
+        "/structured_data/reported_row_count",
+        "/structured_data/parsed_row_count",
+        "/structured_data/included_row_count",
+        "/structured_data/omitted_row_count",
+    ]
     assert evidence.structured_data["root_cause_eligible"] is False
     assert result.recommendation is not None
     assert result.recommendation.summary == "现有结果无法得出根因"

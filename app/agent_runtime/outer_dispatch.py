@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -37,6 +36,13 @@ _DISPATCH_ID_VERSION = "outer-tool-dispatch/v1"
 _EVIDENCE_ID_VERSION = "outer-tool-evidence/v1"
 _RAW_RESULT_ARTIFACT_VERSION = "raw-tool-result/v1"
 _INFLIGHT_POLL_INTERVAL_SECONDS = 0.05
+_PROJECTED_STATUS_FIELDS = (
+    "termination_reason",
+    "termination_error_type",
+    "reason_code",
+    "monitoring_scope_status",
+    "monitoring_scope_reason",
+)
 
 
 class OuterDispatchError(RuntimeError):
@@ -72,9 +78,8 @@ class DurableOuterToolDispatcher:
     A logical dispatch has a deterministic identity. Its first invocation is
     persisted as PENDING before it can cross the handler boundary. Recovery of
     STARTED is conservative: callers in the execution lease epoch join the
-    in-flight attempt. Only a newer fencing epoch or an expired durable deadline
-    may mark its outcome unknown, after which a Host-declared read-only tool may
-    receive one fixed second attempt.
+    in-flight attempt. A newer fencing epoch or expired durable deadline records
+    an unknown outcome without automatically replaying the remote command.
     """
 
     def __init__(
@@ -83,15 +88,11 @@ class DurableOuterToolDispatcher:
         executor: OuterToolExecutor,
         *,
         result_analyzer: ToolResultAnalyzer | None = None,
-        analysis_threshold_chars: int = 12_000,
         fault_hook: OuterDispatchFaultHook | None = None,
     ) -> None:
-        if analysis_threshold_chars < 1:
-            raise ValueError("tool result analysis threshold must be positive")
         self.repository = repository
         self.executor = executor
         self.result_analyzer = result_analyzer
-        self.analysis_threshold_chars = analysis_threshold_chars
         self.fault_hook = fault_hook
 
     async def execute(
@@ -125,7 +126,6 @@ class DurableOuterToolDispatcher:
         first_context = context.model_copy(
             update={
                 "outer_dispatch_id": dispatch_id,
-                "outer_dispatch_attempt": 1,
             }
         )
 
@@ -139,44 +139,14 @@ class DurableOuterToolDispatcher:
             lease_owner=lease_owner,
             fencing_token=fencing_token,
         )
-        first_terminal, first_evidence = await self._resolve_attempt(
+        _first_terminal, first_evidence = await self._resolve_attempt(
             first,
             request=normalized_request,
             context=first_context,
             lease_owner=lease_owner,
             fencing_token=fencing_token,
         )
-        if (
-            first_terminal.status != ToolInvocationStatus.UNKNOWN_OUTCOME
-            or not first_terminal.tool_read_only
-            or first_terminal.tool_max_attempts < 2
-        ):
-            return first_evidence
-
-        retry_context = context.model_copy(
-            update={
-                "outer_dispatch_id": dispatch_id,
-                "outer_dispatch_attempt": 2,
-            }
-        )
-        retry = await self._load_or_create(
-            dispatch_id=dispatch_id,
-            attempt=2,
-            request=normalized_request,
-            context=retry_context,
-            tool_spec=tool_spec,
-            fingerprint=fingerprint,
-            lease_owner=lease_owner,
-            fencing_token=fencing_token,
-        )
-        _retry_terminal, retry_evidence = await self._resolve_attempt(
-            retry,
-            request=normalized_request,
-            context=retry_context,
-            lease_owner=lease_owner,
-            fencing_token=fencing_token,
-        )
-        return retry_evidence
+        return first_evidence
 
     @staticmethod
     def build_dispatch_id(run_id: UUID, *, fingerprint: str, ordinal: int = 1) -> UUID:
@@ -186,8 +156,8 @@ class DurableOuterToolDispatcher:
 
     @staticmethod
     def build_invocation_id(dispatch_id: UUID, *, attempt: int) -> UUID:
-        if attempt not in {1, 2}:
-            raise ValueError("outer dispatch supports only the initial and recovery attempts")
+        if attempt != 1:
+            raise ValueError("outer dispatch executes each explicit Agent action at most once")
         return uuid5(dispatch_id, f"attempt:{attempt}")
 
     @staticmethod
@@ -238,10 +208,6 @@ class DurableOuterToolDispatcher:
             model_arguments=request.parameters,
             effective_arguments=request.parameters,
             fingerprint=fingerprint,
-            tool_read_only=tool_spec.read_only if tool_spec is not None else False,
-            tool_max_attempts=(
-                tool_spec.retry.max_attempts if tool_spec is not None else 1
-            ),
             tool_policy_version=(
                 tool_spec.policy_version if tool_spec is not None else ""
             ),
@@ -459,7 +425,7 @@ class DurableOuterToolDispatcher:
             lease_owner=lease_owner,
             fencing_token=fencing_token,
         )
-        evidence = await self._project_large_result(
+        evidence = await self._project_tool_result(
             evidence,
             request=request,
             artifact_ref=artifact_ref,
@@ -628,11 +594,6 @@ class DurableOuterToolDispatcher:
                 ),
             ),
         )
-        recovery_attempt_allowed = (
-            invocation.attempt == 1
-            and invocation.tool_read_only
-            and invocation.tool_max_attempts >= 2
-        )
         recovered = self._transition(
             invocation,
             status=ToolInvocationStatus.UNKNOWN_OUTCOME,
@@ -640,8 +601,8 @@ class DurableOuterToolDispatcher:
             error=InvocationError(
                 code="outer_invocation_recovered_unknown_outcome",
                 message="The process stopped while the outer tool invocation was in flight",
-                retryable=recovery_attempt_allowed,
-                details={"recovery_attempt_allowed": recovery_attempt_allowed},
+                retryable=False,
+                details={"automatic_replay": False},
             ),
         )
         try:
@@ -738,7 +699,7 @@ class DurableOuterToolDispatcher:
                 "tool_name": invocation.tool_name,
                 "source_system": invocation.provider,
                 "sanitized": True,
-                "read_only": invocation.tool_read_only,
+                "internal_only": True,
             },
         )
         return await self.repository.save_agent_artifact(
@@ -750,7 +711,7 @@ class DurableOuterToolDispatcher:
             fencing_token=fencing_token,
         )
 
-    async def _project_large_result(
+    async def _project_tool_result(
         self,
         evidence: EvidenceRecord,
         *,
@@ -758,18 +719,27 @@ class DurableOuterToolDispatcher:
         artifact_ref: ArtifactRef,
     ) -> EvidenceRecord:
         raw_result = evidence.model_dump(mode="json")
-        serialized = json.dumps(
-            raw_result,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        if (
-            self.result_analyzer is None
-            or len(serialized) < self.analysis_threshold_chars
-        ):
-            return evidence
+        if self.result_analyzer is None:
+            projected_data = self._status_metadata(evidence)
+            projected_data.update(
+                {
+                    "processing_status": "unavailable",
+                    "root_cause_eligible": False,
+                    "root_cause_ineligible_reason": (
+                        "program_fact_projection_not_configured"
+                    ),
+                }
+            )
+            return evidence.model_copy(
+                update={
+                    "summary": (
+                        f"调查工具 {evidence.tool_name} 已返回结果，但程序事实投影器未配置，"
+                        "原始响应仅保存在审计工件中。"
+                    ),
+                    "structured_data": projected_data,
+                    "truncated": False,
+                }
+            )
 
         try:
             analysis = await self.result_analyzer.analyze(
@@ -786,39 +756,25 @@ class DurableOuterToolDispatcher:
                 raise OuterDispatchError(
                     "tool-result analysis provenance does not match its raw artifact"
                 )
-            provider_partial = evidence.structured_data.get("partial") is True
-            provider_ineligible = (
-                evidence.structured_data.get("root_cause_eligible") is False
-            )
             result_usable_by_main_agent = (
                 evidence.status == ToolStatus.SUCCESS
                 and analysis.analysis_usable
                 and analysis.source_coverage_complete
-                and not provider_partial
-                and not provider_ineligible
             )
             projected_data: dict[str, Any] = {
-                "analysis_status": "completed",
-                "tool_result_analysis": analysis.model_dump(mode="json"),
-                "source_artifact": artifact_ref.model_dump(mode="json"),
+                **self._status_metadata(evidence),
+                "processing_status": "completed",
+                "tool_result_analysis": analysis.model_dump(
+                    mode="json",
+                    exclude={"source_artifact_id", "source_sha256"},
+                ),
                 # Mechanical completeness gate only. The main Agent alone decides
                 # whether these facts, combined with other evidence, imply a cause.
                 "root_cause_eligible": result_usable_by_main_agent,
             }
-            for key in (
-                "query_completed",
-                "partial",
-                "allow_followup_dispatch",
-                "termination_reason",
-                "termination_error_type",
-                "reason_code",
-                "root_cause_ineligible_reason",
-            ):
-                if key in evidence.structured_data:
-                    projected_data[key] = evidence.structured_data[key]
             if not analysis.analysis_usable:
                 projected_data["root_cause_ineligible_reason"] = (
-                    "independent_tool_result_analysis_unusable"
+                    "program_fact_projection_unusable"
                 )
             elif not result_usable_by_main_agent and not projected_data.get(
                 "root_cause_ineligible_reason"
@@ -836,20 +792,20 @@ class DurableOuterToolDispatcher:
         except Exception as exc:
             request_id = getattr(exc, "request_id", None)
             error_data: dict[str, Any] = {
-                "analysis_status": "failed",
-                "analysis_error_type": type(exc).__name__,
-                "source_artifact": artifact_ref.model_dump(mode="json"),
+                **self._status_metadata(evidence),
+                "processing_status": "failed",
+                "processing_error_type": type(exc).__name__,
                 "root_cause_eligible": False,
                 "root_cause_ineligible_reason": (
-                    "independent_tool_result_analysis_failed"
+                    "program_fact_projection_failed"
                 ),
             }
             if isinstance(request_id, str) and request_id:
-                error_data["analysis_request_id"] = sanitize_text(request_id)[:512]
+                error_data["processing_request_id"] = sanitize_text(request_id)[:512]
             return evidence.model_copy(
                 update={
                     "summary": (
-                        f"调查工具 {evidence.tool_name} 已返回完整结果，但独立分析会话失败，"
+                        f"调查工具 {evidence.tool_name} 已返回结果，但程序事实投影失败，"
                         "该结果不能用于根因判断。"
                     ),
                     "structured_data": error_data,
@@ -857,28 +813,19 @@ class DurableOuterToolDispatcher:
                 }
             )
 
+    @staticmethod
+    def _status_metadata(evidence: EvidenceRecord) -> dict[str, Any]:
+        """Keep non-payload execution metadata while raw content stays in the artifact."""
+
+        return {
+            key: evidence.structured_data[key]
+            for key in _PROJECTED_STATUS_FIELDS
+            if key in evidence.structured_data
+        }
+
     @classmethod
     def _normalize_request(cls, request: ToolExecutionRequest) -> ToolExecutionRequest:
-        payload = request.model_dump(mode="json")
-        safe_parameters = sanitize(payload.get("parameters") or {})
-        canonical_parameters = json.loads(
-            json.dumps(
-                safe_parameters,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-        )
-        return ToolExecutionRequest.model_validate(
-            {
-                **payload,
-                "tool_name": sanitize_text(str(payload["tool_name"])),
-                "parameters": canonical_parameters,
-                "objective": sanitize_text(str(payload.get("objective") or "")),
-                "hypothesis_ids": sanitize(payload.get("hypothesis_ids") or []),
-            }
-        )
+        return request.model_copy(deep=True)
 
     @classmethod
     def _dispatch_ordinal(
@@ -886,18 +833,15 @@ class DurableOuterToolDispatcher:
         request: ToolExecutionRequest,
         prior_evidence: Sequence[EvidenceRecord],
     ) -> int:
-        """Allocate a new logical dispatch only after an explicit partial success."""
+        """Allocate one durable dispatch for each explicit ReAct action."""
 
-        partial_ids = {
+        prior_ids = {
             evidence.id
             for evidence in prior_evidence
             if evidence.tool_name == request.tool_name
             and evidence.request == request.parameters
-            and evidence.status == ToolStatus.SUCCESS
-            and evidence.structured_data.get("partial") is True
-            and evidence.structured_data.get("allow_followup_dispatch") is not False
         }
-        return len(partial_ids) + 1
+        return len(prior_ids) + 1
 
     @staticmethod
     def _validate_identity(
@@ -910,8 +854,6 @@ class DurableOuterToolDispatcher:
         attempt: int,
     ) -> None:
         provider = "unregistered" if tool_spec is None else tool_spec.provider
-        read_only = tool_spec.read_only if tool_spec is not None else False
-        max_attempts = tool_spec.retry.max_attempts if tool_spec is not None else 1
         policy_version = tool_spec.policy_version if tool_spec is not None else ""
         schema_version = tool_spec.schema_version if tool_spec is not None else ""
         expected_objective = sanitize_text(request.objective).strip() or (
@@ -931,8 +873,6 @@ class DurableOuterToolDispatcher:
             or invocation.attempt != attempt
             or invocation.model_arguments != request.parameters
             or invocation.effective_arguments != request.parameters
-            or invocation.tool_read_only != read_only
-            or invocation.tool_max_attempts != max_attempts
             or invocation.tool_policy_version != policy_version
             or invocation.tool_schema_version != schema_version
             or invocation.objective != expected_objective[:4000]

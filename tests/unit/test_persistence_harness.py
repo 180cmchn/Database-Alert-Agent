@@ -148,11 +148,10 @@ async def test_create_run_persists_manifest_and_config_snapshot(tmp_path: Path) 
         code_version="test-revision",
         model_provider="openai_compatible",
         model_name="test-model",
-        configuration={"react_enabled": True},
+        configuration={"react_max_rounds": 3},
     )
     snapshot = AnalysisConfigSnapshot(
-        react_enabled=True,
-        react_max_dynamic_turns=3,
+        react_max_rounds=3,
         ai_model="test-model",
     )
 
@@ -518,20 +517,23 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
     await repository.append_agent_events(str(run_id), [secret_event], expected_sequence=3)
     sanitized_event = (await repository.list_agent_events(str(run_id), after_sequence=3))[0]
     assert sanitized_event.payload["token"] == REDACTED
-    with pytest.raises(ValueError, match="AgentArtifact"):
-        await repository.append_agent_events(
-            str(run_id),
-            [
-                AgentEvent(
-                    run_id=run_id,
-                    sequence=5,
-                    version=5,
-                    kind=AgentEventKind.EVIDENCE_RECORDED,
-                    payload={"raw_result": "x" * 20_000},
-                )
-            ],
-            expected_sequence=4,
-        )
+    large_event = AgentEvent(
+        run_id=run_id,
+        sequence=5,
+        version=5,
+        kind=AgentEventKind.EVIDENCE_RECORDED,
+        payload={"projection": "x" * 20_000, "token": "large-event-secret"},
+    )
+    await repository.append_agent_events(
+        str(run_id),
+        [large_event],
+        expected_sequence=4,
+    )
+    restored_large_event = (
+        await repository.list_agent_events(str(run_id), after_sequence=4)
+    )[0]
+    assert restored_large_event.payload["projection"] == "x" * 20_000
+    assert restored_large_event.payload["token"] == REDACTED
 
     concurrent_run_id = await _create_run(repository, external_id="concurrent-events")
     candidates = [
@@ -1006,8 +1008,6 @@ async def test_tool_invocation_update_rejects_audit_identity_drift(
             tool_name="query_range",
             effective_arguments=effective_arguments,
         ),
-        tool_read_only=True,
-        tool_max_attempts=2,
         tool_policy_version="policy-v1",
         tool_schema_version="schema-v1",
         request_timeout_seconds=90,

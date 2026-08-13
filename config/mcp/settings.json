@@ -1,7 +1,6 @@
 {
   "mcpServers": {
     "archery": {
-      "readOnly": true,
       "url": "${ARCHERY_MCP_URL}",
       "headers": {
         "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
@@ -14,7 +13,6 @@
       }
     },
     "prometheus": {
-      "readOnly": true,
       "url": "${PROMETHEUS_MCP_SSE_URL}",
       "optionalHeaders": {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
@@ -24,35 +22,6 @@
         "purpose": "prompts/prometheus/purpose.md",
         "workflow": "prompts/prometheus/workflow.md",
         "safety": "prompts/prometheus/safety.md"
-      },
-      "toolPolicies": {
-        "health_check": {
-          "capability": "catalog",
-          "fixedArguments": {}
-        },
-        "execute_query": {
-          "capability": "catalog",
-          "fixedArguments": {}
-        },
-        "execute_range_query": {
-          "capability": "range_query",
-          "startArgument": "start",
-          "endArgument": "end",
-          "timestampEncoding": "rfc3339",
-          "fixedArguments": {}
-        },
-        "list_metrics": {
-          "capability": "catalog",
-          "fixedArguments": {}
-        },
-        "get_metric_metadata": {
-          "capability": "catalog",
-          "fixedArguments": {}
-        },
-        "get_targets": {
-          "capability": "target_discovery",
-          "fixedArguments": {}
-        }
       }
     }
   }

@@ -22,18 +22,8 @@ _SERVER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}")
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _PROMPT_NAMES = ("role", "purpose", "workflow", "safety")
 _PROVIDER_OPTION_NAMES = {
-    "maxAgentSteps",
-    "toolPolicies",
     "toolTimeoutSeconds",
     "transport",
-}
-_TOOL_POLICY_OPTION_NAMES = {
-    "capability",
-    "endArgument",
-    "fixedArguments",
-    "schemaSha256",
-    "startArgument",
-    "timestampEncoding",
 }
 _SENSITIVE_OPTION_TOKENS = {
     "auth",
@@ -86,15 +76,13 @@ class MCPSelectionCandidate:
     name: str
     role: str
     purpose: str
-    read_only: bool
 
 
 @dataclass(frozen=True, slots=True)
 class MCPServerDescriptor:
-    """One enabled, explicitly read-only MCP integration."""
+    """One enabled MCP integration."""
 
     name: str
-    read_only: bool
     url_template: str
     header_templates: Mapping[str, str]
     optional_header_templates: Mapping[str, str]
@@ -110,7 +98,6 @@ class MCPServerDescriptor:
             name=self.name,
             role=self.prompts.role,
             purpose=self.prompts.purpose,
-            read_only=self.read_only,
         )
 
     def resolve_connection(
@@ -186,12 +173,7 @@ class MCPCatalog:
 
 
 def load_mcp_catalog(settings_path: Path | str) -> MCPCatalog:
-    """Load every enabled MCP descriptor without resolving deployment secrets.
-
-    An enabled server must explicitly declare ``readOnly: true``. Missing or
-    false declarations fail closed so a newly configured MCP cannot silently
-    acquire investigation privileges.
-    """
+    """Load every enabled MCP descriptor without resolving deployment secrets."""
 
     path = Path(settings_path)
     raw = _load_json(path)
@@ -278,11 +260,6 @@ def _parse_server(
     raw_server: Mapping[str, Any],
     settings_directory: Path,
 ) -> MCPServerDescriptor:
-    if raw_server.get("readOnly") is not True:
-        raise MCPCatalogConfigurationError(
-            f"Enabled MCP server {name!r} must explicitly declare readOnly: true"
-        )
-
     url_template = _environment_reference(
         raw_server.get("url"), field=f"MCP server {name!r} url"
     )
@@ -311,11 +288,6 @@ def _parse_server(
         raw_prompts=raw_server.get("prompts"),
         settings_directory=settings_directory,
     )
-    if re.search(r"(?im)^\s*read_only\s*:\s*true\s*$", prompts.safety) is None:
-        raise MCPCatalogConfigurationError(
-            f"MCP server {name!r} safety prompt must explicitly declare read_only: true"
-        )
-
     provider_options = {
         key: deepcopy(raw_server[key])
         for key in _PROVIDER_OPTION_NAMES
@@ -328,7 +300,6 @@ def _parse_server(
     )
     return MCPServerDescriptor(
         name=name,
-        read_only=True,
         url_template=url_template,
         header_templates=MappingProxyType(headers),
         optional_header_templates=MappingProxyType(optional_headers),
@@ -347,7 +318,6 @@ def _validate_server_fields(name: str, raw_server: Mapping[str, Any]) -> None:
         "headers",
         "optionalHeaders",
         "prompts",
-        "readOnly",
         "url",
     }
     unknown_options = set(raw_server) - known_keys - _PROVIDER_OPTION_NAMES
@@ -359,12 +329,6 @@ def _validate_server_fields(name: str, raw_server: Mapping[str, Any]) -> None:
 
 
 def _validate_provider_options(name: str, raw_server: Mapping[str, Any]) -> None:
-    if "maxAgentSteps" in raw_server:
-        value = raw_server["maxAgentSteps"]
-        if type(value) is not int or not 1 <= value <= 100:
-            raise MCPCatalogConfigurationError(
-                f"MCP server {name!r} maxAgentSteps must be an integer from 1 to 100"
-            )
     if "toolTimeoutSeconds" in raw_server:
         value = raw_server["toolTimeoutSeconds"]
         if (
@@ -381,33 +345,6 @@ def _validate_provider_options(name: str, raw_server: Mapping[str, Any]) -> None
     }:
         raise MCPCatalogConfigurationError(
             f"MCP server {name!r} transport must be sse or streamable_http"
-        )
-    if "toolPolicies" not in raw_server:
-        return
-    policies = raw_server["toolPolicies"]
-    if not isinstance(policies, dict):
-        raise MCPCatalogConfigurationError(
-            f"MCP server {name!r} toolPolicies must be an object"
-        )
-    for raw_tool_name, raw_policy in policies.items():
-        if (
-            not isinstance(raw_tool_name, str)
-            or not raw_tool_name.strip()
-            or not isinstance(raw_policy, dict)
-        ):
-            raise MCPCatalogConfigurationError(
-                f"MCP server {name!r} toolPolicies must map tool names to objects"
-            )
-        unknown = set(raw_policy) - _TOOL_POLICY_OPTION_NAMES
-        if unknown:
-            raise MCPCatalogConfigurationError(
-                f"MCP server {name!r} tool policy {raw_tool_name!r} contains "
-                "unsupported fields: "
-                + ", ".join(sorted(str(key) for key in unknown))
-            )
-        _reject_embedded_connection_values(
-            raw_policy,
-            field=f"MCP server {name!r} tool policy {raw_tool_name!r}",
         )
 
 

@@ -20,6 +20,10 @@ from app.agent_runtime.contracts import RunManifest
 from app.agent_runtime.leases import LeaseLostError, RunLeaseGuard
 from app.agents.graph import InvestigationAgent
 from app.agents.state import AgentState, create_initial_state
+from app.application.analysis_control import (
+    ActiveAnalysisRegistry,
+    wait_for_persisted_cancellation,
+)
 from app.application.sanitization import sanitize, sanitize_alert
 from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
@@ -45,9 +49,9 @@ from app.domain.ports import (
     AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
-    InvestigationStrategyProvider,
     ManagementNotifier,
     RunbookProvider,
+    RunCancellationRequested,
     RunLeaseConflict,
     ToolResultAnalyzer,
 )
@@ -70,23 +74,19 @@ class AlertAnalysisService:
         advisor: AIAdvisor,
         notifier: ManagementNotifier,
         repository: AlertRepository,
-        strategy_provider: InvestigationStrategyProvider,
         alert_detail_enricher: AlertDetailEnricher | None = None,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
         tool_result_analyzer: ToolResultAnalyzer | None = None,
-        tool_result_analysis_threshold_chars: int = 12_000,
         rule_validator: ConclusionValidator,
-        conclusion_validator: ConclusionValidator,
         fallback_advisor: AIAdvisor | None = None,
         runbook_limit: int = 5,
         investigation_lease_seconds: int = 300,
         lease_heartbeat_interval_seconds: float | None = None,
-        react_enabled: bool = False,
-        validation_enabled: bool = True,
         ai_fallback_enabled: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
-        max_dynamic_turns: int = 0,
+        react_max_rounds: int = 8,
+        analysis_timeout_seconds: int = 1800,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
         external_knowledge_limit: int = 5,
         external_knowledge_min_relevance: float = 0.60,
@@ -100,23 +100,19 @@ class AlertAnalysisService:
         self.advisor = advisor
         self.notifier = notifier
         self.repository = repository
-        self.strategy_provider = strategy_provider
         self.alert_detail_enricher = alert_detail_enricher
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
         self.tool_result_analyzer = tool_result_analyzer
-        self.tool_result_analysis_threshold_chars = tool_result_analysis_threshold_chars
         self.rule_validator = rule_validator
-        self.conclusion_validator = conclusion_validator
         self.fallback_advisor = fallback_advisor
         self.runbook_limit = runbook_limit
         self.investigation_lease_seconds = investigation_lease_seconds
         self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
-        self.react_enabled = react_enabled
-        self.validation_enabled = validation_enabled
         self.ai_fallback_enabled = ai_fallback_enabled
         self.alert_sanitizer = alert_sanitizer
-        self.max_dynamic_turns = max_dynamic_turns
+        self.react_max_rounds = react_max_rounds
+        self.analysis_timeout_seconds = analysis_timeout_seconds
         self.external_knowledge_client = external_knowledge_client
         self.external_knowledge_limit = external_knowledge_limit
         self.external_knowledge_min_relevance = external_knowledge_min_relevance
@@ -130,6 +126,8 @@ class AlertAnalysisService:
         self._retired_adapters: list[object] = []
         self._retired_adapter_ids: set[int] = set()
         self._retirement_task: asyncio.Task[None] | None = None
+        self._analysis_registry = ActiveAnalysisRegistry()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Build the LangGraph agent
         self.agent = InvestigationAgent(
@@ -138,12 +136,9 @@ class AlertAnalysisService:
             advisor=advisor,
             fallback_advisor=fallback_advisor,
             rule_validator=rule_validator,
-            conclusion_validator=conclusion_validator,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
             tool_result_analyzer=tool_result_analyzer,
-            tool_result_analysis_threshold_chars=tool_result_analysis_threshold_chars,
-            strategy_provider=strategy_provider,
             alert_detail_enricher=alert_detail_enricher,
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
@@ -279,12 +274,7 @@ class AlertAnalysisService:
             alert=preprocess_normalized_alert(stored.alert),
             stored_alert=stored,
             run=run,
-            max_dynamic_turns=(
-                run_snapshot.react_max_dynamic_turns
-                if run_snapshot.react_enabled
-                else 0
-            ),
-            validation_enabled=run_snapshot.validation_enabled,
+            react_max_rounds=run_snapshot.react_max_rounds,
             ai_fallback_enabled=run_snapshot.ai_fallback_enabled,
             knowledge_sources=run_snapshot.knowledge_sources,
         )
@@ -309,7 +299,36 @@ class AlertAnalysisService:
                 lease_seconds=self.investigation_lease_seconds,
                 heartbeat_interval_seconds=self.lease_heartbeat_interval_seconds,
             )
-            final_state = await lease_guard.run(agent.run(initial_state))
+            controlled = self._analysis_registry.start(
+                str(run.id),
+                self._run_agent_with_controls(
+                    run_id=str(run.id),
+                    operation=lease_guard.run(agent.run(initial_state)),
+                    timeout_seconds=run_snapshot.analysis_timeout_seconds,
+                ),
+            )
+            try:
+                final_state = await controlled
+            except asyncio.CancelledError:
+                try:
+                    cancellation_requested = (
+                        await self.repository.is_run_cancellation_requested(str(run.id))
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not verify cancellation request run_id=%s",
+                        run.id,
+                        exc_info=True,
+                    )
+                    raise
+                if cancellation_requested:
+                    raise RunCancellationRequested(str(run.id)) from None
+                raise
+        except RunCancellationRequested:
+            await self.repository.finalize_requested_cancellation(alert_id, str(run.id))
+            return await self.get(alert_id)
+        except asyncio.CancelledError:
+            raise
         except LeaseLostError:
             logger.warning(
                 "Investigation stopped after losing its run lease alert_id=%s run_id=%s",
@@ -354,6 +373,9 @@ class AlertAnalysisService:
 
         try:
             await self._persist_terminal_state(alert_id, run, final_state)
+        except RunCancellationRequested:
+            await self.repository.finalize_requested_cancellation(alert_id, str(run.id))
+            return await self.get(alert_id)
         except RunLeaseConflict as exc:
             raise LeaseLostError(
                 run_id=str(run.id),
@@ -383,6 +405,39 @@ class AlertAnalysisService:
             )
 
         return await self.get(alert_id)
+
+    async def _run_agent_with_controls(
+        self,
+        *,
+        run_id: str,
+        operation: Any,
+        timeout_seconds: int,
+    ) -> AgentState:
+        operation_task = asyncio.ensure_future(operation)
+        cancellation_task = asyncio.create_task(
+            wait_for_persisted_cancellation(self.repository, run_id),
+            name=f"analysis-cancellation-watch-{run_id}",
+        )
+        try:
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    done, _ = await asyncio.wait(
+                        {operation_task, cancellation_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancellation_task in done:
+                        await cancellation_task
+                        raise RunCancellationRequested(run_id)
+                    return await operation_task
+            except TimeoutError:
+                raise TimeoutError(
+                    f"Analysis timed out after {timeout_seconds} seconds"
+                ) from None
+        finally:
+            for task in (operation_task, cancellation_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(operation_task, cancellation_task, return_exceptions=True)
 
     async def _require_compatible_resume_manifest(
         self,
@@ -523,13 +578,18 @@ class AlertAnalysisService:
     async def close(self) -> None:
         """Close current and retired AI adapters during application shutdown."""
 
+        await self._analysis_registry.close()
+        background_tasks = list(self._background_tasks)
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         retirement_task = self._retirement_task
         if retirement_task is not None and retirement_task is not asyncio.current_task():
             await retirement_task
         adapters = [
             *self._retired_adapters,
             self.advisor,
-            self.conclusion_validator,
             self.tool_result_analyzer,
         ]
         self._retired_adapters = []
@@ -619,9 +679,9 @@ class AlertAnalysisService:
             external_knowledge_min_relevance=(
                 self.external_knowledge_min_relevance
             ),
-            react_enabled=self.react_enabled,
-            react_max_dynamic_turns=self.max_dynamic_turns,
-            validation_enabled=self.validation_enabled,
+            react_max_rounds=self.react_max_rounds,
+            analysis_timeout_seconds=self.analysis_timeout_seconds,
+            validation_enabled=True,
             ai_fallback_enabled=self.ai_fallback_enabled,
             ai_model=getattr(self.advisor, "model", ""),
             ai_provider=(
@@ -632,7 +692,8 @@ class AlertAnalysisService:
             ai_timeout_seconds=float(
                 self.runtime_manifest_config.get("ai_timeout_seconds", 300)
             ),
-            ai_max_retries=int(self.runtime_manifest_config.get("ai_max_retries", 2)),
+            # Historical snapshot field only; live model calls have no retry-count budget.
+            ai_max_retries=0,
             ai_max_tokens=int(self.runtime_manifest_config.get("ai_max_tokens", 16_384)),
             prompt_version=str(
                 self.runtime_manifest_config.get("prompt_version")
@@ -640,12 +701,6 @@ class AlertAnalysisService:
             ),
             code_version=str(
                 self.runtime_manifest_config.get("code_version", "0.1.0")
-            ),
-            archery_mcp_max_agent_steps=int(
-                self.runtime_manifest_config.get("archery_mcp_max_agent_steps", 0)
-            ),
-            prometheus_mcp_max_agent_steps=int(
-                self.runtime_manifest_config.get("prometheus_mcp_max_agent_steps", 0)
             ),
             tool_schema_versions={item.name: item.schema_version for item in tool_specs},
             tool_policy_versions={item.name: item.policy_version for item in tool_specs},
@@ -699,35 +754,82 @@ class AlertAnalysisService:
                     "An analysis is already in progress. Use force=True to override."
                 )
 
-        self._active_analyses += 1
-        try:
-            agent = self.agent
-            config_snapshot = self._create_config_snapshot()
-            run_id = uuid4()
-            manifest = self._create_run_manifest(run_id, config_snapshot)
-            run = await self.repository.create_run_for_reanalyze(
-                alert_id,
-                lease_owner=f"reanalyze-{uuid4()}",
-                lease_seconds=self.investigation_lease_seconds,
-                config_snapshot=config_snapshot,
-                manifest=manifest,
-                force=force,
-            )
-            if run is None:
-                raise InvalidAlertPayloadError("Failed to create investigation run")
+        agent = self.agent
+        config_snapshot = self._create_config_snapshot()
+        run_id = uuid4()
+        manifest = self._create_run_manifest(run_id, config_snapshot)
+        run = await self.repository.create_run_for_reanalyze(
+            alert_id,
+            lease_owner=f"reanalyze-{uuid4()}",
+            lease_seconds=self.investigation_lease_seconds,
+            config_snapshot=config_snapshot,
+            manifest=manifest,
+            force=force,
+        )
+        if run is None:
+            raise InvalidAlertPayloadError("Failed to create investigation run")
 
-            await self._analyze_claimed_alert(
+        task = asyncio.create_task(
+            self._run_background_reanalysis(
                 stored,
                 alert_id,
                 run,
                 agent=agent,
                 generation_snapshot=config_snapshot,
+            ),
+            name=f"reanalyze-{run.id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return run, config_snapshot
+
+    async def _run_background_reanalysis(
+        self,
+        stored: StoredAlert,
+        alert_id: str,
+        run: InvestigationRun,
+        *,
+        agent: InvestigationAgent,
+        generation_snapshot: AnalysisConfigSnapshot,
+    ) -> None:
+        self._active_analyses += 1
+        try:
+            await self._analyze_claimed_alert(
+                stored,
+                alert_id,
+                run,
+                agent=agent,
+                generation_snapshot=generation_snapshot,
             )
-            return run, config_snapshot
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Background re-analysis failed alert_id=%s run_id=%s",
+                alert_id,
+                run.id,
+            )
         finally:
             self._active_analyses -= 1
             if self._active_analyses == 0:
                 self._schedule_retired_adapter_close()
+
+    async def cancel_run(
+        self,
+        alert_id: str,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> InvestigationRun:
+        run = await self.repository.request_run_cancellation(
+            alert_id,
+            run_id,
+            requested_by,
+        )
+        if run is None:
+            raise AlertNotFoundError(f"{alert_id}/runs/{run_id}")
+        self._analysis_registry.cancel(run_id)
+        return run
 
     async def _send_analysis_result(
         self,

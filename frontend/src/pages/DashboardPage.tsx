@@ -22,6 +22,7 @@ const statusOrder: AlertStatus[] = [
   "INCONCLUSIVE",
   "COMPLETED",
   "FAILED",
+  "CANCELLED",
   "RECEIVED",
 ];
 const severityOrder: Severity[] = ["CRITICAL", "WARNING", "INFO"];

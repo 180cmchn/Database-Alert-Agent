@@ -1,32 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import time
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
-
-from app.agent_runtime.contracts import RetryPolicy, ToolRisk, ToolSpec
+from app.agent_runtime.contracts import ToolSpec
 from app.application.sanitization import sanitize
-from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.models import (
     EvidenceRecord,
-    ExternalKnowledgeExcerpt,
     InvestigationContext,
-    InvestigationStrategy,
-    NormalizedAlert,
-    RunbookExcerpt,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolStatus,
 )
 from app.domain.ports import InvestigationTool
-from app.domain.tool_calling import MCPServerSelectionModel
 
 
 class InvestigationToolRegistry:
@@ -78,14 +66,6 @@ class InvestigationToolRegistry:
         if isinstance(declared, ToolSpec):
             return declared
 
-        if not hasattr(tool, "read_only"):
-            raise TypeError(
-                f"Tool {tool.name} must explicitly declare read_only before registration"
-            )
-        read_only = tool.read_only
-        if type(read_only) is not bool:
-            raise TypeError(f"Tool {tool.name} read_only must be a boolean")
-
         schema = getattr(
             tool,
             "input_schema",
@@ -93,71 +73,26 @@ class InvestigationToolRegistry:
         )
         if not isinstance(schema, dict):
             raise TypeError(f"Tool {tool.name} input_schema must be an object")
-        canonical_schema = json.dumps(
-            schema,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         return ToolSpec(
             name=tool.name,
             provider=tool.source_system,
             capability=str(getattr(tool, "capability", tool.name)),
+            role=str(getattr(tool, "role", "")),
+            workflow=str(getattr(tool, "workflow", "")),
+            safety=str(getattr(tool, "safety", "")),
             input_schema=schema,
-            read_only=read_only,
-            risk=ToolRisk(str(getattr(tool, "risk", ToolRisk.LOW)).upper()),
-            policy_version=str(getattr(tool, "policy_version", "legacy-read-only-v1")),
-            schema_version=(
-                "sha256:"
-                + hashlib.sha256(canonical_schema.encode("utf-8")).hexdigest()[:16]
-            ),
+            policy_version=str(getattr(tool, "policy_version", "mcp-server-key-v1")),
+            schema_version=str(getattr(tool, "schema_version", "dynamic-mcp-schema-v1")),
             timeout=float(getattr(tool, "default_timeout_seconds", 30)),
-            retry=RetryPolicy(
-                max_attempts=int(getattr(tool, "max_attempts", 1)),
-            ),
         )
-
-
-class ToolPolicyViolation(ValueError):
-    """Raised before execution when a request violates its advertised contract."""
-
-
-class InvestigationToolPolicy:
-    """Provider-neutral safety and JSON Schema gate for outer investigation tools."""
-
-    def __init__(self, registry: InvestigationToolRegistry) -> None:
-        self.registry = registry
-
-    def authorize(self, request: ToolExecutionRequest) -> ToolSpec:
-        tool = self.registry.get(request.tool_name)
-        spec = self.registry.spec(request.tool_name)
-        if tool is None or spec is None:
-            raise ToolPolicyViolation(f"Tool is not registered: {request.tool_name}")
-        if not getattr(tool, "available", True):
-            raise ToolPolicyViolation(f"Tool is not available: {request.tool_name}")
-        if not spec.read_only:
-            raise ToolPolicyViolation(
-                f"Investigation tool is not declared read-only: {request.tool_name}"
-            )
-        try:
-            Draft202012Validator.check_schema(spec.input_schema)
-            Draft202012Validator(spec.input_schema).validate(request.parameters)
-        except (SchemaError, ValidationError) as exc:
-            raise ToolPolicyViolation(
-                f"Tool arguments do not satisfy the registered schema: {request.tool_name}"
-            ) from exc
-        return spec
 
 
 class ToolExecutor:
     def __init__(
         self,
         registry: InvestigationToolRegistry,
-        *,
-        policy: InvestigationToolPolicy | None = None,
     ) -> None:
         self.registry = registry
-        self.policy = policy or InvestigationToolPolicy(registry)
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -173,23 +108,6 @@ class ToolExecutor:
                 status=ToolStatus.SKIPPED,
                 summary=f"未执行调查工具 {request.tool_name}：工具未注册或能力未启用。",
                 structured_data={"reason_code": "tool_not_registered"},
-                started_at=started_at,
-                started=started,
-            )
-
-        try:
-            self.policy.authorize(request)
-        except ToolPolicyViolation as exc:
-            return self._record(
-                request,
-                context,
-                source_system=tool.source_system,
-                status=ToolStatus.SKIPPED,
-                summary=f"未执行调查工具 {request.tool_name}：调用未通过只读策略校验。",
-                structured_data={
-                    "reason_code": "tool_policy_rejected",
-                    "policy_error": str(sanitize(exc)),
-                },
                 started_at=started_at,
                 started=started,
             )
@@ -300,8 +218,6 @@ class ToolExecutor:
 class AlertContextTool:
     name = "alert_context"
     source_system = "alert_platform"
-    read_only = True
-    max_attempts = 2
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
@@ -326,7 +242,6 @@ class UnavailableExternalTool:
     """Placeholder for a real log/APM/database-management platform adapter."""
 
     available = False
-    read_only = True
 
     def __init__(self, name: str, source_system: str) -> None:
         self.name = name
@@ -339,118 +254,6 @@ class UnavailableExternalTool:
             status=ToolStatus.SKIPPED,
             summary=f"未执行调查工具 {self.name}：对应的 {self.source_system} 能力未配置。",
             structured_data={"reason_code": "adapter_not_configured"},
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class MCPToolBinding:
-    """Map one secret-free catalog entry to its registered outer tool."""
-
-    server_name: str
-    tool_name: str
-    role: str
-    purpose: str
-    timeout_seconds: float
-    read_only: bool = True
-
-
-class DefaultInvestigationStrategyProvider:
-    """Let the configured model select zero or more relevant MCP servers.
-
-    The name remains stable for callers that inject the default provider, but
-    there are no alert-type or provider-specific strategy branches here.
-    """
-
-    def __init__(
-        self,
-        max_dynamic_turns: int = 0,
-        *,
-        model: MCPServerSelectionModel | None = None,
-        mcp_bindings: list[MCPToolBinding] | None = None,
-        available_tools: list[str] | None = None,
-        **legacy_options: Any,
-    ) -> None:
-        # Legacy keyword arguments are accepted so rolling runtime updates do
-        # not fail while API and worker processes run different code versions.
-        del legacy_options
-        self.max_dynamic_turns = max_dynamic_turns
-        self.model = model
-        available = set(available_tools or [])
-        self.mcp_bindings = tuple(
-            binding
-            for binding in (mcp_bindings or [])
-            if binding.tool_name in available and binding.read_only is True
-        )
-
-    async def select(
-        self,
-        alert: NormalizedAlert,
-        runbooks: list[RunbookExcerpt] | None = None,
-        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
-        knowledge_match_summary: str = "",
-    ) -> InvestigationStrategy:
-        runbooks = runbooks or []
-        external_knowledge = external_knowledge or []
-        selected_names: tuple[str, ...] = ()
-        if self.mcp_bindings:
-            if self.model is None:
-                raise RuntimeError(
-                    "Configured MCP servers require a model that supports relevance selection"
-                )
-            selection = await self.model.select_mcp_servers(
-                alert=preprocess_normalized_alert(alert).model_dump(
-                    mode="json", exclude={"raw_payload"}
-                ),
-                knowledge_matches=[
-                    {
-                        "source": "local_pdf",
-                        "match": item.model_dump(mode="json"),
-                    }
-                    for item in runbooks
-                ]
-                + [
-                    {
-                        "source": "external_knowledge",
-                        "match": item.model_dump(mode="json"),
-                    }
-                    for item in external_knowledge
-                ],
-                knowledge_match_summary=knowledge_match_summary,
-                candidates=[
-                    {
-                        "name": binding.server_name,
-                        "role": binding.role,
-                        "purpose": binding.purpose,
-                        "read_only": binding.read_only,
-                    }
-                    for binding in self.mcp_bindings
-                ],
-            )
-            configured_names = {binding.server_name for binding in self.mcp_bindings}
-            unknown = set(selection.server_names) - configured_names
-            if unknown:
-                raise ValueError(
-                    "MCP selector returned servers outside the configured catalog: "
-                    + ", ".join(sorted(unknown))
-                )
-            selected_names = tuple(dict.fromkeys(selection.server_names))
-
-        by_name = {binding.server_name: binding for binding in self.mcp_bindings}
-        tool_plan = [
-            ToolExecutionRequest(
-                tool_name=by_name[name].tool_name,
-                objective=by_name[name].purpose,
-                required=False,
-                timeout_seconds=by_name[name].timeout_seconds,
-            )
-            for name in selected_names
-        ]
-        return InvestigationStrategy(
-            strategy_id="agent-selected-mcp-v1",
-            title="Agent 自主 MCP 调查",
-            description="Agent 根据 MCP 角色和作用选择零个或多个相关只读 MCP。",
-            tool_plan=tool_plan,
-            max_dynamic_turns=0,
         )
 
 

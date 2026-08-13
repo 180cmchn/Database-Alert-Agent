@@ -1,12 +1,14 @@
+import asyncio
 import json
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
+import openai
 import pytest
 
 import app.adapters.ai as ai_module
 from app.adapters.ai import (
-    ConservativeFallbackAdvisor,
     FakeAIAdvisor,
     _validate_manual_policy,
 )
@@ -19,7 +21,6 @@ from app.domain.models import (
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     ExternalKnowledgeReference,
-    InvestigationRun,
     Recommendation,
     RecommendationStep,
     RunbookExcerpt,
@@ -36,15 +37,12 @@ def make_alert():
 
 
 def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> None:
-    assert "结果包含可解析日志" in ai_module.SYSTEM_PROMPT
-    assert "partial 不为 true" in ai_module.SYSTEM_PROMPT
+    assert "程序根据" in ai_module.SYSTEM_PROMPT
+    assert "过滤、聚合和排序" in ai_module.SYSTEM_PROMPT
     assert "不得比较告警标题端点与 hostname_max" in ai_module.SYSTEM_PROMPT
     assert "不得输出 instance_id 归属核验" in ai_module.SYSTEM_PROMPT
     assert "instance_identity_verification.status=MATCHED" not in (ai_module.SYSTEM_PROMPT)
-    assert "不得比较告警标题端点与 hostname_max" in ai_module.VALIDATION_PROMPT
-    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
-    assert "target_verification=mismatch" in ai_module.SYSTEM_PROMPT
-    assert "target_verification=mismatch" in ai_module.VALIDATION_PROMPT
+    assert "target_verification" not in ai_module.SYSTEM_PROMPT
 
 
 def test_system_prompt_requires_chinese_user_facing_recommendations() -> None:
@@ -60,30 +58,25 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
     assert "不得构造或展示待验证原因、假设" in ai_module.SYSTEM_PROMPT
     assert "status 必须为 SUPPORTED" in ai_module.SYSTEM_PROMPT
     assert "现有结果无法得出根因" in ai_module.SYSTEM_PROMPT
-    assert "不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED" in (
-        ai_module.SYSTEM_PROMPT
-    )
+    assert "不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED" in (ai_module.SYSTEM_PROMPT)
     assert not hasattr(ai_module.OpenAICompatibleAdvisor, "choose_next_tool")
-    assert "合法结果只有两种" in ai_module.VALIDATION_PROMPT
 
 
-def test_prompts_treat_partial_success_as_descriptive_missing_evidence() -> None:
-    assert "NO_DATA 或部分结果只是证据缺失" in ai_module.SYSTEM_PROMPT
-    assert "只能把完整原始返回转换为可追溯的结构化事实、异常与限制" in (
-        ai_module.SYSTEM_PROMPT
-    )
-    assert "不得提出、选择或判断根因" in ai_module.SYSTEM_PROMPT
+def test_prompts_treat_program_projection_as_non_causal_evidence() -> None:
+    assert "NO_DATA 或没有可用事实的程序投影只是证据缺失" in ai_module.SYSTEM_PROMPT
+    assert "只陈述事实、异常、限制和来源" in (ai_module.SYSTEM_PROMPT)
+    assert "不提出、选择或判断根因" in ai_module.SYSTEM_PROMPT
     assert "只有你这个主 Agent" in ai_module.SYSTEM_PROMPT
-    assert "宿主依据状态、完整性、来源绑定和可追溯性设置的机械接纳门禁" in (
-        ai_module.SYSTEM_PROMPT
-    )
-    assert "structured_data.partial 不为 true" in ai_module.SYSTEM_PROMPT
-    assert "partial" in ai_module.VALIDATION_PROMPT
-    assert "大结果子 Agent 只能提供可追溯的结构化事实、异常与限制" in (
-        ai_module.VALIDATION_PROMPT
-    )
-    assert "不是因果结论" in ai_module.VALIDATION_PROMPT
-    assert "analysis_contract_passed 必须为 false" in ai_module.VALIDATION_PROMPT
+    assert "MCP 原始响应只保存在内部审计 artifact" in ai_module.SYSTEM_PROMPT
+    assert "子 Agent" not in ai_module.SYSTEM_PROMPT
+    assert "宿主完整性门禁" not in ai_module.SYSTEM_PROMPT
+    assert "call_limit_reached" not in ai_module.SYSTEM_PROMPT
+
+
+def test_ai_adapter_exposes_no_model_based_conclusion_validator() -> None:
+    assert not hasattr(ai_module, "VALIDATION_PROMPT")
+    assert not hasattr(ai_module, "OpenAICompatibleConclusionValidator")
+    assert not hasattr(ai_module, "FakeConclusionValidator")
 
 
 @pytest.mark.asyncio
@@ -106,22 +99,6 @@ async def test_fake_advisor_returns_fixed_no_cause_for_partial_success() -> None
         make_alert(),
         [],
         evidence=[evidence],
-    )
-
-    assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
-    assert recommendation.root_causes == []
-    assert recommendation.likely_causes == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("advisor", [FakeAIAdvisor(), ConservativeFallbackAdvisor()])
-async def test_deterministic_advisors_ignore_legacy_investigation_memory(
-    advisor: FakeAIAdvisor,
-) -> None:
-    recommendation, _ = await advisor.advise(
-        make_alert(),
-        [],
-        investigation_memory=None,
     )
 
     assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
@@ -215,6 +192,225 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
 
 
 @pytest.mark.asyncio
+async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    captured_payloads: list[dict[str, object]] = []
+    digest = "d" * 64
+    business_checksum = "0123456789abcdef0123456789abcdef"
+    artifact_uri = "agent-artifact://internal-only"
+    program_evidence = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_archery_slow_logs",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="已投影慢查询事实。",
+        request={
+            "objective": "查询慢日志",
+            "raw_parameters": {"token": "must-not-reach-model"},
+            "artifact_uri": artifact_uri,
+        },
+        structured_data={
+            "processing_status": "completed",
+            "root_cause_eligible": True,
+            "source_artifact": {
+                "artifact_id": str(uuid4()),
+                "uri": artifact_uri,
+                "metadata": {"internal_only": True},
+            },
+            "raw_mcp_call_results": [{"result": "raw-secret"}],
+            "provider_private": "must-not-reach-model",
+            "tool_result_analysis": {
+                "summary": "已完成程序事实投影。",
+                "observations": [
+                    {
+                        "statement": (
+                            "慢查询数量升高；业务 checksum=" + business_checksum
+                        ),
+                        "source_paths": [
+                            "/structured_data/rows/0",
+                            "/structured_data/raw_mcp_call_results/0",
+                        ],
+                        "source_spans": [],
+                        "raw_result": "must-not-reach-model",
+                    }
+                ],
+                "anomalies": [],
+                "limitations": [
+                    "完整内容位于 " + artifact_uri,
+                    "片段...[sha256:" + digest[:16] + ",total_chars:9000]",
+                ],
+                "analysis_usable": True,
+                "source_coverage_complete": True,
+                "provider": "deterministic_host",
+                "model": "none",
+                "prompt_version": "program-fact-projection-v3",
+                "source_artifact_id": str(uuid4()),
+                "source_sha256": digest,
+                "request_id": "projection-request-id",
+                "usage": {"input_tokens": 100},
+            },
+        },
+    )
+    alert_detail_evidence = EvidenceRecord(
+        run_id=program_evidence.run_id,
+        tool_name="flashduty_alert_info",
+        source_system="flashduty_alert_detail",
+        status=ToolStatus.SUCCESS,
+        summary="已获取权威 FlashDuty 告警详情。",
+        request={"operation": "alert_info"},
+        structured_data={
+            "partial": False,
+            "authoritative_source": "/alert/info",
+            "alert_detail": {
+                "title": "MySQL 慢查询告警",
+                "database": {"host": "db-prod-1", "port": 3306},
+                "nested": {
+                    "raw_payload": {"secret": "raw-alert-secret"},
+                    "artifact_id": "internal-artifact-id",
+                    "source_sha256": digest,
+                    "sha256": digest,
+                    "hash": digest,
+                    "content_hash": digest,
+                    "audit": {
+                        "uri": artifact_uri,
+                        "request_id": "nested-request-id",
+                        "usage": {"tokens": 20},
+                    },
+                },
+            },
+            "flashduty_alert_info": {
+                "alarm_host": "db-prod-1",
+                "alarm_port": 3306,
+                "raw_response": "raw-flashduty-secret",
+            },
+        },
+    )
+    original_program = program_evidence.model_copy(deep=True)
+    original_alert_detail = alert_detail_evidence.model_copy(deep=True)
+    recommendation = Recommendation(
+        summary=INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
+        analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
+        steps=[],
+        confidence=0.3,
+        manual_matched=False,
+    )
+    calls = 0
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        captured_payloads.append(json.loads(messages[1]["content"]))
+        if calls == 1:
+            return recommendation.model_dump_json(), object()
+        return '{"action":"finish","reason":"done"}', ai_module.AdvisorMetadata(
+            provider="test",
+            model="test-model",
+            prompt_version="test",
+        )
+
+    advisor._complete = complete
+
+    evidence = [program_evidence, alert_detail_evidence]
+    await advisor.advise(make_alert(), [], evidence=evidence)
+    await advisor.decide_investigation(
+        alert=make_alert(),
+        runbooks=[],
+        external_knowledge=[],
+        knowledge_match_summary="",
+        evidence=evidence,
+        available_tools=[],
+        react_round=1,
+        react_max_rounds=8,
+    )
+
+    assert program_evidence == original_program
+    assert alert_detail_evidence == original_alert_detail
+    for payload, evidence_key in zip(
+        captured_payloads,
+        ("tool_evidence", "evidence"),
+        strict=True,
+    ):
+        model_evidence = payload[evidence_key]  # type: ignore[index]
+        program_payload = model_evidence[0]
+        detail_payload = model_evidence[1]
+
+        assert set(program_payload) == {
+            "id",
+            "tool_name",
+            "source_system",
+            "status",
+            "request",
+            "summary",
+            "error",
+            "started_at",
+            "collected_at",
+            "duration_ms",
+            "truncated",
+            "structured_data",
+        }
+        assert program_payload["request"] == {"objective": "查询慢日志"}
+        assert program_payload["structured_data"]["processing_status"] == "completed"
+        assert program_payload["structured_data"]["root_cause_eligible"] is True
+        analysis = program_payload["structured_data"]["tool_result_analysis"]
+        assert set(analysis) == {
+            "summary",
+            "observations",
+            "anomalies",
+            "limitations",
+            "analysis_usable",
+            "source_coverage_complete",
+            "provider",
+            "model",
+            "prompt_version",
+        }
+        assert analysis["observations"][0]["source_paths"] == ["/structured_data/rows/0"]
+        assert business_checksum in analysis["observations"][0]["statement"]
+        assert analysis["limitations"][1].endswith("[total_chars:9000]")
+
+        assert detail_payload["structured_data"] == {
+            "partial": False,
+            "authoritative_source": "/alert/info",
+            "alert_detail": {
+                "title": "MySQL 慢查询告警",
+                "database": {"host": "db-prod-1", "port": 3306},
+                "nested": {"audit": {}},
+            },
+            "flashduty_alert_info": {
+                "alarm_host": "db-prod-1",
+                "alarm_port": 3306,
+            },
+        }
+
+        serialized = json.dumps(model_evidence, ensure_ascii=False, sort_keys=True)
+        for forbidden in (
+            "raw_mcp_call_results",
+            "raw_parameters",
+            "raw_payload",
+            "raw_response",
+            "raw-secret",
+            "raw-alert-secret",
+            "raw-flashduty-secret",
+            "provider_private",
+            "source_artifact",
+            "artifact_id",
+            "artifact_uri",
+            "agent-artifact://",
+            "source_sha256",
+            "sha256",
+            "content_hash",
+            '"hash"',
+            digest,
+            "request_id",
+            "projection-request-id",
+            "nested-request-id",
+            "usage",
+        ):
+            assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
 async def test_fake_advisor_does_not_copy_slow_query_filter_note_into_cause() -> None:
     signal = "五分钟内慢查询触发值为646个"
     raw_text = f"{signal}（已排除640个数据库管理平台采集数据用sql）"
@@ -259,11 +455,11 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
 
 
 @pytest.mark.asyncio
-async def test_advisor_repairs_archery_endpoint_comparison() -> None:
+async def test_advisor_does_not_apply_archery_endpoint_output_gate() -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._api_key = "test-key"
     advisor._model = "test-model"
-    invalid = Recommendation(
+    model_response = Recommendation(
         summary=(
             "Archery 慢日志查询因实例 IP 定位偏差（查询了 100.84.97.139:3306 "
             "而非告警目标实例）未能获取有效慢日志证据。"
@@ -273,32 +469,28 @@ async def test_advisor_repairs_archery_endpoint_comparison() -> None:
         confidence=0.3,
         manual_matched=False,
     )
-    repaired = invalid.model_copy(update={"summary": "Archery 慢日志证据不足，需继续只读核查。"})
     calls = 0
-    repair_prompt = ""
 
     async def complete(messages):  # type: ignore[no-untyped-def]
-        nonlocal calls, repair_prompt
+        nonlocal calls
+        del messages
         calls += 1
-        if calls == 1:
-            return invalid.model_dump_json(), object()
-        repair_prompt = messages[-1]["content"]
-        return repaired.model_dump_json(), object()
+        return model_response.model_dump_json(), object()
 
     advisor._complete = complete
 
     recommendation, _ = await advisor.advise(make_alert(), [])
 
-    assert recommendation.summary == repaired.summary
-    assert "must not compare Archery query endpoints" in repair_prompt
+    assert calls == 1
+    assert recommendation.summary == model_response.summary
 
 
 @pytest.mark.asyncio
-async def test_advisor_rejects_archery_endpoint_comparison_after_repair() -> None:
+async def test_advisor_accepts_schema_valid_archery_endpoint_statement_once() -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._api_key = "test-key"
     advisor._model = "test-model"
-    invalid = Recommendation(
+    model_response = Recommendation(
         summary="Archery 查询的实例与告警目标不一致，因此慢日志无效。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
@@ -306,14 +498,74 @@ async def test_advisor_rejects_archery_endpoint_comparison_after_repair() -> Non
         manual_matched=False,
     )
 
+    calls = 0
+
     async def complete(messages):  # type: ignore[no-untyped-def]
-        del messages
-        return invalid.model_dump_json(), object()
+        nonlocal calls
+        calls += 1
+        assert len(messages) == 2
+        return model_response.model_dump_json(), object()
 
     advisor._complete = complete
 
-    with pytest.raises(AdvisorError, match="invalid after repair"):
-        await advisor.advise(make_alert(), [])
+    recommendation, _ = await advisor.advise(make_alert(), [])
+
+    assert calls == 1
+    assert recommendation.summary == model_response.summary
+
+
+@pytest.mark.asyncio
+async def test_react_decision_keeps_repairing_until_schema_is_valid() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "test-model"
+    calls = 0
+    emitted_reasoning: list[tuple[str, int, str]] = []
+
+    async def complete(messages):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        assert len(messages) <= 4
+        metadata = ai_module.AdvisorMetadata(
+            provider="test",
+            model="test-model",
+            prompt_version="test",
+            reasoning_content=f"repair reasoning {calls}",
+        )
+        if calls <= 4:
+            return '{"action":"tool","tool_name":"unknown"}', metadata
+        return '{"action":"finish","reason":"done"}', metadata
+
+    async def capture_reasoning(
+        content: str,
+        stream_id: str,
+        delta_index: int,
+    ) -> None:
+        emitted_reasoning.append((stream_id, delta_index, content))
+
+    advisor._complete = complete
+
+    result = await advisor.decide_investigation(
+        alert=make_alert(),
+        runbooks=[],
+        external_knowledge=[],
+        knowledge_match_summary="",
+        evidence=[],
+        available_tools=[],
+        react_round=1,
+        react_max_rounds=8,
+        reasoning_callback=capture_reasoning,
+    )
+
+    assert calls == 5
+    assert result.decision.action == "finish"
+    assert emitted_reasoning == [
+        ("react:1:attempt:0", 0, "repair reasoning 1"),
+        ("react:1:attempt:1", 0, "repair reasoning 2"),
+        ("react:1:attempt:2", 0, "repair reasoning 3"),
+        ("react:1:attempt:3", 0, "repair reasoning 4"),
+        ("react:1:attempt:4", 0, "repair reasoning 5"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -534,7 +786,7 @@ def test_system_trust_http_client_keeps_tls_verification_and_environment(
     assert captured["timeout"].connect == 17  # type: ignore[union-attr]
 
 
-def test_real_ai_clients_use_system_trust_http_client(
+def test_real_ai_client_uses_system_trust_http_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     http_client = object()
@@ -558,24 +810,117 @@ def test_real_ai_clients_use_system_trust_http_client(
         model="test-model",
         max_tokens=16_384,
         timeout_seconds=19,
-        max_retries=2,
         json_mode=True,
     )
-    ai_module.OpenAICompatibleConclusionValidator(
-        api_key="test-key",
-        base_url="https://models.example.test/v1",
-        model="test-model",
-        max_tokens=16_384,
-        timeout_seconds=23,
-        max_retries=2,
-    )
-
-    assert timeout_values == [19, 23]
-    assert [item["http_client"] for item in constructed] == [http_client, http_client]
+    assert timeout_values == [19]
+    assert [item["http_client"] for item in constructed] == [http_client]
     assert [item["default_headers"] for item in constructed] == [
         {"User-Agent": ai_module.AI_HTTP_USER_AGENT},
-        {"User-Agent": ai_module.AI_HTTP_USER_AGENT},
     ]
+    assert [item["max_retries"] for item in constructed] == [0]
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_recoverable_failures_past_legacy_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    attempts = 0
+    delays: list[float] = []
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            raise ai_module.APIConnectionError(request=request)
+        return "ok"
+
+    async def no_wait(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(ai_module.asyncio, "sleep", no_wait)
+
+    result = await advisor._request_provider(operation, operation="test")
+
+    assert result == "ok"
+    assert attempts == 5
+    assert delays == [0.5, 1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_retry_permanent_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    attempts = 0
+    sleeps = 0
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise openai.APIStatusError("invalid request", response=response, body=None)
+
+    async def no_wait(_delay: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    monkeypatch.setattr(ai_module.asyncio, "sleep", no_wait)
+
+    with pytest.raises(openai.APIStatusError):
+        await advisor._request_provider(operation, operation="test")
+
+    assert attempts == 1
+    assert sleeps == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_wait_is_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    retry_wait_started = asyncio.Event()
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+
+    async def operation() -> str:
+        raise ai_module.APIConnectionError(request=request)
+
+    async def wait_until_cancelled(_delay: float) -> None:
+        retry_wait_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ai_module.asyncio, "sleep", wait_until_cancelled)
+    task = asyncio.create_task(advisor._request_provider(operation, operation="test"))
+    await retry_wait_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_end_when_outer_analysis_timeout_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    attempts = 0
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise ai_module.APIConnectionError(request=request)
+
+    monkeypatch.setattr(ai_module, "AI_RETRY_INITIAL_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(ai_module, "AI_RETRY_MAX_DELAY_SECONDS", 0.001)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await advisor._request_provider(operation, operation="test")
+
+    assert attempts > 2
 
 
 @pytest.mark.asyncio
@@ -587,7 +932,7 @@ async def test_real_ai_adapters_close_their_owned_clients(
 
     class ClosingAsyncOpenAI:
         def __init__(self, **kwargs: object) -> None:
-            self.kind = "advisor" if not constructed else "validator"
+            self.kind = "advisor"
             constructed.append(self.kind)
 
         async def close(self) -> None:
@@ -602,22 +947,12 @@ async def test_real_ai_adapters_close_their_owned_clients(
         model="test-model",
         max_tokens=16_384,
         timeout_seconds=19,
-        max_retries=2,
         json_mode=True,
     )
-    validator = ai_module.OpenAICompatibleConclusionValidator(
-        api_key="test-key",
-        base_url="https://models.example.test/v1",
-        model="test-model",
-        max_tokens=16_384,
-        timeout_seconds=19,
-        max_retries=2,
-    )
-
     await advisor.aclose()
-    await validator.aclose()
 
-    assert closed == ["advisor", "validator"]
+    assert constructed == ["advisor"]
+    assert closed == ["advisor"]
 
 
 @pytest.mark.asyncio
@@ -680,6 +1015,37 @@ async def test_advisor_empty_content_error_contains_only_safe_response_metadata(
     assert prompt_secret not in error
     assert reasoning_secret not in error
     assert "trace-secret-that-must-not-be-logged" not in error
+
+
+@pytest.mark.asyncio
+async def test_advisor_complete_reads_top_level_provider_reasoning() -> None:
+    class ReasoningCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="top-level-reasoning-request",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content='{"action":"finish","reason":"done"}',
+                            reasoning="top-level provider reasoning",
+                            model_extra={},
+                        ),
+                    )
+                ],
+                usage=None,
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._model = "reasoning-model"
+    advisor._max_tokens = 16_384
+    advisor._json_mode = False
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ReasoningCompletions()))
+
+    _, metadata = await advisor._complete([{"role": "user", "content": "decide"}])
+
+    assert metadata.reasoning_content == "top-level provider reasoning"
 
 
 @pytest.mark.asyncio
@@ -751,6 +1117,93 @@ async def test_advisor_requests_one_selected_mcp_tool_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_advisor_mcp_tool_call_reads_top_level_provider_reasoning() -> None:
+    class ReasoningToolCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="top-level-tool-reasoning-request",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            reasoning="top-level MCP planning reasoning",
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="reasoning-tool-call",
+                                    function=SimpleNamespace(
+                                        name="monitoring_query",
+                                        arguments="{}",
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ReasoningToolCompletions()))
+
+    result = await advisor.request_mcp_tool_call(
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "monitoring_query",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    )
+
+    assert result.reasoning_content == "top-level MCP planning reasoning"
+
+
+@pytest.mark.asyncio
+async def test_advisor_forwards_mcp_tool_definitions_without_host_validation() -> None:
+    tools = [
+        {"type": "function", "function": {"parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "duplicate"}},
+        {"type": "function", "function": {"name": "duplicate"}},
+    ]
+    calls: list[dict[str, object]] = []
+
+    class ToolCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                id="unvalidated-tool-definitions",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="returned-call",
+                                    function=SimpleNamespace(name="duplicate", arguments="{}"),
+                                )
+                            ]
+                        )
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ToolCompletions()))
+
+    result = await advisor.request_mcp_tool_call(messages=[], tools=tools)
+
+    assert calls[0]["tools"] is tools
+    assert result.name == "duplicate"
+
+
+@pytest.mark.asyncio
 async def test_advisor_accepts_one_harness_call_tool_action_from_text_content() -> None:
     action = {
         "action": "call_tool",
@@ -762,8 +1215,7 @@ async def test_advisor_accepts_one_harness_call_tool_action_from_text_content() 
             "instance_id": 17,
             "limit_num": 10,
             "sql_content": (
-                "SELECT id, instance_name, host, port FROM sql_instance "
-                "WHERE id = 3 LIMIT 10"
+                "SELECT id, instance_name, host, port FROM sql_instance WHERE id = 3 LIMIT 10"
             ),
         },
     }
@@ -788,9 +1240,7 @@ async def test_advisor_accepts_one_harness_call_tool_action_from_text_content() 
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=TextActionCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=TextActionCompletions()))
     tool = {
         "type": "function",
         "function": {
@@ -870,7 +1320,7 @@ async def test_advisor_rejects_non_call_tool_text_actions(content: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_advisor_rejects_unavailable_tool_in_text_action() -> None:
+async def test_advisor_preserves_unlisted_tool_in_text_action() -> None:
     content = json.dumps(
         {
             "action": "call_tool",
@@ -898,23 +1348,73 @@ async def test_advisor_rejects_unavailable_tool_in_text_action() -> None:
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=UnknownToolCompletions())
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=UnknownToolCompletions()))
+
+    result = await advisor.request_mcp_tool_call(
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "monitoring_query",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
     )
 
-    with pytest.raises(AdvisorError, match="selected an unavailable MCP tool"):
-        await advisor.request_mcp_tool_call(
-            messages=[],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "monitoring_query",
-                        "parameters": {"type": "object"},
-                    },
-                }
-            ],
-        )
+    assert result.name == "write_database"
+    assert result.arguments == {}
+
+
+@pytest.mark.asyncio
+async def test_advisor_preserves_unlisted_native_tool_call() -> None:
+    class UnknownNativeToolCompletions:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="unknown-native-tool-request",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="unknown-native-tool-call",
+                                    function=SimpleNamespace(
+                                        name="server_discovered_tool",
+                                        arguments='{"opaque":true}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+            )
+
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=UnknownNativeToolCompletions())
+    )
+
+    result = await advisor.request_mcp_tool_call(
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "initially_advertised_tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    )
+
+    assert result.name == "server_discovered_tool"
+    assert result.arguments == {"opaque": True}
 
 
 @pytest.mark.asyncio
@@ -953,9 +1453,7 @@ async def test_advisor_does_not_use_text_fallback_for_multiple_native_tool_calls
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=MultipleToolCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=MultipleToolCompletions()))
 
     with pytest.raises(AdvisorError, match="count=2"):
         await advisor.request_mcp_tool_call(
@@ -1091,59 +1589,3 @@ async def test_advisor_no_choices_error_contains_request_shape() -> None:
         "(request_id=no-choice-request-1, input_chars=5, "
         "max_tokens=16384, json_mode=True)"
     )
-
-
-@pytest.mark.asyncio
-async def test_conclusion_validator_uses_same_model_and_strict_output_schema() -> None:
-    calls: list[dict[str, object]] = []
-
-    class CapturingCompletions:
-        async def create(self, **kwargs: object) -> SimpleNamespace:
-            calls.append(kwargs)
-            content = json.dumps(
-                {
-                    "analysis_contract_passed": True,
-                    "evidence_sufficient": False,
-                    "issues": [],
-                }
-            )
-            return SimpleNamespace(
-                id="validation-request-1",
-                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
-                usage=None,
-            )
-
-    validator = object.__new__(ai_module.OpenAICompatibleConclusionValidator)
-    validator._model = "shared-analysis-model"
-    validator._max_tokens = 16_384
-    validator._json_mode = True
-    validator._client = SimpleNamespace(chat=SimpleNamespace(completions=CapturingCompletions()))
-    alert = make_alert()
-    recommendation, _ = await FakeAIAdvisor().advise(alert, [])
-    run = InvestigationRun(alert_id=alert.id)
-
-    result = await validator.validate(run, alert, recommendation, [], [])
-
-    assert result.passed is True
-    assert result.evidence_sufficient is False
-    assert result.issues == []
-    assert result.metadata["model"] == "shared-analysis-model"
-    assert result.metadata["prompt_version"].endswith("validation-v2")
-    assert len(calls) == 1
-    assert calls[0]["model"] == "shared-analysis-model"
-    assert calls[0]["temperature"] == 0
-    assert calls[0]["max_tokens"] == 16_384
-    response_format = calls[0]["response_format"]
-    assert isinstance(response_format, dict)
-    assert response_format["type"] == "json_schema"
-    json_schema = response_format["json_schema"]
-    assert isinstance(json_schema, dict)
-    assert json_schema["strict"] is True
-    schema = json_schema["schema"]
-    assert isinstance(schema, dict)
-    assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == {
-        "analysis_contract_passed",
-        "evidence_sufficient",
-        "issues",
-    }

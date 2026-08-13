@@ -1,18 +1,18 @@
-"""Unified Agent harness for stateful, reconnectable MCP child runs."""
+"""Unified harness for stateful, reconnectable MCP investigations."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from hashlib import sha256
 from typing import Any
-from uuid import UUID
-
-from jsonschema import Draft202012Validator, SchemaError
+from uuid import UUID, uuid5
 
 from app.agent_runtime.budgets import (
     BudgetAmounts,
@@ -43,7 +43,6 @@ from app.mcp_runtime.contracts import (
     CheckpointHook,
     Finish,
     HarnessObservation,
-    HostRejection,
     InvocationStore,
     MCPConnector,
     MCPHarnessResult,
@@ -52,12 +51,12 @@ from app.mcp_runtime.contracts import (
     MCPPlanner,
     MCPToolSession,
     PreparedCall,
+    RemoteResponseStore,
     RetryDirective,
     ScenarioTransition,
 )
 
 _UNSET = object()
-_MAX_PROVIDER_BUDGET_CAS_ATTEMPTS = 16
 
 
 class HarnessInfrastructureError(RuntimeError):
@@ -80,27 +79,6 @@ class _HostResultProcessingError(RuntimeError):
             f"The MCP Host could not process a successful transport result: {type(cause).__name__}"
         )
         self.details = {"cause_type": type(cause).__name__}
-
-
-class _ToolCatalogDriftError(RuntimeError):
-    code = "mcp_tool_catalog_drift"
-    retryable = False
-
-    def __init__(
-        self,
-        *,
-        added: list[str],
-        removed: list[str],
-        changed: dict[str, list[str]],
-    ) -> None:
-        super().__init__(
-            "The MCP ToolSpec catalog changed after it was frozen in the run checkpoint."
-        )
-        self.details = {
-            "added": added,
-            "removed": removed,
-            "changed": changed,
-        }
 
 
 def event_matches_dispatch_scope(
@@ -175,6 +153,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         checkpoint_hook: CheckpointHook[StateT, ObservationT] | None = None,
         invocation_store: InvocationStore | None = None,
         artifact_store: ArtifactStore | None = None,
+        remote_response_store: RemoteResponseStore | None = None,
         planner_timeout_seconds: float = 60,
         session_timeout_seconds: float = 30,
         dispatch_scope_id: UUID | None = None,
@@ -193,6 +172,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         self.checkpoint_hook = checkpoint_hook
         self.invocation_store = invocation_store
         self.artifact_store = artifact_store
+        self.remote_response_store = remote_response_store
         self.planner_timeout_seconds = planner_timeout_seconds
         self.session_timeout_seconds = session_timeout_seconds
         self.dispatch_scope_id = dispatch_scope_id
@@ -319,6 +299,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             after_sequence=snapshot.event_version,
         )
         await self._reconcile_durable_invocations(ctx, persisted_events)
+        await self._ensure_observation_trace_events(ctx)
         if ctx.finish is not None:
             await self._ensure_run_completed_event(ctx, persisted_events)
             await self._checkpoint(ctx)
@@ -373,7 +354,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if self._deadline_reached(ctx):
                 return Finish(
                     reason=RuntimeStopReason.DEADLINE_EXCEEDED,
-                    summary="The MCP child-run deadline was reached.",
+                    summary="The MCP investigation deadline was reached.",
                     requires_human=True,
                 )
             scenario_finish = self.scenario.completion(ctx.state, tuple(ctx.observations))
@@ -383,55 +364,30 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             durable_pending = self._pending_invocation(ctx)
             if durable_pending is not None:
                 prepared = self._active_or_reconstructed_call(ctx, durable_pending)
-                rejection = self._generic_host_validation(ctx, prepared)
-                if rejection is not None:
-                    raise HarnessInfrastructureError(
-                        "checkpoint PENDING invocation no longer passes its frozen ToolSpec: "
-                        f"{rejection.code}"
-                    )
             elif ctx.pending_retry is None:
                 action_or_finish = await self._next_action(ctx)
                 if isinstance(action_or_finish, Finish):
-                    if action_or_finish.model_requested and action_or_finish.reason not in {
-                        RuntimeStopReason.HUMAN_INPUT_REQUIRED,
-                        RuntimeStopReason.AMBIGUOUS_TARGET,
-                        RuntimeStopReason.NO_SAFE_ACTION,
-                    }:
-                        validated_finish = self.scenario.validate_finish(
-                            ctx.state,
-                            tuple(ctx.observations),
-                            action_or_finish,
-                        )
-                        if isinstance(validated_finish, HostRejection):
-                            await self._record_host_rejection(ctx, validated_finish)
-                            continue
-                        return validated_finish
                     return action_or_finish
-                prepared_or_rejection = self.scenario.prepare_call(
+                scenario_prepared = self.scenario.prepare_call(
                     action_or_finish,
                     state=ctx.state,
-                    catalog=dict(ctx.catalog),
                 )
-                if isinstance(prepared_or_rejection, HostRejection):
-                    await self._record_host_rejection(ctx, prepared_or_rejection)
-                    continue
-                prepared = prepared_or_rejection
-                rejection = self._generic_host_validation(ctx, prepared)
-                if rejection is not None:
-                    await self._record_host_rejection(ctx, rejection)
-                    continue
+                prepared = scenario_prepared.model_copy(
+                    update={
+                        "tool_name": action_or_finish.tool_name,
+                        "objective": action_or_finish.objective,
+                        "hypothesis_ids": list(action_or_finish.hypothesis_ids),
+                        "model_arguments": deepcopy(action_or_finish.arguments),
+                        "effective_arguments": deepcopy(action_or_finish.arguments),
+                    },
+                    deep=True,
+                )
             else:
                 retry_finish = await self._wait_for_pending_retry(ctx)
                 if retry_finish is not None:
                     return retry_finish
                 assert ctx.pending_retry is not None
                 prepared = ctx.pending_retry.model_copy(deep=True)
-                rejection = self._generic_host_validation(ctx, prepared)
-                if rejection is not None:
-                    ctx.pending_retry = None
-                    ctx.retry_not_before = None
-                    await self._record_host_rejection(ctx, rejection)
-                    continue
 
             finish, retry = await self._execute_call(ctx, prepared)
             if finish is not None:
@@ -450,7 +406,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if self._deadline_reached(ctx):
                 return Finish(
                     reason=RuntimeStopReason.DEADLINE_EXCEEDED,
-                    summary="The MCP child-run deadline was reached while connecting.",
+                    summary="The MCP investigation deadline was reached while connecting.",
                     requires_human=True,
                 )
             await self._debit(ctx, session_attempts=1)
@@ -463,7 +419,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             except Exception as exc:
                 if self._deadline_reached(ctx):
                     return self._deadline_finish(
-                        "The MCP child-run deadline was reached while connecting."
+                        "The MCP investigation deadline was reached while connecting."
                     )
                 finish = await self._record_session_failure(ctx, None, exc)
                 if finish is not None:
@@ -482,31 +438,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 )
                 specs = self.scenario.build_tool_specs(discovered)
                 catalog = self._catalog(specs)
-                if ctx.catalog:
-                    self._require_frozen_catalog(ctx.catalog, catalog)
                 bootstrapped_state = await self._await_bounded(
                     self.scenario.bootstrap(bootstrap_session, ctx.state),
                     ctx,
                     cap_seconds=self.session_timeout_seconds,
-                )
-            except _ToolCatalogDriftError as exc:
-                await self._safe_close(candidate)
-                await self._stop_pending_for_catalog_drift(ctx, exc)
-                await self._emit(
-                    ctx,
-                    AgentEventKind.MCP_SESSION_FAILED,
-                    {
-                        "error_code": exc.code,
-                        "message": str(exc),
-                        "reconnect": False,
-                        "details": exc.details,
-                    },
-                )
-                await self._checkpoint(ctx)
-                return Finish(
-                    reason=RuntimeStopReason.FAILED,
-                    summary=str(exc),
-                    requires_human=True,
                 )
             except (BudgetExceededError, HarnessInfrastructureError):
                 await self._safe_close(candidate)
@@ -515,7 +450,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 if self._deadline_reached(ctx):
                     await self._safe_close(candidate)
                     return self._deadline_finish(
-                        "The MCP child-run deadline was reached during session setup."
+                        "The MCP investigation deadline was reached during session setup."
                     )
                 finish = await self._record_session_failure(ctx, candidate, exc)
                 if finish is not None:
@@ -527,7 +462,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
 
             ctx.state = bootstrapped_state
             ctx.session = candidate
-            ctx.catalog = catalog
+            # Keep every previously discovered ToolSpec for audit/recovery while
+            # refreshing descriptions for tools still advertised by the server.
+            # Missing/unknown names are never a Host-side execution gate.
+            ctx.catalog.update(catalog)
             await self._emit(
                 ctx,
                 AgentEventKind.MCP_SESSION_STARTED,
@@ -543,52 +481,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             )
             await self._checkpoint(ctx)
             return None
-
-    async def _stop_pending_for_catalog_drift(
-        self,
-        ctx: _RunContext[StateT, ObservationT],
-        exc: _ToolCatalogDriftError,
-    ) -> None:
-        pending = self._pending_invocation(ctx)
-        ctx.pending_retry = None
-        ctx.retry_not_before = None
-        ctx.active_call = None
-        if pending is None:
-            return
-        error = InvocationError(
-            code=exc.code,
-            message=str(exc),
-            retryable=False,
-            details={"unknown_outcome": False, **exc.details},
-        )
-        skipped = self._transition_invocation(
-            pending,
-            status=ToolInvocationStatus.SKIPPED,
-            completed_at=max(datetime.now(UTC), pending.created_at),
-            error=error,
-        )
-        ctx.invocations[self._invocation_index(ctx, pending.invocation_id)] = skipped
-        ctx.observations.append(
-            HarnessObservation(
-                invocation_id=skipped.invocation_id,
-                fingerprint=skipped.fingerprint,
-                status=skipped.status,
-                error=error,
-            )
-        )
-        self._append_observation_message(
-            ctx,
-            ScenarioTransition(state=ctx.state),
-            skipped,
-        )
-        await self._checkpoint(ctx)
-        await self._persist_invocation(ctx, skipped)
-        await self._emit_invocation(
-            ctx,
-            skipped,
-            AgentEventKind.TOOL_INVOCATION_SKIPPED,
-        )
-        await self._checkpoint(ctx)
 
     async def _bootstrap_tool_call(
         self,
@@ -636,35 +528,105 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         ctx: _RunContext[StateT, ObservationT],
     ) -> CallToolAction | Finish:
         last_error = "planner returned no action"
-        for request_index in range(2):
-            await self._debit(ctx, planner_requests=1)
-            try:
-                raw = await self._await_bounded(
-                    self.planner.plan(
-                        messages=deepcopy(ctx.messages),
-                        tools=[
-                            ctx.catalog[name].model_copy(deep=True) for name in sorted(ctx.catalog)
+        while True:
+            action = None
+            reasoning: str | None = None
+            streamed_reasoning = False
+            decision_key = self._decision_key(ctx)
+            recovered = await self._load_durable_decision(ctx, decision_key)
+            if recovered is None:
+                await self._debit(ctx, planner_requests=1)
+                try:
+                    reasoning_stream_id = (
+                        f"{self.scenario.provider}-agent:decision:{decision_key}"
+                    )
+
+                    async def emit_reasoning_delta(
+                        content: str,
+                        delta_index: int,
+                        *,
+                        _stream_id: str = reasoning_stream_id,
+                        _decision_key: str = decision_key,
+                    ) -> None:
+                        nonlocal streamed_reasoning
+                        emitted = await self._emit_provider_reasoning_delta(
+                            ctx,
+                            content=content,
+                            stream_id=_stream_id,
+                            delta_index=delta_index,
+                            trace_key=(
+                                f"decision:{_decision_key}:reasoning:delta:{delta_index}"
+                            ),
+                        )
+                        streamed_reasoning = streamed_reasoning or emitted is not None
+
+                    planner_kwargs = {
+                        "messages": deepcopy(ctx.messages),
+                        "tools": [
+                            ctx.catalog[name].model_copy(deep=True)
+                            for name in sorted(ctx.catalog)
                         ],
-                    ),
-                    ctx,
-                    cap_seconds=self.planner_timeout_seconds,
-                )
-                action = parse_agent_action(raw)
-            except Exception as exc:
-                last_error = str(exc) or type(exc).__name__
-                if self._deadline_reached(ctx):
-                    return self._deadline_finish(
-                        "The MCP child-run deadline was reached while planning."
+                    }
+                    if self._accepts_keyword_argument(
+                        self.planner.plan,
+                        "reasoning_callback",
+                    ):
+                        planner_kwargs["reasoning_callback"] = emit_reasoning_delta
+                    raw = await self._await_bounded(
+                        self.planner.plan(**planner_kwargs),
+                        ctx,
+                        cap_seconds=self.planner_timeout_seconds,
+                    )
+                    raw_reasoning = getattr(self.planner, "last_reasoning_content", None)
+                    reasoning = (
+                        raw_reasoning
+                        if not streamed_reasoning
+                        and isinstance(raw_reasoning, str)
+                        and raw_reasoning.strip()
+                        else None
+                    )
+                    action = parse_agent_action(raw)
+                except Exception as exc:
+                    last_error = str(exc) or type(exc).__name__
+                    if self._deadline_reached(ctx):
+                        return self._deadline_finish(
+                            "The MCP investigation deadline was reached while planning."
+                        )
+                else:
+                    await self._debit(ctx, accepted_decisions=1)
+                    await self._emit_idempotent(
+                        ctx,
+                        AgentEventKind.MODEL_DECISION,
+                        {
+                            "action": action.action,
+                            "tool_name": getattr(action, "tool_name", None),
+                            "decision": action.model_dump(mode="json"),
+                            "reasoning": reasoning,
+                            "decision_key": decision_key,
+                        },
+                        idempotency_key=f"decision:{decision_key}",
                     )
             else:
-                await self._debit(ctx, accepted_decisions=1)
-                await self._emit(
+                action, reasoning = recovered
+
+            if action is not None:
+                if reasoning is not None:
+                    await self._emit_provider_reasoning(
+                        ctx,
+                        content=reasoning,
+                        trace_key=f"decision:{decision_key}:reasoning",
+                    )
+                await self._emit_trace(
                     ctx,
-                    AgentEventKind.MODEL_DECISION,
-                    {
-                        "action": action.action,
-                        "tool_name": getattr(action, "tool_name", None),
-                    },
+                    AgentEventKind.TRACE_ACTION,
+                    actor=f"{self.scenario.provider}_agent",
+                    content=json.dumps(
+                        action.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    trace_key=f"decision:{decision_key}:action",
                 )
                 ctx.messages.append(
                     {
@@ -676,7 +638,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         ),
                     }
                 )
-                await self._checkpoint(ctx)
                 if isinstance(action, CallToolAction):
                     return action
                 if isinstance(action, FinishAction):
@@ -699,34 +660,27 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     model_requested=True,
                 )
 
-            if request_index == 0:
-                repair_message = {
-                    "role": "user",
-                    "content": (
-                        "Return exactly one valid Agent action: call_tool, finish, or "
-                        f"request_human_input. Previous response was invalid: {last_error}"
-                    ),
-                }
-                ctx.messages.append(repair_message)
-                await self._emit(
-                    ctx,
-                    AgentEventKind.PLANNER_REPAIR_REQUESTED,
-                    {"error": last_error},
-                )
-                await self._checkpoint(ctx)
-
-        return Finish(
-            reason=RuntimeStopReason.HUMAN_INPUT_REQUIRED,
-            summary=f"Planner failed to produce a valid action after one repair: {last_error}",
-            requires_human=True,
-        )
+            repair_message = {
+                "role": "user",
+                "content": (
+                    "Return exactly one valid Agent action: call_tool, finish, or "
+                    f"request_human_input. Previous response was invalid: {last_error}"
+                ),
+            }
+            ctx.messages.append(repair_message)
+            await self._emit(
+                ctx,
+                AgentEventKind.PLANNER_REPAIR_REQUESTED,
+                {"error": last_error},
+            )
+            await self._checkpoint(ctx)
 
     async def _execute_call(
         self,
         ctx: _RunContext[StateT, ObservationT],
         prepared: PreparedCall,
     ) -> tuple[Finish | None, RetryDirective | None]:
-        spec = ctx.catalog[prepared.tool_name]
+        spec = self._tool_spec(ctx, prepared)
         fingerprint = ToolInvocation.build_fingerprint(
             tool_name=prepared.tool_name,
             effective_arguments=prepared.effective_arguments,
@@ -749,31 +703,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 )
             invocation_index = self._invocation_index(ctx, invocation.invocation_id)
         else:
-            if fingerprint in ctx.fingerprints:
-                await self._record_host_rejection(
-                    ctx,
-                    HostRejection(
-                        code="duplicate_call",
-                        message=(
-                            "Host rejected an identical tool call already attempted in this run."
-                        ),
-                        repair_hint="Choose a different discriminating probe or finish.",
-                    ),
-                )
-                return None, None
-
-            budget_snapshot = ctx.budget.snapshot()
-            remote_remaining = budget_snapshot.remaining.remote_tool_calls
-            if remote_remaining is not None and remote_remaining < 1:
-                remote_limit = budget_snapshot.limits.remote_tool_calls
-                assert remote_limit is not None
-                raise BudgetExceededError(
-                    dimension="remote_tool_calls",
-                    limit=remote_limit,
-                    consumed=budget_snapshot.consumed.remote_tool_calls,
-                    reserved=budget_snapshot.reserved.remote_tool_calls,
-                    requested=1,
-                )
             attempt = ctx.attempts.get(fingerprint, 0) + 1
             now = datetime.now(UTC)
             call_deadline = now + timedelta(seconds=timeout_seconds)
@@ -831,6 +760,32 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             )
         except Exception as exc:
             return await self._complete_failure(ctx, prepared, started, fingerprint, exc)
+
+        await self._persist_remote_response(
+            ctx,
+            invocation=started,
+            prepared=prepared,
+            response=raw_result,
+        )
+
+        return await self._complete_response(
+            ctx,
+            prepared=prepared,
+            started=started,
+            fingerprint=fingerprint,
+            raw_result=raw_result,
+        )
+
+    async def _complete_response(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        *,
+        prepared: PreparedCall,
+        started: ToolInvocation,
+        fingerprint: str,
+        raw_result: Any,
+    ) -> tuple[Finish | None, RetryDirective | None]:
+        """Apply one durable response without crossing the transport again."""
 
         try:
             transition = self.scenario.on_result(ctx.state, prepared, raw_result)
@@ -893,6 +848,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             completed_at=datetime.now(UTC),
             artifact_ref=transition.artifact_ref,
         )
+        invocation_index = self._invocation_index(ctx, started.invocation_id)
         ctx.invocations[invocation_index] = completed
         ctx.state = transition.state
         ctx.observations.append(
@@ -909,6 +865,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         # it can backfill the artifact, invocation row, and terminal event
         # without calling the remote MCP tool again.
         await self._checkpoint(ctx)
+        await self._emit_observation_trace(ctx, completed, transition.observation)
         await self._persist_artifact(ctx, completed)
         await self._persist_invocation(ctx, completed)
         kind = (
@@ -931,12 +888,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         directive: RetryDirective | None = None,
     ) -> tuple[Finish | None, RetryDirective | None]:
         directive = directive or self.scenario.retry_directive(ctx.state, prepared, exc)
-        if directive.allow_unknown_outcome_retry:
-            spec = ctx.catalog[prepared.tool_name]
-            if not spec.read_only:
-                raise HarnessInfrastructureError(
-                    "unknown-outcome retry authorization is valid only for read-only tools"
-                )
         error = self._invocation_error(exc, directive)
         status = (
             ToolInvocationStatus.UNKNOWN_OUTCOME
@@ -976,6 +927,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             directive=directive,
         )
         await self._checkpoint(ctx)
+        await self._emit_observation_trace(ctx, completed, transition.observation)
         await self._persist_invocation(ctx, completed)
         await self._emit_invocation(
             ctx,
@@ -990,7 +942,9 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
 
         if self._deadline_reached(ctx):
             return (
-                self._deadline_finish("The MCP child-run deadline was reached during a tool call."),
+                self._deadline_finish(
+                    "The MCP investigation deadline was reached during a tool call."
+                ),
                 None,
             )
 
@@ -1022,17 +976,28 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         for index, invocation in enumerate(ctx.invocations):
             if invocation.status != ToolInvocationStatus.STARTED:
                 continue
+            prepared = self._active_or_reconstructed_call(ctx, invocation)
+            recovered_response = await self._load_remote_response(
+                ctx,
+                invocation=invocation,
+                prepared=prepared,
+            )
+            if recovered_response is not None:
+                finish, _retry = await self._complete_response(
+                    ctx,
+                    prepared=prepared,
+                    started=invocation,
+                    fingerprint=invocation.fingerprint,
+                    raw_result=recovered_response,
+                )
+                if finish is not None:
+                    ctx.finish = finish
+                observed_invocations.add(invocation.invocation_id)
+                continue
             recovered = _RecoveredUnknownOutcome(
                 "The process stopped while the MCP invocation was in flight."
             )
-            prepared = self._active_or_reconstructed_call(ctx, invocation)
             directive = self.scenario.retry_directive(ctx.state, prepared, recovered)
-            if directive.allow_unknown_outcome_retry:
-                spec = ctx.catalog[prepared.tool_name]
-                if not spec.read_only:
-                    raise HarnessInfrastructureError(
-                        "unknown-outcome retry authorization is valid only for read-only tools"
-                    )
             error = self._invocation_error(recovered, directive)
             completed = self._transition_invocation(
                 invocation,
@@ -1239,7 +1204,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
 
         provider_debits = self._provider_remote_debit_events(
             events,
-            provider_limit=self._provider_remote_tool_call_limit(ctx),
         )
         for invocation_id, event in provider_debits.items():
             if event.sequence <= after_sequence and event_matches_dispatch_scope(
@@ -1329,39 +1293,17 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
     ) -> bool:
         if not directive.retry_call:
             return False
-        spec = ctx.catalog[prepared.tool_name]
-        retry = spec.retry
-        if invocation.attempt >= retry.max_attempts:
-            self._append_retry_suppressed_message(
-                ctx,
-                code="max_attempts_reached",
-                detail=f"Retry limit is {retry.max_attempts} attempts.",
-            )
-            return False
-        if retry.retryable_error_codes and error.code not in retry.retryable_error_codes:
-            self._append_retry_suppressed_message(
-                ctx,
-                code="error_code_not_retryable",
-                detail=f"Error code {error.code!r} is not in the tool retry policy.",
-            )
-            return False
-        if directive.unknown_outcome and (
-            not directive.allow_unknown_outcome_retry or not spec.read_only
-        ):
+        if directive.unknown_outcome and not directive.allow_unknown_outcome_retry:
             raise HarnessInfrastructureError(
-                "unknown-outcome retry requires explicit authorization for a read-only tool"
+                "unknown-outcome retry requires explicit authorization"
             )
-        delay = min(
-            retry.initial_backoff_seconds
-            * (retry.backoff_multiplier ** max(invocation.attempt - 1, 0)),
-            retry.max_backoff_seconds,
-        )
+        delay = 0
         retry_not_before = datetime.now(UTC) + timedelta(seconds=delay)
         if ctx.deadline is not None and retry_not_before >= ctx.deadline:
             self._append_retry_suppressed_message(
                 ctx,
                 code="retry_exceeds_deadline",
-                detail="Retry backoff would exceed the child-run deadline.",
+                detail="Retry backoff would exceed the MCP investigation deadline.",
             )
             return False
         if ctx.pending_retry is not None:
@@ -1393,7 +1335,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         ):
             return Finish(
                 reason=RuntimeStopReason.DEADLINE_EXCEEDED,
-                summary="The MCP child-run deadline was reached before a policy retry.",
+                summary="The MCP investigation deadline was reached before a policy retry.",
                 requires_human=True,
             )
         await asyncio.sleep(delay)
@@ -1504,71 +1446,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 "persisted invocation identity does not match the checkpoint"
             )
 
-    def _generic_host_validation(
-        self,
-        ctx: _RunContext[StateT, ObservationT],
-        call: PreparedCall,
-    ) -> HostRejection | None:
-        spec = ctx.catalog.get(call.tool_name)
-        if spec is None:
-            return HostRejection(
-                code="tool_not_approved",
-                message=f"Tool {call.tool_name!r} is not in the approved MCP catalog.",
-                repair_hint="Choose one of the advertised read-only tools.",
-            )
-        if spec.provider != self.scenario.provider:
-            return HostRejection(
-                code="provider_mismatch",
-                message="The prepared tool belongs to another MCP provider.",
-            )
-        if not spec.read_only:
-            return HostRejection(
-                code="tool_not_read_only",
-                message="The prepared MCP tool is not approved for read-only investigation.",
-            )
-        schema_errors = sorted(
-            Draft202012Validator(spec.input_schema).iter_errors(call.effective_arguments),
-            key=lambda error: tuple(str(item) for item in error.absolute_path),
-        )
-        if schema_errors:
-            first = schema_errors[0]
-            return HostRejection(
-                code="input_schema_validation_failed",
-                message=f"Effective MCP arguments do not match the tool schema: {first.message}",
-                repair_hint="Use arguments that conform to the advertised JSON Schema.",
-                details={
-                    "path": [str(item) for item in first.absolute_path],
-                    "validator": str(first.validator),
-                },
-            )
-        return None
-
-    async def _record_host_rejection(
-        self,
-        ctx: _RunContext[StateT, ObservationT],
-        rejection: HostRejection,
-    ) -> None:
-        ctx.messages.append(
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "host_rejection": rejection.code,
-                        "message": rejection.message,
-                        "repair_hint": rejection.repair_hint,
-                    },
-                    ensure_ascii=True,
-                    sort_keys=True,
-                ),
-            }
-        )
-        await self._emit(
-            ctx,
-            AgentEventKind.HOST_REJECTED,
-            rejection.model_dump(mode="json"),
-        )
-        await self._checkpoint(ctx)
-
     async def _debit(
         self,
         ctx: _RunContext[StateT, ObservationT],
@@ -1613,11 +1490,11 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         *,
         invocation_id: UUID,
     ) -> None:
-        """Atomically claim one run/provider remote-call slot before transport.
+        """Atomically record one run/provider remote call before transport.
 
-        The scope-local ledger remains the checkpoint authority for this child
-        run. The append-only run event stream is the durable serialization
-        point shared by sibling dispatch scopes and processes.
+        The scope-local ledger remains the checkpoint authority for this MCP
+        investigation. The append-only run event stream serializes audit usage
+        shared by sibling dispatch scopes and processes; it never caps calls.
         """
 
         before = ctx.budget.snapshot()
@@ -1628,10 +1505,9 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 "remote_tool_calls": before.consumed.remote_tool_calls + 1,
             }
         )
-        provider_limit = self._provider_remote_tool_call_limit(ctx)
         settled = False
         try:
-            for _attempt in range(_MAX_PROVIDER_BUDGET_CAS_ATTEMPTS):
+            while True:
                 events = await self.event_sink.read(ctx.run_id)
                 observed_version = max((event.version for event in events), default=0)
                 if observed_version < ctx.event_version:
@@ -1641,24 +1517,14 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 ctx.event_version = observed_version
                 provider_debits = self._provider_remote_debit_events(
                     events,
-                    provider_limit=provider_limit,
                 )
                 if invocation_id in provider_debits:
-                    # A debit that appears while this process is competing for
-                    # the slot belongs to another live/resuming executor. Only
-                    # resume reconciliation may adopt an existing durable debit.
+                    # Another live/resuming executor already recorded this
+                    # invocation. Only resume reconciliation may adopt it.
                     raise HarnessInfrastructureError(
                         "remote tool budget debit was claimed concurrently for this invocation"
                     )
                 provider_consumed = len(provider_debits)
-                if provider_limit is not None and provider_consumed >= provider_limit:
-                    raise BudgetExceededError(
-                        dimension="remote_tool_calls",
-                        limit=provider_limit,
-                        consumed=provider_consumed,
-                        reserved=0,
-                        requested=1,
-                    )
 
                 payload = {
                     "provider": self.scenario.provider,
@@ -1666,13 +1532,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     "consumed": expected_consumed.model_dump(mode="json"),
                     "remaining": reserved.remaining.model_dump(mode="json"),
                     "provider_remote_tool_calls": {
-                        "limit": provider_limit,
                         "consumed": provider_consumed + 1,
-                        "remaining": (
-                            None
-                            if provider_limit is None
-                            else provider_limit - provider_consumed - 1
-                        ),
                     },
                 }
                 if self.dispatch_scope_id is not None:
@@ -1691,8 +1551,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         expected_version=observed_version,
                     )
                 except EventVersionConflictError:
-                    # The conflicting writer may have consumed the last slot.
-                    # Re-read and decide again before any transport call.
+                    # Serialize audit usage with the conflicting writer before
+                    # making the transport call.
                     continue
                 except Exception as exc:
                     raise HarnessInfrastructureError(
@@ -1708,27 +1568,13 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 ctx.event_version = committed.version
                 ctx.remote_debited_invocations.add(invocation_id)
                 return
-            raise HarnessInfrastructureError(
-                "provider remote tool budget remained contended; refusing remote call"
-            )
         finally:
             if not settled:
                 ctx.budget.release(reservation)
 
-    @staticmethod
-    def _provider_remote_tool_call_limit(
-        ctx: _RunContext[StateT, ObservationT],
-    ) -> int | None:
-        # The effective child ledger is configured from this provider's
-        # max_agent_steps. A parent may represent a broader outer-run budget
-        # with a different (or unlimited) remote-call dimension.
-        return ctx.budget.snapshot().limits.remote_tool_calls
-
     def _provider_remote_debit_events(
         self,
         events: list[AgentEvent],
-        *,
-        provider_limit: int | None,
     ) -> dict[UUID, AgentEvent]:
         debits: dict[UUID, AgentEvent] = {}
         for event in events:
@@ -1762,12 +1608,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if provider_budget is not None:
                 if not isinstance(provider_budget, dict):
                     raise HarnessInfrastructureError(
-                        "provider remote tool budget metadata is invalid"
-                    )
-                recorded_limit = provider_budget.get("limit")
-                if recorded_limit != provider_limit:
-                    raise HarnessInfrastructureError(
-                        "provider remote tool budget limit changed within one run"
+                        "provider remote tool usage metadata is invalid"
                     )
             debits[event.invocation_id] = event
         return debits
@@ -1799,12 +1640,14 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         payload: dict[str, Any],
         *,
         invocation_id: UUID | None = None,
+        event_id: UUID | None = None,
     ) -> AgentEvent:
         event_payload = {**payload, "provider": self.scenario.provider}
         if self.dispatch_scope_id is not None:
             event_payload["dispatch_scope_id"] = str(self.dispatch_scope_id)
         committed = await self.event_sink.append(
             AgentEvent(
+                **({"event_id": event_id} if event_id is not None else {}),
                 run_id=ctx.run_id,
                 parent_run_id=ctx.parent_run_id,
                 invocation_id=invocation_id,
@@ -1816,6 +1659,216 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         )
         ctx.event_version = committed.version
         return committed
+
+    def _decision_key(self, ctx: _RunContext[StateT, ObservationT]) -> str:
+        payload = {
+            "dispatch_scope_id": (
+                str(self.dispatch_scope_id) if self.dispatch_scope_id is not None else None
+            ),
+            "messages": ctx.messages,
+            "provider": self.scenario.provider,
+            "tools": [
+                ctx.catalog[name].model_dump(mode="json") for name in sorted(ctx.catalog)
+            ],
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return sha256(canonical.encode("utf-8")).hexdigest()
+
+    async def _load_durable_decision(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        decision_key: str,
+    ) -> tuple[Any, str | None] | None:
+        for event in reversed(await self.event_sink.read(ctx.run_id)):
+            if (
+                event.kind != AgentEventKind.MODEL_DECISION
+                or event.payload.get("provider") != self.scenario.provider
+                or event.payload.get("decision_key") != decision_key
+                or not event_matches_dispatch_scope(event, self.dispatch_scope_id)
+            ):
+                continue
+            raw_decision = event.payload.get("decision")
+            try:
+                action = parse_agent_action(raw_decision)
+            except Exception as exc:
+                raise HarnessInfrastructureError(
+                    "durable MCP decision payload is invalid"
+                ) from exc
+            raw_reasoning = event.payload.get("reasoning")
+            reasoning = (
+                raw_reasoning
+                if isinstance(raw_reasoning, str) and raw_reasoning.strip()
+                else None
+            )
+            return action, reasoning
+        return None
+
+    async def _emit_trace(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        kind: AgentEventKind,
+        *,
+        actor: str,
+        content: str,
+        trace_key: str,
+        invocation_id: UUID | None = None,
+    ) -> AgentEvent:
+        if kind not in {
+            AgentEventKind.TRACE_REASONING,
+            AgentEventKind.TRACE_ACTION,
+            AgentEventKind.TRACE_OBSERVATION,
+        }:
+            raise ValueError("_emit_trace accepts only UI trace event kinds")
+        return await self._emit_idempotent(
+            ctx,
+            kind,
+            {
+                "actor": actor,
+                "content": content,
+                "scope": "mcp_internal",
+                "trace_key": trace_key,
+            },
+            idempotency_key=f"trace:{kind.value}:{trace_key}",
+            invocation_id=invocation_id,
+        )
+
+    async def _emit_provider_reasoning(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        *,
+        content: str,
+        trace_key: str,
+    ) -> AgentEvent | None:
+        from app.agent_runtime.trace import AgentTraceEmitter, AgentTraceScope
+
+        emitter = AgentTraceEmitter(
+            self.event_sink,
+            run_id=ctx.run_id,
+            actor=f"{self.scenario.provider}_agent",
+            provider=self.scenario.provider,
+            scope=AgentTraceScope.MCP_INTERNAL,
+        )
+        event = await emitter.emit_reasoning(content, trace_key=trace_key)
+        ctx.event_version = await self.event_sink.current_version(ctx.run_id)
+        return event
+
+    async def _emit_provider_reasoning_delta(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        *,
+        content: str,
+        stream_id: str,
+        delta_index: int,
+        trace_key: str,
+    ) -> AgentEvent | None:
+        from app.agent_runtime.trace import AgentTraceEmitter, AgentTraceScope
+
+        emitter = AgentTraceEmitter(
+            self.event_sink,
+            run_id=ctx.run_id,
+            actor=f"{self.scenario.provider}_agent",
+            provider=self.scenario.provider,
+            scope=AgentTraceScope.MCP_INTERNAL,
+        )
+        event = await emitter.emit_reasoning_delta(
+            content,
+            stream_id=stream_id,
+            delta_index=delta_index,
+            trace_key=trace_key,
+        )
+        ctx.event_version = await self.event_sink.current_version(ctx.run_id)
+        return event
+
+    async def _emit_observation_trace(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        invocation: ToolInvocation,
+        observation: ObservationT | None,
+    ) -> AgentEvent | None:
+        if observation is None:
+            return None
+        return await self._emit_trace(
+            ctx,
+            AgentEventKind.TRACE_OBSERVATION,
+            actor=invocation.tool_name,
+            content=json.dumps(
+                observation,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            trace_key=f"invocation:{invocation.invocation_id}:{invocation.status.value}",
+            invocation_id=invocation.invocation_id,
+        )
+
+    async def _ensure_observation_trace_events(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+    ) -> None:
+        invocations = {item.invocation_id: item for item in ctx.invocations}
+        for observation in ctx.observations:
+            invocation = invocations.get(observation.invocation_id)
+            if invocation is None or observation.payload is None:
+                continue
+            await self._emit_observation_trace(ctx, invocation, observation.payload)
+
+    async def _emit_idempotent(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        kind: AgentEventKind,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+        invocation_id: UUID | None = None,
+    ) -> AgentEvent:
+        scope = str(self.dispatch_scope_id) if self.dispatch_scope_id is not None else "root"
+        event_id = uuid5(
+            ctx.run_id,
+            f"mcp-runtime-v1:{self.scenario.provider}:{scope}:{idempotency_key}",
+        )
+        expected_payload = {**payload, "provider": self.scenario.provider}
+        if self.dispatch_scope_id is not None:
+            expected_payload["dispatch_scope_id"] = str(self.dispatch_scope_id)
+        events = await self.event_sink.read(ctx.run_id)
+        existing = next((event for event in events if event.event_id == event_id), None)
+        if existing is not None:
+            existing_payload = existing.payload
+            if (
+                kind
+                in {
+                    AgentEventKind.TRACE_REASONING,
+                    AgentEventKind.TRACE_ACTION,
+                    AgentEventKind.TRACE_OBSERVATION,
+                }
+                and "scope" not in existing_payload
+            ):
+                existing_payload = {**existing_payload, "scope": "mcp_internal"}
+            if (
+                existing.kind != kind
+                or existing.invocation_id != invocation_id
+                or existing_payload != expected_payload
+            ):
+                raise HarnessInfrastructureError(
+                    f"idempotent MCP event {event_id} conflicts with durable history"
+                )
+            ctx.event_version = max(ctx.event_version, max(item.version for item in events))
+            return existing
+        actual_version = max((event.version for event in events), default=0)
+        if actual_version > ctx.event_version:
+            ctx.event_version = actual_version
+        return await self._emit(
+            ctx,
+            kind,
+            payload,
+            invocation_id=invocation_id,
+            event_id=event_id,
+        )
 
     async def _checkpoint(self, ctx: _RunContext[StateT, ObservationT]) -> None:
         await self._sync_wall_time(ctx)
@@ -1853,6 +1906,72 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             raise HarnessInfrastructureError(
                 f"failed to persist artifact {invocation.artifact_ref.artifact_id}"
             ) from exc
+
+    async def _persist_remote_response(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        *,
+        invocation: ToolInvocation,
+        prepared: PreparedCall,
+        response: Any,
+    ) -> None:
+        if self.remote_response_store is None:
+            return
+        try:
+            await self.remote_response_store.save(
+                run_id=ctx.run_id,
+                invocation_id=invocation.invocation_id,
+                tool_name=prepared.tool_name,
+                arguments=deepcopy(prepared.effective_arguments),
+                response=response,
+            )
+        except Exception as exc:
+            raise HarnessInfrastructureError(
+                "failed to persist the remote MCP response before processing"
+            ) from exc
+
+    async def _load_remote_response(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        *,
+        invocation: ToolInvocation,
+        prepared: PreparedCall,
+    ) -> Any | None:
+        if self.remote_response_store is None:
+            return None
+        loader = getattr(self.remote_response_store, "load", None)
+        if loader is None:
+            return None
+        try:
+            return await loader(
+                run_id=ctx.run_id,
+                invocation_id=invocation.invocation_id,
+                tool_name=prepared.tool_name,
+                arguments=deepcopy(prepared.effective_arguments),
+            )
+        except Exception as exc:
+            raise HarnessInfrastructureError(
+                "failed to load a durable remote MCP response during recovery"
+            ) from exc
+
+    @staticmethod
+    def _accepts_keyword_argument(callable_object: Any, keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(callable_object).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == keyword
+                and parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            )
+            for parameter in parameters
+        )
 
     async def _snapshot(
         self,
@@ -1920,13 +2039,13 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         if seconds <= 0:
             if hasattr(awaitable, "close"):
                 awaitable.close()
-            raise TimeoutError("MCP child-run deadline exceeded")
+            raise TimeoutError("MCP investigation deadline exceeded")
         try:
             async with asyncio.timeout(seconds):
                 return await awaitable
         except TimeoutError as exc:
             reason = (
-                "MCP child-run deadline exceeded"
+                "MCP investigation deadline exceeded"
                 if self._deadline_reached(ctx)
                 else f"MCP operation timed out after {seconds:.3f} seconds"
             )
@@ -2040,41 +2159,26 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 raise ValueError(
                     f"MCP ToolSpec {spec.name!r} does not belong to {self.scenario.provider!r}"
                 )
-            try:
-                Draft202012Validator.check_schema(spec.input_schema)
-            except SchemaError as exc:
-                raise ValueError(f"Invalid JSON Schema for MCP tool {spec.name!r}") from exc
             catalog[spec.name] = spec
         return catalog
 
-    @staticmethod
-    def _require_frozen_catalog(
-        expected: dict[str, ToolSpec],
-        actual: dict[str, ToolSpec],
-    ) -> None:
-        expected_names = set(expected)
-        actual_names = set(actual)
-        changed: dict[str, list[str]] = {}
-        for name in sorted(expected_names & actual_names):
-            # Compare typed values so set-backed policy fields remain order-insensitive
-            # after checkpoint serialization and process restart.
-            expected_payload = expected[name].model_dump(mode="python")
-            actual_payload = actual[name].model_dump(mode="python")
-            fields = sorted(
-                field
-                for field in expected_payload.keys() | actual_payload.keys()
-                if expected_payload.get(field) != actual_payload.get(field)
-            )
-            if fields:
-                changed[name] = fields
-        added = sorted(actual_names - expected_names)
-        removed = sorted(expected_names - actual_names)
-        if added or removed or changed:
-            raise _ToolCatalogDriftError(
-                added=added,
-                removed=removed,
-                changed=changed,
-            )
+    def _tool_spec(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        call: PreparedCall,
+    ) -> ToolSpec:
+        discovered = ctx.catalog.get(call.tool_name)
+        if discovered is not None:
+            return discovered
+        return ToolSpec(
+            name=call.tool_name,
+            provider=self.scenario.provider,
+            capability=call.tool_name,
+            input_schema={"type": "object", "additionalProperties": True},
+            policy_version="mcp-server-key-v1",
+            schema_version="dynamic-mcp-schema-v1",
+            timeout=call.timeout_seconds or self.session_timeout_seconds,
+        )
 
     @staticmethod
     def _transition_invocation(invocation: ToolInvocation, **updates: Any) -> ToolInvocation:
@@ -2137,6 +2241,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
     def _budget_finish(exc: BudgetExceededError) -> Finish:
         return Finish(
             reason=RuntimeStopReason.BUDGET_EXHAUSTED,
-            summary=f"MCP child-run budget exhausted: {exc.dimension}",
+            summary=f"MCP investigation budget exhausted: {exc.dimension}",
             requires_human=True,
         )

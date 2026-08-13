@@ -20,8 +20,8 @@ sequenceDiagram
         API->>Q: 首次告警才异步入队
     end
     Q->>W: 消费分析任务
-    W->>FD: 只读补充告警、故障、指标和日志上下文
-    W->>DB: 保存手册匹配、证据和建议
+    W->>FD: POST /alert/info 获取权威告警详情
+    W->>DB: 保存知识匹配、ReAct轨迹、证据和建议
     W->>WC: 发送最终分析结果
 ```
 
@@ -121,9 +121,25 @@ source = "flashduty"
 external_id = FlashDuty alert_id
 ```
 
-FlashDuty 将 `/alert/list` 的 `AlertItem` 定义为完整告警对象。轮询器直接把已捕获的列表项交给统一入站服务保存；进入分析阶段后，`alert_context` 再按需调用 `/alert/info` 补充上下文。首次见到某个 `alert_id` 时创建本地告警并入队分析；后续重叠窗口、下一轮扫描或 API 重试再次返回同一 `alert_id` 时，数据库返回已有记录，**不会创建第二条告警或重复入队**。
+轮询器把 `/alert/list` 返回的 `AlertItem` 交给统一入站服务保存。进入分析阶段后，第一步固定调用
+`/alert/info` 获取权威详情；详情中的数据库、`alarm_host`、`alarm_port` 和 `occurred_at` 会参与知识
+匹配、MCP 选择和查询，host、port 不从标题推断。首次见到某个 `alert_id` 时创建本地告警并入队分析；
+后续重叠窗口、下一轮扫描或 API 重试再次返回同一 `alert_id` 时，数据库返回已有记录，**不会创建第二条
+告警或重复入队**。
 
 当前策略以“避免重复分析”为优先：同一 `alert_id` 后续字段更新不会自动启动新的完整分析。如果需要在 `Warning → Critical` 或关键标签变化时重跑，应额外设计生命周期事件表与明确的重分析规则。
+
+### 扩展协作空间
+
+在 `FLASHDUTY_POLL_CHANNEL_IDS` 中追加协作空间数字 ID 后重启服务即可，例如：
+
+```dotenv
+FLASHDUTY_POLL_CHANNEL_IDS=[123456789,234567890,345678901]
+```
+
+每轮请求都会携带完整列表。`FLASHDUTY_POLL_INTEGRATION_IDS` 只是在这些空间内进一步过滤集成来源，
+不能替代协作空间配置。扩展前确认 APP Key 能读取新增空间，并根据告警量评估数据库、调度器和模型
+并发容量；扩展后可调用管理员手动轮询接口并检查去重计数。
 
 ### 水位和故障恢复
 

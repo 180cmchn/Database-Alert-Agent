@@ -1,4 +1,4 @@
-"""Durable codec and checkpoint hook for MCP Agent child runs."""
+"""Durable codec and checkpoint hook for MCP investigations."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class MCPCheckpointDecodeError(RuntimeError):
 
 
 class RepositoryMCPCheckpointStore[StateT, ObservationT]:
-    """Persist and restore one provider's complete child-run snapshot."""
+    """Persist and restore one provider's complete investigation snapshot."""
 
     def __init__(
         self,

@@ -11,9 +11,9 @@ from app.domain.models import (
     AlertStatus,
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
+    InvestigationDecision,
     InvestigationRun,
     InvestigationStage,
-    InvestigationStrategy,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -23,8 +23,6 @@ from app.domain.models import (
     ToolExecutionRequest,
     ValidationRecord,
 )
-from app.investigations.models import InvestigationMemory
-from app.investigations.stop import StopDecision
 
 
 def merge_evidence(left: list[EvidenceRecord], right: list[EvidenceRecord]) -> list[EvidenceRecord]:
@@ -64,18 +62,15 @@ class AgentState(BaseModel):
     external_knowledge: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
     knowledge_match_summary: str = ""
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)
-    strategy: InvestigationStrategy | None = None
-    investigation_memory: InvestigationMemory = Field(default_factory=InvestigationMemory)
-    stop_decision: StopDecision | None = None
 
     # Tool execution for dynamic investigation
     pending_tool_requests: list[ToolExecutionRequest] = Field(default_factory=list)
+    react_decision: InvestigationDecision | None = None
 
     # Results
     recommendation: Recommendation | None = None
     advisor_metadata: AdvisorMetadata | None = None
     rule_validation: ValidationRecord | None = None
-    agent_validation: ValidationRecord | None = None
 
     # Progress tracking
     progress: Annotated[list[ProgressRecord], merge_progress] = Field(default_factory=list)
@@ -91,16 +86,15 @@ class AgentState(BaseModel):
     primary_advisor_error: str | None = None
 
     # Control flow
-    should_continue_investigation: bool = False
-    dynamic_turns_remaining: int = 0
-    max_dynamic_turns: int = 0
+    react_round: int = 0
+    react_max_rounds: int = 8
+    react_finished: bool = False
 
     # Validation flags
     validation_passed: bool = False
     evidence_sufficient: bool = False
 
     # Configuration
-    validation_enabled: bool = True
     ai_fallback_enabled: bool = True
     knowledge_sources: list[str] = Field(default_factory=lambda: ["local_pdf"])
 
@@ -111,8 +105,7 @@ def create_initial_state(
     stored_alert: StoredAlert,
     run: InvestigationRun,
     *,
-    max_dynamic_turns: int = 0,
-    validation_enabled: bool = True,
+    react_max_rounds: int = 8,
     ai_fallback_enabled: bool = True,
     knowledge_sources: list[str] | None = None,
 ) -> AgentState:
@@ -123,8 +116,7 @@ def create_initial_state(
         alert: The normalized alert
         stored_alert: The stored alert from repository
         run: The investigation run
-        max_dynamic_turns: Maximum dynamic tool selection turns
-        validation_enabled: Whether to enable validation
+        react_max_rounds: Maximum main-Agent ReAct rounds
         ai_fallback_enabled: Whether AI fallback is enabled
         knowledge_sources: Which knowledge sources to use for matching
 
@@ -139,9 +131,7 @@ def create_initial_state(
         current_stage=InvestigationStage.RECEIVED,
         status=AlertStatus.QUEUED,
         run_status=RunStatus.RUNNING,
-        max_dynamic_turns=max_dynamic_turns,
-        dynamic_turns_remaining=max_dynamic_turns,
-        validation_enabled=validation_enabled,
+        react_max_rounds=react_max_rounds,
         ai_fallback_enabled=ai_fallback_enabled,
         knowledge_sources=(
             knowledge_sources if knowledge_sources is not None else ["local_pdf"]

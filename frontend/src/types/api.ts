@@ -6,7 +6,8 @@ export type AlertStatus =
   | "ANALYZING"
   | "COMPLETED"
   | "INCONCLUSIVE"
-  | "FAILED";
+  | "FAILED"
+  | "CANCELLED";
 
 export type InvestigationStage =
   | "RECEIVED"
@@ -19,7 +20,8 @@ export type InvestigationStage =
   | "REPORTING"
   | "COMPLETED"
   | "INCONCLUSIVE"
-  | "FAILED";
+  | "FAILED"
+  | "CANCELLED";
 
 export interface AlertListItem {
   id: string;
@@ -214,8 +216,8 @@ export interface AnalysisConfigSnapshot {
   runbook_match_min_score: number;
   runbook_match_min_confidence: number;
   external_knowledge_min_relevance: number;
-  react_enabled: boolean;
-  react_max_dynamic_turns: number;
+  react_max_rounds: number;
+  analysis_timeout_seconds: number;
   validation_enabled: boolean;
   ai_fallback_enabled: boolean;
   ai_model: string;
@@ -226,10 +228,12 @@ export interface InvestigationRun {
   id: string;
   alert_id: string;
   attempt: number;
-  status: "RUNNING" | "COMPLETED" | "INCONCLUSIVE" | "FAILED";
+  status: "RUNNING" | "COMPLETED" | "INCONCLUSIVE" | "FAILED" | "CANCELLED";
   current_stage: InvestigationStage;
-  strategy_id?: string | null;
   error?: string | null;
+  cancel_requested_at?: string | null;
+  cancel_requested_by?: string | null;
+  cancelled_at?: string | null;
   config_snapshot?: AnalysisConfigSnapshot | null;
   created_at: string;
   updated_at: string;
@@ -269,6 +273,39 @@ export interface ReanalyzeResponse {
   attempt: number;
   config_snapshot: AnalysisConfigSnapshot;
   message: string;
+}
+
+export interface CancelRunResponse {
+  alert_id: string;
+  run_id: string;
+  status: InvestigationRun["status"];
+  cancel_requested_at: string;
+  message: string;
+}
+
+export type AgentTraceKind = "REASONING" | "ACTION" | "OBSERVATION";
+export type AgentTraceScope = "main_agent" | "mcp_internal";
+
+export interface AgentTraceEntry {
+  event_id: string;
+  run_id: string;
+  sequence: number;
+  kind: AgentTraceKind;
+  scope: AgentTraceScope;
+  actor: string;
+  provider: string;
+  content: string;
+  stream_id: string | null;
+  delta_index: number | null;
+  occurred_at: string;
+}
+
+export interface AgentTraceResponse {
+  run_id: string;
+  after_sequence: number;
+  next_sequence: number;
+  has_more: boolean;
+  items: AgentTraceEntry[];
 }
 
 export interface AlertAccepted {
@@ -338,14 +375,12 @@ export interface AdminSettings {
   ai_base_url: string;
   ai_model: string;
   ai_timeout_seconds: number;
-  ai_max_retries: number;
   ai_json_mode: boolean;
   ai_fallback_enabled: boolean;
   runbook_limit: number;
   scheduler_workers: number;
-  react_enabled: boolean;
-  react_max_dynamic_turns: number;
-  validation_enabled: boolean;
+  react_max_rounds: number;
+  analysis_timeout_seconds: number;
   ai_api_key_configured: boolean;
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
@@ -358,7 +393,6 @@ export interface AdminSettings {
   flashduty_poll_lookback_seconds: number;
   flashduty_poll_channel_ids: number[];
   flashduty_poll_integration_ids: number[];
-  archery_mcp_max_agent_steps: number;
   external_knowledge_enabled: boolean;
   external_knowledge_base_url: string;
   external_knowledge_api_key_configured: boolean;
@@ -377,7 +411,6 @@ export interface AdminSettingsPatch {
   ai_base_url?: string;
   ai_model?: string;
   ai_timeout_seconds?: number;
-  ai_max_retries?: number;
   ai_json_mode?: boolean;
   ai_fallback_enabled?: boolean;
   runbook_limit?: number;
@@ -385,15 +418,13 @@ export interface AdminSettingsPatch {
   wecom_webhook_url?: string;
   wecom_page_base_url?: string;
   wecom_enabled?: boolean;
-  react_enabled?: boolean;
-  react_max_dynamic_turns?: number;
-  validation_enabled?: boolean;
+  react_max_rounds?: number;
+  analysis_timeout_seconds?: number;
   ai_api_key?: string;
   knowledge_sources?: string[];
   flashduty_polling_enabled?: boolean;
   flashduty_poll_interval_seconds?: number;
   flashduty_poll_lookback_seconds?: number;
-  archery_mcp_max_agent_steps?: number;
   external_knowledge_api_key?: string;
 }
 

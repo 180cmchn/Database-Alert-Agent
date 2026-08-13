@@ -3,13 +3,22 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from pathlib import Path
 from shutil import copy2
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from app.adapters.ai import OpenAICompatibleAdvisor
 from app.adapters.notification import WeComManagementNotifier
+from app.agent_runtime import (
+    AgentEvent,
+    AgentEventKind,
+    AgentTraceEmitter,
+    AgentTraceScope,
+)
+from app.agent_runtime.persistence import RepositoryEventSink
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
@@ -24,6 +33,24 @@ from tests.pdf_fixtures import (
 
 ADMIN_TOKEN = "integration-admin-token"
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def wait_for_run_terminal(
+    client: TestClient,
+    endpoint: str,
+    run_id: str,
+    *,
+    timeout_seconds: float = 3,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = client.get(endpoint, params={"run_id": run_id})
+        assert response.status_code == 200
+        body = response.json()
+        if body["selected_run"]["status"] != "RUNNING":
+            return body
+        time.sleep(0.01)
+    raise AssertionError(f"run {run_id} did not reach a terminal state")
 
 
 def create_admin_client(
@@ -98,11 +125,10 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "expected_revision": initial["revision"],
                 "ai_provider": "openai_compatible",
                 "ai_base_url": "https://models.example.test/v1",
-                "ai_api_key": secret,
-                "ai_model": "example-model-v2",
-                "runbook_limit": 7,
-                "archery_mcp_max_agent_steps": 18,
-                "validation_enabled": False,
+                    "ai_api_key": secret,
+                    "ai_model": "example-model-v2",
+                    "runbook_limit": 7,
+                    "analysis_timeout_seconds": 2400,
             },
         )
         assert response.status_code == 200
@@ -110,11 +136,13 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert body["ai_api_key_configured"] is True
         assert body["ai_model"] == "example-model-v2"
         assert body["runbook_limit"] == 7
-        assert body["archery_mcp_max_agent_steps"] == 18
+        assert body["analysis_timeout_seconds"] == 2400
+        assert "archery_mcp_max_agent_steps" not in body
         assert body["apply_status"] == "applied"
         assert body["worker_refresh_mode"] == "before_each_batch"
         assert secret not in response.text
         assert "ai_api_key" not in body
+        assert "ai_max_retries" not in body
 
         current = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS)
         assert secret not in current.text
@@ -155,8 +183,28 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert isinstance(runtime.service.advisor, OpenAICompatibleAdvisor)
         assert runtime.service.advisor._model == "example-model-v2"
         assert runtime.service.runbook_limit == 7
-        assert runtime.settings.archery_mcp_max_agent_steps == 18
-        assert runtime.service.validation_enabled is False
+        assert runtime.settings.analysis_timeout_seconds == 2400
+        assert "validation_enabled" not in body
+
+        removed_validator_setting = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": body["revision"],
+                "validation_enabled": False,
+            },
+        )
+        assert removed_validator_setting.status_code == 422
+
+        removed_retry_limit = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": body["revision"],
+                "ai_max_retries": 3,
+            },
+        )
+        assert removed_retry_limit.status_code == 422
 
         rejected = client.patch(
             "/api/v1/admin/settings",
@@ -190,7 +238,8 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert settings_path.is_file()
     persisted = json.loads(settings_path.read_text(encoding="utf-8"))
     assert persisted["ai_api_key"] == secret
-    assert persisted["archery_mcp_max_agent_steps"] == 18
+    assert persisted["analysis_timeout_seconds"] == 2400
+    assert "archery_mcp_max_agent_steps" not in persisted
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert secret not in audit
     assert "ai_api_key" in audit
@@ -596,7 +645,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         assert reanalyzed.status_code == 202
         second_run_id = reanalyzed.json()["run_id"]
 
-        latest = client.get(endpoint).json()
+        latest = wait_for_run_terminal(client, endpoint, second_run_id)
         assert latest["latest_run"]["id"] == second_run_id
         assert latest["selected_run"]["id"] == second_run_id
         assert latest["manual_matches"] == []
@@ -614,8 +663,183 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         assert all(item["run_id"] == first_run_id for item in history_body["evidence_records"])
         assert all(item["run_id"] == first_run_id for item in history_body["validations"])
 
-        missing_run = client.get(
+
+def test_agent_trace_api_is_incremental_and_excludes_internal_audit_events(
+    tmp_path: Path,
+) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "trace-api-1",
+                "severity": "WARNING",
+                "title": "Trace API",
+                "reason": "trace_test",
+            },
+        ).json()
+        alert_id = accepted["alert_id"]
+        assert client.portal is not None
+        client.portal.call(runtime.service.analyze_by_id, alert_id)
+        detail = client.get(f"/api/v1/alerts/{alert_id}").json()
+        run_id = detail["latest_run"]["id"]
+        endpoint = f"/api/v1/alerts/{alert_id}/runs/{run_id}/trace"
+        existing = client.get(endpoint)
+        assert existing.status_code == 200
+        baseline_sequence = existing.json()["next_sequence"]
+        sink = RepositoryEventSink(runtime.repository)
+        emitter = AgentTraceEmitter(
+            sink,
+            run_id=UUID(run_id),
+            actor="main-agent",
+            provider="test-provider",
+            scope=AgentTraceScope.MAIN_AGENT,
+        )
+        client.portal.call(emitter.emit_reasoning, "real provider reasoning")
+        client.portal.call(
+            sink.append,
+            AgentEvent(run_id=UUID(run_id), kind=AgentEventKind.CHECKPOINT_SAVED),
+        )
+        client.portal.call(emitter.emit_action, "call_tool metrics.query")
+        internal_emitter = AgentTraceEmitter(
+            sink,
+            run_id=UUID(run_id),
+            actor="archery_mcp_agent",
+            provider="archery",
+            scope=AgentTraceScope.MCP_INTERNAL,
+        )
+        client.portal.call(internal_emitter.emit_reasoning, "internal MCP reasoning")
+
+        first = client.get(
             endpoint,
-            params={"run_id": "00000000-0000-0000-0000-000000000000"},
+            params={"after_sequence": baseline_sequence, "limit": 2},
+        )
+        assert first.status_code == 200
+        body = first.json()
+        assert [item["kind"] for item in body["items"]] == ["REASONING"]
+        assert body["items"][0]["content"] == "real provider reasoning"
+        assert body["items"][0]["actor"] == "main-agent"
+        assert body["items"][0]["scope"] == "main_agent"
+        assert body["next_sequence"] == baseline_sequence + 2
+        assert body["has_more"] is True
+
+        second = client.get(
+            endpoint,
+            params={"after_sequence": body["next_sequence"], "limit": 1},
+        )
+        assert second.status_code == 200
+        second_body = second.json()
+        assert [item["kind"] for item in second_body["items"]] == ["ACTION"]
+        assert second_body["items"][0]["scope"] == "main_agent"
+        assert second_body["next_sequence"] == baseline_sequence + 3
+        assert second_body["has_more"] is True
+
+        internal = client.get(
+            endpoint,
+            params={"after_sequence": second_body["next_sequence"], "limit": 2},
+        )
+        assert internal.status_code == 200
+        internal_body = internal.json()
+        assert [item["kind"] for item in internal_body["items"]] == ["REASONING"]
+        assert internal_body["items"][0]["scope"] == "mcp_internal"
+        assert internal_body["items"][0]["content"] == "internal MCP reasoning"
+        assert internal_body["has_more"] is False
+
+        empty_tail = client.get(
+            endpoint,
+            params={"after_sequence": internal_body["next_sequence"]},
+        )
+        assert empty_tail.status_code == 200
+        assert empty_tail.json()["items"] == []
+        assert empty_tail.json()["next_sequence"] == baseline_sequence + 4
+        assert empty_tail.json()["has_more"] is False
+
+        wrong_alert = client.get(
+            f"/api/v1/alerts/00000000-0000-0000-0000-000000000000/runs/{run_id}/trace"
+        )
+        assert wrong_alert.status_code == 404
+
+        missing_run = client.get(
+            f"/api/v1/alerts/{alert_id}/runs/00000000-0000-0000-0000-000000000000/trace",
         )
         assert missing_run.status_code == 404
+
+
+def test_cancel_run_api_requires_admin_and_enforces_run_state(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "cancel-api-1",
+                "severity": "WARNING",
+                "title": "Cancel API",
+                "reason": "cancel_test",
+            },
+        ).json()
+        alert_id = accepted["alert_id"]
+        assert client.portal is not None
+        run = client.portal.call(
+            runtime.repository.create_run,
+            alert_id,
+            "cancel-api-worker",
+            300,
+        )
+        assert run is not None
+        endpoint = f"/api/v1/alerts/{alert_id}/runs/{run.id}/cancel"
+
+        assert client.post(endpoint).status_code == 401
+        accepted_cancel = client.post(endpoint, headers=ADMIN_HEADERS)
+        assert accepted_cancel.status_code == 202
+        body = accepted_cancel.json()
+        assert body["alert_id"] == alert_id
+        assert body["run_id"] == str(run.id)
+        assert body["status"] == "RUNNING"
+        assert body["cancel_requested_at"]
+
+        repeated = client.post(endpoint, headers=ADMIN_HEADERS)
+        assert repeated.status_code == 202
+        assert repeated.json()["cancel_requested_at"] == body["cancel_requested_at"]
+
+        wrong_alert = client.post(
+            f"/api/v1/alerts/00000000-0000-0000-0000-000000000000/runs/{run.id}/cancel",
+            headers=ADMIN_HEADERS,
+        )
+        assert wrong_alert.status_code == 404
+
+        finished = client.portal.call(
+            runtime.repository.finalize_requested_cancellation,
+            alert_id,
+            str(run.id),
+        )
+        assert finished is not None
+        assert finished.status.value == "CANCELLED"
+        repeated_terminal = client.post(endpoint, headers=ADMIN_HEADERS)
+        assert repeated_terminal.status_code == 202
+        assert repeated_terminal.json()["status"] == "CANCELLED"
+
+
+def test_cancel_run_api_rejects_non_cancelled_terminal_run(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "cancel-api-terminal",
+                "severity": "WARNING",
+                "title": "Cancel terminal API",
+                "reason": "cancel_test",
+            },
+        ).json()
+        alert_id = accepted["alert_id"]
+        assert client.portal is not None
+        client.portal.call(runtime.service.analyze_by_id, alert_id)
+        detail = client.get(f"/api/v1/alerts/{alert_id}").json()
+        run_id = detail["latest_run"]["id"]
+
+        conflict = client.post(
+            f"/api/v1/alerts/{alert_id}/runs/{run_id}/cancel",
+            headers=ADMIN_HEADERS,
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "RUN_CANCELLATION_CONFLICT"

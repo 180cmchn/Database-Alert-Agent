@@ -22,7 +22,6 @@ from app.config import Settings
 from app.domain.models import (
     AlertStatus,
     InvestigationContext,
-    InvestigationStrategy,
     ToolExecutionRequest,
     ToolStatus,
 )
@@ -143,7 +142,6 @@ async def test_live_ai_provider_returns_valid_schema_and_request_id(
         model=live_settings.ai_model,
         max_tokens=live_settings.ai_max_tokens,
         timeout_seconds=live_settings.ai_timeout_seconds,
-        max_retries=live_settings.ai_max_retries,
         json_mode=live_settings.ai_json_mode,
     )
     alert = CanonicalAlertSourceAdapter().normalize(
@@ -177,15 +175,10 @@ async def test_live_flashduty_context_records_read_request_ids(
         live_settings, flashduty_channel_ids
     )
     initial = await client.alert_info(alert_id)
-    alert = FlashDutyAlertSourceAdapter(live_settings.environment_aliases).normalize(
+    alert = FlashDutyAlertSourceAdapter(live_settings.environment_aliases).normalize_detail(
         {"request_id": initial.request_id, "data": initial.data}
     )
-    strategy = InvestigationStrategy(
-        strategy_id="live-flashduty-context",
-        title="Live FlashDuty read-only context test",
-        description="Read alert and incident context without mutations.",
-    )
-    context = InvestigationContext(run_id=uuid4(), alert=alert, strategy=strategy)
+    context = InvestigationContext(run_id=uuid4(), alert=alert)
 
     _, structured_data = await FlashDutyAlertContextTool(
         client, item_limit=min(live_settings.flashduty_context_item_limit, 5)
@@ -226,10 +219,7 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
             "http_scheduler": "manual",
             "kafka_enabled": False,
             "wecom_webhook_url": "",
-            "react_enabled": False,
-            "validation_enabled": True,
             "flashduty_context_item_limit": min(live_settings.flashduty_context_item_limit, 5),
-            "tool_result_analysis_threshold_chars": 100_000,
         }
     )
     client, alert_id, list_request_id = await _latest_alert_in_channels(

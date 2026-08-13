@@ -5,27 +5,20 @@ import pytest
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.investigation import (
-    DefaultInvestigationStrategyProvider,
     InvestigationToolRegistry,
-    MCPToolBinding,
     ToolExecutor,
 )
 from app.domain.models import (
-    ExternalKnowledgeExcerpt,
     InvestigationContext,
-    InvestigationStrategy,
-    RunbookExcerpt,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolStatus,
 )
-from app.domain.tool_calling import MCPServerSelection
 
 
 class SuccessfulTool:
     name = "successful"
     source_system = "test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "evidence collected", {"value": 42}
@@ -34,7 +27,6 @@ class SuccessfulTool:
 class SlowTool:
     name = "slow"
     source_system = "test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         await asyncio.sleep(0.05)
@@ -44,7 +36,6 @@ class SlowTool:
 class FailingTool:
     name = "failing"
     source_system = "test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         raise RuntimeError("backend unavailable")
@@ -53,7 +44,6 @@ class FailingTool:
 class NoDataTool:
     name = "no_data"
     source_system = "test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return ToolExecutionResult(
@@ -72,7 +62,6 @@ class PermissionDeniedError(RuntimeError):
 class PermissionDeniedTool:
     name = "permission_denied"
     source_system = "test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         raise PermissionDeniedError("not allowed")
@@ -81,7 +70,6 @@ class PermissionDeniedTool:
 class LargeControlledTool:
     name = "large_controlled"
     source_system = "archery_mcp"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence", {
@@ -101,7 +89,6 @@ class LargeControlledTool:
 class LargeUnqualifiedTool:
     name = "large_unqualified"
     source_system = "live_test_system"
-    read_only = True
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         return "large evidence without eligibility", {"sample": "x" * 3000}
@@ -112,7 +99,6 @@ class SchemaBoundTool:
     source_system = "test_system"
     capability = "lookup_by_service"
     policy_version = "test-policy-v2"
-    read_only = True
     input_schema = {
         "type": "object",
         "properties": {"service": {"type": "string", "minLength": 1}},
@@ -128,9 +114,8 @@ class SchemaBoundTool:
         return "matched", {"service": request.parameters["service"]}
 
 
-class WriteCapableTool(SchemaBoundTool):
-    name = "write_capable"
-    read_only = False
+class ArbitraryCommandTool(SchemaBoundTool):
+    name = "arbitrary_command"
 
 
 def make_context() -> InvestigationContext:
@@ -142,124 +127,7 @@ def make_context() -> InvestigationContext:
             "reason": "latency",
         }
     )
-    strategy = InvestigationStrategy(
-        strategy_id="tool-test-v1",
-        title="Tool test",
-        description="Exercise tool execution outcomes",
-    )
-    return InvestigationContext(run_id=uuid4(), alert=alert, strategy=strategy)
-
-
-class StaticMCPSelector:
-    def __init__(self, names: tuple[str, ...]) -> None:
-        self.names = names
-        self.calls: list[dict[str, object]] = []
-
-    async def select_mcp_servers(self, **payload):  # type: ignore[no-untyped-def]
-        self.calls.append(payload)
-        return MCPServerSelection(server_names=self.names)
-
-
-@pytest.mark.asyncio
-async def test_strategy_model_can_select_zero_relevant_mcp_servers() -> None:
-    selector = StaticMCPSelector(())
-    provider = DefaultInvestigationStrategyProvider(
-        model=selector,
-        mcp_bindings=[
-            MCPToolBinding(
-                server_name="archery",
-                tool_name="query_archery_slow_logs",
-                role="slow log agent",
-                purpose="query slow query logs",
-                timeout_seconds=60,
-            )
-        ],
-        available_tools=["query_archery_slow_logs"],
-    )
-
-    strategy = await provider.select(make_context().alert)
-
-    assert strategy.tool_plan == []
-    assert selector.calls[0]["candidates"] == [
-        {
-            "name": "archery",
-            "role": "slow log agent",
-            "purpose": "query slow query logs",
-            "read_only": True,
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_strategy_selection_receives_local_and_external_knowledge() -> None:
-    selector = StaticMCPSelector(())
-    provider = DefaultInvestigationStrategyProvider(
-        model=selector,
-        mcp_bindings=[MCPToolBinding("archery", "archery_tool", "role", "logs", 120)],
-        available_tools=["archery_tool"],
-    )
-    runbook = RunbookExcerpt(
-        runbook_id="pdf-1",
-        title="Slow query PDF",
-        content="PDF root cause guidance",
-    )
-    external = ExternalKnowledgeExcerpt(
-        knowledge_id="external-1",
-        title="External slow query note",
-        content="External handling guidance",
-        source_uri="https://knowledge.example.test/items/1",
-        score=0.9,
-        raw_score=0.9,
-    )
-
-    await provider.select(
-        make_context().alert,
-        [runbook],
-        [external],
-        "知识匹配结果：本地 PDF 和外部知识库均命中。",
-    )
-
-    payload = selector.calls[0]
-    assert [item["source"] for item in payload["knowledge_matches"]] == [
-        "local_pdf",
-        "external_knowledge",
-    ]
-    assert payload["knowledge_matches"][0]["match"]["runbook_id"] == "pdf-1"
-    assert payload["knowledge_matches"][1]["match"]["knowledge_id"] == "external-1"
-    assert "均命中" in payload["knowledge_match_summary"]
-
-
-@pytest.mark.asyncio
-async def test_strategy_model_can_select_multiple_optional_mcp_servers() -> None:
-    selector = StaticMCPSelector(("prometheus", "archery"))
-    provider = DefaultInvestigationStrategyProvider(
-        model=selector,
-        mcp_bindings=[
-            MCPToolBinding("archery", "archery_tool", "log role", "logs", 120),
-            MCPToolBinding("prometheus", "prometheus_tool", "metric role", "metrics", 180),
-        ],
-        available_tools=["archery_tool", "prometheus_tool"],
-    )
-
-    strategy = await provider.select(make_context().alert)
-
-    assert [request.tool_name for request in strategy.tool_plan] == [
-        "prometheus_tool",
-        "archery_tool",
-    ]
-    assert all(request.required is False for request in strategy.tool_plan)
-
-
-@pytest.mark.asyncio
-async def test_strategy_rejects_model_selected_server_outside_catalog() -> None:
-    provider = DefaultInvestigationStrategyProvider(
-        model=StaticMCPSelector(("invented",)),
-        mcp_bindings=[MCPToolBinding("archery", "archery_tool", "role", "logs", 120)],
-        available_tools=["archery_tool"],
-    )
-
-    with pytest.raises(ValueError, match="outside the configured catalog"):
-        await provider.select(make_context().alert)
+    return InvestigationContext(run_id=uuid4(), alert=alert)
 
 
 @pytest.mark.asyncio
@@ -425,21 +293,20 @@ def test_registry_exposes_versioned_tool_contracts() -> None:
     assert spec.name == "schema_bound"
     assert spec.provider == "test_system"
     assert spec.capability == "lookup_by_service"
-    assert spec.read_only is True
+    assert not hasattr(spec, "read_only")
     assert spec.policy_version == "test-policy-v2"
-    assert spec.schema_version.startswith("sha256:")
+    assert spec.schema_version == "dynamic-mcp-schema-v1"
     assert spec.input_schema["required"] == ["service"]
 
 
-def test_registry_rejects_missing_read_only_declaration() -> None:
+def test_registry_does_not_invent_a_permission_contract_for_legacy_tool() -> None:
     class UndeclaredTool:
         name = "undeclared"
         source_system = "test_system"
 
     registry = InvestigationToolRegistry([UndeclaredTool()])  # type: ignore[list-item]
 
-    with pytest.raises(TypeError, match="explicitly declare read_only"):
-        registry.available_specs()
+    assert not hasattr(registry.available_specs()[0], "read_only")
 
 
 @pytest.mark.asyncio
@@ -448,10 +315,10 @@ def test_registry_rejects_missing_read_only_declaration() -> None:
     [
         (SchemaBoundTool(), {"service": 42}),
         (SchemaBoundTool(), {"service": "orders", "unsafe": True}),
-        (WriteCapableTool(), {"service": "orders"}),
+        (ArbitraryCommandTool(), {"service": "orders"}),
     ],
 )
-async def test_tool_policy_rejects_invalid_or_non_read_only_calls_before_execution(
+async def test_executor_does_not_reject_or_rewrite_agent_arguments_from_host_policy(
     tool: SchemaBoundTool,
     parameters: dict[str, object],
 ) -> None:
@@ -462,6 +329,6 @@ async def test_tool_policy_rejects_invalid_or_non_read_only_calls_before_executi
         make_context(),
     )
 
-    assert record.status == ToolStatus.SKIPPED
-    assert record.structured_data["reason_code"] == "tool_policy_rejected"
-    assert tool.calls == 0
+    assert record.status == ToolStatus.SUCCESS
+    assert record.structured_data["service"] == parameters["service"]
+    assert tool.calls == 1

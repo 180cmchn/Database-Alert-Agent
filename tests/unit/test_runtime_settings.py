@@ -56,6 +56,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
                 "ai_model": "persisted-model",
                 "runbook_limit": 9,
                 "scheduler_workers": 4,
+                "analysis_timeout_seconds": 2400,
                 "archery_mcp_max_agent_steps": 18,
                 "database_url": "sqlite+aiosqlite:///must-not-be-used.db",
                 "shadow_enabled": True,
@@ -78,8 +79,9 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
     assert settings.ai_model == "persisted-model"
     assert settings.runbook_limit == 9
     assert settings.scheduler_workers == 4
-    assert settings.archery_mcp_max_agent_steps == 18
+    assert settings.analysis_timeout_seconds == 2400
     assert settings.database_url == "sqlite+aiosqlite:///bootstrap.db"
+    assert not hasattr(settings, "archery_mcp_max_agent_steps")
     assert not hasattr(settings, "shadow_enabled")
     assert not hasattr(settings, "production_gate_approved")
 
@@ -128,6 +130,18 @@ def test_ai_max_tokens_has_reasoning_safe_default_and_bounds() -> None:
         Settings(_env_file=None, ai_provider="fake", ai_max_tokens=1023)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, ai_provider="fake", ai_max_tokens=131_073)
+
+
+def test_ai_retry_count_is_not_a_runtime_setting() -> None:
+    settings = Settings(_env_file=None, ai_provider="fake", ai_max_retries=99)
+
+    assert settings.ai_max_retries == 99
+    assert "ai_max_retries" not in RUNTIME_SETTINGS_KEYS
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            ai_max_retries=3,
+        )
 
 
 def test_pdf_runbook_default_uses_generated_typed_directory(
@@ -378,17 +392,12 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     assert any("model with tool calling" in issue for issue in configured.readiness_issues())
     assert "archery_mcp_url" not in RUNTIME_SETTINGS_KEYS
     assert "archery_mcp_token" not in RUNTIME_SETTINGS_KEYS
-    assert "archery_mcp_instance_ref" not in RUNTIME_SETTINGS_KEYS
-    assert "archery_mcp_db_name" not in RUNTIME_SETTINGS_KEYS
-    assert "archery_mcp_max_agent_steps" in RUNTIME_SETTINGS_KEYS
+    assert "archery_mcp_max_agent_steps" not in RUNTIME_SETTINGS_KEYS
     assert "mcp_settings_path" not in RUNTIME_SETTINGS_KEYS
     assert configured.archery_slow_log_window_seconds == 300
-    assert configured.archery_mcp_max_agent_steps == 12
+    assert not hasattr(configured, "archery_mcp_max_agent_steps")
 
     monkeypatch.setenv("ARCHERY_MCP_HTTP_API_KEY", "existing-server-token")
-    # Legacy target variables remain loadable but no longer gate or scope MCP.
-    monkeypatch.setenv("ARCHERY_MCP_INSTANCE_REF", "archery-from-env")
-    monkeypatch.setenv("ARCHERY_MCP_DB_NAME", "archery_db_from_env")
     monkeypatch.setenv("ARCHERY_SLOW_LOG_WINDOW_SECONDS", "600")
     monkeypatch.setenv("ARCHERY_MCP_MAX_AGENT_STEPS", "18")
     alias_configured = Settings(
@@ -398,10 +407,8 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
     )
     assert alias_configured.archery_mcp_enabled is True
     assert alias_configured.archery_mcp_token == "existing-server-token"
-    assert alias_configured.archery_mcp_instance_ref == "archery-from-env"
-    assert alias_configured.archery_mcp_db_name == "archery_db_from_env"
     assert alias_configured.archery_slow_log_window_seconds == 600
-    assert alias_configured.archery_mcp_max_agent_steps == 18
+    assert not hasattr(alias_configured, "archery_mcp_max_agent_steps")
 
     with pytest.raises(ValidationError, match="full MCP endpoint"):
         Settings(
@@ -441,13 +448,18 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         expected_revision="0123456789abcdef",
         runbook_limit=7,
         scheduler_workers=4,
-        archery_mcp_max_agent_steps=18,
+        analysis_timeout_seconds=2400,
     )
     assert payload.updates() == {
         "runbook_limit": 7,
         "scheduler_workers": 4,
-        "archery_mcp_max_agent_steps": 18,
+        "analysis_timeout_seconds": 2400,
     }
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            archery_mcp_max_agent_steps=18,
+        )
     with pytest.raises(ValidationError):
         RuntimeSettingsPatch(
             expected_revision="0123456789abcdef",
@@ -475,7 +487,7 @@ async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_value
     with pytest.raises(RuntimeSettingsConflictError) as conflict:
         await second.patch(
             settings,
-            {"validation_enabled": False},
+            {"runbook_limit": 8},
             expected_revision=initial_revision,
         )
     assert conflict.value.expected_revision == initial_revision
@@ -483,16 +495,16 @@ async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_value
 
     merged, merged_revision, changed = await second.patch(
         settings,
-        {"validation_enabled": False},
+        {"scheduler_workers": 2},
         expected_revision=first_revision,
     )
-    assert changed == ["validation_enabled"]
+    assert changed == ["scheduler_workers"]
     assert merged.runbook_limit == 7
-    assert merged.validation_enabled is False
+    assert merged.scheduler_workers == 2
     assert merged_revision not in {initial_revision, first_revision}
     persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
     assert persisted["runbook_limit"] == 7
-    assert persisted["validation_enabled"] is False
+    assert persisted["scheduler_workers"] == 2
     assert first_settings.runbook_limit == 7
 
 
@@ -576,14 +588,18 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["wecom_webhook_url_configured"] is False
     assert body["wecom_page_base_url"] == ""
     assert body["ai_fallback_enabled"] is True
+    assert "ai_max_retries" not in body
     assert body["scheduler_workers"] == 1
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
-    assert body["archery_mcp_max_agent_steps"] == 12
+    assert body["analysis_timeout_seconds"] == 1800
+    assert "archery_mcp_max_agent_steps" not in body
     assert "shadow_enabled" not in body
     assert "production_gate_approved" not in body
     assert "shadow_enabled" not in RUNTIME_SETTINGS_KEYS
     assert "production_gate_approved" not in RUNTIME_SETTINGS_KEYS
+    assert "validation_enabled" not in RUNTIME_SETTINGS_KEYS
+    assert "validation_enabled" not in body
     assert "prometheus_mcp_use_shared_harness" not in body
     assert "scheduler_workers" in RUNTIME_SETTINGS_KEYS
     assert "wecom_page_base_url" in RUNTIME_SETTINGS_KEYS

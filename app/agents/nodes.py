@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import logging
 from typing import Any
 from uuid import uuid5
@@ -12,11 +14,14 @@ from app.adapters.external_knowledge import (
     format_items_for_advisor,
 )
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.agent_runtime.events import AgentEvent, AgentEventKind
 from app.agent_runtime.outer_dispatch import DurableOuterToolDispatcher
+from app.agent_runtime.persistence import RepositoryEventSink
+from app.agent_runtime.trace import AgentTraceEmitter, AgentTraceScope
 from app.agents.state import AgentState
 from app.application.sanitization import sanitize, sanitize_alert
 from app.application.validation import enforce_post_evidence_root_cause_policy
-from app.domain.alert_preprocessing import preprocess_normalized_alert
+from app.domain.alert_preprocessing import preprocess_alert_data, preprocess_normalized_alert
 from app.domain.errors import RunbookAlertTypeNotFoundError
 from app.domain.models import (
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
@@ -25,6 +30,8 @@ from app.domain.models import (
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     InvestigationContext,
+    InvestigationDecision,
+    InvestigationDecisionResult,
     InvestigationRun,
     InvestigationStage,
     NormalizedAlert,
@@ -32,20 +39,17 @@ from app.domain.models import (
     Recommendation,
     RunbookExcerpt,
     RunStatus,
+    ToolExecutionRequest,
     ToolStatus,
-    ValidationKind,
-    ValidationRecord,
 )
 from app.domain.ports import (
     AIAdvisor,
     AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
-    InvestigationStrategyProvider,
     RunbookProvider,
     ToolResultAnalyzer,
 )
-from app.investigations.models import InvestigationMemory
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +69,9 @@ class NodeContext:
         advisor: AIAdvisor,
         fallback_advisor: AIAdvisor | None,
         rule_validator: ConclusionValidator,
-        conclusion_validator: ConclusionValidator,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
         tool_result_analyzer: ToolResultAnalyzer | None = None,
-        tool_result_analysis_threshold_chars: int = 12_000,
-        strategy_provider: InvestigationStrategyProvider,
         alert_detail_enricher: AlertDetailEnricher | None = None,
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
@@ -83,12 +84,9 @@ class NodeContext:
         self.advisor = advisor
         self.fallback_advisor = fallback_advisor
         self.rule_validator = rule_validator
-        self.conclusion_validator = conclusion_validator
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
         self.tool_result_analyzer = tool_result_analyzer
-        self.tool_result_analysis_threshold_chars = tool_result_analysis_threshold_chars
-        self.strategy_provider = strategy_provider
         self.alert_detail_enricher = alert_detail_enricher
         self.runbook_limit = runbook_limit
         self.external_knowledge_client = external_knowledge_client
@@ -132,7 +130,6 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
         detail_data = existing_evidence.structured_data
         if (
             existing_evidence.status != ToolStatus.SUCCESS
-            or detail_data.get("read_only") is not True
             or detail_data.get("partial") is not False
             or detail_data.get("authoritative_source") != "/alert/info"
             or not isinstance(detail_data.get("alert_detail"), dict)
@@ -199,10 +196,6 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
         raise RuntimeError(
             "FlashDuty alert detail is required before knowledge matching and MCP selection"
         )
-    if getattr(enricher, "read_only", None) is not True:
-        raise RuntimeError(
-            "FlashDuty alert detail enricher must explicitly declare read_only=true"
-        )
     try:
         enriched = sanitize_alert(
             preprocess_normalized_alert(await enricher.enrich(baseline))
@@ -233,11 +226,9 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
         request={
             "operation": "alert_info",
             "alert_id": enriched.external_id,
-            "read_only": True,
         },
         summary="已获取权威 FlashDuty 告警详情；该记录仅陈述告警事实，不代表根因结论。",
         structured_data={
-            "read_only": True,
             "partial": False,
             "authoritative_source": "/alert/info",
             "flashduty_alert_info": enriched.raw_payload.get("flashduty_alert_info"),
@@ -259,7 +250,6 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
         ),
         details={
             "flashduty_detail_status": "loaded",
-            "read_only": True,
         },
     )
     await ctx.repository.append_progress(
@@ -481,125 +471,312 @@ async def runbook_match_node(state: AgentState, ctx: NodeContext) -> dict[str, A
     }
 
 
-async def select_strategy_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Select investigation strategy based on alert and runbooks."""
+async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
+    """Ask the single main Agent for one ReAct tool-or-finish decision."""
+
     if state.error:
-        return {}
+        return {"react_finished": True, "pending_tool_requests": []}
 
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    runbooks = state.runbooks
-
     if not run or not alert:
-        return {"error": "Missing run or alert in strategy selection node"}
+        return {"error": "Missing run or alert in ReAct decision node"}
 
-    strategy = await ctx.strategy_provider.select(
-        alert,
-        runbooks,
-        state.external_knowledge,
-        state.knowledge_match_summary,
+    next_round = state.react_round + 1
+    sink = RepositoryEventSink(ctx.repository, **_lease_fence(run))
+    emitter = AgentTraceEmitter(
+        sink,
+        run_id=run.id,
+        actor="main_agent",
+        provider=str(getattr(ctx.advisor, "provider", type(ctx.advisor).__name__)),
+        scope=AgentTraceScope.MAIN_AGENT,
     )
-    await ctx.repository.update_run(
-        str(run.id),
-        strategy_id=strategy.strategy_id,
-        **_lease_fence(run),
+    if state.react_round >= state.react_max_rounds:
+        decision = InvestigationDecision(
+            action="finish",
+            reason="react_max_rounds_reached",
+        )
+        await emitter.emit_action(
+            json.dumps(decision.model_dump(mode="json"), ensure_ascii=False),
+            trace_key=f"react:{state.react_round}:max-rounds",
+        )
+        progress = await _update_progress(
+            ctx.repository,
+            alert_id,
+            run,
+            InvestigationStage.INVESTIGATING,
+            "ReAct 已达到配置的最大轮次，基于现有证据正常结束调查。",
+            {
+                "event": "react_decision",
+                "outcome": "max_rounds_reached",
+                "react_round": state.react_round,
+                "react_max_rounds": state.react_max_rounds,
+            },
+        )
+        return {
+            "current_stage": InvestigationStage.INVESTIGATING,
+            "react_decision": decision,
+            "react_finished": True,
+            "pending_tool_requests": [],
+            "progress": [progress],
+        }
+
+    result = await _load_react_decision(sink, run, next_round)
+    reasoning_request_attempt = await _next_reasoning_request_attempt(
+        sink,
+        run,
+        prefix=f"main-agent:react:{next_round}:request:",
+    )
+    reasoning_callback_invoked = False
+    if result is None:
+        decide = getattr(ctx.advisor, "decide_investigation", None)
+        if decide is None:
+            result = InvestigationDecisionResult(
+                decision=InvestigationDecision(
+                    action="finish",
+                    reason="configured advisor does not expose ReAct decisions",
+                ),
+                metadata=AdvisorMetadata(
+                    provider=str(getattr(ctx.advisor, "provider", "compatibility")),
+                    model=str(getattr(ctx.advisor, "model", type(ctx.advisor).__name__)),
+                    prompt_version=str(getattr(ctx.advisor, "prompt_version", "compatibility")),
+                ),
+            )
+        else:
+            try:
+                decision_kwargs = {
+                    "alert": alert,
+                    "runbooks": state.runbooks,
+                    "external_knowledge": state.external_knowledge,
+                    "knowledge_match_summary": state.knowledge_match_summary,
+                    "evidence": state.evidence,
+                    "available_tools": ctx.tool_registry.available_specs(),
+                    "react_round": next_round,
+                    "react_max_rounds": state.react_max_rounds,
+                }
+
+                async def emit_response_reasoning(
+                    content: str,
+                    stream_id: str,
+                    delta_index: int,
+                ) -> None:
+                    nonlocal reasoning_callback_invoked
+                    durable_stream_id = (
+                        f"main-agent:react:{next_round}:request:"
+                        f"{reasoning_request_attempt}:{stream_id}"
+                    )
+                    emitted = await emitter.emit_reasoning_delta(
+                        content,
+                        stream_id=durable_stream_id,
+                        delta_index=delta_index,
+                        trace_key=f"{durable_stream_id}:delta:{delta_index}",
+                    )
+                    reasoning_callback_invoked = (
+                        reasoning_callback_invoked or emitted is not None
+                    )
+
+                if _accepts_keyword_argument(decide, "reasoning_callback"):
+                    result = await decide(
+                        **decision_kwargs,
+                        reasoning_callback=emit_response_reasoning,
+                    )
+                else:
+                    result = await decide(**decision_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "react_decision_failed run_id=%s round=%s error=%s",
+                    run.id,
+                    next_round,
+                    type(exc).__name__,
+                )
+                result = InvestigationDecisionResult(
+                    decision=InvestigationDecision(
+                        action="finish",
+                        reason=f"ReAct decision unavailable: {type(exc).__name__}",
+                    ),
+                    metadata=AdvisorMetadata(
+                        provider=str(getattr(ctx.advisor, "provider", "unavailable")),
+                        model=str(getattr(ctx.advisor, "model", type(ctx.advisor).__name__)),
+                        prompt_version=str(
+                            getattr(ctx.advisor, "prompt_version", "unavailable")
+                        ),
+                    ),
+                )
+        await sink.append(
+            AgentEvent(
+                run_id=run.id,
+                kind=AgentEventKind.MODEL_DECISION,
+                payload={
+                    "actor": "main_agent",
+                    "react_round": next_round,
+                    "decision": result.decision.model_dump(mode="json"),
+                    "metadata": result.metadata.model_dump(mode="json"),
+                },
+            )
+        )
+
+    if not reasoning_callback_invoked:
+        await emitter.emit_reasoning(
+            result.metadata.reasoning_content,
+            trace_key=f"react:{next_round}:reasoning",
+        )
+    await emitter.emit_action(
+        json.dumps(result.decision.model_dump(mode="json"), ensure_ascii=False),
+        trace_key=f"react:{next_round}:action",
     )
 
-    pending_requests = [
-        request.model_copy(update={"hypothesis_ids": []}) for request in strategy.tool_plan
-    ]
+    pending: list[ToolExecutionRequest] = []
+    if result.decision.action == "tool":
+        spec = ctx.tool_registry.spec(result.decision.tool_name or "")
+        if spec is None or result.decision.tool_name not in ctx.tool_registry.available_names():
+            raise RuntimeError(
+                f"ReAct Agent selected unavailable tool: {result.decision.tool_name}"
+            )
+        pending = [
+            ToolExecutionRequest(
+                tool_name=result.decision.tool_name,
+                parameters=result.decision.parameters,
+                objective=result.decision.objective or result.decision.reason or spec.capability,
+                hypothesis_ids=[],
+                timeout_seconds=spec.timeout,
+                required=False,
+            )
+        ]
 
-    await _update_progress(
+    outcome = "tool" if pending else "finish"
+    progress = await _update_progress(
         ctx.repository,
         alert_id,
         run,
         InvestigationStage.INVESTIGATING,
-        f"执行调查策略 {strategy.strategy_id}。",
+        (
+            f"ReAct 第 {next_round} 轮选择工具 {pending[0].tool_name}。"
+            if pending
+            else f"ReAct 第 {next_round} 轮输出 finish，结束证据调查。"
+        ),
         {
-            "tool_count": len(pending_requests),
-            "analysis_deferred": True,
+            "event": "react_decision",
+            "outcome": outcome,
+            "react_round": next_round,
+            "react_max_rounds": state.react_max_rounds,
+            **({"tool_name": pending[0].tool_name} if pending else {}),
         },
     )
-
     return {
         "current_stage": InvestigationStage.INVESTIGATING,
-        "strategy": strategy,
-        "investigation_memory": InvestigationMemory(),
-        "stop_decision": None,
-        "pending_tool_requests": pending_requests,
-        "dynamic_turns_remaining": 0,
-        "max_dynamic_turns": 0,
-        "progress": [
-            ProgressRecord(
-                run_id=run.id,
-                stage=InvestigationStage.INVESTIGATING,
-                message=f"执行调查策略 {strategy.strategy_id}。",
-                details={
-                    "tool_count": len(pending_requests),
-                    "analysis_deferred": True,
-                },
-            )
-        ],
+        "react_round": next_round,
+        "react_decision": result.decision,
+        "react_finished": not pending,
+        "pending_tool_requests": pending,
+        "progress": [progress],
     }
 
 
-async def execute_tools_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Execute pending tool requests and collect evidence."""
-    if state.error:
-        return {}
+async def execute_react_tool_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
+    """Execute exactly one outer tool and emit its projected observation."""
 
+    if state.error:
+        return {"pending_tool_requests": []}
     alert_id = state.alert_id
     run = state.run
     alert = state.alert
-    strategy = state.strategy
     pending_requests = state.pending_tool_requests
+    if not run or not alert or len(pending_requests) != 1:
+        return {"error": "ReAct tool node requires one run, alert, and pending request"}
 
-    if not run or not alert or not strategy:
-        return {"error": "Missing run, alert, or strategy in tool execution node"}
-
-    new_evidence: list[EvidenceRecord] = []
-    known_evidence_ids = {item.id for item in state.evidence}
+    request = pending_requests[0]
     context = InvestigationContext(
         run_id=run.id,
         alert=alert,
-        strategy=strategy,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
-        investigation_memory={},
     )
     dispatcher = DurableOuterToolDispatcher(
         ctx.repository,
         ctx.tool_executor,
         result_analyzer=ctx.tool_result_analyzer,
-        analysis_threshold_chars=ctx.tool_result_analysis_threshold_chars,
     )
 
-    for request in pending_requests:
-        result = await dispatcher.execute(
-            alert_id=alert_id,
-            request=request,
-            context=context,
-            tool_spec=ctx.tool_registry.spec(request.tool_name),
-            prior_evidence=[*state.evidence, *new_evidence],
-        )
-
-        # Local state application and persistence failures are not provider
-        # failures. Let them escape so checkpoint recovery can preserve the real
-        # remote outcome instead of manufacturing a misleading FAILED record.
-        await ctx.repository.save_evidence(
-            alert_id,
-            result,
-            **_lease_fence(run),
-        )
-        if result.id not in known_evidence_ids:
-            new_evidence.append(result)
-            known_evidence_ids.add(result.id)
+    result = await dispatcher.execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=ctx.tool_registry.spec(request.tool_name),
+        prior_evidence=state.evidence,
+    )
+    await ctx.repository.save_evidence(alert_id, result, **_lease_fence(run))
+    new_evidence = [] if any(item.id == result.id for item in state.evidence) else [result]
+    emitter = AgentTraceEmitter(
+        RepositoryEventSink(ctx.repository, **_lease_fence(run)),
+        run_id=run.id,
+        actor="main_agent",
+        provider=str(getattr(ctx.advisor, "provider", type(ctx.advisor).__name__)),
+        scope=AgentTraceScope.MAIN_AGENT,
+    )
+    observation = preprocess_alert_data(result.model_dump(mode="json"))
+    await emitter.emit_observation(
+        json.dumps(observation, ensure_ascii=False),
+        actor=request.tool_name,
+        provider=result.source_system,
+        trace_key=f"react:{state.react_round}:observation:{result.id}",
+    )
 
     return {
         "evidence": new_evidence,
-        "pending_tool_requests": [],  # Clear pending requests after execution
+        "pending_tool_requests": [],
     }
+
+
+async def _load_react_decision(
+    sink: RepositoryEventSink,
+    run: InvestigationRun,
+    react_round: int,
+) -> InvestigationDecisionResult | None:
+    for event in reversed(await sink.read(run.id)):
+        if (
+            event.kind == AgentEventKind.MODEL_DECISION
+            and event.payload.get("actor") == "main_agent"
+            and event.payload.get("react_round") == react_round
+        ):
+            return InvestigationDecisionResult(
+                decision=InvestigationDecision.model_validate(event.payload.get("decision")),
+                metadata=AdvisorMetadata.model_validate(event.payload.get("metadata")),
+            )
+    return None
+
+
+async def _next_reasoning_request_attempt(
+    sink: RepositoryEventSink,
+    run: InvestigationRun,
+    *,
+    prefix: str,
+) -> int:
+    attempts: list[int] = []
+    for event in await sink.read(run.id):
+        if event.kind != AgentEventKind.TRACE_REASONING:
+            continue
+        stream_id = event.payload.get("stream_id")
+        if not isinstance(stream_id, str) or not stream_id.startswith(prefix):
+            continue
+        request_attempt = stream_id.removeprefix(prefix).partition(":")[0]
+        if request_attempt.isdigit():
+            attempts.append(int(request_attempt))
+    return max(attempts, default=-1) + 1
+
+
+def _accepts_keyword_argument(callable_obj: Any, argument: str) -> bool:
+    """Check callback support without masking a TypeError raised inside an advisor."""
+
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == argument
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
@@ -614,11 +791,24 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     evidence = state.evidence
     external_knowledge = state.external_knowledge
     knowledge_match_summary = state.knowledge_match_summary
-    strategy = state.strategy
     ai_fallback_enabled = state.ai_fallback_enabled
 
-    if not run or not alert or not strategy:
-        return {"error": "Missing run, alert, or strategy in advise node"}
+    if not run or not alert:
+        return {"error": "Missing run or alert in advise node"}
+
+    sink = RepositoryEventSink(ctx.repository, **_lease_fence(run))
+    emitter = AgentTraceEmitter(
+        sink,
+        run_id=run.id,
+        actor="main_agent",
+        provider=str(getattr(ctx.advisor, "provider", type(ctx.advisor).__name__)),
+        scope=AgentTraceScope.MAIN_AGENT,
+    )
+    reasoning_request_attempt = await _next_reasoning_request_attempt(
+        sink,
+        run,
+        prefix="main-agent:final:request:",
+    )
 
     await _update_progress(
         ctx.repository,
@@ -637,17 +827,46 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     primary_advisor_error: Exception | None = None
     recommendation: Recommendation | None = None
     advisor_metadata: AdvisorMetadata | None = None
+    final_reasoning_callback_invoked = False
+
+    async def emit_final_reasoning(
+        content: str,
+        stream_id: str,
+        delta_index: int,
+    ) -> None:
+        nonlocal final_reasoning_callback_invoked
+        durable_stream_id = (
+            f"main-agent:final:request:{reasoning_request_attempt}:{stream_id}"
+        )
+        emitted = await emitter.emit_reasoning_delta(
+            content,
+            stream_id=durable_stream_id,
+            delta_index=delta_index,
+            trace_key=f"{durable_stream_id}:delta:{delta_index}",
+        )
+        final_reasoning_callback_invoked = (
+            final_reasoning_callback_invoked or emitted is not None
+        )
 
     try:
-        recommendation, advisor_metadata = await ctx.advisor.advise(
-            alert,
-            runbooks,
-            evidence=evidence,
-            external_knowledge=external_knowledge,
-            knowledge_match_summary=knowledge_match_summary,
-            strategy=strategy,
-            investigation_memory=None,
-        )
+        advise_kwargs = {
+            "evidence": evidence,
+            "external_knowledge": external_knowledge,
+            "knowledge_match_summary": knowledge_match_summary,
+        }
+        if _accepts_keyword_argument(ctx.advisor.advise, "reasoning_callback"):
+            recommendation, advisor_metadata = await ctx.advisor.advise(
+                alert,
+                runbooks,
+                **advise_kwargs,
+                reasoning_callback=emit_final_reasoning,
+            )
+        else:
+            recommendation, advisor_metadata = await ctx.advisor.advise(
+                alert,
+                runbooks,
+                **advise_kwargs,
+            )
     except Exception as exc:
         primary_advisor_error = exc
         if not ai_fallback_enabled or ctx.fallback_advisor is None:
@@ -664,8 +883,6 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             evidence=evidence,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
-            strategy=strategy,
-            investigation_memory=None,
         )
         advisor_metadata = advisor_metadata.model_copy(
             update={"usage": {"fallback_reason": type(exc).__name__}}
@@ -701,14 +918,12 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         recommendation,
         evidence,
         alert,
-        None,
     )
-    host_inconclusive_reasons = _host_inconclusive_reasons(state)
-    if host_inconclusive_reasons:
-        recommendation = recommendation.model_copy(
-            update={
-                "confidence": min(recommendation.confidence, 0.5),
-            }
+
+    if not final_reasoning_callback_invoked:
+        await emitter.emit_reasoning(
+            advisor_metadata.reasoning_content,
+            trace_key=f"final:request:{reasoning_request_attempt}:reasoning",
         )
 
     return {
@@ -735,7 +950,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
 
 
 async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
-    """Validate the recommendation using rule and agent validators."""
+    """Check the main Agent's output with deterministic contract rules only."""
     if state.error:
         return {}
 
@@ -744,41 +959,35 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     alert = state.alert
     runbooks = state.runbooks
     evidence = state.evidence
-    strategy = state.strategy
     recommendation = state.recommendation
-    validation_enabled = state.validation_enabled
     advisor_degraded = state.advisor_degraded
     primary_advisor_error = state.primary_advisor_error
 
-    if not run or not alert or not strategy or not recommendation:
-        return {"error": "Missing run, alert, strategy, or recommendation in validate node"}
+    if not run or not alert or not recommendation:
+        return {"error": "Missing run, alert, or recommendation in validate node"}
 
     await _update_progress(
         ctx.repository,
         alert_id,
         run,
         InvestigationStage.VALIDATING,
-        "正在进行规则验收和独立结论验收。",
+        "正在进行确定性分析契约校验。",
     )
 
-    # Rule validation
     rule_validation = await ctx.rule_validator.validate(
         run,
         alert,
         recommendation,
         evidence,
         runbooks,
-        None,
     )
-
-    host_inconclusive_reasons = _host_inconclusive_reasons(state)
-    if host_inconclusive_reasons:
+    if advisor_degraded:
         rule_validation = rule_validation.model_copy(
             update={
-                "evidence_sufficient": False,
                 "metadata": {
                     **rule_validation.metadata,
-                    "host_inconclusive_reasons": host_inconclusive_reasons,
+                    "fallback": True,
+                    "primary_error_type": primary_advisor_error or "Unknown",
                 },
             }
         )
@@ -788,79 +997,16 @@ async def validate_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         **_lease_fence(run),
     )
 
-    # Agent validation
-    agent_validation: ValidationRecord | None = None
-    if advisor_degraded and validation_enabled:
-        agent_validation = ValidationRecord(
-            run_id=run.id,
-            kind=ValidationKind.AGENT,
-            passed=False,
-            issues=["AI 主分析不可用，现有结果无法得出根因"],
-            metadata={
-                "fallback": True,
-                "primary_error_type": primary_advisor_error or "Unknown",
-            },
-        )
-        await ctx.repository.save_validation(
-            alert_id,
-            agent_validation,
-            **_lease_fence(run),
-        )
-    elif rule_validation.passed and validation_enabled:
-        try:
-            agent_validation = await ctx.conclusion_validator.validate(
-                run,
-                alert,
-                recommendation,
-                evidence,
-                runbooks,
-                None,
-            )
-        except Exception as exc:
-            agent_validation = ValidationRecord(
-                run_id=run.id,
-                kind=ValidationKind.AGENT,
-                passed=False,
-                evidence_sufficient=False,
-                issues=[f"独立验收不可用：{type(exc).__name__}: {sanitize(str(exc))}"],
-            )
-        if agent_validation.evidence_sufficient and not rule_validation.evidence_sufficient:
-            agent_validation = agent_validation.model_copy(
-                update={
-                    "evidence_sufficient": False,
-                    "metadata": {
-                        **agent_validation.metadata,
-                        "evidence_sufficiency_clamped_by_rules": True,
-                    },
-                }
-            )
-        await ctx.repository.save_validation(
-            alert_id,
-            agent_validation,
-            **_lease_fence(run),
-        )
-
-    # Contract validity and evidence sufficiency are independent. The fixed
-    # no-root-cause result can pass the contract while remaining evidence-insufficient.
-    validation_passed = rule_validation.passed and (
-        not validation_enabled or (agent_validation is not None and agent_validation.passed)
-    )
-    evidence_sufficient = rule_validation.evidence_sufficient and (
-        not validation_enabled
-        or (agent_validation is not None and agent_validation.evidence_sufficient)
-    )
-
     return {
         "current_stage": InvestigationStage.VALIDATING,
         "rule_validation": rule_validation,
-        "agent_validation": agent_validation,
-        "validation_passed": validation_passed,
-        "evidence_sufficient": evidence_sufficient,
+        "validation_passed": rule_validation.passed,
+        "evidence_sufficient": rule_validation.evidence_sufficient,
         "progress": [
             ProgressRecord(
                 run_id=run.id,
                 stage=InvestigationStage.VALIDATING,
-                message="正在进行规则验收和独立结论验收。",
+                message="正在进行确定性分析契约校验。",
             )
         ],
     }
@@ -876,7 +1022,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     evidence_sufficient = state.evidence_sufficient
     advisor_degraded = state.advisor_degraded
     error = state.error
-    host_inconclusive_reasons = _host_inconclusive_reasons(state)
 
     if not run or not alert:
         return {"error": "Missing run or alert in report node"}
@@ -893,7 +1038,6 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         validation_passed
         and evidence_sufficient
         and not advisor_degraded
-        and not host_inconclusive_reasons
     )
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.INCONCLUSIVE
     run_status = RunStatus.COMPLETED if passed else RunStatus.INCONCLUSIVE
@@ -932,22 +1076,10 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                     "validation_passed": validation_passed,
                     "evidence_sufficient": evidence_sufficient,
                     "advisor_degraded": advisor_degraded,
-                    "host_inconclusive_reasons": host_inconclusive_reasons,
                 },
             )
         ],
     }
-
-
-def _host_inconclusive_reasons(state: AgentState) -> list[str]:
-    """Return deterministic reasons that forbid autonomous completion."""
-
-    reasons: list[str] = []
-    decision = state.stop_decision
-    if decision is not None and decision.requires_human:
-        reasons.append(f"stop:{decision.reason.value}")
-
-    return list(dict.fromkeys(reasons))
 
 
 async def _update_progress(

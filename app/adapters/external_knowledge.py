@@ -2,7 +2,7 @@
 
 This adapter bridges the project's analyze-database-alerts skill contract with the
 actual KnowledgePack HTTP API. It follows the same defensive patterns as the
-FlashDuty adapter: typed errors, bounded retries, and graceful degradation.
+FlashDuty adapter: typed errors, cancellation-aware retries, and graceful degradation.
 
 Per the deployment and skill contracts:
 - Results are advisory data, never live evidence.
@@ -129,14 +129,12 @@ class ExternalKnowledgeClient:
         *,
         api_key: str = "",
         timeout_seconds: float = 30,
-        max_retries: int = 2,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
-        self.max_retries = max_retries
         self._transport = transport
         self._sleep = sleep
 
@@ -162,8 +160,8 @@ class ExternalKnowledgeClient:
     ) -> KnowledgeSearchResponse:
         """Call ``POST /search`` on the KnowledgePack service.
 
-        Raises:
-            ExternalKnowledgeAPIError: On network or HTTP errors after retries.
+        Recoverable failures retry until the owning analysis times out or is
+        actively cancelled. Permanent HTTP and response errors still fail fast.
         """
 
         if not query.strip():
@@ -200,21 +198,19 @@ class ExternalKnowledgeClient:
             headers=self._headers(),
         ) as client:
             response: httpx.Response | None = None
-            for attempt in range(self.max_retries + 1):
+            attempt = 0
+            while True:
                 try:
                     response = await client.request(method, url, json=json)
-                except httpx.TransportError as exc:
-                    if attempt >= self.max_retries:
-                        raise ExternalKnowledgeAPIError(
-                            type(exc).__name__, code="NetworkError"
-                        ) from exc
-                    await self._sleep(min(2**attempt, 10))
+                except httpx.TransportError:
+                    await self._sleep(min(2 ** min(attempt, 4), 10))
+                    attempt += 1
                     continue
 
                 if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < self.max_retries:
-                        await self._sleep(self._retry_delay(response, attempt))
-                        continue
+                    await self._sleep(self._retry_delay(response, attempt))
+                    attempt += 1
+                    continue
                 break
 
         if response is None:  # pragma: no cover - loop contract guard
@@ -227,9 +223,9 @@ class ExternalKnowledgeClient:
         try:
             retry_after_seconds = float(retry_after)
         except ValueError:
-            return min(2**attempt, 10)
+            return min(2 ** min(attempt, 4), 10)
         if not math.isfinite(retry_after_seconds):
-            return min(2**attempt, 10)
+            return min(2 ** min(attempt, 4), 10)
         return min(max(retry_after_seconds, 0), 10)
 
     def _decode_response(self, response: httpx.Response) -> Any:

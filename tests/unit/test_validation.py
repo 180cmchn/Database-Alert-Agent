@@ -214,11 +214,11 @@ def test_post_evidence_policy_accepts_truncated_record_after_complete_fact_proje
     assert result.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY
 
 
-def test_host_eligibility_gate_does_not_create_a_root_cause() -> None:
+def test_program_projection_usability_does_not_create_a_root_cause() -> None:
     evidence = make_live_evidence(
         structured_data={"root_cause_eligible": True, "analyzed_from_complete_raw": True}
     )
-    recommendation = make_recommendation(summary="子 Agent 仅返回结构化事实。")
+    recommendation = make_recommendation(summary="程序事实投影仅返回结构化事实。")
 
     result = enforce_post_evidence_root_cause_policy(recommendation, [evidence])
 
@@ -508,12 +508,12 @@ async def test_rule_validator_rejects_hypothesis_binding_in_new_result() -> None
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_rejects_dangerous_action() -> None:
+async def test_rule_validator_does_not_enforce_action_permissions() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
     recommendation = make_recommendation(action="立即重启数据库实例恢复服务")
 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
 
-    assert result.passed is False
-    assert any("禁止的危险动作" in issue and "重启" in issue for issue in result.issues)
+    assert result.passed is True
+    assert result.issues == []

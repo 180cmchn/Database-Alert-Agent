@@ -10,12 +10,12 @@ from pydantic import ValidationError
 from app.agent_runtime import (
     AgentEvent,
     AgentEventKind,
+    AgentTraceEmitter,
+    AgentTraceScope,
     ArtifactRef,
-    BudgetExceededError,
     BudgetLedger,
     BudgetLimits,
     CallToolAction,
-    ChildBudgetLimitError,
     EventVersionConflictError,
     EvidenceDisposition,
     FinishAction,
@@ -29,6 +29,8 @@ from app.agent_runtime import (
     ToolInvocation,
     ToolInvocationStatus,
     parse_agent_action,
+    provider_reasoning_text,
+    trace_entry_from_event,
 )
 
 
@@ -93,18 +95,17 @@ def test_agent_action_uses_a_strict_discriminator() -> None:
         )
 
 
-def test_budget_reservation_prevents_concurrent_overcommit() -> None:
+def test_count_limit_input_is_normalized_to_unlimited_usage_accounting() -> None:
     ledger = BudgetLedger(BudgetLimits(remote_tool_calls=2))
     first = ledger.reserve(remote_tool_calls=2)
+    second = ledger.reserve(remote_tool_calls=1)
 
-    with pytest.raises(BudgetExceededError) as caught:
-        ledger.reserve(remote_tool_calls=1)
-
-    assert caught.value.dimension == "remote_tool_calls"
-    snapshot = ledger.debit(first)
-    assert snapshot.consumed.remote_tool_calls == 2
+    ledger.debit(first)
+    snapshot = ledger.debit(second)
+    assert snapshot.consumed.remote_tool_calls == 3
     assert snapshot.reserved.remote_tool_calls == 0
-    assert snapshot.remaining.remote_tool_calls == 0
+    assert snapshot.limits.remote_tool_calls is None
+    assert snapshot.remaining.remote_tool_calls is None
 
 
 def test_released_budget_can_be_reserved_again() -> None:
@@ -117,7 +118,7 @@ def test_released_budget_can_be_reserved_again() -> None:
     assert ledger.snapshot().consumed.planner_requests == 1
 
 
-def test_budget_snapshot_restores_consumption_without_replenishing_limit() -> None:
+def test_budget_snapshot_restores_count_usage_without_a_count_limit() -> None:
     ledger = BudgetLedger(BudgetLimits(remote_tool_calls=3, planner_requests=4))
     ledger.debit(remote_tool_calls=2)
     ledger.debit(planner_requests=1)
@@ -126,8 +127,8 @@ def test_budget_snapshot_restores_consumption_without_replenishing_limit() -> No
 
     assert restored.snapshot() == ledger.snapshot()
     restored.debit(remote_tool_calls=1)
-    with pytest.raises(BudgetExceededError):
-        restored.debit(remote_tool_calls=1)
+    restored.debit(remote_tool_calls=1)
+    assert restored.snapshot().consumed.remote_tool_calls == 4
 
 
 def test_budget_snapshot_with_live_reservation_is_not_resumable() -> None:
@@ -138,13 +139,9 @@ def test_budget_snapshot_with_live_reservation_is_not_resumable() -> None:
         BudgetLedger.from_snapshot(ledger.snapshot())
 
 
-def test_child_budget_is_bounded_and_debits_parent() -> None:
+def test_child_count_usage_is_unbounded_and_debits_parent() -> None:
     parent = BudgetLedger({"remote_tool_calls": 3, "model_tokens": 100})
     parent.debit(remote_tool_calls=1)
-
-    with pytest.raises(ChildBudgetLimitError) as caught:
-        parent.create_child({"remote_tool_calls": 3})
-    assert caught.value.dimension == "remote_tool_calls"
 
     child = parent.create_child({"remote_tool_calls": 2, "model_tokens": 40})
     reservation = child.reserve(remote_tool_calls=2, model_tokens=25)
@@ -155,6 +152,8 @@ def test_child_budget_is_bounded_and_debits_parent() -> None:
     assert child.snapshot().consumed.remote_tool_calls == 2
     assert parent.snapshot().consumed.remote_tool_calls == 3
     assert parent.snapshot().consumed.model_tokens == 25
+    child.debit(remote_tool_calls=1)
+    assert parent.snapshot().consumed.remote_tool_calls == 4
 
 
 def test_child_budget_restore_requires_and_reuses_the_same_parent_ledger() -> None:
@@ -237,6 +236,106 @@ async def test_event_sink_serializes_concurrent_appends() -> None:
 
     events = await sink.read(run_id)
     assert [event.sequence for event in events] == list(range(1, 21))
+
+
+@pytest.mark.asyncio
+async def test_agent_trace_emitter_preserves_real_provider_content_and_order() -> None:
+    sink = InMemoryEventSink()
+    run_id = uuid4()
+    emitter = AgentTraceEmitter(
+        sink,
+        run_id=run_id,
+        actor="main-agent",
+        provider="openai-compatible",
+    )
+
+    assert await emitter.emit_provider_reasoning({"content": "answer only"}) is None
+    reasoning = "真实 reasoning_content，不是宿主摘要。"
+    await emitter.emit_provider_reasoning(
+        {"reasoning_content": reasoning, "reasoning": "lower-priority reasoning"}
+    )
+    await emitter.emit_action('call_tool archery.query {"read_only":true}')
+    await emitter.emit_observation(
+        "query returned 3 rows",
+        actor="archery-mcp",
+        provider="archery",
+    )
+
+    entries = [
+        entry
+        for event in await sink.read(run_id)
+        if (entry := trace_entry_from_event(event)) is not None
+    ]
+    assert [entry.sequence for entry in entries] == [1, 2, 3]
+    assert [entry.kind.value for entry in entries] == [
+        "REASONING",
+        "ACTION",
+        "OBSERVATION",
+    ]
+    assert entries[0].content == reasoning
+    assert [entry.scope for entry in entries] == [
+        AgentTraceScope.MAIN_AGENT,
+        AgentTraceScope.MAIN_AGENT,
+        AgentTraceScope.MAIN_AGENT,
+    ]
+    assert entries[0].actor == "main-agent"
+    assert entries[2].actor == "archery-mcp"
+    assert entries[2].provider == "archery"
+
+
+def test_provider_reasoning_text_reads_model_extra_without_fabricating_fallback() -> None:
+    class Message:
+        reasoning_content = None
+        reasoning = None
+        model_extra = {"reasoning": "provider reasoning"}
+
+    assert provider_reasoning_text(Message()) == "provider reasoning"
+    assert provider_reasoning_text({"content": "ordinary answer"}) is None
+
+
+def test_trace_projection_skips_malformed_historical_event() -> None:
+    malformed = AgentEvent(
+        run_id=uuid4(),
+        sequence=1,
+        version=1,
+        kind=AgentEventKind.TRACE_ACTION,
+        payload={"actor": "main-agent", "provider": "fixture"},
+    )
+
+    assert trace_entry_from_event(malformed) is None
+
+
+def test_trace_projection_infers_scopes_for_legacy_events() -> None:
+    run_id = uuid4()
+    main_entry = trace_entry_from_event(
+        AgentEvent(
+            run_id=run_id,
+            sequence=1,
+            version=1,
+            kind=AgentEventKind.TRACE_REASONING,
+            payload={
+                "actor": "main_agent",
+                "provider": "openai-compatible",
+                "content": "main thought",
+            },
+        )
+    )
+    mcp_entry = trace_entry_from_event(
+        AgentEvent(
+            run_id=run_id,
+            sequence=2,
+            version=2,
+            kind=AgentEventKind.TRACE_REASONING,
+            payload={
+                "actor": "archery_mcp_agent",
+                "provider": "archery",
+                "content": "internal thought",
+            },
+        )
+    )
+
+    assert main_entry is not None and main_entry.scope == AgentTraceScope.MAIN_AGENT
+    assert mcp_entry is not None and mcp_entry.scope == AgentTraceScope.MCP_INTERNAL
 
 
 @pytest.mark.asyncio

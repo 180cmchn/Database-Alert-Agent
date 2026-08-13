@@ -15,17 +15,14 @@ from app.agent_runtime import (
     ArtifactRef,
     BudgetLedger,
     InMemoryEventSink,
-    RetryPolicy,
     RuntimeStopReason,
     ToolInvocationStatus,
-    ToolRisk,
     ToolSpec,
 )
 from app.mcp_runtime import (
     DiscoveredMCPTool,
     Finish,
     HarnessObservation,
-    HostRejection,
     MCPAgentHarnessRuntime,
     PreparedCall,
     ReplayCallFixture,
@@ -66,8 +63,6 @@ class _Scenario:
                 provider=self.provider,
                 capability="fixture.query",
                 input_schema=tool.input_schema,
-                read_only=True,
-                risk=ToolRisk.LOW,
                 policy_version="fixture-policy-v1",
                 schema_version="fixture-schema-v1",
                 timeout=1,
@@ -80,15 +75,8 @@ class _Scenario:
         action: Any,
         *,
         state: _ScenarioState,
-        catalog: dict[str, ToolSpec],
-    ) -> PreparedCall | HostRejection:
+    ) -> PreparedCall:
         assert state is not None
-        if action.arguments.get("host_reject"):
-            return HostRejection(
-                code="fixture_policy_rejection",
-                message="The fixture Host rejected these arguments.",
-                repair_hint="Use an approved fixture query.",
-            )
         return PreparedCall(
             tool_name=action.tool_name,
             objective=action.objective,
@@ -167,14 +155,26 @@ class _Scenario:
         del state, observations
         return None
 
-    def validate_finish(
+class _InterruptAfterDecisionSink(InMemoryEventSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupt_after_decision = True
+
+    async def append(
         self,
-        state: _ScenarioState,
-        observations: Sequence[HarnessObservation[dict[str, Any]]],
-        finish: Finish,
-    ) -> Finish | HostRejection:
-        del state, observations
-        return finish
+        event: AgentEvent,
+        *,
+        expected_version: int | None = None,
+    ) -> AgentEvent:
+        committed = await super().append(event, expected_version=expected_version)
+        if (
+            self.interrupt_after_decision
+            and event.kind == AgentEventKind.MODEL_DECISION
+            and event.payload.get("decision_key")
+        ):
+            self.interrupt_after_decision = False
+            raise asyncio.CancelledError
+        return committed
 
 
 class _BootstrapScenario(_Scenario):
@@ -183,38 +183,7 @@ class _BootstrapScenario(_Scenario):
         return state
 
 
-class _ReadOnlyUnknownOutcomeRetryScenario(_Scenario):
-    def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
-        return [
-            spec.model_copy(
-                update={
-                    "retry": RetryPolicy(
-                        max_attempts=2,
-                        retryable_error_codes={"connection_lost"},
-                    )
-                }
-            )
-            for spec in super().build_tool_specs(tools)
-        ]
-
-    def retry_directive(
-        self,
-        state: _ScenarioState,
-        call: PreparedCall | None,
-        error: Exception,
-    ) -> RetryDirective:
-        del state, call
-        return RetryDirective(
-            reason=str(error),
-            reconnect=True,
-            retry_call=True,
-            continue_run=True,
-            unknown_outcome=True,
-            allow_unknown_outcome_retry=True,
-        )
-
-
-class _ResultProcessingFailureScenario(_ReadOnlyUnknownOutcomeRetryScenario):
+class _ResultProcessingFailureScenario(_Scenario):
     def on_result(
         self,
         state: _ScenarioState,
@@ -236,7 +205,24 @@ class _ResultErrorDirectiveFailureScenario(_ResultProcessingFailureScenario):
         raise RuntimeError("fixture result-error classifier failed")
 
 
-class _CatalogAwareRetryScenario(_ReadOnlyUnknownOutcomeRetryScenario):
+class _RewritingScenario(_Scenario):
+    def prepare_call(
+        self,
+        action: Any,
+        *,
+        state: _ScenarioState,
+    ) -> PreparedCall:
+        prepared = super().prepare_call(action, state=state)
+        return prepared.model_copy(
+            update={
+                "tool_name": "fixture.rewritten",
+                "model_arguments": {"query": "rewritten"},
+                "effective_arguments": {"query": "rewritten"},
+            }
+        )
+
+
+class _CatalogAwareScenario(_Scenario):
     def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
         specs = super().build_tool_specs(tools)
         versions = {
@@ -246,27 +232,10 @@ class _CatalogAwareRetryScenario(_ReadOnlyUnknownOutcomeRetryScenario):
         return [spec.model_copy(update={"policy_version": versions[spec.name]}) for spec in specs]
 
 
-class _BootstrapCatalogAwareRetryScenario(_CatalogAwareRetryScenario):
+class _BootstrapCatalogAwareScenario(_CatalogAwareScenario):
     async def bootstrap(self, session: Any, state: _ScenarioState) -> _ScenarioState:
         await session.call_tool("fixture.login", {"credential_ref": "redacted-fixture"})
         return state
-
-
-class _FinishGateScenario(_Scenario):
-    def validate_finish(
-        self,
-        state: _ScenarioState,
-        observations: Sequence[HarnessObservation[dict[str, Any]]],
-        finish: Finish,
-    ) -> Finish | HostRejection:
-        del state
-        if not observations:
-            return HostRejection(
-                code="finish_requires_observation",
-                message="At least one MCP observation is required before finish.",
-                repair_hint="Collect one read-only observation.",
-            )
-        return finish
 
 
 class _ArtifactScenario(_Scenario):
@@ -503,7 +472,7 @@ def _budget(**overrides: int | float) -> BudgetLedger:
 
 
 @pytest.mark.asyncio
-async def test_provider_remote_budget_is_shared_across_sequential_dispatch_scopes() -> None:
+async def test_provider_remote_usage_is_shared_across_sequential_dispatch_scopes() -> None:
     run_id = uuid4()
     sink = InMemoryEventSink()
     sessions = [_TrackingSession() for _ in range(3)]
@@ -521,26 +490,27 @@ async def test_provider_remote_budget_is_shared_across_sequential_dispatch_scope
         ).run(run_id=run_id)
         results.append(result)
 
-    assert [session.call_calls for session in sessions] == [1, 1, 0]
+    assert [session.call_calls for session in sessions] == [1, 1, 1]
     assert results[-1].finish is not None
-    assert results[-1].finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED
-    assert results[-1].budget.consumed.remote_tool_calls == 0
+    assert results[-1].finish.reason == RuntimeStopReason.COMPLETED
+    assert results[-1].budget.consumed.remote_tool_calls == 1
     remote_debits = [
         event
         for event in await sink.read(run_id)
         if event.kind == AgentEventKind.BUDGET_DEBITED
         and event.payload.get("amounts", {}).get("remote_tool_calls") == 1
     ]
-    assert len(remote_debits) == 2
-    assert len({event.payload.get("dispatch_scope_id") for event in remote_debits}) == 2
+    assert len(remote_debits) == 3
+    assert len({event.payload.get("dispatch_scope_id") for event in remote_debits}) == 3
     assert [event.payload["provider_remote_tool_calls"]["consumed"] for event in remote_debits] == [
         1,
         2,
+        3,
     ]
 
 
 @pytest.mark.asyncio
-async def test_provider_remote_budget_cas_allows_only_one_concurrent_sibling_scope() -> None:
+async def test_provider_remote_usage_cas_records_both_concurrent_sibling_scopes() -> None:
     run_id = uuid4()
     sink = _RemoteDebitBarrierSink()
     first_session = _TrackingSession()
@@ -569,15 +539,20 @@ async def test_provider_remote_budget_cas_allows_only_one_concurrent_sibling_sco
         if event.kind == AgentEventKind.BUDGET_DEBITED
         and event.payload.get("amounts", {}).get("remote_tool_calls") == 1
     ]
-    assert len(remote_debits) == 1
-    assert sum(session.call_calls for session in (first_session, second_session)) <= 1
-    winning_scope = remote_debits[0].payload["dispatch_scope_id"]
-    losing_session = second_session if winning_scope == str(first_scope) else first_session
-    assert losing_session.call_calls == 0
-    assert any(
+    assert len(remote_debits) == 2
+    assert first_session.call_calls == second_session.call_calls == 1
+    assert {event.payload["dispatch_scope_id"] for event in remote_debits} == {
+        str(first_scope),
+        str(second_scope),
+    }
+    assert sorted(
+        event.payload["provider_remote_tool_calls"]["consumed"]
+        for event in remote_debits
+    ) == [1, 2]
+    assert all(
         not isinstance(outcome, Exception)
         and outcome.finish is not None
-        and outcome.finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED
+        and outcome.finish.reason == RuntimeStopReason.COMPLETED
         for outcome in outcomes
     )
 
@@ -763,14 +738,38 @@ async def test_no_tool_call_gets_exactly_one_repair_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_host_rejection_consumes_decision_but_not_remote_budget() -> None:
-    planner = ScriptedPlanner([_call("unsafe", host_reject=True), _finish()])
-    connector = ReplayMCPConnector("fixture-mcp", [_session("session-1")])
+async def test_runtime_forwards_unknown_tool_and_arguments_without_host_rewrite() -> None:
+    raw_arguments = {"query": "unrestricted", "custom_parameter": True}
+    planner = ScriptedPlanner(
+        [
+            {
+                "action": "call_tool",
+                "tool_name": "fixture.dynamic",
+                "objective": "Exercise a deployment-specific MCP capability",
+                "hypothesis_ids": [],
+                "arguments": raw_arguments,
+            },
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        "fixture-mcp",
+        [
+            _session(
+                "session-1",
+                ReplayCallFixture(
+                    tool_name="fixture.dynamic",
+                    expected_arguments=raw_arguments,
+                    result={"rows": [1]},
+                ),
+            )
+        ],
+    )
     sink = InMemoryEventSink()
     runtime = MCPAgentHarnessRuntime(
         connector=connector,
         planner=planner,
-        scenario=_Scenario(),
+        scenario=_RewritingScenario(),
         event_sink=sink,
         budget=_budget(),
     )
@@ -778,16 +777,12 @@ async def test_host_rejection_consumes_decision_but_not_remote_budget() -> None:
     result = await runtime.run(run_id=uuid4())
 
     assert result.budget.consumed.accepted_decisions == 2
-    assert result.budget.consumed.remote_tool_calls == 0
-    assert result.invocations == ()
-    host_events = [
-        event
-        for event in await sink.read(result.run_id)
-        if event.kind == AgentEventKind.HOST_REJECTED
-    ]
-    assert len(host_events) == 1
-    assert host_events[0].payload["code"] == "fixture_policy_rejection"
-    assert host_events[0].payload["provider"] == "fixture-mcp"
+    assert result.budget.consumed.remote_tool_calls == 1
+    assert len(result.invocations) == 1
+    assert result.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert result.invocations[0].tool_name == "fixture.dynamic"
+    assert result.invocations[0].model_arguments == raw_arguments
+    assert result.invocations[0].effective_arguments == raw_arguments
 
 
 @pytest.mark.asyncio
@@ -864,7 +859,7 @@ async def test_reconnect_preserves_partial_results_state_messages_and_budget() -
 
 
 @pytest.mark.asyncio
-async def test_explicit_read_only_unknown_outcome_retry_replays_after_reconnect() -> None:
+async def test_unknown_outcome_is_not_replayed_without_new_agent_action() -> None:
     disconnect = ReplayErrorFixture(
         code="connection_lost",
         message="Connection closed while awaiting response",
@@ -896,7 +891,7 @@ async def test_explicit_read_only_unknown_outcome_retry_replays_after_reconnect(
     runtime = MCPAgentHarnessRuntime(
         connector=connector,
         planner=ScriptedPlanner([_call("same-read-only-query"), _finish()]),
-        scenario=_ReadOnlyUnknownOutcomeRetryScenario(),
+        scenario=_Scenario(),
         event_sink=InMemoryEventSink(),
         budget=_budget(),
     )
@@ -905,13 +900,10 @@ async def test_explicit_read_only_unknown_outcome_retry_replays_after_reconnect(
 
     assert connector.opened_session_ids == ["session-1", "session-2"]
     assert [item.status for item in result.invocations] == [
-        ToolInvocationStatus.UNKNOWN_OUTCOME,
-        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.UNKNOWN_OUTCOME
     ]
-    assert result.invocations[0].fingerprint == result.invocations[1].fingerprint
-    assert result.invocations[1].attempt == 2
-    assert result.state.successful_queries == ["same-read-only-query"]
-    assert result.budget.consumed.remote_tool_calls == 2
+    assert result.state.successful_queries == []
+    assert result.budget.consumed.remote_tool_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1003,7 +995,7 @@ async def test_result_error_classifier_failure_is_not_replayed_or_reconnected() 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", ["input_schema", "policy_version"])
-async def test_reconnect_fails_closed_when_frozen_tool_catalog_drifts(
+async def test_second_explicit_action_uses_refreshed_tool_catalog(
     drift: str,
 ) -> None:
     baseline_tool = _tool(annotations={"policy_version": "fixture-policy-v1"})
@@ -1044,36 +1036,48 @@ async def test_reconnect_fails_closed_when_frozen_tool_catalog_drifts(
             ReplaySessionFixture(
                 session_id="session-2",
                 tools=[changed_tool],
+                calls=[
+                    ReplayCallFixture(
+                        tool_name="fixture.query",
+                        expected_arguments={"query": "catalog-drift"},
+                        result={"rows": [1]},
+                    )
+                ],
             ),
         ],
     )
     sink = InMemoryEventSink()
     result = await MCPAgentHarnessRuntime(
         connector=connector,
-        planner=ScriptedPlanner([_call("catalog-drift")]),
-        scenario=_CatalogAwareRetryScenario(),
+        planner=ScriptedPlanner(
+            [_call("catalog-drift"), _call("catalog-drift"), _finish()]
+        ),
+        scenario=_CatalogAwareScenario(),
         event_sink=sink,
         budget=_budget(),
     ).run(run_id=uuid4())
 
     assert connector.opened_session_ids == ["session-1", "session-2"]
     assert result.finish is not None
-    assert result.finish.reason == RuntimeStopReason.FAILED
-    assert result.finish.requires_human is True
-    assert result.budget.consumed.remote_tool_calls == 1
-    assert [item.status for item in result.invocations] == [ToolInvocationStatus.UNKNOWN_OUTCOME]
-    session_failures = [
-        event
-        for event in await sink.read(result.run_id)
-        if event.kind == AgentEventKind.MCP_SESSION_FAILED
+    assert result.finish.reason == RuntimeStopReason.COMPLETED
+    assert result.budget.consumed.remote_tool_calls == 2
+    assert [item.status for item in result.invocations] == [
+        ToolInvocationStatus.UNKNOWN_OUTCOME,
+        ToolInvocationStatus.SUCCEEDED,
     ]
-    assert session_failures[-1].payload["error_code"] == "mcp_tool_catalog_drift"
-    assert session_failures[-1].payload["reconnect"] is False
-    assert session_failures[-1].payload["details"]["changed"]["fixture.query"] == [drift]
+    assert all(
+        item.model_arguments == item.effective_arguments == {"query": "catalog-drift"}
+        for item in result.invocations
+    )
+    refreshed = next(item for item in result.tool_specs if item.name == "fixture.query")
+    if drift == "input_schema":
+        assert "step" in refreshed.input_schema["properties"]
+    else:
+        assert refreshed.policy_version == "fixture-policy-v2"
 
 
 @pytest.mark.asyncio
-async def test_reconnect_checks_catalog_drift_before_remote_bootstrap() -> None:
+async def test_reconnect_bootstraps_changed_catalog_before_second_explicit_action() -> None:
     baseline_tool = _tool(annotations={"policy_version": "fixture-policy-v1"})
     changed_tool = _tool(annotations={"policy_version": "fixture-policy-v2"})
     disconnect = ReplayErrorFixture(
@@ -1106,27 +1110,44 @@ async def test_reconnect_checks_catalog_drift_before_remote_bootstrap() -> None:
             ReplaySessionFixture(
                 session_id="session-2",
                 tools=[changed_tool],
-                calls=[login],
+                calls=[
+                    login,
+                    ReplayCallFixture(
+                        tool_name="fixture.query",
+                        expected_arguments={"query": "catalog-before-bootstrap"},
+                        result={"rows": [1]},
+                    ),
+                ],
             ),
         ],
     )
     result = await MCPAgentHarnessRuntime(
         connector=connector,
-        planner=ScriptedPlanner([_call("catalog-before-bootstrap")]),
-        scenario=_BootstrapCatalogAwareRetryScenario(),
+        planner=ScriptedPlanner(
+            [
+                _call("catalog-before-bootstrap"),
+                _call("catalog-before-bootstrap"),
+                _finish(),
+            ]
+        ),
+        scenario=_BootstrapCatalogAwareScenario(),
         event_sink=InMemoryEventSink(),
         budget=_budget(),
     ).run(run_id=uuid4())
 
     assert connector.opened_session_ids == ["session-1", "session-2"]
     assert result.finish is not None
-    assert result.finish.reason == RuntimeStopReason.FAILED
-    assert result.budget.consumed.host_bootstrap_calls == 1
-    assert result.budget.consumed.remote_tool_calls == 1
+    assert result.finish.reason == RuntimeStopReason.COMPLETED
+    assert result.budget.consumed.host_bootstrap_calls == 2
+    assert result.budget.consumed.remote_tool_calls == 2
+    assert [item.status for item in result.invocations] == [
+        ToolInvocationStatus.UNKNOWN_OUTCOME,
+        ToolInvocationStatus.SUCCEEDED,
+    ]
 
 
 @pytest.mark.asyncio
-async def test_duplicate_call_is_rejected_without_second_remote_call() -> None:
+async def test_identical_explicit_calls_are_both_forwarded_to_remote() -> None:
     replay_call = ReplayCallFixture(
         tool_name="fixture.query",
         expected_arguments={"query": "same"},
@@ -1135,7 +1156,7 @@ async def test_duplicate_call_is_rejected_without_second_remote_call() -> None:
     planner = ScriptedPlanner([_call("same"), _call("same"), _finish()])
     connector = ReplayMCPConnector(
         "fixture-mcp",
-        [_session("session-1", replay_call)],
+        [_session("session-1", replay_call, replay_call.model_copy(deep=True))],
     )
     sink = InMemoryEventSink()
     runtime = MCPAgentHarnessRuntime(
@@ -1148,20 +1169,19 @@ async def test_duplicate_call_is_rejected_without_second_remote_call() -> None:
 
     result = await runtime.run(run_id=uuid4())
 
-    assert len(result.invocations) == 1
-    assert result.budget.consumed.remote_tool_calls == 1
+    assert len(result.invocations) == 2
+    assert result.budget.consumed.remote_tool_calls == 2
     assert result.budget.consumed.accepted_decisions == 3
-    host_events = [
-        event
-        for event in await sink.read(result.run_id)
-        if event.kind == AgentEventKind.HOST_REJECTED
+    assert result.state.successful_queries == ["same", "same"]
+    assert [item.status for item in result.invocations] == [
+        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.SUCCEEDED,
     ]
-    assert host_events[-1].payload["code"] == "duplicate_call"
 
 
 @pytest.mark.asyncio
-async def test_remote_budget_exhaustion_keeps_existing_observation() -> None:
-    planner = ScriptedPlanner([_call("first"), _call("second")])
+async def test_remote_usage_limit_is_audit_only_and_keeps_all_observations() -> None:
+    planner = ScriptedPlanner([_call("first"), _call("second"), _finish()])
     connector = ReplayMCPConnector(
         "fixture-mcp",
         [
@@ -1171,6 +1191,11 @@ async def test_remote_budget_exhaustion_keeps_existing_observation() -> None:
                     tool_name="fixture.query",
                     expected_arguments={"query": "first"},
                     result={"rows": [1]},
+                ),
+                ReplayCallFixture(
+                    tool_name="fixture.query",
+                    expected_arguments={"query": "second"},
+                    result={"rows": [2]},
                 ),
             )
         ],
@@ -1189,13 +1214,13 @@ async def test_remote_budget_exhaustion_keeps_existing_observation() -> None:
     result = await runtime.run(run_id=uuid4())
 
     assert result.finish is not None
-    assert result.finish.reason == RuntimeStopReason.BUDGET_EXHAUSTED
-    assert [item.payload["query"] for item in result.observations] == ["first"]
-    assert result.state.successful_queries == ["first"]
-    assert result.budget.consumed.remote_tool_calls == 1
-    assert parent_budget.snapshot().consumed.remote_tool_calls == 1
-    assert result.budget.consumed.planner_requests == 2
-    assert result.budget.consumed.accepted_decisions == 2
+    assert result.finish.reason == RuntimeStopReason.COMPLETED
+    assert [item.payload["query"] for item in result.observations] == ["first", "second"]
+    assert result.state.successful_queries == ["first", "second"]
+    assert result.budget.consumed.remote_tool_calls == 2
+    assert parent_budget.snapshot().consumed.remote_tool_calls == 2
+    assert result.budget.consumed.planner_requests == 3
+    assert result.budget.consumed.accepted_decisions == 3
 
 
 @pytest.mark.asyncio
@@ -1230,7 +1255,7 @@ async def test_bootstrap_is_counted_only_when_hook_calls_remote_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_finish_must_pass_scenario_finish_gate() -> None:
+async def test_model_finish_ends_without_remote_call() -> None:
     connector = ReplayMCPConnector(
         "fixture-mcp",
         [
@@ -1249,7 +1274,7 @@ async def test_model_finish_must_pass_scenario_finish_gate() -> None:
     runtime = MCPAgentHarnessRuntime(
         connector=connector,
         planner=planner,
-        scenario=_FinishGateScenario(),
+        scenario=_Scenario(),
         event_sink=sink,
         budget=_budget(),
     )
@@ -1258,23 +1283,30 @@ async def test_model_finish_must_pass_scenario_finish_gate() -> None:
 
     assert result.finish is not None
     assert result.finish.reason == RuntimeStopReason.COMPLETED
-    assert result.state.successful_queries == ["required"]
-    assert result.budget.consumed.accepted_decisions == 3
-    host_events = [
-        event
-        for event in await sink.read(result.run_id)
-        if event.kind == AgentEventKind.HOST_REJECTED
-    ]
-    assert host_events[0].payload["code"] == "finish_requires_observation"
+    assert result.state.successful_queries == []
+    assert result.budget.consumed.accepted_decisions == 1
+    assert result.budget.consumed.remote_tool_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_effective_arguments_must_match_draft_2020_12_schema() -> None:
+async def test_schema_mismatch_is_forwarded_to_remote_unchanged() -> None:
     invalid_call = _call("placeholder")
     invalid_call["arguments"] = {"query": 42}
     sink = InMemoryEventSink()
     runtime = MCPAgentHarnessRuntime(
-        connector=ReplayMCPConnector("fixture-mcp", [_session("session-1")]),
+        connector=ReplayMCPConnector(
+            "fixture-mcp",
+            [
+                _session(
+                    "session-1",
+                    ReplayCallFixture(
+                        tool_name="fixture.query",
+                        expected_arguments={"query": 42},
+                        result={"rows": [1]},
+                    ),
+                )
+            ],
+        ),
         planner=ScriptedPlanner([invalid_call, _finish()]),
         scenario=_Scenario(),
         event_sink=sink,
@@ -1284,13 +1316,10 @@ async def test_effective_arguments_must_match_draft_2020_12_schema() -> None:
     result = await runtime.run(run_id=uuid4())
 
     assert result.budget.consumed.accepted_decisions == 2
-    assert result.budget.consumed.remote_tool_calls == 0
-    schema_events = [
-        event
-        for event in await sink.read(result.run_id)
-        if event.kind == AgentEventKind.HOST_REJECTED
-    ]
-    assert schema_events[0].payload["code"] == "input_schema_validation_failed"
+    assert result.budget.consumed.remote_tool_calls == 1
+    assert result.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert result.invocations[0].model_arguments == {"query": 42}
+    assert result.invocations[0].effective_arguments == {"query": 42}
 
 
 @pytest.mark.asyncio
@@ -1370,7 +1399,7 @@ async def test_pending_checkpoint_resumes_same_invocation_before_remote_debit() 
 
 
 @pytest.mark.asyncio
-async def test_resume_fails_closed_when_checkpoint_tool_catalog_drifts() -> None:
+async def test_resume_uses_pending_call_when_tool_catalog_changes() -> None:
     run_id = uuid4()
     sink = InMemoryEventSink()
     captured: list[Any] = []
@@ -1391,7 +1420,7 @@ async def test_resume_fails_closed_when_checkpoint_tool_catalog_drifts() -> None
             ],
         ),
         planner=ScriptedPlanner([_call("resume-catalog-drift")]),
-        scenario=_CatalogAwareRetryScenario(),
+        scenario=_CatalogAwareScenario(),
         event_sink=sink,
         budget=_budget(remote_tool_calls=1),
         checkpoint_hook=interrupt_pending_checkpoint,
@@ -1407,11 +1436,18 @@ async def test_resume_fails_closed_when_checkpoint_tool_catalog_drifts() -> None
                 ReplaySessionFixture(
                     session_id="session-2",
                     tools=[_tool(annotations={"policy_version": "fixture-policy-v2"})],
+                    calls=[
+                        ReplayCallFixture(
+                            tool_name="fixture.query",
+                            expected_arguments={"query": "resume-catalog-drift"},
+                            result={"rows": [1]},
+                        )
+                    ],
                 )
             ],
         ),
-        planner=ScriptedPlanner([]),
-        scenario=_CatalogAwareRetryScenario(),
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_CatalogAwareScenario(),
         event_sink=sink,
         budget=_budget(),
     ).resume(
@@ -1420,13 +1456,11 @@ async def test_resume_fails_closed_when_checkpoint_tool_catalog_drifts() -> None
     )
 
     assert result.finish is not None
-    assert result.finish.reason == RuntimeStopReason.FAILED
-    assert result.finish.requires_human is True
-    assert result.budget.consumed.remote_tool_calls == 0
-    assert [item.status for item in result.invocations] == [ToolInvocationStatus.SKIPPED]
-    assert result.invocations[0].error is not None
-    assert result.invocations[0].error.code == "mcp_tool_catalog_drift"
-    assert result.observations[0].status == ToolInvocationStatus.SKIPPED
+    assert result.finish.reason == RuntimeStopReason.COMPLETED
+    assert result.budget.consumed.remote_tool_calls == 1
+    assert [item.status for item in result.invocations] == [ToolInvocationStatus.SUCCEEDED]
+    assert result.invocations[0].model_arguments == {"query": "resume-catalog-drift"}
+    assert result.invocations[0].effective_arguments == {"query": "resume-catalog-drift"}
 
 
 @pytest.mark.asyncio
@@ -1668,6 +1702,79 @@ async def test_resume_restores_context_budget_and_does_not_repeat_run_started() 
     assert result.budget.consumed.session_attempts == 2
     events = await sink.read(run_id)
     assert sum(event.kind == AgentEventKind.RUN_STARTED for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> None:
+    run_id = uuid4()
+    sink = _InterruptAfterDecisionSink()
+    checkpoints: list[Any] = []
+    first_planner = ScriptedPlanner([_call("durable-decision")])
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    first_runtime = MCPAgentHarnessRuntime(
+        connector=ReplayMCPConnector("fixture-mcp", [_session("session-1")]),
+        planner=first_planner,
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        checkpoint_hook=capture_checkpoint,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await first_runtime.run(run_id=run_id)
+
+    stale_checkpoint = checkpoints[-1]
+    second_planner = ScriptedPlanner([_finish()])
+    resumed = await MCPAgentHarnessRuntime(
+        connector=ReplayMCPConnector(
+            "fixture-mcp",
+            [
+                _session(
+                    "session-2",
+                    ReplayCallFixture(
+                        tool_name="fixture.query",
+                        expected_arguments={"query": "durable-decision"},
+                        result={"rows": [1]},
+                    ),
+                )
+            ],
+        ),
+        planner=second_planner,
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+    ).resume(
+        stale_checkpoint,
+        restored_budget=BudgetLedger.from_snapshot(stale_checkpoint.budget),
+    )
+
+    assert len(first_planner.requests) == 1
+    assert len(second_planner.requests) == 1
+    assert resumed.state.successful_queries == ["durable-decision"]
+    events = await sink.read(run_id)
+    durable_decisions = [
+        event
+        for event in events
+        if event.kind == AgentEventKind.MODEL_DECISION
+        and event.payload.get("decision_key")
+    ]
+    action_traces = [
+        event for event in events if event.kind == AgentEventKind.TRACE_ACTION
+    ]
+    observation_traces = [
+        event for event in events if event.kind == AgentEventKind.TRACE_OBSERVATION
+    ]
+    assert len(durable_decisions) == 2
+    assert [event.payload["decision"]["action"] for event in durable_decisions] == [
+        "call_tool",
+        "finish",
+    ]
+    assert len(action_traces) == 2
+    assert len(observation_traces) == 1
+    assert all(event.payload["scope"] == "mcp_internal" for event in action_traces)
+    assert observation_traces[0].payload["scope"] == "mcp_internal"
 
 
 @pytest.mark.asyncio
@@ -2000,7 +2107,7 @@ async def test_event_tail_ahead_of_checkpoint_is_reconciled_without_duplicate_ev
 
 
 @pytest.mark.asyncio
-async def test_pending_retry_survives_checkpoint_interruption() -> None:
+async def test_unknown_outcome_checkpoint_survives_interruption_without_replay() -> None:
     run_id = uuid4()
     sink = InMemoryEventSink()
     captured: list[Any] = []
@@ -2011,8 +2118,12 @@ async def test_pending_retry_survives_checkpoint_interruption() -> None:
         unknown_outcome=True,
     )
 
-    async def interrupt_with_pending_retry(snapshot: Any) -> None:
-        if snapshot.pending_retry is not None:
+    async def interrupt_after_unknown_outcome(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status
+            == ToolInvocationStatus.UNKNOWN_OUTCOME
+        ):
             captured.append(snapshot)
             raise asyncio.CancelledError
 
@@ -2032,41 +2143,33 @@ async def test_pending_retry_survives_checkpoint_interruption() -> None:
             ],
         ),
         planner=ScriptedPlanner([_call("retry-me")]),
-        scenario=_ReadOnlyUnknownOutcomeRetryScenario(),
+        scenario=_Scenario(),
         event_sink=sink,
         budget=_budget(),
-        checkpoint_hook=interrupt_with_pending_retry,
+        checkpoint_hook=interrupt_after_unknown_outcome,
     )
     with pytest.raises(asyncio.CancelledError):
         await first_runtime.run(run_id=run_id)
 
     snapshot = captured[0]
-    assert snapshot.pending_retry is not None
+    assert snapshot.pending_retry is None
     result = await MCPAgentHarnessRuntime(
         connector=ReplayMCPConnector(
             "fixture-mcp",
             [
-                _session(
-                    "session-2",
-                    ReplayCallFixture(
-                        tool_name="fixture.query",
-                        expected_arguments={"query": "retry-me"},
-                        result={"rows": [1]},
-                    ),
-                )
+                _session("session-2")
             ],
         ),
         planner=ScriptedPlanner([_finish()]),
-        scenario=_ReadOnlyUnknownOutcomeRetryScenario(),
+        scenario=_Scenario(),
         event_sink=sink,
         budget=_budget(),
     ).resume(snapshot, restored_budget=first_runtime.budget)
 
     assert [item.status for item in result.invocations] == [
-        ToolInvocationStatus.UNKNOWN_OUTCOME,
-        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.UNKNOWN_OUTCOME
     ]
-    assert result.invocations[1].attempt == 2
+    assert result.budget.consumed.remote_tool_calls == 1
     assert result.pending_retry is None
 
 
@@ -2085,7 +2188,7 @@ async def test_human_escalation_bypasses_evidence_finish_gate() -> None:
                 }
             ]
         ),
-        scenario=_FinishGateScenario(),
+        scenario=_Scenario(),
         event_sink=sink,
         budget=_budget(),
     )
@@ -2095,9 +2198,6 @@ async def test_human_escalation_bypasses_evidence_finish_gate() -> None:
     assert result.finish is not None
     assert result.finish.reason == RuntimeStopReason.HUMAN_INPUT_REQUIRED
     assert result.finish.requires_human is True
-    assert not any(
-        event.kind == AgentEventKind.HOST_REJECTED for event in await sink.read(result.run_id)
-    )
 
 
 @pytest.mark.asyncio

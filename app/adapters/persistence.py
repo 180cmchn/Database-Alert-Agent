@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -58,6 +59,8 @@ from app.domain.ports import (
     AgentCheckpointVersionConflict,
     AgentEventSequenceConflict,
     EvidenceRecordConflict,
+    RunCancellationConflict,
+    RunCancellationRequested,
     RunLeaseConflict,
     ToolInvocationConflict,
 )
@@ -219,11 +222,6 @@ def _safe_agent_event_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         separators=(",", ":"),
         default=str,
     )
-    if len(serialized) > AGENT_EVENT_PAYLOAD_MAX_CHARS:
-        raise ValueError(
-            "AgentEvent payload exceeds the persistence limit; store the full "
-            "sanitized content as an AgentArtifact and reference its id/hash"
-        )
     decoded = json.loads(serialized)
     if not isinstance(decoded, dict):
         raise TypeError("AgentEvent payload must be an object")
@@ -293,8 +291,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0013"
-AGENT_EVENT_PAYLOAD_MAX_CHARS = 12_000
+DATABASE_SCHEMA_REVISION = "0014"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -351,10 +348,15 @@ class InvestigationRunRow(Base):
     fencing_token: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     current_stage: Mapped[str] = mapped_column(String(40), nullable=False)
+    # Legacy schema column retained so existing databases remain readable. New
+    # runs never read, write, or expose the removed strategy-branch contract.
     strategy_id: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    cancel_requested_by: Mapped[str | None] = mapped_column(String(255))
+    cancelled_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     config_snapshot_json: Mapped[dict | None] = mapped_column(JSON)
     manifest_json: Mapped[dict | None] = mapped_column(JSON)
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
@@ -697,6 +699,7 @@ class SQLAlchemyAlertRepository:
                         AlertStatus.COMPLETED.value,
                         AlertStatus.INCONCLUSIVE.value,
                         AlertStatus.FAILED.value,
+                        AlertStatus.CANCELLED.value,
                     ]
                 ),
             )
@@ -1032,6 +1035,7 @@ class SQLAlchemyAlertRepository:
             if not alert_row or alert_row.status in {
                 AlertStatus.COMPLETED.value,
                 AlertStatus.INCONCLUSIVE.value,
+                AlertStatus.CANCELLED.value,
             }:
                 return None
             latest_query = (
@@ -1224,6 +1228,16 @@ class SQLAlchemyAlertRepository:
             latest = (await session.execute(latest_query)).scalar_one_or_none()
             if latest is None or latest.status != RunStatus.RUNNING.value:
                 return None
+            if latest.cancel_requested_at is not None:
+                await self._finalize_cancelled_row(
+                    session,
+                    alert_id=alert_id,
+                    run_row=latest,
+                    requested_by=latest.cancel_requested_by or "unknown",
+                    now=now,
+                )
+                await session.commit()
+                return None
             lease_expires_at = latest.lease_expires_at
             if lease_expires_at is None:
                 return None
@@ -1318,6 +1332,120 @@ class SQLAlchemyAlertRepository:
             result = await session.execute(statement)
             await session.commit()
             return result.rowcount == 1
+
+    async def request_run_cancellation(
+        self,
+        alert_id: str,
+        run_id: str,
+        requested_by: str,
+    ) -> InvestigationRun | None:
+        if not requested_by.strip():
+            raise ValueError("requested_by must not be empty")
+        async with self.session_factory() as session:
+            alert_row = await _lock_alert_row(session, alert_id)
+            if alert_row is None:
+                return None
+            run_row = await session.get(InvestigationRunRow, run_id)
+            if run_row is None or run_row.alert_id != alert_id:
+                return None
+            if run_row.status == RunStatus.CANCELLED.value:
+                return self._run(run_row)
+            if run_row.status != RunStatus.RUNNING.value:
+                raise RunCancellationConflict(run_id, run_row.status)
+            now = _utc_now()
+            if run_row.cancel_requested_at is None:
+                run_row.cancel_requested_at = now
+                run_row.cancel_requested_by = requested_by
+                run_row.updated_at = now
+            await session.commit()
+            await session.refresh(run_row)
+            return self._run(run_row)
+
+    async def is_run_cancellation_requested(self, run_id: str) -> bool:
+        async with self.session_factory() as session:
+            value = await session.scalar(
+                select(InvestigationRunRow.cancel_requested_at).where(
+                    InvestigationRunRow.id == run_id,
+                    InvestigationRunRow.status == RunStatus.RUNNING.value,
+                )
+            )
+            return value is not None
+
+    async def finalize_requested_cancellation(
+        self,
+        alert_id: str,
+        run_id: str,
+    ) -> InvestigationRun | None:
+        async with self.session_factory() as session:
+            alert_row = await _lock_alert_row(session, alert_id)
+            if alert_row is None:
+                return None
+            run_row = await session.get(InvestigationRunRow, run_id)
+            if run_row is None or run_row.alert_id != alert_id:
+                return None
+            if run_row.status == RunStatus.CANCELLED.value:
+                return self._run(run_row)
+            if run_row.status != RunStatus.RUNNING.value:
+                raise RunCancellationConflict(run_id, run_row.status)
+            if run_row.cancel_requested_at is None:
+                raise ValueError("run cancellation has not been requested")
+            latest_run_id = await session.scalar(
+                select(InvestigationRunRow.id)
+                .where(InvestigationRunRow.alert_id == alert_id)
+                .order_by(desc(InvestigationRunRow.attempt))
+                .limit(1)
+            )
+            if latest_run_id != run_id:
+                raise RunCancellationConflict(run_id, "SUPERSEDED")
+            await self._finalize_cancelled_row(
+                session,
+                alert_id=alert_id,
+                run_row=run_row,
+                requested_by=run_row.cancel_requested_by or "unknown",
+                now=_utc_now(),
+            )
+            await session.commit()
+            await session.refresh(run_row)
+            return self._run(run_row)
+
+    @staticmethod
+    async def _finalize_cancelled_row(
+        session: AsyncSession,
+        *,
+        alert_id: str,
+        run_row: InvestigationRunRow,
+        requested_by: str,
+        now: datetime,
+    ) -> None:
+        latest_sequence = await session.scalar(
+            select(ProgressRow.sequence)
+            .where(ProgressRow.run_id == run_row.id)
+            .order_by(desc(ProgressRow.sequence))
+            .limit(1)
+        )
+        run_row.status = RunStatus.CANCELLED.value
+        run_row.current_stage = InvestigationStage.CANCELLED.value
+        run_row.cancelled_at = now
+        run_row.lease_expires_at = None
+        run_row.error = None
+        run_row.updated_at = now
+        session.add(
+            ProgressRow(
+                id=str(uuid4()),
+                alert_id=alert_id,
+                run_id=run_row.id,
+                sequence=(latest_sequence or 0) + 1,
+                stage=InvestigationStage.CANCELLED.value,
+                message="分析已主动取消。",
+                details_json={"requested_by": requested_by},
+                created_at=now,
+            )
+        )
+        alert_row = await session.get(AlertRow, alert_id)
+        if alert_row is not None:
+            alert_row.status = AlertStatus.CANCELLED.value
+            alert_row.error = None
+            alert_row.updated_at = now
 
     async def renew(
         self,
@@ -1436,11 +1564,14 @@ class SQLAlchemyAlertRepository:
         run_id: str,
         *,
         after_sequence: int = 0,
+        limit: int | None = None,
     ) -> list[AgentEvent]:
         from app.agent_runtime.events import AgentEvent
 
         if after_sequence < 0:
             raise ValueError("after_sequence must be non-negative")
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be positive")
         async with self.session_factory() as session:
             query = (
                 select(AgentEventRow)
@@ -1450,6 +1581,8 @@ class SQLAlchemyAlertRepository:
                 )
                 .order_by(AgentEventRow.sequence)
             )
+            if limit is not None:
+                query = query.limit(limit)
             rows = (await session.execute(query)).scalars().all()
             return [
                 AgentEvent.model_validate(
@@ -2205,7 +2338,6 @@ class SQLAlchemyAlertRepository:
         run_id: str,
         *,
         stage: InvestigationStage | None = None,
-        strategy_id: str | None = None,
         error: str | None = None,
         lease_owner: str,
         fencing_token: int,
@@ -2222,6 +2354,7 @@ class SQLAlchemyAlertRepository:
             InvestigationStage.COMPLETED,
             InvestigationStage.INCONCLUSIVE,
             InvestigationStage.FAILED,
+            InvestigationStage.CANCELLED,
         }:
             raise ValueError("terminal run stages must be persisted with finalize_run")
 
@@ -2229,8 +2362,6 @@ class SQLAlchemyAlertRepository:
         values: dict[str, Any] = {"updated_at": now}
         if stage is not None:
             values["current_stage"] = stage.value
-        if strategy_id is not None:
-            values["strategy_id"] = strategy_id
         if error is not None:
             values["error"] = error
         statement = (
@@ -2326,6 +2457,8 @@ class SQLAlchemyAlertRepository:
             )
             if latest_run_id != run_id:
                 raise RunLeaseConflict(run_id, "run is no longer the latest alert attempt")
+            if run_row.cancel_requested_at is not None:
+                raise RunCancellationRequested(run_id)
 
             latest_sequence = await session.scalar(
                 select(ProgressRow.sequence)
@@ -2747,6 +2880,7 @@ class SQLAlchemyAlertRepository:
                 RunStatus.COMPLETED.value: AlertStatus.COMPLETED,
                 RunStatus.INCONCLUSIVE.value: AlertStatus.INCONCLUSIVE,
                 RunStatus.FAILED.value: AlertStatus.FAILED,
+                RunStatus.CANCELLED.value: AlertStatus.CANCELLED,
             }[run_row.status]
             selected_error = run_row.error
             selected_result_available = any(
@@ -2817,10 +2951,12 @@ class SQLAlchemyAlertRepository:
             fencing_token=row.fencing_token,
             status=RunStatus(row.status),
             current_stage=InvestigationStage(row.current_stage),
-            strategy_id=row.strategy_id,
             error=row.error,
             lease_owner=row.lease_owner,
             lease_expires_at=row.lease_expires_at,
+            cancel_requested_at=row.cancel_requested_at,
+            cancel_requested_by=row.cancel_requested_by,
+            cancelled_at=row.cancelled_at,
             config_snapshot=config_snapshot,
             created_at=row.created_at,
             updated_at=row.updated_at,

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent_runtime.trace import AgentTraceEntry
 from app.application.admin import runtime_configuration_issues
 from app.config import Settings
 from app.domain.models import (
@@ -12,6 +14,7 @@ from app.domain.models import (
     AnalysisConfigSnapshot,
     NormalizedAlert,
     RunbookDocument,
+    RunStatus,
 )
 
 
@@ -47,6 +50,22 @@ class ReanalyzeResponse(BaseModel):
     run_id: UUID
     attempt: int = Field(ge=1)
     config_snapshot: AnalysisConfigSnapshot
+    message: str
+
+
+class AgentTraceResponse(BaseModel):
+    run_id: UUID
+    after_sequence: int = Field(ge=0)
+    next_sequence: int = Field(ge=0)
+    has_more: bool
+    items: list[AgentTraceEntry]
+
+
+class CancelRunResponse(BaseModel):
+    alert_id: UUID
+    run_id: UUID
+    status: RunStatus
+    cancel_requested_at: datetime
     message: str
 
 
@@ -108,12 +127,10 @@ class RuntimeSettingsPatch(BaseModel):
     ai_api_key: str | None = Field(default=None, max_length=8192, repr=False)
     ai_model: str | None = Field(default=None, max_length=300)
     ai_timeout_seconds: float | None = Field(default=None, gt=0, le=600)
-    ai_max_retries: int | None = Field(default=None, ge=0, le=20)
     ai_json_mode: bool | None = None
     ai_fallback_enabled: bool | None = None
-    react_enabled: bool | None = None
-    react_max_dynamic_turns: int | None = Field(default=None, ge=0, le=10)
-    validation_enabled: bool | None = None
+    react_max_rounds: int | None = Field(default=None, ge=1, le=100)
+    analysis_timeout_seconds: int | None = Field(default=None, ge=30, le=86_400)
     runbook_limit: int | None = Field(default=None, ge=1, le=20)
     scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
@@ -123,8 +140,6 @@ class RuntimeSettingsPatch(BaseModel):
     flashduty_polling_enabled: bool | None = None
     flashduty_poll_interval_seconds: int | None = Field(default=None, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int | None = Field(default=None, ge=300, le=2678400)
-    archery_mcp_max_agent_steps: int | None = Field(default=None, ge=1, le=100)
-    prometheus_mcp_max_agent_steps: int | None = Field(default=None, ge=1, le=100)
     external_knowledge_api_key: str | None = Field(default=None, max_length=8192, repr=False)
 
     def updates(self) -> dict[str, Any]:
@@ -141,12 +156,10 @@ class RuntimeSettingsResponse(BaseModel):
     ai_api_key_configured: bool
     ai_model: str
     ai_timeout_seconds: float
-    ai_max_retries: int
     ai_json_mode: bool
     ai_fallback_enabled: bool
-    react_enabled: bool
-    react_max_dynamic_turns: int
-    validation_enabled: bool
+    react_max_rounds: int
+    analysis_timeout_seconds: int
     runbook_limit: int
     scheduler_workers: int
     runbook_match_min_confidence: float
@@ -161,8 +174,6 @@ class RuntimeSettingsResponse(BaseModel):
     flashduty_poll_lookback_seconds: int
     flashduty_poll_channel_ids: list[int]
     flashduty_poll_integration_ids: list[int]
-    archery_mcp_max_agent_steps: int
-    prometheus_mcp_max_agent_steps: int
     external_knowledge_enabled: bool
     external_knowledge_base_url: str
     external_knowledge_api_key_configured: bool
@@ -192,12 +203,10 @@ class RuntimeSettingsResponse(BaseModel):
             ai_api_key_configured=bool(settings.ai_api_key),
             ai_model=settings.ai_model,
             ai_timeout_seconds=settings.ai_timeout_seconds,
-            ai_max_retries=settings.ai_max_retries,
             ai_json_mode=settings.ai_json_mode,
             ai_fallback_enabled=settings.ai_fallback_enabled,
-            react_enabled=settings.react_enabled,
-            react_max_dynamic_turns=settings.react_max_dynamic_turns,
-            validation_enabled=settings.validation_enabled,
+            react_max_rounds=settings.react_max_rounds,
+            analysis_timeout_seconds=settings.analysis_timeout_seconds,
             runbook_limit=settings.runbook_limit,
             scheduler_workers=settings.scheduler_workers,
             runbook_match_min_confidence=settings.runbook_match_min_confidence,
@@ -212,8 +221,6 @@ class RuntimeSettingsResponse(BaseModel):
             flashduty_poll_lookback_seconds=settings.flashduty_poll_lookback_seconds,
             flashduty_poll_channel_ids=settings.flashduty_poll_channel_ids,
             flashduty_poll_integration_ids=settings.flashduty_poll_integration_ids,
-            archery_mcp_max_agent_steps=settings.archery_mcp_max_agent_steps,
-            prometheus_mcp_max_agent_steps=settings.prometheus_mcp_max_agent_steps,
             external_knowledge_enabled=settings.external_knowledge_enabled,
             external_knowledge_base_url=settings.external_knowledge_base_url,
             external_knowledge_api_key_configured=(

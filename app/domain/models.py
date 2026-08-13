@@ -27,6 +27,7 @@ class AlertStatus(StrEnum):
     COMPLETED = "COMPLETED"
     INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class InvestigationStage(StrEnum):
@@ -41,6 +42,7 @@ class InvestigationStage(StrEnum):
     COMPLETED = "COMPLETED"
     INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class RunStatus(StrEnum):
@@ -48,6 +50,7 @@ class RunStatus(StrEnum):
     COMPLETED = "COMPLETED"
     INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class ToolStatus(StrEnum):
@@ -97,10 +100,11 @@ class ToolResultObservation(BaseModel):
 
 
 class ToolResultAnalysis(BaseModel):
-    """Traceable fact projection produced by an independent tool-result session.
+    """Traceable fact projection produced by deterministic program processing.
 
-    The child session never decides causality. ``source_coverage_complete`` is set
-    by the host only after every lossless source partition has been processed.
+    The projection never decides causality. ``source_coverage_complete`` records
+    that the processor inspected the complete audited response before selecting
+    bounded observations for the main Agent.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -128,6 +132,7 @@ class ToolResultAnalysis(BaseModel):
 
 class ValidationKind(StrEnum):
     RULE = "RULE"
+    # Retained so historical runs with the removed model-based validator remain readable.
     AGENT = "AGENT"
 
 
@@ -194,7 +199,6 @@ class NormalizedAlert(BaseModel):
 class RunbookProbe(BaseModel):
     tool_name: str
     objective: str
-    read_only: bool = True
 
 
 class RunbookCause(BaseModel):
@@ -381,9 +385,8 @@ class ToolExecutionRequest(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     objective: str = ""
     hypothesis_ids: list[str] = Field(default_factory=list)
-    # A bounded multi-step MCP investigation can legitimately outlive the
-    # former single-request ceiling. This remains an internal strategy value;
-    # API callers cannot supply tool plans directly.
+    # A multi-step MCP investigation can legitimately outlive the former
+    # single-request ceiling. API callers cannot supply Agent tool calls directly.
     timeout_seconds: float = Field(default=10, gt=0, le=1200)
     required: bool = False
 
@@ -396,36 +399,18 @@ class ToolExecutionResult(BaseModel):
     structured_data: dict[str, Any] = Field(default_factory=dict)
 
 
-class InvestigationStrategy(BaseModel):
-    strategy_id: str
-    title: str
-    description: str
-    tool_plan: list[ToolExecutionRequest] = Field(default_factory=list)
-    max_dynamic_turns: int = Field(default=0, ge=0, le=10)
-
-
 class InvestigationContext(BaseModel):
     run_id: UUID
     alert: NormalizedAlert
-    strategy: InvestigationStrategy
     lease_owner: str | None = None
     fencing_token: int | None = Field(default=None, ge=1)
-    # The outer dispatcher scopes durable child checkpoints to one logical tool
-    # dispatch. Attempt 2 may only resume that same child run.
+    # The outer dispatcher scopes embedded MCP checkpoints to one logical tool
+    # dispatch so recovery cannot attach state from another explicit Agent action.
     outer_dispatch_id: UUID | None = None
-    outer_dispatch_attempt: int | None = Field(default=None, ge=1, le=2)
-    # Kept as a JSON-compatible projection so domain tool adapters do not depend
-    # on the harness' richer checkpoint model.
-    investigation_memory: dict[str, Any] = Field(default_factory=dict)
-
     @model_validator(mode="after")
     def require_complete_lease_identity(self) -> InvestigationContext:
         if (self.lease_owner is None) != (self.fencing_token is None):
             raise ValueError("lease_owner and fencing_token must be provided together")
-        if (self.outer_dispatch_id is None) != (self.outer_dispatch_attempt is None):
-            raise ValueError(
-                "outer_dispatch_id and outer_dispatch_attempt must be provided together"
-            )
         return self
 
 
@@ -471,29 +456,6 @@ class ProgressRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class ConclusionValidationDecision(BaseModel):
-    """Strict independent-validator output.
-
-    ``analysis_contract_passed`` answers whether the recommendation is honest,
-    traceable, and safe. ``evidence_sufficient`` separately answers whether the
-    live evidence is strong enough to complete the RCA conclusively.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    analysis_contract_passed: bool
-    evidence_sufficient: bool
-    issues: list[str] = Field(max_length=50)
-
-    @model_validator(mode="after")
-    def validate_decision_consistency(self) -> ConclusionValidationDecision:
-        if self.analysis_contract_passed and self.issues:
-            raise ValueError("a passed validation decision must not contain blocking issues")
-        if not self.analysis_contract_passed and not self.issues:
-            raise ValueError("a rejected validation decision must explain at least one issue")
-        return self
-
-
 class ValidationRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     run_id: UUID
@@ -521,19 +483,20 @@ class AnalysisConfigSnapshot(BaseModel):
     runbook_match_min_score: float = 12
     runbook_match_min_confidence: float = 0.35
     external_knowledge_min_relevance: float = 0.60
-    react_enabled: bool = False
-    react_max_dynamic_turns: int = 0
+    react_max_rounds: int = Field(default=8, ge=1, le=100)
+    analysis_timeout_seconds: int = Field(default=1800, ge=30, le=86_400)
+    # Retained in run snapshots so historical independent-validator settings deserialize.
     validation_enabled: bool = True
     ai_fallback_enabled: bool = True
     ai_model: str = ""
     ai_provider: str = "openai_compatible"
     ai_timeout_seconds: float = 300
-    ai_max_retries: int = 2
+    # Historical compatibility only. New analyses always store zero because
+    # provider retries are bounded by analysis timeout/cancellation, not a count.
+    ai_max_retries: int = 0
     ai_max_tokens: int = 16_384
     prompt_version: str = ""
     code_version: str = ""
-    archery_mcp_max_agent_steps: int = 0
-    prometheus_mcp_max_agent_steps: int = 0
     tool_schema_versions: dict[str, str] = Field(default_factory=dict)
     tool_policy_versions: dict[str, str] = Field(default_factory=dict)
 
@@ -545,10 +508,12 @@ class InvestigationRun(BaseModel):
     fencing_token: int = Field(default=1, ge=1)
     status: RunStatus = RunStatus.RUNNING
     current_stage: InvestigationStage = InvestigationStage.RECEIVED
-    strategy_id: str | None = None
     error: str | None = None
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
+    cancel_requested_by: str | None = None
+    cancelled_at: datetime | None = None
     config_snapshot: AnalysisConfigSnapshot | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -595,6 +560,14 @@ class AdvisorMetadata(BaseModel):
     prompt_version: str
     request_id: str | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
+    reasoning_content: str | None = None
+
+
+class InvestigationDecisionResult(BaseModel):
+    """One main-Agent ReAct decision and the provider's actual reasoning field."""
+
+    decision: InvestigationDecision
+    metadata: AdvisorMetadata
 
 
 class AnalysisResultEvent(BaseModel):

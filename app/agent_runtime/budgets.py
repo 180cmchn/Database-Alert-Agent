@@ -1,4 +1,4 @@
-"""Concurrency-safe hierarchical budgets for Agent and provider runs."""
+"""Concurrency-safe usage accounting with an optional wall-clock budget."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ _COUNT_DIMENSIONS = (
     "model_tokens",
 )
 _DIMENSIONS = (*_COUNT_DIMENSIONS, "wall_time_seconds")
+_ENFORCED_DIMENSIONS = ("wall_time_seconds",)
 
 
 class BudgetContract(BaseModel):
@@ -37,6 +38,13 @@ class BudgetAmounts(BudgetContract):
 
 
 class BudgetLimits(BudgetContract):
+    """Legacy-compatible limits model.
+
+    Count fields remain deserializable for historical checkpoints, but
+    ``BudgetLedger`` normalizes them to ``None``. Counts are audit data; only
+    wall-clock time may stop a live investigation.
+    """
+
     planner_requests: int | None = Field(default=None, ge=0)
     accepted_decisions: int | None = Field(default=None, ge=0)
     remote_tool_calls: int | None = Field(default=None, ge=0)
@@ -108,10 +116,10 @@ class InvalidBudgetReservationError(BudgetError, ValueError):
 
 
 class BudgetLedger:
-    """Tracks reserved and consumed capacity across a hierarchy of runs.
+    """Tracks reserved and consumed usage across a hierarchy of runs.
 
-    A child operation reserves the same capacity in its parent. This keeps
-    sibling runs within the global budget even when they execute concurrently.
+    A child operation mirrors reservations into its parent so usage remains
+    auditable across sibling runs. Count dimensions never enforce capacity.
     """
 
     def __init__(
@@ -121,7 +129,9 @@ class BudgetLedger:
         parent: BudgetLedger | None = None,
         ledger_id: UUID | None = None,
     ) -> None:
-        requested_limits = BudgetLimits.model_validate(limits or {})
+        requested_limits = self._usage_only_count_limits(
+            BudgetLimits.model_validate(limits or {})
+        )
         self.parent = parent
         self.ledger_id = ledger_id or uuid4()
         self._lock = RLock()
@@ -132,6 +142,12 @@ class BudgetLedger:
         self.limits = self._bounded_child_limits(requested_limits, parent)
 
     @staticmethod
+    def _usage_only_count_limits(limits: BudgetLimits) -> BudgetLimits:
+        return limits.model_copy(
+            update={dimension: None for dimension in _COUNT_DIMENSIONS}
+        )
+
+    @staticmethod
     def _bounded_child_limits(
         requested: BudgetLimits,
         parent: BudgetLedger | None,
@@ -140,7 +156,9 @@ class BudgetLedger:
             return requested
         parent_remaining = parent.snapshot().remaining
         bounded: dict[str, int | float | None] = {}
-        for dimension in _DIMENSIONS:
+        for dimension in _COUNT_DIMENSIONS:
+            bounded[dimension] = None
+        for dimension in _ENFORCED_DIMENSIONS:
             requested_limit = getattr(requested, dimension)
             available = getattr(parent_remaining, dimension)
             if requested_limit is None:
@@ -186,7 +204,13 @@ class BudgetLedger:
         ledger = cls(snapshot.limits, ledger_id=snapshot.ledger_id)
         ledger.parent = parent
         ledger._consumed = snapshot.consumed.model_dump(mode="python")
-        if ledger.snapshot() != snapshot:
+        normalized_snapshot = snapshot.model_copy(
+            update={
+                "limits": cls._usage_only_count_limits(snapshot.limits),
+                "remaining": cls._usage_only_count_limits(snapshot.remaining),
+            }
+        )
+        if ledger.snapshot() != normalized_snapshot:
             raise ValueError("budget snapshot is internally inconsistent")
         return ledger
 
@@ -273,7 +297,7 @@ class BudgetLedger:
         return requested
 
     def _ensure_capacity(self, requested: BudgetAmounts) -> None:
-        for dimension in _DIMENSIONS:
+        for dimension in _ENFORCED_DIMENSIONS:
             limit = getattr(self.limits, dimension)
             if limit is None:
                 continue

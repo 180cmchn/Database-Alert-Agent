@@ -22,12 +22,6 @@ class StrictContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ToolRisk(StrEnum):
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-
-
 class ToolInvocationStatus(StrEnum):
     PENDING = "PENDING"
     STARTED = "STARTED"
@@ -53,33 +47,19 @@ class RuntimeStopReason(StrEnum):
     FAILED = "FAILED"
 
 
-class RetryPolicy(StrictContract):
-    max_attempts: int = Field(default=1, ge=1, le=20)
-    initial_backoff_seconds: float = Field(default=0, ge=0, le=300)
-    backoff_multiplier: float = Field(default=2, ge=1, le=10)
-    max_backoff_seconds: float = Field(default=30, ge=0, le=900)
-    retryable_error_codes: set[str] = Field(default_factory=set)
-
-    @model_validator(mode="after")
-    def validate_backoff(self) -> RetryPolicy:
-        if self.initial_backoff_seconds > self.max_backoff_seconds:
-            raise ValueError("initial_backoff_seconds cannot exceed max_backoff_seconds")
-        return self
-
-
 class ToolSpec(StrictContract):
-    """Discovered tool capabilities plus the Host policy applied to them."""
+    """A model-visible outer tool contract discovered by the runtime."""
 
     name: str = Field(min_length=1, max_length=256)
     provider: str = Field(min_length=1, max_length=128)
     capability: str = Field(min_length=1, max_length=256)
+    role: str = ""
+    workflow: str = ""
+    safety: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
-    read_only: bool
-    risk: ToolRisk = ToolRisk.LOW
     policy_version: str = Field(min_length=1, max_length=128)
     schema_version: str = Field(min_length=1, max_length=128)
     timeout: float = Field(default=30, gt=0, le=3600)
-    retry: RetryPolicy = Field(default_factory=RetryPolicy)
 
 
 class ArtifactRef(StrictContract):
@@ -110,8 +90,6 @@ class ToolInvocation(StrictContract):
     model_arguments: dict[str, Any] = Field(default_factory=dict)
     effective_arguments: dict[str, Any] = Field(default_factory=dict)
     fingerprint: str = Field(min_length=1, max_length=256)
-    tool_read_only: bool = False
-    tool_max_attempts: int = Field(default=1, ge=1, le=20)
     tool_policy_version: str = Field(default="", max_length=128)
     tool_schema_version: str = Field(default="", max_length=128)
     request_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)

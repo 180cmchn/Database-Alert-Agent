@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -35,7 +35,7 @@ class DiscoveredMCPTool(MCPRuntimeContract):
 
 
 class PreparedCall(MCPRuntimeContract):
-    """Host-approved arguments ready to cross the MCP transport boundary."""
+    """Arguments prepared for transport without Host-side policy enforcement."""
 
     tool_name: str = Field(min_length=1, max_length=256)
     objective: str = Field(min_length=1, max_length=4000)
@@ -44,13 +44,6 @@ class PreparedCall(MCPRuntimeContract):
     effective_arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class HostRejection(MCPRuntimeContract):
-    code: str = Field(min_length=1, max_length=256)
-    message: str = Field(min_length=1, max_length=4000)
-    repair_hint: str = Field(default="", max_length=4000)
-    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class Finish(MCPRuntimeContract):
@@ -113,6 +106,7 @@ class MCPPlanner(Protocol):
         *,
         messages: list[dict[str, Any]],
         tools: list[ToolSpec],
+        reasoning_callback: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> AgentAction | dict[str, Any] | None: ...
 
 
@@ -153,8 +147,7 @@ class MCPHarnessScenario[StateT, ObservationT](Protocol):
         action: CallToolAction,
         *,
         state: StateT,
-        catalog: dict[str, ToolSpec],
-    ) -> PreparedCall | HostRejection: ...
+    ) -> PreparedCall: ...
 
     def on_result(
         self,
@@ -192,14 +185,6 @@ class MCPHarnessScenario[StateT, ObservationT](Protocol):
         state: StateT,
         observations: Sequence[HarnessObservation[ObservationT]],
     ) -> Finish | None: ...
-
-    def validate_finish(
-        self,
-        state: StateT,
-        observations: Sequence[HarnessObservation[ObservationT]],
-        finish: Finish,
-    ) -> Finish | HostRejection: ...
-
 
 @dataclass(frozen=True, slots=True)
 class MCPHarnessSnapshot[StateT, ObservationT]:
@@ -251,3 +236,28 @@ class ArtifactStore(Protocol):
         invocation_id: UUID,
         artifact: ArtifactRef,
     ) -> None: ...
+
+
+class RemoteResponseStore(Protocol):
+    """Durably retain a transport response before scenario-side processing."""
+
+    async def save(
+        self,
+        *,
+        run_id: UUID,
+        invocation_id: UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+        response: Any,
+    ) -> None: ...
+
+    async def load(
+        self,
+        *,
+        run_id: UUID,
+        invocation_id: UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> Any | None:
+        """Return a retained response for recovery, or ``None`` when absent."""
+        ...

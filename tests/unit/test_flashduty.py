@@ -15,18 +15,16 @@ from app.adapters.flashduty import (
     FlashDutyAPIError,
     FlashDutyChangesTool,
     FlashDutyClient,
+    FlashDutyConfigurationError,
     FlashDutyDatabaseDiagnosticsTool,
     FlashDutyDataSourceTool,
-    FlashDutyReadOnlyViolation,
     FlashDutyResponse,
     FlashDutySimilarIncidentsTool,
 )
-from app.adapters.investigation import DefaultInvestigationStrategyProvider
 from app.application.factory import build_runtime
 from app.config import Settings
 from app.domain.models import (
     InvestigationContext,
-    InvestigationStrategy,
     Severity,
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -42,7 +40,7 @@ async def no_sleep(_seconds: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_uses_query_app_key_and_rejects_write_operations() -> None:
+async def test_client_uses_query_app_key_and_reports_unsupported_operations() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -64,21 +62,8 @@ async def test_client_uses_query_app_key_and_rejects_write_operations() -> None:
     assert requests[0].method == "POST"
     assert requests[0].url.path == "/alert/info"
     assert requests[0].url.params["app_key"] == "test-app-key"
-    with pytest.raises(FlashDutyReadOnlyViolation, match="read-only allowlist"):
+    with pytest.raises(FlashDutyConfigurationError, match="Unsupported FlashDuty operation"):
         await client.call("incident_ack", {"incident_id": INCIDENT_ID})
-    with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
-        await client.call(
-            "monit_tools_invoke",
-            {
-                "target_locator": "db-prod-01",
-                "tools": [{"tool": "mysql.kill_session", "params": {}}],
-            },
-        )
-    with pytest.raises(FlashDutyReadOnlyViolation, match="SELECT/SHOW"):
-        await client.call(
-            "monit_query_rows",
-            {"ds_type": "mysql", "ds_name": "prod", "expr": "DROP TABLE alerts"},
-        )
 
 
 @pytest.mark.asyncio
@@ -94,25 +79,29 @@ async def test_client_uses_query_app_key_and_rejects_write_operations() -> None:
         "mysql.session_action",
     ],
 )
-async def test_client_rejects_mutating_or_unclassified_dynamic_tool_names(
+async def test_client_forwards_dynamic_tool_names_without_local_classification(
     tool_name: str,
 ) -> None:
-    def unexpected_request(_request: httpx.Request) -> httpx.Response:
-        raise AssertionError("unsafe tool names must be rejected before the API call")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"request_id": "req-tool", "data": {}})
 
     client = FlashDutyClient(
         "test-app-key",
-        transport=httpx.MockTransport(unexpected_request),
+        transport=httpx.MockTransport(handler),
     )
 
-    with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
-        await client.call(
-            "monit_tools_invoke",
-            {
-                "target_locator": "db-prod-01",
-                "tools": [{"tool": tool_name, "params": {}}],
-            },
-        )
+    payload = {
+        "target_locator": "db-prod-01",
+        "tools": [{"tool": tool_name, "params": {}}],
+    }
+    response = await client.call("monit_tools_invoke", payload)
+
+    assert response.request_id == "req-tool"
+    assert requests[0].url.path == "/monit/tools/invoke"
+    assert json.loads(requests[0].content) == payload
 
 
 @pytest.mark.asyncio
@@ -127,7 +116,7 @@ async def test_client_rejects_mutating_or_unclassified_dynamic_tool_names(
         "redis.health-check",
     ],
 )
-async def test_client_allows_explicit_read_only_dynamic_tool_names(
+async def test_client_forwards_query_shaped_dynamic_tool_names(
     tool_name: str,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -202,6 +191,67 @@ async def test_client_retries_rate_limit_and_redacts_secret_from_errors() -> Non
         await failing.alert_info(ALERT_ID)
     assert "super-secret" not in str(caught.value)
     assert "***REDACTED***" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_analysis_call_retries_recoverable_errors_without_count_limit() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            return httpx.Response(
+                503,
+                json={
+                    "request_id": f"retry-{attempts}",
+                    "error": {"code": "Unavailable", "message": "try later"},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"request_id": "recovered", "data": {"alert_id": ALERT_ID}},
+        )
+
+    client = FlashDutyClient(
+        "test-app-key",
+        max_retries=1,
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    response = await client.alert_info(ALERT_ID)
+
+    assert response.request_id == "recovered"
+    assert attempts == 5
+
+
+@pytest.mark.asyncio
+async def test_poll_call_keeps_finite_cycle_retry_policy() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503,
+            json={
+                "request_id": f"poll-{attempts}",
+                "error": {"code": "Unavailable", "message": "try next poll"},
+            },
+        )
+
+    client = FlashDutyClient(
+        "test-app-key",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    with pytest.raises(FlashDutyAPIError, match="Unavailable"):
+        await client.list_alerts(start_time=1712650000, end_time=1712650300)
+
+    assert attempts == 3
 
 
 @pytest.mark.asyncio
@@ -346,7 +396,7 @@ def test_flashduty_alert_adapter_normalizes_alert_info_envelope() -> None:
     assert alert.incident_fingerprint.startswith("incident-v1-")
 
 
-def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> None:
+def test_flashduty_alert_detail_prefers_label_endpoint_and_normalizes_queries() -> None:
     payload = flashduty_alert_payload()
     payload["data"]["alarm_host"] = "pg-prod-01"
     payload["data"]["alarm_port"] = "5432"
@@ -366,13 +416,13 @@ def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> No
 
     assert alert.database is not None
     assert alert.database.engine == "postgresql"
-    assert alert.database.instance == "pg-prod-01"
-    assert alert.database.host == "pg-prod-01"
-    assert alert.database.port == 5432
+    assert alert.database.instance == "ignored-label-host"
+    assert alert.database.host == "ignored-label-host"
+    assert alert.database.port == 15432
     assert alert.database.database == "orders"
     assert "alarm_host" not in alert.labels
     assert "alarm_port" not in alert.labels
-    assert alert.attributes["flashduty_target_locator"] == "pg-prod-01"
+    assert alert.attributes["flashduty_target_locator"] == "ignored-label-host"
     assert alert.attributes["flashduty_target_kind"] == "postgres"
     assert alert.attributes["flashduty_metrics"] == {
         "expr": "pg_stat_activity_count"
@@ -382,6 +432,50 @@ def test_flashduty_alert_adapter_normalizes_database_aliases_and_queries() -> No
     }
     assert alert.features["observed_value"] == "95"
     assert alert.features["threshold"] == "90"
+
+
+def test_flashduty_alert_detail_uses_nested_alarm_endpoint() -> None:
+    payload = flashduty_alert_payload()
+    payload["data"].pop("alarm_host", None)
+    payload["data"].pop("alarm_port", None)
+    payload["data"]["labels"].update(
+        {
+            "alarm_host": "detail-label-host",
+            "alarm_port": "3307",
+        }
+    )
+
+    alert = FlashDutyAlertSourceAdapter().normalize_detail(payload)
+
+    assert alert.database is not None
+    assert alert.database.host == "detail-label-host"
+    assert alert.database.port == 3307
+    assert "alarm_host" not in alert.labels
+    assert "alarm_port" not in alert.labels
+
+
+def test_flashduty_alert_detail_falls_back_to_legacy_top_level_endpoint() -> None:
+    payload = flashduty_alert_payload()
+    payload["data"]["alarm_host"] = "legacy-detail-host"
+    payload["data"]["alarm_port"] = "3308"
+
+    alert = FlashDutyAlertSourceAdapter().normalize_detail(payload)
+
+    assert alert.database is not None
+    assert alert.database.host == "legacy-detail-host"
+    assert alert.database.port == 3308
+
+
+def test_flashduty_alert_detail_does_not_replace_invalid_label_port_with_legacy_value(
+) -> None:
+    payload = flashduty_alert_payload()
+    payload["data"]["alarm_port"] = "3308"
+    payload["data"]["labels"]["alarm_port"] = "70000"
+
+    alert = FlashDutyAlertSourceAdapter().normalize_detail(payload)
+
+    assert alert.database is not None
+    assert alert.database.port is None
 
 
 def test_flashduty_poll_item_cannot_define_database_endpoint() -> None:
@@ -419,8 +513,9 @@ async def test_flashduty_detail_enricher_preserves_identity_and_detail_endpoint(
         async def alert_info(self, alert_id: str) -> FlashDutyResponse:
             assert alert_id == ALERT_ID
             detail = flashduty_alert_payload()["data"]
-            detail["alarm_host"] = "detail-host"
-            detail["alarm_port"] = "3306"
+            detail["labels"].update(
+                {"alarm_host": "detail-host", "alarm_port": "3306"}
+            )
             return FlashDutyResponse(request_id="req-detail", data=detail)
 
     enriched = await FlashDutyAlertDetailEnricher(  # type: ignore[arg-type]
@@ -479,11 +574,6 @@ def make_context() -> InvestigationContext:
     return InvestigationContext(
         run_id=uuid4(),
         alert=alert,
-        strategy=InvestigationStrategy(
-            strategy_id="flashduty-test",
-            title="FlashDuty test",
-            description="test",
-        ),
     )
 
 
@@ -539,10 +629,10 @@ async def test_alert_context_keeps_partial_data_when_auxiliary_feed_fails() -> N
             data = flashduty_alert_payload()["data"]
         elif request.url.path == "/alert/feed":
             return httpx.Response(
-                503,
+                400,
                 json={
                     "request_id": "req-feed-error",
-                    "error": {"code": "Unavailable", "message": "try later"},
+                    "error": {"code": "InvalidRequest", "message": "invalid feed query"},
                 },
             )
         elif request.url.path == "/incident/info":
@@ -652,9 +742,13 @@ class RecordingMonitorClient:
         )
 
 
-class NoRowsClient:
-    async def query_rows(self, _payload: dict[str, Any]) -> Any:
-        raise AssertionError("write-shaped SQL must be rejected before the API call")
+class RecordingRowsClient:
+    def __init__(self) -> None:
+        self.payload: dict[str, Any] | None = None
+
+    async def query_rows(self, payload: dict[str, Any]) -> Any:
+        self.payload = payload
+        return FlashDutyResponse("req-rows", [])
 
 
 class EmptyPlatformClient:
@@ -700,28 +794,36 @@ async def test_metrics_tool_uses_documented_diagnose_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_raw_query_tool_rejects_write_shaped_sql() -> None:
+async def test_raw_query_tool_forwards_sql_without_local_content_review() -> None:
+    client = RecordingRowsClient()
     tool = FlashDutyDataSourceTool(
         "query_trace",
-        NoRowsClient(),  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
     )
 
-    with pytest.raises(FlashDutyReadOnlyViolation, match="SELECT/SHOW"):
-        await tool.execute(
-            ToolExecutionRequest(
-                tool_name="query_trace",
-                parameters={
-                    "ds_type": "mysql",
-                    "ds_name": "prod-mysql",
-                    "expr": "DELETE FROM sessions",
-                },
-            ),
-            make_context(),
-        )
+    result = await tool.execute(
+        ToolExecutionRequest(
+            tool_name="query_trace",
+            parameters={
+                "ds_type": "mysql",
+                "ds_name": "prod-mysql",
+                "expr": "DELETE FROM sessions",
+            },
+        ),
+        make_context(),
+    )
+
+    assert isinstance(result, ToolExecutionResult)
+    assert result.status == ToolStatus.NO_DATA
+    assert client.payload == {
+        "ds_type": "mysql",
+        "ds_name": "prod-mysql",
+        "expr": "DELETE FROM sessions",
+    }
 
 
 @pytest.mark.asyncio
-async def test_database_tool_discovers_and_invokes_only_compatible_tools() -> None:
+async def test_database_tool_discovers_and_invokes_catalog_tools() -> None:
     client = RecordingMonitorClient()
     tool = FlashDutyDatabaseDiagnosticsTool(client)  # type: ignore[arg-type]
 
@@ -746,21 +848,24 @@ async def test_database_tool_discovers_and_invokes_only_compatible_tools() -> No
     assert data["selected_tools"] == ["mysql.connection_overview"]
 
     for tool_name in ("mysql.kill_session", "mysql.killSession", "terminateConnection"):
-        with pytest.raises(FlashDutyReadOnlyViolation, match="not read-only"):
-            await tool.execute(
-                ToolExecutionRequest(
-                    tool_name="query_database_diagnostics",
-                    parameters={
-                        "tools": [
-                            {
-                                "tool": tool_name,
-                                "params": {"session_id": 1},
-                            }
-                        ]
-                    },
-                ),
-                make_context(),
-            )
+        await tool.execute(
+            ToolExecutionRequest(
+                tool_name="query_database_diagnostics",
+                parameters={
+                    "tools": [
+                        {
+                            "tool": tool_name,
+                            "params": {"session_id": 1},
+                        }
+                    ]
+                },
+            ),
+            make_context(),
+        )
+        assert client.invoke_payload is not None
+        assert client.invoke_payload["tools"] == [
+            {"tool": tool_name, "params": {"session_id": 1}}
+        ]
 
 
 @pytest.mark.asyncio
@@ -815,21 +920,6 @@ async def test_unavailable_monitor_target_is_skipped_as_missing_capability() -> 
     }
 
 
-@pytest.mark.asyncio
-async def test_default_strategy_does_not_create_fixed_flashduty_probes() -> None:
-    strategy = await DefaultInvestigationStrategyProvider(
-        available_tools=[
-            "alert_context",
-            "query_similar_incidents",
-            "query_changes",
-            "query_database_diagnostics",
-        ]
-    ).select(make_context().alert)
-
-    assert strategy.tool_plan == []
-    assert strategy.strategy_id == "agent-selected-mcp-v1"
-
-
 def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     runbooks = tmp_path / "runbooks"
     runbooks.mkdir()
@@ -852,7 +942,11 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     assert normalized.source == "flashduty"
     assert isinstance(runtime.service.tool_registry.get("query_metrics"), FlashDutyDataSourceTool)
     assert isinstance(runtime.service.tool_registry.get("query_changes"), FlashDutyChangesTool)
-    assert runtime.service.strategy_provider.mcp_bindings == ()  # type: ignore[attr-defined]
+    visible_specs = {
+        spec.name: spec for spec in runtime.service.tool_registry.available_specs()
+    }
+    assert not hasattr(visible_specs["query_metrics"], "read_only")
+    assert not hasattr(visible_specs["query_changes"], "read_only")
 
 
 def test_factory_disables_unaudited_flashduty_capabilities_by_default(

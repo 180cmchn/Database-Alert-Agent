@@ -16,6 +16,10 @@ from app.config import Settings
 from app.domain.models import INCONCLUSIVE_ROOT_CAUSE_SUMMARY, AnalysisBasisSource
 
 
+async def no_sleep(_seconds: float) -> None:
+    return None
+
+
 def knowledge_result(
     content: str,
     source: str,
@@ -92,6 +96,42 @@ async def test_search_uses_knowledge_pack_contract_and_bearer_key() -> None:
     assert response.items[0].relevance == pytest.approx(0.8)
 
 
+@pytest.mark.asyncio
+async def test_search_retries_recoverable_errors_without_count_limit() -> None:
+    attempts = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            return httpx.Response(503, json={"detail": "temporarily unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "query": "replica lag",
+                "results": [
+                    {
+                        "content": "Check replica apply latency.",
+                        "metadata": {"source": "replication.md"},
+                        "score": 0.2,
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    client = ExternalKnowledgeClient(
+        "http://knowledge.test",
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    response = await client.search("replica lag")
+
+    assert attempts == 5
+    assert response.items[0].content == "Check replica apply latency."
+
+
 def test_persisted_excerpt_has_stable_traceable_identity() -> None:
     item = knowledge_result(
         "Check read-only replica diagnostics.",
@@ -140,8 +180,6 @@ class CapturingAdvisor(FakeAIAdvisor):
         evidence=None,
         external_knowledge=None,
         knowledge_match_summary="",
-        strategy=None,
-        investigation_memory=None,
     ):
         self.external_knowledge = list(external_knowledge or [])
         self.knowledge_match_summary = knowledge_match_summary
@@ -151,8 +189,6 @@ class CapturingAdvisor(FakeAIAdvisor):
             evidence=evidence,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
-            strategy=strategy,
-            investigation_memory=investigation_memory,
         )
 
 

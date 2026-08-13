@@ -17,13 +17,11 @@ from app.agent_runtime.contracts import (
     FinishAction,
     InvocationError,
     RequestHumanInputAction,
-    RetryPolicy,
     RunCheckpoint,
     RunManifest,
     RuntimeStopReason,
     ToolInvocation,
     ToolInvocationStatus,
-    ToolRisk,
     ToolSpec,
     parse_agent_action,
 )
@@ -55,11 +53,24 @@ from app.agent_runtime.outer_dispatch import (
     OuterDispatchFaultPoint,
 )
 from app.agent_runtime.persistence import RepositoryEventSink, RepositoryInvocationStore
+from app.agent_runtime.trace import (
+    AgentTraceEmitter,
+    AgentTraceEntry,
+    AgentTraceKind,
+    AgentTraceScope,
+    provider_reasoning_delta,
+    provider_reasoning_text,
+    trace_entry_from_event,
+)
 
 __all__ = [
     "AgentAction",
     "AgentEvent",
     "AgentEventKind",
+    "AgentTraceEmitter",
+    "AgentTraceEntry",
+    "AgentTraceKind",
+    "AgentTraceScope",
     "ArtifactRef",
     "BudgetAmounts",
     "BudgetExceededError",
@@ -90,7 +101,6 @@ __all__ = [
     "OuterDispatchError",
     "OuterDispatchFaultPoint",
     "RequestHumanInputAction",
-    "RetryPolicy",
     "RunCheckpoint",
     "RunLeaseGuard",
     "RunManifest",
@@ -98,9 +108,11 @@ __all__ = [
     "RepositoryInvocationStore",
     "RepositoryLangGraphCheckpointer",
     "RuntimeStopReason",
+    "provider_reasoning_delta",
+    "provider_reasoning_text",
+    "trace_entry_from_event",
     "ToolInvocation",
     "ToolInvocationStatus",
-    "ToolRisk",
     "ToolSpec",
     "parse_agent_action",
 ]

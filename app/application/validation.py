@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 from app.domain.alert_preprocessing import (
     has_management_platform_sql_filter_note,
     is_management_platform_collection_sql_cause,
@@ -22,45 +20,21 @@ from app.domain.models import (
     ValidationKind,
     ValidationRecord,
 )
-from app.investigations.models import InvestigationMemory
-
-_DANGEROUS_ACTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("DROP", re.compile(r"(?<![A-Z0-9_])DROP(?![A-Z0-9_])", re.IGNORECASE)),
-    ("TRUNCATE", re.compile(r"(?<![A-Z0-9_])TRUNCATE(?![A-Z0-9_])", re.IGNORECASE)),
-    ("DELETE", re.compile(r"(?<![A-Z0-9_])DELETE(?![A-Z0-9_])", re.IGNORECASE)),
-    ("UPDATE", re.compile(r"(?<![A-Z0-9_])UPDATE(?![A-Z0-9_])", re.IGNORECASE)),
-    ("INSERT", re.compile(r"(?<![A-Z0-9_])INSERT(?![A-Z0-9_])", re.IGNORECASE)),
-    ("ALTER", re.compile(r"(?<![A-Z0-9_])ALTER(?![A-Z0-9_])", re.IGNORECASE)),
-    ("RESTART/REBOOT", re.compile(r"\b(?:RESTART|REBOOT)\b", re.IGNORECASE)),
-    (
-        "KILL/TERMINATE SESSION",
-        re.compile(
-            r"\b(?:KILL|TERMINATE)\s+(?:SESSION|CONNECTION|QUERY|PROCESS)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    ("SHUTDOWN", re.compile(r"\bSHUTDOWN\b", re.IGNORECASE)),
-    ("重启", re.compile(r"重启")),
-    ("终止会话/连接", re.compile(r"终止.{0,8}(?:会话|连接|查询|进程)")),
-    ("杀会话/连接", re.compile(r"(?:杀掉?|强杀).{0,8}(?:会话|连接|查询|进程)")),
-)
 
 
 def enforce_post_evidence_root_cause_policy(
     recommendation: Recommendation,
     evidence: list[EvidenceRecord],
     alert: NormalizedAlert | None = None,
-    investigation_memory: InvestigationMemory | None = None,
 ) -> Recommendation:
-    """Apply mechanical evidence gates to the main Agent's completed conclusion.
+    """Validate evidence references in the main Agent's completed conclusion.
 
-    This host policy never infers causality. Historical status values remain
+    This deterministic check never infers causality. Historical status values remain
     deserializable, but they are never accepted as output from the strict
     post-collection analysis phase.
     """
 
     evidence_by_id = {str(item.id): item for item in evidence}
-    del investigation_memory
     supported_causes: list[RootCauseAssessment] = []
     management_sql_already_filtered = bool(
         alert and has_management_platform_sql_filter_note(alert.raw_payload)
@@ -115,7 +89,7 @@ def enforce_post_evidence_root_cause_policy(
 
 
 class RuleConclusionValidator:
-    """Validate a recommendation using deterministic safety and provenance rules."""
+    """Validate output shape and provenance without reassessing causal reasoning."""
 
     async def validate(
         self,
@@ -124,10 +98,8 @@ class RuleConclusionValidator:
         recommendation: Recommendation,
         evidence: list[EvidenceRecord],
         runbooks: list[RunbookExcerpt],
-        investigation_memory: InvestigationMemory | None = None,
     ) -> ValidationRecord:
         issues: list[str] = []
-        del investigation_memory
         evidence_by_id = {str(item.id): item for item in evidence}
         has_supported_cause = bool(recommendation.root_causes)
 
@@ -175,8 +147,8 @@ class RuleConclusionValidator:
                     )
                 elif record.structured_data.get("root_cause_eligible") is False:
                     issues.append(
-                        f"根因 #{index}（{cause_label}）引用了未通过宿主完整性、"
-                        f"来源绑定或可追溯性机械门禁的证据：{evidence_ref}"
+                        f"根因 #{index}（{cause_label}）引用了没有可用、可追溯程序事实投影的"
+                        f"证据：{evidence_ref}"
                     )
 
             if not live_successful_refs:
@@ -192,6 +164,8 @@ class RuleConclusionValidator:
             if root_cause.next_probe is not None:
                 issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）不得提供 next_probe")
 
+        # This mirrors whether the main Agent returned a structurally valid supported
+        # result. It does not independently infer whether the cited facts prove causality.
         evidence_sufficient = has_supported_cause and bool(recommendation.root_causes)
         manual_matched = recommendation.manual_matched
         sources = [item.source for item in recommendation.analysis_bases]
@@ -285,15 +259,6 @@ class RuleConclusionValidator:
         if ranks != sorted(ranks):
             issues.append("判断依据顺序错误：所有知识依据必须排在 AI 依据之前")
 
-        for index, step in enumerate(recommendation.steps, start=1):
-            matches = [
-                label
-                for label, pattern in _DANGEROUS_ACTION_PATTERNS
-                if pattern.search(step.action)
-            ]
-            if matches:
-                issues.append(f"处理步骤 #{index} 包含禁止的危险动作：{', '.join(matches)}")
-
         return ValidationRecord(
             run_id=run.id,
             kind=ValidationKind.RULE,
@@ -308,6 +273,5 @@ class RuleConclusionValidator:
                 "evidence_count": len(evidence),
                 "runbook_count": len(runbooks),
                 "external_knowledge_count": len(external_matches),
-                "investigation_memory_bound": False,
             },
         )

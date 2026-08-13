@@ -1,13 +1,16 @@
 import asyncio
+import json
 from pathlib import Path
 from uuid import uuid5
 
 import pytest
 
-from app.adapters.ai import FakeAIAdvisor
+from app.adapters.ai import FakeAIAdvisor, OpenAICompatibleAdvisor
 from app.adapters.investigation import InvestigationToolRegistry
 from app.adapters.notification import LogManagementNotifier
-from app.agents.nodes import enrich_alert_node
+from app.agent_runtime.events import AgentEvent, AgentEventKind
+from app.agent_runtime.persistence import RepositoryEventSink
+from app.agents.nodes import enrich_alert_node, react_decide_node
 from app.agents.state import AgentState
 from app.application.factory import apply_runtime_settings, build_runtime
 from app.application.validation import enforce_post_evidence_root_cause_policy
@@ -19,8 +22,9 @@ from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
     DatabaseTarget,
+    InvestigationDecision,
+    InvestigationDecisionResult,
     InvestigationStage,
-    InvestigationStrategy,
     Recommendation,
     RecommendationStep,
     RootCauseAssessment,
@@ -28,6 +32,7 @@ from app.domain.models import (
     RunStatus,
     ToolExecutionRequest,
     ToolStatus,
+    ValidationKind,
 )
 
 
@@ -76,23 +81,6 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
         async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
             raise AssertionError("not used")
 
-    class RecordingStrategy:
-        async def select(
-            self,
-            alert,
-            runbooks=None,
-            external_knowledge=None,
-            knowledge_match_summary="",
-        ):  # type: ignore[no-untyped-def]
-            events.append("MCP_SELECTION")
-            seen_hosts.append(alert.database.host if alert.database else None)
-            return InvestigationStrategy(
-                strategy_id="detail-first",
-                title="Detail first",
-                description="Use the enriched target.",
-                tool_plan=[ToolExecutionRequest(tool_name="detail_probe")],
-            )
-
     class RecordingTool:
         name = "detail_probe"
         source_system = "test_mcp"
@@ -107,11 +95,22 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
             return "detail endpoint observed", {"root_cause_eligible": False}
 
     provider = RecordingRunbookProvider()
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="detail_probe",
+                objective="Read facts for the authoritative FlashDuty target.",
+            ),
+            InvestigationDecision(action="finish", reason="Detail probe completed."),
+        ],
+        events=events,
+    )
     runtime = build_runtime(
         settings_for(tmp_path),
+        advisor=advisor,
         runbook_provider=provider,
         runbook_store=EmptyRunbookStore(),
-        strategy_provider=RecordingStrategy(),
         tool_registry=InvestigationToolRegistry([RecordingTool()]),
     )
     runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
@@ -136,8 +135,16 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
         },
     )
 
-    assert events[:4] == ["DETAIL", "KNOWLEDGE", "MCP_SELECTION", "MCP_CALL"]
-    assert seen_hosts == ["detail-host", "detail-host", "detail-host"]
+    assert events == [
+        "DETAIL",
+        "KNOWLEDGE",
+        "REACT:1",
+        "MCP_CALL",
+        "REACT:2",
+        "ADVISOR",
+    ]
+    assert seen_hosts == ["detail-host", "detail-host"]
+    assert advisor.alert_hosts == ["detail-host", "detail-host"]
     assert result.alert.database is not None
     assert result.alert.database.host == "detail-host"
     assert result.alert.database.port == 3306
@@ -151,8 +158,6 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
     )
     assert detail_evidence.source_system == "flashduty_alert_detail"
     assert detail_evidence.status == ToolStatus.SUCCESS
-    assert detail_evidence.request["read_only"] is True
-    assert detail_evidence.structured_data["read_only"] is True
     assert detail_evidence.structured_data["partial"] is False
     assert detail_evidence.structured_data["flashduty_alert_info"] is not None
     assert detail_evidence.structured_data["alert_detail"]["database"] == {
@@ -230,22 +235,23 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
                 }
             )
 
-    class EmptyStrategy:
-        async def select(
-            self,
-            alert,
-            runbooks=None,
-            external_knowledge=None,
-            knowledge_match_summary="",
-        ):  # type: ignore[no-untyped-def]
-            return InvestigationStrategy(
-                strategy_id="zero-mcp",
-                title="No MCP needed",
-                description="Use the authoritative alert detail facts.",
-                tool_plan=[],
+    class DetailEvidenceAdvisor:
+        async def decide_investigation(self, **kwargs):  # type: ignore[no-untyped-def]
+            alert = kwargs["alert"]
+            assert alert.database is not None
+            assert alert.database.host == "detail-host"
+            return InvestigationDecisionResult(
+                decision=InvestigationDecision(
+                    action="finish",
+                    reason="The authoritative detail is sufficient for final synthesis.",
+                ),
+                metadata=AdvisorMetadata(
+                    provider="test",
+                    model="detail-evidence-advisor",
+                    prompt_version="test-v1",
+                ),
             )
 
-    class DetailEvidenceAdvisor:
         async def advise(
             self,
             alert,
@@ -253,10 +259,8 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
             evidence=None,
             external_knowledge=None,
             knowledge_match_summary="",
-            strategy=None,
-            investigation_memory=None,
         ):  # type: ignore[no-untyped-def]
-            del runbooks, external_knowledge, strategy, investigation_memory
+            del runbooks, external_knowledge
             detail = next(
                 item for item in evidence or [] if item.tool_name == "flashduty_alert_info"
             )
@@ -308,11 +312,10 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
             raise AssertionError("not used")
 
     runtime = build_runtime(
-        settings_for(tmp_path).model_copy(update={"validation_enabled": False}),
+        settings_for(tmp_path),
         advisor=DetailEvidenceAdvisor(),
         runbook_provider=EmptyRunbookStore(),
         runbook_store=EmptyRunbookStore(),
-        strategy_provider=EmptyStrategy(),
     )
     runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
     await runtime.repository.initialize()
@@ -335,6 +338,9 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
     assert result.status == AlertStatus.COMPLETED
     assert result.recommendation is not None
     assert result.recommendation.root_causes[0].cause != result.alert.reason
+    assert len(result.validations) == 1
+    assert result.validations[0].kind == ValidationKind.RULE
+    assert result.validations[0].evidence_sufficient is True
     assert [item.tool_name for item in result.evidence_records] == [
         "flashduty_alert_info"
     ]
@@ -365,14 +371,14 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("read_only", [None, False, True])
 async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
     tmp_path: Path,
-    read_only: bool | None,
 ) -> None:
     calls: list[str] = []
 
     class UnusableDetailEnricher:
+        read_only = True
+
         async def enrich(self, _alert):  # type: ignore[no-untyped-def]
             calls.append("DETAIL")
             raise RuntimeError("detail unavailable")
@@ -389,27 +395,12 @@ async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
         async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
             raise AssertionError("not used")
 
-    class RecordingStrategy:
-        async def select(
-            self,
-            _alert,
-            runbooks=None,
-            external_knowledge=None,
-            knowledge_match_summary="",
-        ):  # type: ignore[no-untyped-def]
-            calls.append("MCP_SELECTION")
-            raise AssertionError("MCP selection must not run without alert detail")
-
     runtime = build_runtime(
         settings_for(tmp_path),
         runbook_provider=RecordingRunbookProvider(),
         runbook_store=EmptyRunbookStore(),
-        strategy_provider=RecordingStrategy(),
     )
-    enricher = UnusableDetailEnricher()
-    if read_only is not None:
-        enricher.read_only = read_only  # type: ignore[attr-defined]
-    runtime.service.agent.ctx.alert_detail_enricher = enricher  # type: ignore[assignment]
+    runtime.service.agent.ctx.alert_detail_enricher = UnusableDetailEnricher()  # type: ignore[assignment]
     await runtime.repository.initialize()
 
     with pytest.raises(AnalysisFailedError, match="FlashDuty alert detail"):
@@ -418,7 +409,7 @@ async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
             {
                 "request_id": "req-list",
                 "data": {
-                    "alert_id": f"663a1b2c3d4e5f6789abcde{int(bool(read_only))}",
+                    "alert_id": "663a1b2c3d4e5f6789abcdef",
                     "title": "MySQL/mysql_slow_query/list-host:3307",
                     "alert_severity": "Warning",
                     "alert_key": "slow_query",
@@ -432,7 +423,7 @@ async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
             },
         )
 
-    assert calls == (["DETAIL"] if read_only is True else [])
+    assert calls == ["DETAIL"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -452,7 +443,6 @@ class RecordingAdvisor(FakeAIAdvisor):
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.calls = 0
-        self.planner_calls = 0
         self.evidence_tool_names: list[str] = []
 
     async def advise(  # type: ignore[no-untyped-def]
@@ -462,8 +452,7 @@ class RecordingAdvisor(FakeAIAdvisor):
         evidence=None,
         external_knowledge=None,
         knowledge_match_summary="",
-        strategy=None,
-        investigation_memory=None,
+        reasoning_callback=None,
     ):
         self.events.append("ADVISOR")
         self.calls += 1
@@ -474,15 +463,57 @@ class RecordingAdvisor(FakeAIAdvisor):
             evidence=evidence,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
-            strategy=strategy,
-            investigation_memory=investigation_memory,
+            reasoning_callback=reasoning_callback,
         )
 
-    async def choose_next_tool(  # type: ignore[no-untyped-def]
-        self, context, evidence, available_tools
-    ):
-        self.planner_calls += 1
-        raise AssertionError("the post-collection advisor must not plan evidence collection")
+
+
+class ScriptedReActAdvisor(RecordingAdvisor):
+    def __init__(
+        self,
+        decisions: list[InvestigationDecision],
+        *,
+        events: list[str] | None = None,
+        reasoning: list[str | None] | None = None,
+        final_reasoning: str | None = None,
+    ) -> None:
+        super().__init__(events if events is not None else [])
+        self.decisions = list(decisions)
+        self.reasoning = list(reasoning or [None] * len(decisions))
+        self.final_reasoning = final_reasoning
+        self.decision_evidence: list[list[tuple[str, ToolStatus]]] = []
+        self.alert_hosts: list[str | None] = []
+        self.available_tool_names: list[list[str]] = []
+
+    async def decide_investigation(self, **kwargs):  # type: ignore[no-untyped-def]
+        index = len(self.decision_evidence)
+        if index >= len(self.decisions):
+            raise AssertionError("main Agent requested an unexpected ReAct decision")
+        alert = kwargs["alert"]
+        evidence = kwargs["evidence"]
+        available_tools = kwargs["available_tools"]
+        self.events.append(f"REACT:{kwargs['react_round']}")
+        self.alert_hosts.append(alert.database.host if alert.database else None)
+        self.decision_evidence.append(
+            [(item.tool_name, item.status) for item in evidence]
+        )
+        self.available_tool_names.append([item.name for item in available_tools])
+        return InvestigationDecisionResult(
+            decision=self.decisions[index],
+            metadata=AdvisorMetadata(
+                provider=self.provider,
+                model=self.model,
+                prompt_version=self.prompt_version,
+                request_id=f"react-{index + 1}",
+                reasoning_content=self.reasoning[index],
+            ),
+        )
+
+    async def advise(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        recommendation, metadata = await super().advise(*args, **kwargs)
+        return recommendation, metadata.model_copy(
+            update={"reasoning_content": self.final_reasoning}
+        )
 
 
 class FailingAdvisor:
@@ -493,8 +524,6 @@ class FailingAdvisor:
         evidence=None,
         external_knowledge=None,
         knowledge_match_summary="",
-        strategy=None,
-        investigation_memory=None,
     ):
         raise AdvisorError("provider unavailable")
 
@@ -510,8 +539,6 @@ class FlakyAdvisor(FakeAIAdvisor):
         evidence=None,
         external_knowledge=None,
         knowledge_match_summary="",
-        strategy=None,
-        investigation_memory=None,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -522,43 +549,7 @@ class FlakyAdvisor(FakeAIAdvisor):
             evidence=evidence,
             external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
-            strategy=strategy,
-            investigation_memory=investigation_memory,
         )
-
-
-class FlakyRetryableMCPTool:
-    name = "retryable_mcp_probe"
-    source_system = "test_mcp"
-    read_only = True
-
-    def __init__(self) -> None:
-        self.calls: list[ToolExecutionRequest] = []
-
-    async def execute(self, request, context):  # type: ignore[no-untyped-def]
-        self.calls.append(request)
-        if len(self.calls) == 1:
-            raise RuntimeError("transient MCP transport failure")
-        return "MCP retry returned evidence.", {"matches": 1}
-
-
-class PartialRetryableMCPTool:
-    name = "partial_mcp_probe"
-    source_system = "test_mcp"
-    read_only = True
-
-    def __init__(self) -> None:
-        self.calls: list[ToolExecutionRequest] = []
-
-    async def execute(self, request, context):  # type: ignore[no-untyped-def]
-        self.calls.append(request)
-        if len(self.calls) == 1:
-            return "Partial MCP evidence.", {
-                "matches": 1,
-                "partial": True,
-                "termination_reason": "sse_error_after_partial_result",
-            }
-        return "Complete MCP evidence.", {"matches": 2, "partial": False}
 
 
 class RecordingMCPStyleTool:
@@ -569,144 +560,28 @@ class RecordingMCPStyleTool:
     def __init__(self, events: list[str] | None = None) -> None:
         self.calls: list[ToolExecutionRequest] = []
         self.events = events
-        self.context_memories: list[dict] = []
 
     async def execute(self, request, context):  # type: ignore[no-untyped-def]
         self.calls.append(request)
-        self.context_memories.append(context.investigation_memory)
         if self.events is not None:
             self.events.append(f"TOOL:{request.parameters['phase']}")
         return "MCP evidence collected.", {"phase": request.parameters["phase"]}
 
 
-class RetryableMCPStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        return InvestigationStrategy(
-            strategy_id="retryable-mcp-strategy",
-            title="Retryable MCP strategy",
-            description="Retry one transiently failed MCP request.",
-            tool_plan=[
-                ToolExecutionRequest(
-                    tool_name="retryable_mcp_probe",
-                    parameters={"filters": {"environment": "test", "service": "orders"}},
-                    timeout_seconds=240,
-                )
-            ],
-            max_dynamic_turns=1,
-        )
+class StaticOutcomeTool(RecordingMCPStyleTool):
+    def __init__(self, outcome: str) -> None:
+        super().__init__()
+        self.outcome = outcome
 
-
-class PartialMCPStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        return InvestigationStrategy(
-            strategy_id="partial-mcp-strategy",
-            title="Partial MCP strategy",
-            description="Retry one incomplete MCP result.",
-            tool_plan=[
-                ToolExecutionRequest(
-                    tool_name="partial_mcp_probe",
-                    parameters={"query": "up"},
-                    timeout_seconds=240,
-                )
-            ],
-            max_dynamic_turns=1,
-        )
-
-
-class LongTimeoutMCPStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        return InvestigationStrategy(
-            strategy_id="long-timeout-mcp-strategy",
-            title="Long timeout MCP strategy",
-            description="Use the MCP host's bounded multi-step timeout.",
-            tool_plan=[
-                ToolExecutionRequest(
-                    tool_name="mcp_style_probe",
-                    parameters={"phase": "initial"},
-                    timeout_seconds=240,
-                    required=True,
-                )
-            ],
-            max_dynamic_turns=1,
-        )
-
-
-class NoReactMCPStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        strategy = await LongTimeoutMCPStrategy().select(
-            alert, runbooks, external_knowledge, knowledge_match_summary
-        )
-        return strategy.model_copy(update={"max_dynamic_turns": 0})
-
-
-class TwoPhaseCollectionStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        return InvestigationStrategy(
-            strategy_id="two-phase-collection",
-            title="Two planned read-only collections",
-            description="Collect both terminal observations before analysis.",
-            tool_plan=[
-                ToolExecutionRequest(
-                    tool_name="mcp_style_probe",
-                    parameters={"phase": phase},
-                    hypothesis_ids=["legacy-hypothesis"],
-                    timeout_seconds=240,
-                )
-                for phase in ("first", "second")
-            ],
-            max_dynamic_turns=2,
-        )
-
-
-class RequiredToolStrategy:
-    async def select(
-        self,
-        alert,
-        runbooks=None,
-        external_knowledge=None,
-        knowledge_match_summary="",
-    ):  # type: ignore[no-untyped-def]
-        return InvestigationStrategy(
-            strategy_id="custom-required-tool",
-            title="Custom required tool",
-            description="Exercise required-tool validation from the selected strategy.",
-            tool_plan=[
-                ToolExecutionRequest(
-                    tool_name="custom_required_probe",
-                    required=True,
-                )
-            ],
-        )
+    async def execute(self, request, context):  # type: ignore[no-untyped-def]
+        self.calls.append(request)
+        if self.outcome == "failed":
+            raise RuntimeError("simulated MCP transport failure")
+        return "Partial MCP evidence.", {
+            "phase": request.parameters["phase"],
+            "partial": True,
+            "termination_reason": "remote_partial_result",
+        }
 
 
 def settings_for(tmp_path: Path) -> Settings:
@@ -771,6 +646,7 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
     assert advisor.evidence_tool_names == []
     assert first.alert.id == second.alert.id
     assert first.status == AlertStatus.INCONCLUSIVE
+    assert [item.kind for item in first.validations] == [ValidationKind.RULE]
     assert all(item.passed for item in first.validations)
     assert all(not item.evidence_sufficient for item in first.validations)
     await runtime.repository.close()  # type: ignore[attr-defined]
@@ -859,19 +735,34 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_all_planned_collection_finishes_before_advisor_and_react_is_ignored(
+async def test_main_agent_executes_one_outer_tool_per_round_then_finishes(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    advisor = RecordingAdvisor(events)
-    tool = RecordingMCPStyleTool(events)
-    settings = settings_for(tmp_path).model_copy(
-        update={"react_enabled": True, "react_max_dynamic_turns": 2}
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="mcp_style_probe",
+                parameters={"phase": "first"},
+                objective="Collect the first read-only fact set.",
+            ),
+            InvestigationDecision(
+                action="tool",
+                tool_name="mcp_style_probe",
+                parameters={"phase": "second"},
+                objective="Collect a follow-up fact set from the prior observation.",
+            ),
+            InvestigationDecision(action="finish", reason="No more evidence is useful."),
+        ],
+        events=events,
+        reasoning=["reason-one", "reason-two", "reason-finish"],
+        final_reasoning="final-root-cause-reasoning",
     )
+    tool = RecordingMCPStyleTool(events)
     runtime = build_runtime(
-        settings,
+        settings_for(tmp_path).model_copy(update={"react_max_rounds": 8}),
         advisor=advisor,
-        strategy_provider=TwoPhaseCollectionStrategy(),
         tool_registry=InvestigationToolRegistry([tool]),
     )
     await runtime.repository.initialize()
@@ -879,7 +770,7 @@ async def test_all_planned_collection_finishes_before_advisor_and_react_is_ignor
     result = await runtime.service.analyze(
         "canonical",
         {
-            "external_id": "strict-two-phase-order",
+            "external_id": "single-react-two-tools",
             "severity": "WARNING",
             "title": "Database timeout",
             "reason": "database_timeout",
@@ -887,201 +778,88 @@ async def test_all_planned_collection_finishes_before_advisor_and_react_is_ignor
         },
     )
 
-    assert events == ["TOOL:first", "TOOL:second", "ADVISOR"]
-    assert advisor.calls == 1
-    assert advisor.planner_calls == 0
-    assert advisor.evidence_tool_names == ["mcp_style_probe", "mcp_style_probe"]
+    assert events == [
+        "REACT:1",
+        "TOOL:first",
+        "REACT:2",
+        "TOOL:second",
+        "REACT:3",
+        "ADVISOR",
+    ]
+    assert advisor.decision_evidence == [
+        [],
+        [("mcp_style_probe", ToolStatus.SUCCESS)],
+        [
+            ("mcp_style_probe", ToolStatus.SUCCESS),
+            ("mcp_style_probe", ToolStatus.SUCCESS),
+        ],
+    ]
+    assert advisor.available_tool_names == [
+        ["mcp_style_probe"],
+        ["mcp_style_probe"],
+        ["mcp_style_probe"],
+    ]
     assert [item.parameters for item in tool.calls] == [
         {"phase": "first"},
         {"phase": "second"},
     ]
-    assert [item.hypothesis_ids for item in tool.calls] == [[], []]
-    assert tool.context_memories == [{}, {}]
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
-    assert not any(item.details.get("event") == "react_decision" for item in result.progress)
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_planned_collection_does_not_repeat_terminal_failed_request(
-    tmp_path: Path,
-) -> None:
-    tool = FlakyRetryableMCPTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=RetryableMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-retry-failure",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert [item.status for item in result.evidence_records] == [ToolStatus.FAILED]
-    assert tool.calls[0].timeout_seconds == 240
-    react_progress = [
-        item for item in result.progress if item.details.get("event") == "react_decision"
-    ]
-    assert react_progress == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_analysis_does_not_repeat_terminal_failed_probe(
-    tmp_path: Path,
-) -> None:
-    tool = FlakyRetryableMCPTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=RetryableMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-finish-no-missing-probe-replay",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert [item.status for item in result.evidence_records] == [ToolStatus.FAILED]
-    react_progress = [
-        item for item in result.progress if item.details.get("event") == "react_decision"
-    ]
-    assert react_progress == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_planned_collection_does_not_retry_partial_success(
-    tmp_path: Path,
-) -> None:
-    tool = PartialRetryableMCPTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=PartialMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-retry-partial",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert [item.status for item in result.evidence_records] == [ToolStatus.SUCCESS]
-    assert [item.structured_data["partial"] for item in result.evidence_records] == [
-        True,
-    ]
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_planned_mcp_request_uses_strategy_timeout_and_required(
-    tmp_path: Path,
-) -> None:
-    tool = RecordingMCPStyleTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=LongTimeoutMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-mcp-timeout",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert [item.parameters for item in tool.calls] == [
-        {"phase": "initial"},
-    ]
-    assert [item.timeout_seconds for item in tool.calls] == [240]
-    assert [item.required for item in tool.calls] == [True]
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_post_collection_analysis_does_not_promote_alert_symptom(
-    tmp_path: Path,
-) -> None:
-    tool = RecordingMCPStyleTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=LongTimeoutMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-assessed-finish",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert not any(item.details.get("event") == "react_decision" for item in result.progress)
+    assert all(item.required is False for item in tool.calls)
+    assert advisor.evidence_tool_names == ["mcp_style_probe", "mcp_style_probe"]
+    assert [
+        item.details["outcome"]
+        for item in result.progress
+        if item.details.get("event") == "react_decision"
+    ] == ["tool", "tool", "finish"]
     assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
+    assert result.latest_run is not None
+
+    trace = [
+        event
+        for event in await runtime.repository.list_agent_events(str(result.latest_run.id))
+        if event.kind
+        in {
+            AgentEventKind.TRACE_REASONING,
+            AgentEventKind.TRACE_ACTION,
+            AgentEventKind.TRACE_OBSERVATION,
+        }
+    ]
+    assert [item.kind for item in trace] == [
+        AgentEventKind.TRACE_REASONING,
+        AgentEventKind.TRACE_ACTION,
+        AgentEventKind.TRACE_OBSERVATION,
+        AgentEventKind.TRACE_REASONING,
+        AgentEventKind.TRACE_ACTION,
+        AgentEventKind.TRACE_OBSERVATION,
+        AgentEventKind.TRACE_REASONING,
+        AgentEventKind.TRACE_ACTION,
+        AgentEventKind.TRACE_REASONING,
+    ]
+    assert all(item.payload["scope"] == "main_agent" for item in trace)
+    assert [
+        item.payload["content"]
+        for item in trace
+        if item.kind == AgentEventKind.TRACE_REASONING
+    ] == ["reason-one", "reason-two", "reason-finish", "final-root-cause-reasoning"]
+    action_payloads = [
+        json.loads(item.payload["content"])
+        for item in trace
+        if item.kind == AgentEventKind.TRACE_ACTION
+    ]
+    assert [item["action"] for item in action_payloads] == ["tool", "tool", "finish"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_target_stops_before_first_tool_call(tmp_path: Path) -> None:
+async def test_main_agent_can_finish_without_mcp_or_fabricated_reasoning(
+    tmp_path: Path,
+) -> None:
+    advisor = ScriptedReActAdvisor(
+        [InvestigationDecision(action="finish", reason="No MCP is relevant.")]
+    )
     tool = RecordingMCPStyleTool()
     runtime = build_runtime(
         settings_for(tmp_path),
-        strategy_provider=LongTimeoutMCPStrategy(),
+        advisor=advisor,
         tool_registry=InvestigationToolRegistry([tool]),
     )
     await runtime.repository.initialize()
@@ -1089,65 +867,268 @@ async def test_ambiguous_target_stops_before_first_tool_call(tmp_path: Path) -> 
     result = await runtime.service.analyze(
         "canonical",
         {
-            "external_id": "ambiguous-target-stops-tools",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
+            "external_id": "react-direct-finish",
+            "severity": "INFO",
+            "title": "Informational database alert",
+            "reason": "informational",
         },
     )
 
-    assert len(tool.calls) == 1
-    assert len(result.evidence_records) == 1
+    assert tool.calls == []
+    assert advisor.decision_evidence == [[]]
     assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
+    assert result.latest_run is not None
+    trace = await runtime.repository.list_agent_events(str(result.latest_run.id))
+    assert not any(item.kind == AgentEventKind.TRACE_REASONING for item in trace)
+    assert sum(item.kind == AgentEventKind.TRACE_ACTION for item in trace) == 1
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_explicit_target_runs_baseline_but_keeps_unknown_cause_inconclusive(
+async def test_react_structure_repairs_emit_each_provider_reasoning_immediately(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(settings_for(tmp_path))
     await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
+    stored, _ = await runtime.service.ingest(
         "canonical",
         {
-            "external_id": "baseline-context-before-causal-probe",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
+            "external_id": "react-repair-reasoning",
+            "severity": "INFO",
+            "title": "Repair reasoning",
+            "reason": "repair_reasoning",
         },
     )
-
-    strategy_progress = next(
-        item
-        for item in result.progress
-        if "tool_count" in item.details and "analysis_deferred" in item.details
+    run = await runtime.repository.create_run(
+        str(stored.alert.id),
+        lease_owner="repair-reasoning-worker",
+        lease_seconds=300,
     )
-    assert strategy_progress.details == {"tool_count": 0, "analysis_deferred": True}
-    assert result.evidence_records == []
-    assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
+    assert run is not None
+
+    advisor = object.__new__(OpenAICompatibleAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "reasoning-model"
+    calls = 0
+
+    async def complete(_messages):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            prior_events = await runtime.repository.list_agent_events(str(run.id))
+            assert [
+                item.payload["content"]
+                for item in prior_events
+                if item.kind == AgentEventKind.TRACE_REASONING
+            ] == ["first invalid action reasoning"]
+        metadata = AdvisorMetadata(
+            provider="openai_compatible",
+            model="reasoning-model",
+            prompt_version="test-v1",
+            reasoning_content=(
+                "first invalid action reasoning"
+                if calls == 1
+                else "second repaired action reasoning"
+            ),
+        )
+        if calls == 1:
+            return '{"action":"tool","tool_name":"not-configured"}', metadata
+        return '{"action":"finish","reason":"done"}', metadata
+
+    advisor._complete = complete
+    runtime.service.agent.ctx.advisor = advisor
+    state = AgentState(
+        alert_id=str(stored.alert.id),
+        alert=stored.alert,
+        stored_alert=stored,
+        run=run,
+        react_max_rounds=8,
+    )
+
+    result = await react_decide_node(state, runtime.service.agent.ctx)
+
+    assert result["react_decision"].action == "finish"
+    assert calls == 2
+    trace = await runtime.repository.list_agent_events(str(run.id))
+    reasoning_events = [
+        item for item in trace if item.kind == AgentEventKind.TRACE_REASONING
+    ]
+    assert [item.payload["content"] for item in reasoning_events] == [
+        "first invalid action reasoning",
+        "second repaired action reasoning",
+    ]
+    assert [item.payload["trace_key"] for item in reasoning_events] == [
+        "main-agent:react:1:request:0:react:1:attempt:0:delta:0",
+        "main-agent:react:1:request:0:react:1:attempt:1:delta:0",
+    ]
+    assert max(item.sequence for item in reasoning_events) < next(
+        item.sequence for item in trace if item.kind == AgentEventKind.TRACE_ACTION
+    )
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_planned_tool_result_is_analyzed_only_after_collection(
+async def test_react_reasoning_attempts_resume_after_interrupted_decision(
+    tmp_path: Path,
+) -> None:
+    class InterruptedAdvisor(FakeAIAdvisor):
+        calls = 0
+
+        async def decide_investigation(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            reasoning_callback,
+            **_kwargs,
+        ):
+            self.calls += 1
+            metadata = AdvisorMetadata(
+                provider="test",
+                model="interrupted-reasoning-model",
+                prompt_version="test-v1",
+                reasoning_content=f"reasoning attempt {self.calls}",
+            )
+            await reasoning_callback(
+                metadata.reasoning_content,
+                "react:1:attempt:0",
+                0,
+            )
+            if self.calls == 1:
+                raise asyncio.CancelledError
+            return InvestigationDecisionResult(
+                decision=InvestigationDecision(action="finish", reason="recovered"),
+                metadata=metadata,
+            )
+
+    advisor = InterruptedAdvisor()
+    runtime = build_runtime(settings_for(tmp_path), advisor=advisor)
+    await runtime.repository.initialize()
+    stored, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "react-interrupted-reasoning-resume",
+            "severity": "INFO",
+            "title": "Interrupted reasoning",
+            "reason": "interrupted_reasoning",
+        },
+    )
+    run = await runtime.repository.create_run(
+        str(stored.alert.id),
+        lease_owner="interrupted-reasoning-worker",
+        lease_seconds=300,
+    )
+    assert run is not None
+    state = AgentState(
+        alert_id=str(stored.alert.id),
+        alert=stored.alert,
+        stored_alert=stored,
+        run=run,
+        react_max_rounds=8,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await react_decide_node(state, runtime.service.agent.ctx)
+
+    first_events = await runtime.repository.list_agent_events(str(run.id))
+    assert not any(item.kind == AgentEventKind.MODEL_DECISION for item in first_events)
+
+    result = await react_decide_node(state, runtime.service.agent.ctx)
+
+    assert result["react_decision"].action == "finish"
+    reasoning_events = [
+        item
+        for item in await runtime.repository.list_agent_events(str(run.id))
+        if item.kind == AgentEventKind.TRACE_REASONING
+    ]
+    assert [item.payload["content"] for item in reasoning_events] == [
+        "reasoning attempt 1",
+        "reasoning attempt 2",
+    ]
+    assert [item.payload["trace_key"] for item in reasoning_events] == [
+        "main-agent:react:1:request:0:react:1:attempt:0:delta:0",
+        "main-agent:react:1:request:1:react:1:attempt:0:delta:0",
+    ]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_react_node_supports_advisor_without_reasoning_callback(
+    tmp_path: Path,
+) -> None:
+    class LegacyAdvisor(FakeAIAdvisor):
+        async def decide_investigation(
+            self,
+            *,
+            alert,
+            runbooks,
+            external_knowledge,
+            knowledge_match_summary,
+            evidence,
+            available_tools,
+            react_round,
+            react_max_rounds,
+        ):  # type: ignore[no-untyped-def]
+            del (
+                alert,
+                runbooks,
+                external_knowledge,
+                knowledge_match_summary,
+                evidence,
+                available_tools,
+                react_round,
+                react_max_rounds,
+            )
+            return InvestigationDecisionResult(
+                decision=InvestigationDecision(action="finish", reason="legacy finish"),
+                metadata=AdvisorMetadata(
+                    provider="legacy",
+                    model="legacy-model",
+                    prompt_version="legacy-v1",
+                    reasoning_content="legacy provider reasoning",
+                ),
+            )
+
+    runtime = build_runtime(settings_for(tmp_path), advisor=LegacyAdvisor())
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "legacy-reasoning-callback-compatibility",
+            "severity": "INFO",
+            "title": "Legacy advisor",
+            "reason": "legacy_advisor",
+        },
+    )
+
+    assert result.latest_run is not None
+    events = await runtime.repository.list_agent_events(str(result.latest_run.id))
+    assert [
+        item.payload["content"]
+        for item in events
+        if item.kind == AgentEventKind.TRACE_REASONING
+    ] == ["legacy provider reasoning"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_react_max_rounds_stops_normally_after_existing_observation(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    advisor = RecordingAdvisor(events)
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="mcp_style_probe",
+                parameters={"phase": "only"},
+            )
+        ],
+        events=events,
+    )
     tool = RecordingMCPStyleTool(events)
     runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
+        settings_for(tmp_path).model_copy(update={"react_max_rounds": 1}),
         advisor=advisor,
-        strategy_provider=LongTimeoutMCPStrategy(),
         tool_registry=InvestigationToolRegistry([tool]),
     )
     await runtime.repository.initialize()
@@ -1155,28 +1136,102 @@ async def test_planned_tool_result_is_analyzed_only_after_collection(
     result = await runtime.service.analyze(
         "canonical",
         {
-            "external_id": "assess-last-budgeted-result",
+            "external_id": "react-round-ceiling",
             "severity": "WARNING",
             "title": "Database timeout",
             "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
         },
     )
 
-    assert advisor.planner_calls == 0
-    assert events == ["TOOL:initial", "ADVISOR"]
-    assert [item.parameters for item in tool.calls] == [
-        {"phase": "initial"},
-    ]
-    react_outcomes = [
+    assert events == ["REACT:1", "TOOL:only", "ADVISOR"]
+    assert len(advisor.decision_evidence) == 1
+    assert len(tool.calls) == 1
+    assert [
         item.details["outcome"]
         for item in result.progress
         if item.details.get("event") == "react_decision"
-    ]
-    assert react_outcomes == []
+    ] == ["tool", "max_rounds_reached"]
     assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [("failed", ToolStatus.FAILED), ("partial", ToolStatus.SUCCESS)],
+)
+async def test_failed_or_partial_observation_returns_to_main_agent_without_auto_retry(
+    tmp_path: Path,
+    outcome: str,
+    expected_status: ToolStatus,
+) -> None:
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="mcp_style_probe",
+                parameters={"phase": outcome},
+            ),
+            InvestigationDecision(action="finish", reason="The result is insufficient."),
+        ]
+    )
+    tool = StaticOutcomeTool(outcome)
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        advisor=advisor,
+        tool_registry=InvestigationToolRegistry([tool]),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": f"react-{outcome}-observation",
+            "severity": "WARNING",
+            "title": "Database timeout",
+            "reason": "database_timeout",
+        },
+    )
+
+    assert len(tool.calls) == 1
+    assert advisor.decision_evidence == [[], [("mcp_style_probe", expected_status)]]
+    evidence = next(item for item in result.evidence_records if item.tool_name == tool.name)
+    assert evidence.status == expected_status
+    if outcome == "partial":
+        assert "partial" not in evidence.structured_data
+        assert evidence.structured_data["root_cause_eligible"] is False
+        assert evidence.structured_data["processing_status"] == "completed"
+    assert result.status == AlertStatus.INCONCLUSIVE
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_main_agent_selecting_unknown_tool_fails_the_run(tmp_path: Path) -> None:
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="not_configured",
+                objective="This must be rejected as unavailable.",
+            )
+        ]
+    )
+    runtime = build_runtime(settings_for(tmp_path), advisor=advisor)
+    await runtime.repository.initialize()
+
+    with pytest.raises(AnalysisFailedError, match="selected unavailable tool") as exc_info:
+        await runtime.service.analyze(
+            "canonical",
+            {
+                "external_id": "react-unknown-tool",
+                "severity": "INFO",
+                "title": "Custom probe alert",
+                "reason": "custom_probe",
+            },
+        )
+
+    failed = await runtime.service.get(exc_info.value.alert_id)
+    assert failed.status == AlertStatus.FAILED
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1185,10 +1240,19 @@ async def test_evidence_persistence_failure_is_not_reclassified_as_tool_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    advisor = ScriptedReActAdvisor(
+        [
+            InvestigationDecision(
+                action="tool",
+                tool_name="mcp_style_probe",
+                parameters={"phase": "persist"},
+            )
+        ]
+    )
     tool = RecordingMCPStyleTool()
     runtime = build_runtime(
         settings_for(tmp_path),
-        strategy_provider=LongTimeoutMCPStrategy(),
+        advisor=advisor,
         tool_registry=InvestigationToolRegistry([tool]),
     )
     await runtime.repository.initialize()
@@ -1204,11 +1268,10 @@ async def test_evidence_persistence_failure_is_not_reclassified_as_tool_failure(
         await runtime.service.analyze(
             "canonical",
             {
-                "external_id": "evidence-persistence-failure",
+                "external_id": "react-evidence-persistence-failure",
                 "severity": "WARNING",
                 "title": "Database timeout",
                 "reason": "database_timeout",
-                "database": {"engine": "mysql", "instance": "orders-primary"},
             },
         )
 
@@ -1218,161 +1281,70 @@ async def test_evidence_persistence_failure_is_not_reclassified_as_tool_failure(
 
 
 @pytest.mark.asyncio
-async def test_legacy_react_settings_do_not_add_duplicate_collection(tmp_path: Path) -> None:
-    tool = RecordingMCPStyleTool()
-    runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"react_enabled": True, "react_max_dynamic_turns": 1}
-        ),
-        advisor=FakeAIAdvisor(),
-        strategy_provider=LongTimeoutMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "duplicate-keeps-assessment",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert not any(item.details.get("event") == "react_decision" for item in result.progress)
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_zero_dynamic_budget_keeps_unresolved_memory_inconclusive(
+async def test_persisted_react_reasoning_replays_idempotently_after_interruption(
     tmp_path: Path,
 ) -> None:
-    tool = RecordingMCPStyleTool()
-    runtime = build_runtime(
-        settings_for(tmp_path),
-        strategy_provider=NoReactMCPStrategy(),
-        tool_registry=InvestigationToolRegistry([tool]),
-    )
+    runtime = build_runtime(settings_for(tmp_path))
     await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
+    stored, _ = await runtime.service.ingest(
         "canonical",
         {
-            "external_id": "zero-dynamic-budget",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert len(tool.calls) == 1
-    assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
-    assert not any(item.details.get("event") == "react_decision" for item in result.progress)
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_legacy_react_settings_do_not_invoke_a_planner(
-    tmp_path: Path,
-) -> None:
-    settings = settings_for(tmp_path).model_copy(
-        update={"react_enabled": True, "react_max_dynamic_turns": 1}
-    )
-    events: list[str] = []
-    advisor = RecordingAdvisor(events)
-    runtime = build_runtime(settings, advisor=advisor)
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-planner-failure",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    react_progress = [
-        item for item in result.progress if item.details.get("event") == "react_decision"
-    ]
-    assert react_progress == []
-    assert advisor.planner_calls == 0
-    assert events == ["ADVISOR"]
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_legacy_react_settings_keep_only_planned_collection(
-    tmp_path: Path,
-) -> None:
-    settings = settings_for(tmp_path).model_copy(
-        update={"react_enabled": True, "react_max_dynamic_turns": 1}
-    )
-    events: list[str] = []
-    advisor = RecordingAdvisor(events)
-    runtime = build_runtime(settings, advisor=advisor)
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "dynamic-investigation-duplicate",
-            "severity": "WARNING",
-            "title": "Database timeout",
-            "reason": "database_timeout",
-            "database": {"engine": "mysql", "instance": "orders-primary"},
-        },
-    )
-
-    assert result.evidence_records == []
-    react_progress = [
-        item for item in result.progress if item.details.get("event") == "react_decision"
-    ]
-    assert react_progress == []
-    assert advisor.planner_calls == 0
-    assert events == ["ADVISOR"]
-    assert result.recommendation is not None
-    assert result.recommendation.root_causes == []
-    await runtime.repository.close()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_unavailable_selected_tool_does_not_create_global_required_failure(
-    tmp_path: Path,
-) -> None:
-    runtime = build_runtime(
-        settings_for(tmp_path),
-        strategy_provider=RequiredToolStrategy(),
-        tool_registry=InvestigationToolRegistry(),
-    )
-    await runtime.repository.initialize()
-
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": "custom-required-1",
+            "external_id": "react-reasoning-recovery",
             "severity": "INFO",
-            "title": "Custom probe alert",
-            "reason": "custom_probe",
+            "title": "Reasoning recovery",
+            "reason": "checkpoint_recovery",
         },
     )
+    run = await runtime.repository.create_run(
+        str(stored.alert.id),
+        lease_owner="reasoning-worker",
+        lease_seconds=300,
+    )
+    assert run is not None
+    decision = InvestigationDecision(action="finish", reason="Recovered finish.")
+    reasoning = "真实 provider reasoning，必须在恢复后原样写入轨迹。"
+    sink = RepositoryEventSink(
+        runtime.repository,
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+    await sink.append(
+        AgentEvent(
+            run_id=run.id,
+            kind=AgentEventKind.MODEL_DECISION,
+            payload={
+                "actor": "main_agent",
+                "react_round": 1,
+                "decision": decision.model_dump(mode="json"),
+                "metadata": AdvisorMetadata(
+                    provider="test",
+                    model="reasoning-model",
+                    prompt_version="test-v1",
+                    reasoning_content=reasoning,
+                ).model_dump(mode="json"),
+            },
+        )
+    )
+    state = AgentState(
+        alert_id=str(stored.alert.id),
+        alert=stored.alert,
+        stored_alert=stored,
+        run=run,
+        react_max_rounds=8,
+    )
 
-    assert result.status == AlertStatus.INCONCLUSIVE
-    assert result.validations[0].passed is True
-    assert result.validations[0].evidence_sufficient is False
-    assert "required_tool_failures" not in result.validations[0].metadata
+    first = await react_decide_node(state, runtime.service.agent.ctx)
+    second = await react_decide_node(state, runtime.service.agent.ctx)
+
+    assert first["react_decision"] == decision
+    assert second["react_decision"] == decision
+    events = await runtime.repository.list_agent_events(str(run.id))
+    assert sum(item.kind == AgentEventKind.MODEL_DECISION for item in events) == 1
+    reasoning_events = [
+        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
+    ]
+    assert [item.payload["content"] for item in reasoning_events] == [reasoning]
+    assert sum(item.kind == AgentEventKind.TRACE_ACTION for item in events) == 1
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1406,8 +1378,7 @@ async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Pa
     updated = settings.model_copy(
         update={
             "runbook_limit": 9,
-            "react_enabled": True,
-            "react_max_dynamic_turns": 3,
+            "react_max_rounds": 3,
         }
     )
     apply_runtime_settings(runtime, updated)
@@ -1424,7 +1395,7 @@ async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Pa
     assert runtime.service.agent is not old_agent
     assert runtime.service.agent.ctx.advisor is runtime.service.advisor
     assert runtime.service.agent.ctx.runbook_limit == 9
-    assert runtime.service.max_dynamic_turns == 3
+    assert runtime.service.react_max_rounds == 3
     assert provider.limits == [9]
     assert result.status == AlertStatus.INCONCLUSIVE
     await runtime.repository.close()  # type: ignore[attr-defined]

@@ -21,13 +21,14 @@ from app.adapters.archery_harness import (
     ArcheryMCPConnector,
 )
 from app.adapters.archery_mcp import (
-    ARCHERY_MCP_LOGIN_TOOL_NAME,
-    ARCHERY_MCP_QUERY_TOOL_NAME,
-    ARCHERY_SLOW_LOG_TABLE,
+    ARCHERY_MCP_COLUMNS_TOOL_NAME,
+    ARCHERY_MCP_DATABASES_TOOL_NAME,
+    ARCHERY_MCP_INSTANCES_TOOL_NAME,
+    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+    ARCHERY_MCP_TABLES_TOOL_NAME,
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPClient,
-    ArcheryMCPConfigurationError,
-    ArcheryMCPToolError,
+    ArcheryMCPProtocolError,
     MCPServerSettings,
 )
 from app.adapters.persistence import (
@@ -47,15 +48,17 @@ from app.mcp_runtime import (
     ReplayErrorFixture,
     ReplayMCPConnector,
     ReplaySessionFixture,
-    RepositoryMCPCheckpointStore,
 )
 
 OCCURRED_AT = datetime.fromisoformat("2026-07-23T16:00:00+08:00")
+ARCHERY_MCP_LOGIN_TOOL_NAME = "ensure_login_gymJPA"
+ARCHERY_MCP_QUERY_TOOL_NAME = "sql_query_gymJPA"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ARCHERY_PROMPTS = load_mcp_catalog(
     PROJECT_ROOT / "config/mcp/settings.json"
 ).require("archery").prompts
 ALERT_CONTEXT = {"alert_endpoint": "db-1.example:3306"}
+FINISH_TOOL_NAME = "finish_archery_investigation"
 TARGET_ARGUMENTS = {
     "instance_id": 17,
     "db_name": "archery",
@@ -81,6 +84,7 @@ def _lineage_actions(final_sql: str = FINAL_SQL) -> list[MCPModelToolCall]:
         _call("member", MEMBER_SQL),
         _call("instance", INSTANCE_SQL),
         _call("final", final_sql),
+        _finish(),
     ]
 
 
@@ -90,7 +94,6 @@ def _lineage_replay_calls(
     rows: list[dict[str, Any]] | None = None,
 ) -> list[ReplayCallFixture]:
     return [
-        _login(),
         _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
         _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
         _success(final_sql, rows=rows),
@@ -130,6 +133,19 @@ def _call(call_id: str, sql: str) -> MCPModelToolCall:
     )
 
 
+def _finish(
+    call_id: str = "finish",
+    *,
+    reason: str = "Archery evidence collection is complete",
+) -> MCPModelToolCall:
+    return MCPModelToolCall(
+        call_id=call_id,
+        name=FINISH_TOOL_NAME,
+        arguments={"reason": reason},
+        request_id=f"request-{call_id}",
+    )
+
+
 def _tools() -> list[DiscoveredMCPTool]:
     return [
         DiscoveredMCPTool(
@@ -157,14 +173,6 @@ def _tools() -> list[DiscoveredMCPTool]:
     ]
 
 
-def _login() -> ReplayCallFixture:
-    return ReplayCallFixture(
-        tool_name=ARCHERY_MCP_LOGIN_TOOL_NAME,
-        expected_arguments={},
-        result={"structuredContent": {"status": "success", "username": "fixture"}},
-    )
-
-
 def _success(sql: str, *, rows: list[dict[str, Any]] | None = None) -> ReplayCallFixture:
     return ReplayCallFixture(
         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -183,7 +191,6 @@ def _client(
     model: _ScriptedModel,
     connector: ReplayMCPConnector,
     *,
-    max_agent_steps: int = 4,
     repository: SQLAlchemyAlertRepository | None = None,
 ) -> ArcheryMCPClient:
     return ArcheryMCPClient(
@@ -193,7 +200,6 @@ def _client(
             prompts=ARCHERY_PROMPTS,
         ),
         model,
-        max_agent_steps=max_agent_steps,
         harness_connector=connector,
         harness_runtime_dependencies=(
             ArcheryHarnessRuntimeDependencies(repository)
@@ -354,23 +360,82 @@ async def test_archery_sdk_session_preserves_null_fields_and_aliases() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_preserves_sanitized_login_envelope_before_business_validation() -> None:
-    raw_result = {
-        "structuredContent": {
-            "status": "failed",
-            "message": "bad credentials",
-            "trace_token": "private-token",
-        },
-        "isError": False,
-    }
+async def test_archery_sdk_session_lists_more_than_ten_tool_pages() -> None:
+    requested_cursors: list[str | None] = []
 
-    class _FailedLoginSession:
-        session_id = "archery-failed-login"
+    class _RawTool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def model_dump(self, **options: Any) -> dict[str, Any]:
+            assert options == {
+                "by_alias": True,
+                "mode": "json",
+                "exclude_none": True,
+            }
+            return {
+                "name": self.name,
+                "description": f"Capability for {self.name}",
+                "inputSchema": {"type": "object"},
+            }
+
+    class _PagedSession:
+        async def list_tools(self, *, params: Any = None) -> Any:
+            requested_cursors.append(getattr(params, "cursor", None))
+            page = len(requested_cursors)
+            return SimpleNamespace(
+                tools=[_RawTool(f"archery_tool_{page}")],
+                nextCursor=f"cursor-{page}" if page < 12 else None,
+            )
+
+    sdk_session = archery_harness_module._ArcherySDKSession(
+        owner=_client(_ScriptedModel([]), ReplayMCPConnector("archery", [])),
+        stack=archery_harness_module.AsyncExitStack(),
+        session=_PagedSession(),  # type: ignore[arg-type]
+        session_id="multi-page-tools",
+    )
+
+    tools = await sdk_session.list_tools()
+
+    assert len(tools) == 12
+    assert [tool.name for tool in tools] == [
+        f"archery_tool_{page}" for page in range(1, 13)
+    ]
+    assert requested_cursors == [None, *(f"cursor-{page}" for page in range(1, 12))]
+
+
+@pytest.mark.asyncio
+async def test_archery_sdk_session_rejects_repeated_tool_list_cursor() -> None:
+    class _RawTool:
+        name = "archery_tool"
+
+        @staticmethod
+        def model_dump(**_options: Any) -> dict[str, Any]:
+            return {"name": "archery_tool", "inputSchema": {"type": "object"}}
+
+    class _RepeatingCursorSession:
+        async def list_tools(self, *, params: Any = None) -> Any:
+            del params
+            return SimpleNamespace(tools=[_RawTool()], nextCursor="repeated-cursor")
+
+    sdk_session = archery_harness_module._ArcherySDKSession(
+        owner=_client(_ScriptedModel([]), ReplayMCPConnector("archery", [])),
+        stack=archery_harness_module.AsyncExitStack(),
+        session=_RepeatingCursorSession(),  # type: ignore[arg-type]
+        session_id="repeated-cursor",
+    )
+
+    with pytest.raises(ArcheryMCPProtocolError, match="repeated tools/list cursor"):
+        await sdk_session.list_tools()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_records_session_without_calling_a_fixed_login_tool() -> None:
+    class _SessionWithoutBootstrapCalls:
+        session_id = "archery-dynamic-session"
 
         async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            assert name == ARCHERY_MCP_LOGIN_TOOL_NAME
-            assert arguments == {}
-            return deepcopy(raw_result)
+            raise AssertionError(f"unexpected bootstrap call: {name} {arguments}")
 
     client = _client(
         _ScriptedModel([]),
@@ -389,26 +454,15 @@ async def test_bootstrap_preserves_sanitized_login_envelope_before_business_vali
         archery_harness_module._PlannerCallRegistry(),
     )
 
-    with pytest.raises(ArcheryMCPToolError, match="bad credentials"):
-        await scenario.bootstrap(_FailedLoginSession(), state)  # type: ignore[arg-type]
+    restored = await scenario.bootstrap(_SessionWithoutBootstrapCalls(), state)  # type: ignore[arg-type]
 
-    assert state.raw_mcp_call_results == [
-        {
-            "tool_name": ARCHERY_MCP_LOGIN_TOOL_NAME,
-            "result": {
-                "structuredContent": {
-                    "status": "failed",
-                    "message": "bad credentials",
-                    "trace_token": "***REDACTED***",
-                },
-                "isError": False,
-            },
-        }
-    ]
+    assert restored.session_id == "archery-dynamic-session"
+    assert restored.mcp_roundtrip_count == 0
+    assert not hasattr(restored, "raw_mcp_call_results")
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_repairs_a_model_response_without_a_tool_call() -> None:
+async def test_shared_harness_repairs_model_response_without_local_step_limit() -> None:
     model = _ScriptedModel(
         [RuntimeError("model returned zero tool calls"), *_lineage_actions()]
     )
@@ -431,26 +485,33 @@ async def test_shared_harness_repairs_a_model_response_without_a_tool_call() -> 
 
     assert result.query_completed is True
     assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
-    assert len(model.requests) == 4
+    assert len(model.requests) == 5
     assert "Return exactly one valid Agent action" in str(model.requests[1]["messages"])
     assert connector.opened_session_ids == ["archery-1"]
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_accepts_fixed_archery_tools_without_annotations(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_shared_harness_ignores_annotations_and_exposes_all_discovered_tools() -> None:
     tools = _tools()
     for tool in tools:
-        tool.annotations = {}
+        tool.annotations = {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "provider_extension": "ignored",
+        }
     tools.extend(
-        DiscoveredMCPTool(name=name, input_schema={"type": "object"})
+        DiscoveredMCPTool(
+            name=name,
+            description=f"Dynamic capability for {name}",
+            input_schema={"type": "object"},
+            annotations={"readOnlyHint": "not-a-boolean"},
+        )
         for name in (
-            archery_harness_module.ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
-            archery_harness_module.ARCHERY_MCP_INSTANCES_TOOL_NAME,
-            archery_harness_module.ARCHERY_MCP_DATABASES_TOOL_NAME,
-            archery_harness_module.ARCHERY_MCP_TABLES_TOOL_NAME,
-            archery_harness_module.ARCHERY_MCP_COLUMNS_TOOL_NAME,
+            ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+            ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+            ARCHERY_MCP_COLUMNS_TOOL_NAME,
         )
     )
     model = _ScriptedModel(_lineage_actions())
@@ -467,49 +528,23 @@ async def test_shared_harness_accepts_fixed_archery_tools_without_annotations(
         ],
     )
 
-    with caplog.at_level("WARNING", logger=archery_harness_module.__name__):
-        result = await _client(model, connector).execute_slow_log_query(
-            OCCURRED_AT,
-            alert_context=ALERT_CONTEXT,
-        )
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
 
     assert result.query_completed is True
     assert connector.opened_session_ids == ["archery-without-annotations"]
     assert set(model.requests[0]["tool_names"]) == {
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
-        archery_harness_module.ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
-        archery_harness_module.ARCHERY_MCP_INSTANCES_TOOL_NAME,
-        archery_harness_module.ARCHERY_MCP_DATABASES_TOOL_NAME,
-        archery_harness_module.ARCHERY_MCP_TABLES_TOOL_NAME,
-        archery_harness_module.ARCHERY_MCP_COLUMNS_TOOL_NAME,
+        ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+        ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        ARCHERY_MCP_DATABASES_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
+        ARCHERY_MCP_COLUMNS_TOOL_NAME,
+        FINISH_TOOL_NAME,
     }
-    assert "omitted annotations.readOnlyHint" in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("annotations", "expected_detail"),
-    [
-        ({"readOnlyHint": False}, "readOnlyHint=false"),
-        (
-            {"readOnlyHint": True, "destructiveHint": True},
-            "destructiveHint=true",
-        ),
-        ({"readOnlyHint": "true"}, "readOnlyHint must be boolean or null"),
-        (
-            {"readOnlyHint": True, "read_only_hint": False},
-            "conflicting readOnlyHint aliases",
-        ),
-    ],
-)
-def test_archery_harness_rejects_explicitly_unsafe_or_invalid_annotations(
-    annotations: dict[str, Any],
-    expected_detail: str,
-) -> None:
-    tools = _tools()
-    tools[-1].annotations = annotations
-
-    with pytest.raises(ArcheryMCPConfigurationError, match=expected_detail):
-        _scenario().build_tool_specs(tools)
 
 
 @pytest.mark.parametrize(
@@ -520,9 +555,13 @@ def test_archery_harness_rejects_explicitly_unsafe_or_invalid_annotations(
         {"destructiveHint": False},
         {"readOnlyHint": True},
         {"readOnlyHint": True, "destructiveHint": False},
+        {"readOnlyHint": False},
+        {"readOnlyHint": True, "destructiveHint": True},
+        {"readOnlyHint": "true"},
+        {"readOnlyHint": True, "read_only_hint": False},
     ],
 )
-def test_archery_harness_accepts_safe_or_missing_annotations(
+def test_archery_harness_ignores_all_remote_annotations(
     annotations: dict[str, Any],
 ) -> None:
     tools = _tools()
@@ -530,36 +569,293 @@ def test_archery_harness_accepts_safe_or_missing_annotations(
 
     specs = _scenario().build_tool_specs(tools)
 
-    assert [spec.name for spec in specs] == [ARCHERY_MCP_QUERY_TOOL_NAME]
-    assert all(spec.read_only for spec in specs)
+    assert [spec.name for spec in specs] == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    ]
+    assert specs[-1].input_schema == tools[-1].input_schema
 
 
-def test_archery_harness_never_exposes_unknown_unannotated_tools() -> None:
+def test_archery_harness_exposes_unknown_dynamic_tool_with_original_contract() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"scope": {"type": "string"}},
+        "required": ["scope"],
+        "additionalProperties": False,
+    }
     tools = [
         *_tools(),
         DiscoveredMCPTool(
             name="request_query_permission_gymJPA",
-            input_schema={"type": "object"},
+            description="Dynamically discovered Archery capability",
+            input_schema=schema,
         ),
     ]
 
     specs = _scenario().build_tool_specs(tools)
 
-    assert [spec.name for spec in specs] == [ARCHERY_MCP_QUERY_TOOL_NAME]
+    assert [spec.name for spec in specs] == [
+        ARCHERY_MCP_LOGIN_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        "request_query_permission_gymJPA",
+    ]
+    assert specs[-1].capability == "Dynamically discovered Archery capability"
+    assert specs[-1].input_schema == schema
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_does_not_expose_or_send_remote_character_limit() -> None:
-    model = _ScriptedModel(_lineage_actions())
+async def test_unknown_dynamic_tool_can_return_final_history_by_actual_sql() -> None:
+    dynamic_tool_name = "deployment_specific_query"
+    dynamic_arguments = {"deployment_scope": "primary"}
+    model = _ScriptedModel(
+        [
+            MCPModelToolCall(
+                call_id="dynamic-history",
+                name=dynamic_tool_name,
+                arguments=dynamic_arguments,
+                request_id="request-dynamic-history",
+            ),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-dynamic-history",
+                tools=[
+                    DiscoveredMCPTool(
+                        name=dynamic_tool_name,
+                        description="Deployment-specific query capability",
+                        input_schema={"type": "object", "additionalProperties": True},
+                    )
+                ],
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=dynamic_tool_name,
+                        expected_arguments=dynamic_arguments,
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": FINAL_SQL,
+                                "rows": [
+                                    {
+                                        "hostname_max": "db-1.example:3306",
+                                        "sample": "SELECT dynamic history",
+                                    }
+                                ],
+                            }
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == FINAL_SQL
+    assert result.executed_sql == FINAL_SQL
+    assert result.model_tool_calls == (dynamic_tool_name,)
+
+
+@pytest.mark.asyncio
+async def test_actual_response_sql_overrides_requested_history_for_classification() -> None:
+    actual_sql = "SELECT index_name FROM information_schema.statistics"
+    model = _ScriptedModel([_call("mismatched-sql", FINAL_SQL), _finish()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-actual-sql-wins",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": actual_sql,
+                                "rows": [{"index_name": "idx_hostname"}],
+                            }
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is False
+    assert result.requested_sql == ""
+    assert not hasattr(result, "raw_mcp_call_results")
+
+
+def test_archery_harness_does_not_require_or_hide_a_fixed_login_tool() -> None:
+    specs_without_login = _scenario().build_tool_specs(_tools()[1:])
+    assert [spec.name for spec in specs_without_login] == [ARCHERY_MCP_QUERY_TOOL_NAME]
+
+    specs = _scenario().build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="new_archery_tool",
+                input_schema={"type": "object"},
+            ),
+        ]
+    )
+
+    assert [spec.name for spec in specs] == ["new_archery_tool"]
+
+
+@pytest.mark.asyncio
+async def test_archery_planner_exposes_model_reasoning_content() -> None:
+    class ReasoningModel(_ScriptedModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            self.requests.append({"messages": messages, "tools": tools})
+            return MCPModelToolCall(
+                call_id="finish-with-reasoning",
+                name=FINISH_TOOL_NAME,
+                arguments={"reason": "No additional evidence is needed"},
+                request_id="request-finish-with-reasoning",
+                reasoning_content="Inspect the returned slow-log facts.",
+            )
+
+    client = _client(
+        ReasoningModel([]),
+        ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, []),
+    )
+    registry = archery_harness_module._PlannerCallRegistry()
+    scenario = archery_harness_module.ArcheryHarnessScenario(
+        client,
+        archery_harness_module.ArcheryHarnessState(
+            window_start=OCCURRED_AT,
+            window_end=OCCURRED_AT,
+            occurred_at=OCCURRED_AT,
+            alert_context=dict(ALERT_CONTEXT),
+            alert_endpoint=ALERT_CONTEXT["alert_endpoint"],
+        ),
+        registry,
+    )
+    planner = archery_harness_module.ArcheryHarnessPlanner(
+        client,
+        scenario,
+        registry,
+    )
+
+    await planner.plan(messages=[], tools=[])
+
+    assert planner.last_reasoning_content == "Inspect the returned slow-log facts."
+
+
+@pytest.mark.asyncio
+async def test_archery_planner_forwards_provider_reasoning_deltas() -> None:
+    class StreamingReasoningModel(_ScriptedModel):
+        async def request_mcp_tool_call(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            messages,
+            tools,
+            reasoning_callback,
+        ):
+            self.requests.append({"messages": messages, "tools": tools})
+            await reasoning_callback("Inspect ", 0)
+            await reasoning_callback("slow-log facts.", 1)
+            return MCPModelToolCall(
+                call_id="finish-streaming-reasoning",
+                name=FINISH_TOOL_NAME,
+                arguments={"reason": "No additional evidence is needed"},
+                request_id="request-finish-streaming-reasoning",
+                reasoning_content="Inspect slow-log facts.",
+            )
+
+    client = _client(
+        StreamingReasoningModel([]),
+        ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, []),
+    )
+    registry = archery_harness_module._PlannerCallRegistry()
+    scenario = archery_harness_module.ArcheryHarnessScenario(
+        client,
+        archery_harness_module.ArcheryHarnessState(
+            window_start=OCCURRED_AT,
+            window_end=OCCURRED_AT,
+            occurred_at=OCCURRED_AT,
+            alert_context=dict(ALERT_CONTEXT),
+            alert_endpoint=ALERT_CONTEXT["alert_endpoint"],
+        ),
+        registry,
+    )
+    planner = archery_harness_module.ArcheryHarnessPlanner(
+        client,
+        scenario,
+        registry,
+    )
+    deltas: list[tuple[int, str]] = []
+
+    async def capture(content: str, delta_index: int) -> None:
+        deltas.append((delta_index, content))
+
+    await planner.plan(messages=[], tools=[], reasoning_callback=capture)
+
+    assert deltas == [(0, "Inspect "), (1, "slow-log facts.")]
+    assert planner.last_reasoning_content == "Inspect slow-log facts."
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_preserves_schema_and_sends_remote_character_limit() -> None:
+    final_arguments = {
+        **TARGET_ARGUMENTS,
+        "sql_content": FINAL_SQL,
+        "max_result_chars": 123_456,
+    }
+    model = _ScriptedModel(
+        [
+            MCPModelToolCall(
+                call_id="final-with-limit",
+                name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                arguments=final_arguments,
+                request_id="request-final-with-limit",
+            ),
+            _finish(),
+        ]
+    )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
             ReplaySessionFixture(
                 session_id="archery-no-character-limit",
                 tools=_tools(),
-                calls=_lineage_replay_calls(
-                    rows=[{"hostname_max": "db-1.example:3306", "sql_text": "SELECT 1"}]
-                ),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments=final_arguments,
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": FINAL_SQL,
+                                "rows": [
+                                    {
+                                        "hostname_max": "db-1.example:3306",
+                                        "sql_text": "SELECT 1",
+                                    }
+                                ],
+                            }
+                        },
+                    ),
+                ],
             )
         ],
     )
@@ -575,8 +871,71 @@ async def test_shared_harness_does_not_expose_or_send_remote_character_limit() -
         for item in model.requests[0]["tools"]
         if item["function"]["name"] == ARCHERY_MCP_QUERY_TOOL_NAME
     )
-    assert "max_result_chars" not in query_tool["function"]["parameters"]["properties"]
+    assert "max_result_chars" in query_tool["function"]["parameters"]["properties"]
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
+    assert len(model.requests) == 2
     assert connector.opened_session_ids == ["archery-no-character-limit"]
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
+    auxiliary_secret = "authentication-and-metadata-raw-response"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("final", FINAL_SQL),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-auxiliary-projection",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": MEMBER_SQL,
+                                "rows": [{"f_instance_id": 53}],
+                                "authentication_token": auxiliary_secret,
+                                "raw_metadata": {"secret": auxiliary_secret},
+                            }
+                        },
+                    ),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sample": "SELECT 1",
+                                "query_time_max": 2.5,
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    final_request_messages = json.dumps(
+        model.requests[1]["messages"], ensure_ascii=False, default=str
+    )
+    assert auxiliary_secret not in final_request_messages
+    assert "f_instance_id" in final_request_messages
+    assert "internal_audit_artifact_only" in final_request_messages
+    assert "authentication_token" not in final_request_messages
+    assert "raw_metadata" not in final_request_messages
 
 
 @pytest.mark.asyncio
@@ -590,8 +949,35 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
     }
 
     class TextActionCompletions:
+        def __init__(self) -> None:
+            self.request_count = 0
+
         async def create(self, **kwargs: object) -> SimpleNamespace:
             del kwargs
+            self.request_count += 1
+            if self.request_count == 2:
+                return SimpleNamespace(
+                    id="archery-text-finish-request",
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="tool_calls",
+                            message=SimpleNamespace(
+                                content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="archery-text-finish-call",
+                                        function=SimpleNamespace(
+                                            name=FINISH_TOOL_NAME,
+                                            arguments=json.dumps(
+                                                {"reason": "Text action evidence is complete"}
+                                            ),
+                                        ),
+                                    )
+                                ],
+                            ),
+                        )
+                    ],
+                )
             return SimpleNamespace(
                 id="archery-text-action-request",
                 choices=[
@@ -609,8 +995,9 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
     advisor._api_key = "test-key"
     advisor._model = "tool-model"
     advisor._max_tokens = 16_384
+    completions = TextActionCompletions()
     advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=TextActionCompletions())
+        chat=SimpleNamespace(completions=completions)
     )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
@@ -619,7 +1006,6 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
                 session_id="archery-text-action",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(
                         FINAL_SQL,
                         rows=[
@@ -634,24 +1020,27 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
         ],
     )
 
-    result = await _client(advisor, connector, max_agent_steps=1).execute_slow_log_query(
+    result = await _client(advisor, connector).execute_slow_log_query(
         OCCURRED_AT,
         alert_context=ALERT_CONTEXT,
     )
 
-    assert result.query_completed is False
-    assert result.requested_sql == ""
+    assert result.query_completed is True
+    assert result.requested_sql == FINAL_SQL
     assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
     assert result.model_request_ids == ("archery-text-action-request",)
+    assert completions.request_count == 2
     assert connector.opened_session_ids == ["archery-text-action"]
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_stops_after_one_model_repair_and_keeps_diagnostics() -> None:
+async def test_shared_harness_keeps_repairing_until_model_explicitly_finishes() -> None:
     model = _ScriptedModel(
         [
             RuntimeError("provider returned zero tool calls request-1"),
             RuntimeError("provider returned zero tool calls request-2"),
+            RuntimeError("provider returned zero tool calls request-3"),
+            _finish(reason="No useful Archery call remains"),
         ]
     )
     connector = ReplayMCPConnector(
@@ -660,7 +1049,7 @@ async def test_shared_harness_stops_after_one_model_repair_and_keeps_diagnostics
             ReplaySessionFixture(
                 session_id="archery-1",
                 tools=_tools(),
-                calls=[_login()],
+                calls=[],
             )
         ],
     )
@@ -671,19 +1060,15 @@ async def test_shared_harness_stops_after_one_model_repair_and_keeps_diagnostics
     )
 
     assert result.query_completed is False
-    assert len(model.requests) == 2
+    assert len(model.requests) == 4
     assert result.diagnostics is not None
-    assert [
-        item["error"] for item in result.diagnostics["model_selection_errors"]
-    ] == [
-        "provider returned zero tool calls request-1",
-        "provider returned zero tool calls request-2",
-    ]
+    assert result.diagnostics["model_selection_errors"] == []
     assert result.diagnostics["mcp_tool_call_count"] == 0
+    assert result.diagnostics["harness_stop_reason"] == "COMPLETED"
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
+async def test_shared_harness_resume_keeps_repairing_until_explicit_finish(
     tmp_path: Path,
 ) -> None:
     class FailureThenInterruptModel(_ScriptedModel):
@@ -718,7 +1103,7 @@ async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
                     ReplaySessionFixture(
                         session_id="archery-model-before-restart",
                         tools=_tools(),
-                        calls=[_login()],
+                        calls=[],
                     )
                 ],
             ),
@@ -728,7 +1113,6 @@ async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
             alert_context=ALERT_CONTEXT,
             run_id=run.id,
             outer_dispatch_id=outer_dispatch_id,
-            outer_dispatch_attempt=1,
             lease_owner=run.lease_owner,
             fencing_token=run.fencing_token,
         )
@@ -737,7 +1121,11 @@ async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
     restarted_repository = SQLAlchemyAlertRepository(database_url)
     await restarted_repository.initialize()
     resumed_model = _ScriptedModel(
-        [RuntimeError("second selection failed after restart")]
+        [
+            RuntimeError("second selection failed after restart"),
+            RuntimeError("third selection failed after restart"),
+            _finish(reason="No useful Archery call remains after restart"),
+        ]
     )
     result = await _client(
         resumed_model,
@@ -747,7 +1135,7 @@ async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
                 ReplaySessionFixture(
                     session_id="archery-model-after-restart",
                     tools=_tools(),
-                    calls=[_login()],
+                    calls=[],
                 )
             ],
         ),
@@ -757,20 +1145,15 @@ async def test_shared_harness_resume_does_not_grant_a_third_model_selection(
         alert_context=ALERT_CONTEXT,
         run_id=run.id,
         outer_dispatch_id=outer_dispatch_id,
-        outer_dispatch_attempt=2,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
 
-    assert len(resumed_model.requests) == 1
+    assert len(resumed_model.requests) == 3
     assert result.query_completed is False
     assert result.diagnostics is not None
-    assert [
-        item["error"] for item in result.diagnostics["model_selection_errors"]
-    ] == [
-        "first selection failed before restart",
-        "second selection failed after restart",
-    ]
+    assert result.diagnostics["model_selection_errors"] == []
+    assert result.diagnostics["harness_stop_reason"] == "COMPLETED"
     await restarted_repository.close()
 
 
@@ -788,6 +1171,7 @@ async def test_shared_harness_reconnects_without_losing_prior_observations() -> 
             _call("instance", INSTANCE_SQL),
             _call("interrupted", interrupted_sql),
             _call("final", FINAL_SQL),
+            _finish(),
         ]
     )
     connector = ReplayMCPConnector(
@@ -797,7 +1181,6 @@ async def test_shared_harness_reconnects_without_losing_prior_observations() -> 
                 session_id="archery-1",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(auxiliary_sql, rows=[{"index_name": "idx_host_ts"}]),
                     _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
                     _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
@@ -821,7 +1204,6 @@ async def test_shared_harness_reconnects_without_losing_prior_observations() -> 
                 session_id="archery-2",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(
                         FINAL_SQL,
                         rows=[{"hostname_max": "db-1.example:3306", "sql_text": "SELECT 2"}],
@@ -830,7 +1212,7 @@ async def test_shared_harness_reconnects_without_losing_prior_observations() -> 
             ),
         ],
     )
-    result = await _client(model, connector, max_agent_steps=5).execute_slow_log_query(
+    result = await _client(model, connector).execute_slow_log_query(
         OCCURRED_AT,
         alert_context=ALERT_CONTEXT,
     )
@@ -845,61 +1227,74 @@ async def test_shared_harness_reconnects_without_losing_prior_observations() -> 
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_rejects_write_and_legacy_slow_log_without_remote_calls() -> None:
-    write_sql = "DELETE FROM mysql_slow_query_review_history"
-    legacy_sql = (
-        f"SELECT * FROM {ARCHERY_SLOW_LOG_TABLE} "
-        "WHERE f_insert_time >= FROM_UNIXTIME(1784793300) "
-        "AND f_insert_time < FROM_UNIXTIME(1784793600) LIMIT 20"
-    )
-    model = _ScriptedModel(
-        [
-            _call("write", write_sql),
-            _call("legacy", legacy_sql),
-            *_lineage_actions(),
-        ]
+async def test_shared_harness_allows_more_than_two_session_attempts() -> None:
+    connection_error = ReplayErrorFixture(
+        code="temporary_connection_error",
+        message="Archery MCP transport temporarily unavailable",
+        retryable=True,
     )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
             ReplaySessionFixture(
-                session_id="archery-1",
+                session_id="archery-session-attempt-1",
+                open_error=connection_error,
+            ),
+            ReplaySessionFixture(
+                session_id="archery-session-attempt-2",
+                open_error=connection_error.model_copy(deep=True),
+            ),
+            ReplaySessionFixture(
+                session_id="archery-session-attempt-3",
                 tools=_tools(),
-                calls=_lineage_replay_calls(),
-            )
+                calls=_lineage_replay_calls(
+                    rows=[{"hostname_max": "db-1.example:3306", "sql_text": "SELECT 3"}]
+                ),
+            ),
         ],
     )
-    result = await _client(model, connector, max_agent_steps=3).execute_slow_log_query(
+
+    result = await _client(
+        _ScriptedModel(_lineage_actions()),
+        connector,
+    ).execute_slow_log_query(
         OCCURRED_AT,
         alert_context=ALERT_CONTEXT,
     )
 
     assert result.query_completed is True
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert connector.opened_session_ids == [
+        "archery-session-attempt-1",
+        "archery-session-attempt-2",
+        "archery-session-attempt-3",
+    ]
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_tool_call_count"] == 3
-    assert result.diagnostics["model_decision_count"] == 5
-    assert "legacy_slow_log_table_not_approved" in str(model.requests[2]["messages"])
+    assert result.diagnostics["mcp_session_attempts"] == 3
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_returns_progressive_repair_after_server_timeout() -> None:
+async def test_shared_harness_reconnects_and_continues_after_tool_timeout() -> None:
     broad_sql = FINAL_SQL.replace(
         "AND ts_min >= FROM_UNIXTIME(1784793300) ",
         "AND ts_max >= FROM_UNIXTIME(1784793300) ",
     )
     model = _ScriptedModel(
-        [*_lineage_actions()[:2], _call("broad", broad_sql), _call("final", FINAL_SQL)]
+        [
+            *_lineage_actions()[:2],
+            _call("broad", broad_sql),
+            _call("final", FINAL_SQL),
+            _finish(),
+        ]
     )
     timeout = ReplayCallFixture(
         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
         expected_arguments={**TARGET_ARGUMENTS, "sql_content": broad_sql},
-        result={
-            "structuredContent": {
-                "status": "failed",
-                "message": "查询超时被 kill",
-            }
-        },
+        outcome=ReplayCallOutcome.ERROR,
+        error=ReplayErrorFixture(
+            code="TimeoutError",
+            message="Archery query timed out",
+            retryable=True,
+        ),
     )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
@@ -908,13 +1303,26 @@ async def test_shared_harness_returns_progressive_repair_after_server_timeout() 
                 session_id="archery-1",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
                     _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
                     timeout,
-                    _success(FINAL_SQL),
                 ],
-            )
+            ),
+            ReplaySessionFixture(
+                session_id="archery-after-timeout",
+                tools=_tools(),
+                calls=[
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sql_text": "SELECT after timeout",
+                            }
+                        ],
+                    ),
+                ],
+            ),
         ],
     )
     result = await _client(model, connector).execute_slow_log_query(
@@ -923,137 +1331,13 @@ async def test_shared_harness_returns_progressive_repair_after_server_timeout() 
     )
 
     assert result.query_completed is True
-    repair_messages = str(model.requests[3]["messages"])
-    assert "information_schema.statistics" in repair_messages
-    assert "ts_min >= FROM_UNIXTIME(1784793300)" in repair_messages
+    assert connector.opened_session_ids == ["archery-1", "archery-after-timeout"]
+    timeout_feedback = str(model.requests[3]["messages"])
+    assert "Archery query timed out" in timeout_feedback
+    assert "MISSING" in timeout_feedback
     assert result.diagnostics is not None
     assert result.diagnostics["query_trace"][2]["outcome"] == "tool_error"
-    assert len(result.raw_mcp_call_results) == 5
-    failed_envelope = result.raw_mcp_call_results[3]
-    assert failed_envelope["tool_name"] == ARCHERY_MCP_QUERY_TOOL_NAME
-    assert failed_envelope["result"]["structuredContent"]["status"] == "failed"
-    assert failed_envelope["result"]["structuredContent"]["message"] == (
-        "查询超时被 kill"
-    )
-
-
-@pytest.mark.asyncio
-async def test_shared_harness_reserves_final_calls_and_recovers_actual_mysql_timeout() -> None:
-    member_sql = (
-        "SELECT f_instance_id FROM t_instance_member "
-        "WHERE f_ip = 'db-1.example' AND f_port = 3306 LIMIT 1"
-    )
-    instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
-    redundant_instance_sql = (
-        "SELECT host, port, instance_name FROM sql_instance WHERE id = 53 LIMIT 1"
-    )
-    expensive_history_sql = FINAL_SQL.replace(
-        "ORDER BY ts_min DESC",
-        "ORDER BY Query_time_sum DESC",
-    )
-    overlap_history_sql = FINAL_SQL.replace(
-        "ts_min >= FROM_UNIXTIME(1784793300) ",
-        "ts_max >= FROM_UNIXTIME(1784793300) ",
-    )
-    index_sql = (
-        "SELECT index_name, seq_in_index, column_name "
-        "FROM information_schema.statistics "
-        "WHERE table_schema = 'archery' "
-        "AND table_name = 'mysql_slow_query_review_history' LIMIT 20"
-    )
-    timeout_message = (
-        "SQL 查询失败：{'errors': ErrorDetail(string=\"(1028, 'Sort aborted: "
-        "Query execution was interrupted, maximum statement execution time exceeded')\", "
-        "code='invalid')}"
-    )
-    model = _ScriptedModel(
-        [
-            _call("member", member_sql),
-            _call("instance", instance_sql),
-            _call("redundant-instance", redundant_instance_sql),
-            _call("expensive-history", expensive_history_sql),
-            _call("overlap-history", overlap_history_sql),
-            _call("history-index", index_sql),
-            _call("recovered-history", FINAL_SQL),
-        ]
-    )
-    timeout = ReplayCallFixture(
-        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
-        expected_arguments={**TARGET_ARGUMENTS, "sql_content": overlap_history_sql},
-        result={
-            "structuredContent": {
-                "status": "failed",
-                "message": timeout_message,
-            }
-        },
-    )
-    connector = ReplayMCPConnector(
-        ARCHERY_HARNESS_PROVIDER,
-        [
-            ReplaySessionFixture(
-                session_id="archery-finalization-reserve",
-                tools=_tools(),
-                calls=[
-                    _login(),
-                    _success(member_sql, rows=[{"f_instance_id": 53}]),
-                    _success(instance_sql, rows=[{"host": "db-1.example", "port": 3306}]),
-                    timeout,
-                    _success(
-                        index_sql,
-                        rows=[
-                            {
-                                "index_name": "idx_hostname_ts_min",
-                                "seq_in_index": 1,
-                                "column_name": "hostname_max",
-                            },
-                            {
-                                "index_name": "idx_hostname_ts_min",
-                                "seq_in_index": 2,
-                                "column_name": "ts_min",
-                            },
-                        ],
-                    ),
-                    _success(
-                        FINAL_SQL,
-                        rows=[
-                            {
-                                "hostname_max": "db-1.example:3306",
-                                "ts_min": "2026-07-23 15:59:00",
-                                "sql_text": "SELECT recovered",
-                            }
-                        ],
-                    ),
-                ],
-            )
-        ],
-    )
-
-    result = await _client(
-        model,
-        connector,
-        max_agent_steps=6,
-    ).execute_slow_log_query(
-        OCCURRED_AT,
-        alert_context=ALERT_CONTEXT,
-    )
-
-    assert result.query_completed is True
-    assert result.requested_sql == FINAL_SQL
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 5
-    assert result.diagnostics is not None
-    assert result.diagnostics["mcp_tool_call_count"] == 5
-    trace = result.diagnostics["query_trace"]
-    assert len(trace) == 7
-    assert trace[2]["outcome"] == "host_rejected"
-    assert "sql_instance 已完成" in trace[2]["continuation_reason"]
-    assert trace[3]["outcome"] == "host_rejected"
-    assert "只能按真实ts_min字段排序" in trace[3]["continuation_reason"]
-    assert trace[4]["outcome"] == "tool_error"
-    assert "maximum statement execution time exceeded" in trace[4]["error_detail"]
-    assert "Host最终取证保留区" in str(model.requests[2]["messages"])
-    timeout_feedback = str(model.requests[5]["messages"])
-    assert "当前告警窗口的日志事实仍不完整" in timeout_feedback
-    assert "ts_min >= FROM_UNIXTIME(1784793300)" in timeout_feedback
+    assert not hasattr(result, "raw_mcp_call_results")
 
 
 @pytest.mark.asyncio
@@ -1096,7 +1380,6 @@ async def test_shared_harness_persists_and_resumes_completed_run_without_reconne
         alert_context=ALERT_CONTEXT,
         run_id=run.id,
         outer_dispatch_id=outer_dispatch_id,
-        outer_dispatch_attempt=1,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
@@ -1139,7 +1422,6 @@ async def test_shared_harness_persists_and_resumes_completed_run_without_reconne
         alert_context=ALERT_CONTEXT,
         run_id=run.id,
         outer_dispatch_id=outer_dispatch_id,
-        outer_dispatch_attempt=2,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
@@ -1206,7 +1488,6 @@ async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
                 session_id="archery-before-restart",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
                     _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
                 ],
@@ -1223,7 +1504,6 @@ async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
             alert_context=ALERT_CONTEXT,
             run_id=run.id,
             outer_dispatch_id=outer_dispatch_id,
-            outer_dispatch_attempt=1,
             lease_owner=run.lease_owner,
             fencing_token=run.fencing_token,
         )
@@ -1231,27 +1511,19 @@ async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
 
     restarted_repository = SQLAlchemyAlertRepository(database_url)
     await restarted_repository.initialize()
-    resumed_login = ReplayCallFixture(
-        tool_name=ARCHERY_MCP_LOGIN_TOOL_NAME,
-        expected_arguments={},
-        result={
-            "structuredContent": {
-                "status": "success",
-                "username": "resumed-fixture",
-            }
-        },
-    )
     resume_connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
             ReplaySessionFixture(
                 session_id="archery-after-restart",
                 tools=_tools(),
-                calls=[resumed_login, _success(FINAL_SQL)],
+                calls=[_success(FINAL_SQL)],
             )
         ],
     )
-    resumed_model = _ScriptedModel([_call("final-after-restart", FINAL_SQL)])
+    resumed_model = _ScriptedModel(
+        [_call("final-after-restart", FINAL_SQL), _finish("finish-after-restart")]
+    )
     resumed = await _client(
         resumed_model,
         resume_connector,
@@ -1261,7 +1533,6 @@ async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
         alert_context=ALERT_CONTEXT,
         run_id=run.id,
         outer_dispatch_id=outer_dispatch_id,
-        outer_dispatch_attempt=2,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
@@ -1270,12 +1541,12 @@ async def test_shared_harness_mid_run_resume_plans_from_restored_runtime_state(
     assert resumed.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
     assert resumed.diagnostics is not None
     assert resumed.diagnostics["model_decision_count"] == 3
-    assert "resumed-fixture" in str(resumed_model.requests[0]["messages"])
+    assert "resumed-fixture" not in str(resumed_model.requests[0]["messages"])
     await restarted_repository.close()
 
 
 @pytest.mark.asyncio
-async def test_outer_recovery_without_scoped_checkpoint_never_opens_archery_session(
+async def test_new_scoped_dispatch_without_checkpoint_starts_archery_session(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(
@@ -1286,22 +1557,34 @@ async def test_outer_recovery_without_scoped_checkpoint_never_opens_archery_sess
         repository,
         external_id="archery-missing-outer-checkpoint",
     )
-    connector = ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, [])
-    client = _client(_ScriptedModel([]), connector, repository=repository)
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-new-dispatch",
+                tools=_tools(),
+                calls=[],
+            )
+        ],
+    )
+    client = _client(
+        _ScriptedModel([_finish("No Archery call is required")]),
+        connector,
+        repository=repository,
+    )
     assert run.lease_owner is not None
 
-    with pytest.raises(ArcheryMCPConfigurationError, match="no matching child checkpoint"):
-        await client.execute_slow_log_query(
-            OCCURRED_AT,
-            alert_context=ALERT_CONTEXT,
-            run_id=run.id,
-            outer_dispatch_id=uuid4(),
-            outer_dispatch_attempt=2,
-            lease_owner=run.lease_owner,
-            fencing_token=run.fencing_token,
-        )
+    result = await client.execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
+        outer_dispatch_id=uuid4(),
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
 
-    assert connector.opened_session_ids == []
+    assert result.query_completed is False
+    assert connector.opened_session_ids == ["archery-new-dispatch"]
     await repository.close()
 
 
@@ -1313,7 +1596,7 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'artifact-recovery.db'}"
     repository = SQLAlchemyAlertRepository(database_url)
     await repository.initialize()
-    manifest, run = await _create_durable_run(
+    _, run = await _create_durable_run(
         repository,
         external_id="archery-artifact-recovery",
     )
@@ -1330,18 +1613,27 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
                 session_id="archery-artifact-first-process",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
                 ],
             )
         ],
     )
 
-    async def interrupt_artifact_write(*args: Any, **kwargs: Any) -> Any:
-        del args, kwargs
-        raise asyncio.CancelledError
+    original_save = archery_harness_module.RepositoryArcheryRemoteResponseStore.save
+    interrupted = False
 
-    monkeypatch.setattr(repository, "save_agent_artifact", interrupt_artifact_write)
+    async def interrupt_after_response_save(store: Any, **kwargs: Any) -> None:
+        nonlocal interrupted
+        await original_save(store, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        archery_harness_module.RepositoryArcheryRemoteResponseStore,
+        "save",
+        interrupt_after_response_save,
+    )
     assert run.lease_owner is not None
     with pytest.raises(asyncio.CancelledError):
         await _client(
@@ -1356,24 +1648,6 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
             fencing_token=run.fencing_token,
         )
 
-    checkpoint = await repository.load_checkpoint(
-        str(run.id),
-        namespace=f"mcp:{ARCHERY_HARNESS_PROVIDER}",
-    )
-    assert checkpoint is not None
-    interrupted_checkpoint_store = RepositoryMCPCheckpointStore[
-        Any,
-        dict[str, Any],
-    ](
-        repository,
-        provider=ARCHERY_HARNESS_PROVIDER,
-        manifest_hash=manifest.digest(),
-        lease_owner=run.lease_owner,
-        fencing_token=run.fencing_token,
-    )
-    interrupted_snapshot = await interrupted_checkpoint_store.load(run.id)
-    assert interrupted_snapshot is not None
-    assert len(interrupted_snapshot.state.pending_artifact_content) == 1
     async with repository.session_factory() as session:
         invocations = (
             await session.execute(
@@ -1387,9 +1661,28 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
         ).scalars().all()
     assert len(invocations) == 1
     assert invocations[0].status == ToolInvocationStatus.STARTED.value
-    assert artifacts == []
+    assert len(artifacts) == 1
+    stored_before_restart = await repository.get_agent_artifact(artifacts[0].id)
+    assert stored_before_restart is not None
+    first_artifact, first_content = stored_before_restart
+    assert first_artifact.kind == "archery_mcp_remote_response"
+    assert first_artifact.metadata["internal_only"] is True
+    assert first_artifact.metadata["invocation_id"] == invocations[0].id
+    assert isinstance(first_content, dict)
+    assert first_content["response"] == {
+        "structuredContent": {
+            "status": "success",
+            "full_sql": MEMBER_SQL,
+            "rows": [{"f_instance_id": 53}],
+        }
+    }
     await repository.close()
 
+    monkeypatch.setattr(
+        archery_harness_module.RepositoryArcheryRemoteResponseStore,
+        "save",
+        original_save,
+    )
     restarted_repository = SQLAlchemyAlertRepository(database_url)
     await restarted_repository.initialize()
     resume_connector = ReplayMCPConnector(
@@ -1399,7 +1692,6 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
                 session_id="archery-artifact-recovery-resume",
                 tools=_tools(),
                 calls=[
-                    _login(),
                     _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
                     _success(FINAL_SQL, rows=rows),
                 ],
@@ -1440,27 +1732,79 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
     artifact_id = recovered_artifacts[-1].id
     persisted_artifact = await restarted_repository.get_agent_artifact(artifact_id)
     assert persisted_artifact is not None
-    assert persisted_artifact[1] == {
+    assert isinstance(persisted_artifact[1], dict)
+    assert persisted_artifact[1]["response"] == {
         "structuredContent": {
             "status": "success",
             "full_sql": FINAL_SQL,
             "rows": rows,
         }
     }
-    checkpoint_store = RepositoryMCPCheckpointStore[
-        Any,
-        dict[str, Any],
-    ](
-        restarted_repository,
-        provider=ARCHERY_HARNESS_PROVIDER,
-        manifest_hash=manifest.digest(),
+    assert not hasattr(resumed, "raw_mcp_call_results")
+    await restarted_repository.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_persists_tool_error_response_before_processing(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'archery-tool-error-audit.db'}"
+    )
+    await repository.initialize()
+    _, run = await _create_durable_run(
+        repository,
+        external_id="archery-tool-error-audit",
+    )
+    raw_error = {
+        "isError": True,
+        "content": [{"type": "text", "text": "Archery rejected the query"}],
+    }
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-tool-error-audit",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                        result=raw_error,
+                    )
+                ],
+            )
+        ],
+    )
+    assert run.lease_owner is not None
+
+    result = await _client(
+        _ScriptedModel([_call("tool-error", MEMBER_SQL), _finish()]),
+        connector,
+        repository=repository,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
         lease_owner=run.lease_owner,
         fencing_token=run.fencing_token,
     )
-    recovered_checkpoint = await checkpoint_store.load(run.id)
-    assert recovered_checkpoint is not None
-    assert recovered_checkpoint.state.pending_artifact_content == {}
-    await restarted_repository.close()
+
+    assert result.query_completed is False
+    async with repository.session_factory() as session:
+        artifacts = (
+            await session.execute(
+                select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
+            )
+        ).scalars().all()
+    assert len(artifacts) == 1
+    stored = await repository.get_agent_artifact(artifacts[0].id)
+    assert stored is not None
+    artifact, content = stored
+    assert artifact.metadata["internal_only"] is True
+    assert isinstance(content, dict)
+    assert content["response"] == raw_error
+    await repository.close()
 
 
 @pytest.mark.asyncio

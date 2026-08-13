@@ -17,11 +17,11 @@ from app.agents.nodes import (
     NodeContext,
     advise_node,
     enrich_alert_node,
-    execute_tools_node,
+    execute_react_tool_node,
     fingerprint_node,
+    react_decide_node,
     report_node,
     runbook_match_node,
-    select_strategy_node,
     validate_node,
 )
 from app.agents.state import AgentState
@@ -30,7 +30,6 @@ from app.domain.ports import (
     AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
-    InvestigationStrategyProvider,
     RunbookProvider,
     ToolResultAnalyzer,
 )
@@ -42,8 +41,8 @@ logger = logging.getLogger(__name__)
 NODE_ENRICH_ALERT = "enrich_alert"
 NODE_FINGERPRINT = "fingerprint"
 NODE_RUNBOOK = "runbook"
-NODE_STRATEGY = "strategy"
-NODE_EXECUTE_TOOLS = "execute_tools"
+NODE_REACT_DECIDE = "react_decide"
+NODE_EXECUTE_REACT_TOOL = "execute_react_tool"
 NODE_ADVISE = "advise"
 NODE_VALIDATE = "validate"
 NODE_REPORT = "report"
@@ -58,11 +57,13 @@ def build_investigation_graph(
 
     The graph implements the following flow:
 
-    START -> enrich_alert -> fingerprint -> runbook -> strategy -> execute_tools
-          -> advise -> validate -> report -> END
+    START -> enrich_alert -> fingerprint -> runbook -> react_decide
+          -> execute_react_tool -> react_decide -> ... -> advise -> validate
+          -> report -> END
 
-    Knowledge retrieval and every planned read-only collection finish before
-    the advisor is allowed to analyze a root cause.
+    Every ReAct round lets the main Agent either call exactly one configured
+    outer tool or finish evidence collection. The final root-cause synthesis
+    runs only after ``finish`` or the configured ReAct round ceiling.
 
     Args:
         ctx: NodeContext containing all dependencies for node execution
@@ -78,8 +79,11 @@ def build_investigation_graph(
     graph.add_node(NODE_ENRICH_ALERT, partial(enrich_alert_node, ctx=ctx))
     graph.add_node(NODE_FINGERPRINT, partial(fingerprint_node, ctx=ctx))
     graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
-    graph.add_node(NODE_STRATEGY, partial(select_strategy_node, ctx=ctx))
-    graph.add_node(NODE_EXECUTE_TOOLS, partial(execute_tools_node, ctx=ctx))
+    graph.add_node(NODE_REACT_DECIDE, partial(react_decide_node, ctx=ctx))
+    graph.add_node(
+        NODE_EXECUTE_REACT_TOOL,
+        partial(execute_react_tool_node, ctx=ctx),
+    )
     graph.add_node(NODE_ADVISE, partial(advise_node, ctx=ctx))
     graph.add_node(NODE_VALIDATE, partial(validate_node, ctx=ctx))
     graph.add_node(NODE_REPORT, partial(report_node, ctx=ctx))
@@ -90,14 +94,29 @@ def build_investigation_graph(
     # Add linear edges
     graph.add_edge(NODE_ENRICH_ALERT, NODE_FINGERPRINT)
     graph.add_edge(NODE_FINGERPRINT, NODE_RUNBOOK)
-    graph.add_edge(NODE_RUNBOOK, NODE_STRATEGY)
-    graph.add_edge(NODE_STRATEGY, NODE_EXECUTE_TOOLS)
-    graph.add_edge(NODE_EXECUTE_TOOLS, NODE_ADVISE)
+    graph.add_edge(NODE_RUNBOOK, NODE_REACT_DECIDE)
+    graph.add_conditional_edges(
+        NODE_REACT_DECIDE,
+        _route_after_react_decision,
+        {
+            "tool": NODE_EXECUTE_REACT_TOOL,
+            "finish": NODE_ADVISE,
+        },
+    )
+    graph.add_edge(NODE_EXECUTE_REACT_TOOL, NODE_REACT_DECIDE)
     graph.add_edge(NODE_ADVISE, NODE_VALIDATE)
     graph.add_edge(NODE_VALIDATE, NODE_REPORT)
     graph.add_edge(NODE_REPORT, END)
 
     return graph.compile(checkpointer=checkpointer)
+
+
+def _route_after_react_decision(state: AgentState) -> str:
+    """Route one ReAct decision without introducing alert-type branches."""
+
+    if state.error or state.react_finished:
+        return "finish"
+    return "tool" if len(state.pending_tool_requests) == 1 else "finish"
 
 
 class InvestigationAgent:
@@ -115,12 +134,9 @@ class InvestigationAgent:
         advisor: AIAdvisor,
         fallback_advisor: AIAdvisor | None = None,
         rule_validator: ConclusionValidator,
-        conclusion_validator: ConclusionValidator,
         tool_registry: InvestigationToolRegistry,
         tool_executor: ToolExecutor,
         tool_result_analyzer: ToolResultAnalyzer | None = None,
-        tool_result_analysis_threshold_chars: int = 12_000,
-        strategy_provider: InvestigationStrategyProvider,
         alert_detail_enricher: AlertDetailEnricher | None = None,
         runbook_limit: int = 5,
         external_knowledge_client: ExternalKnowledgeClient | None = None,
@@ -135,11 +151,9 @@ class InvestigationAgent:
             runbook_provider: Runbook search provider
             advisor: Primary AI advisor
             fallback_advisor: Fallback AI advisor for degraded mode
-            rule_validator: Rule-based validator
-            conclusion_validator: AI-based conclusion validator
+            rule_validator: Deterministic recommendation-contract validator
             tool_registry: Registry of investigation tools
             tool_executor: Tool execution engine
-            strategy_provider: Investigation strategy provider
             runbook_limit: Maximum runbooks to retrieve per alert
             external_knowledge_client: Optional external knowledge API client
             external_knowledge_limit: Maximum external knowledge items to retrieve
@@ -153,12 +167,9 @@ class InvestigationAgent:
             advisor=advisor,
             fallback_advisor=fallback_advisor,
             rule_validator=rule_validator,
-            conclusion_validator=conclusion_validator,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
             tool_result_analyzer=tool_result_analyzer,
-            tool_result_analysis_threshold_chars=tool_result_analysis_threshold_chars,
-            strategy_provider=strategy_provider,
             alert_detail_enricher=alert_detail_enricher,
             runbook_limit=runbook_limit,
             external_knowledge_client=external_knowledge_client,
@@ -178,13 +189,16 @@ class InvestigationAgent:
             The final state after investigation completes
         """
         run = initial_state.run
+        invocation_config: RunnableConfig = {
+            "recursion_limit": max(25, initial_state.react_max_rounds * 2 + 12),
+        }
         if run is None or not run.lease_owner:
-            result = await self.graph.ainvoke(initial_state)
+            result = await self.graph.ainvoke(initial_state, invocation_config)
             return AgentState.model_validate(result)
 
         manifest = await self.ctx.repository.get_run_manifest(str(run.id))
         if manifest is None:
-            result = await self.graph.ainvoke(initial_state)
+            result = await self.graph.ainvoke(initial_state, invocation_config)
             return AgentState.model_validate(result)
         if manifest.run_id != run.id:
             raise RuntimeError("Run manifest identity does not match the investigation run")
@@ -198,6 +212,7 @@ class InvestigationAgent:
         )
         graph = build_investigation_graph(self.ctx, checkpointer=checkpointer)
         config: RunnableConfig = {
+            "recursion_limit": max(25, initial_state.react_max_rounds * 2 + 12),
             "configurable": {
                 "thread_id": str(run.id),
             }

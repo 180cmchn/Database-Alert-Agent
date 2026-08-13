@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+ReasoningDeltaCallback = Callable[[str, int], Awaitable[None]]
+ReasoningTraceCallback = Callable[[str, str, int], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,14 +16,8 @@ class MCPModelToolCall:
     name: str
     arguments: dict[str, Any]
     request_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class MCPServerSelection:
-    """Zero or more declarative MCP servers selected for one alert."""
-
-    server_names: tuple[str, ...]
-    request_id: str | None = None
+    reasoning_content: str | None = None
+    usage: dict[str, Any] | None = None
 
 
 @runtime_checkable
@@ -31,18 +29,5 @@ class MCPToolCallingModel(Protocol):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        reasoning_callback: ReasoningDeltaCallback | None = None,
     ) -> MCPModelToolCall: ...
-
-
-@runtime_checkable
-class MCPServerSelectionModel(Protocol):
-    """Model capability used to select relevant MCP servers from their roles."""
-
-    async def select_mcp_servers(
-        self,
-        *,
-        alert: dict[str, Any],
-        knowledge_matches: list[dict[str, Any]],
-        knowledge_match_summary: str,
-        candidates: list[dict[str, Any]],
-    ) -> MCPServerSelection: ...

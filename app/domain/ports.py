@@ -13,9 +13,9 @@ from app.domain.models import (
     EvidenceRecord,
     ExternalKnowledgeExcerpt,
     InvestigationContext,
+    InvestigationDecisionResult,
     InvestigationRun,
     InvestigationStage,
-    InvestigationStrategy,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -28,6 +28,7 @@ from app.domain.models import (
     ToolResultAnalysis,
     ValidationRecord,
 )
+from app.domain.tool_calling import ReasoningTraceCallback
 
 if TYPE_CHECKING:
     from app.agent_runtime.contracts import (
@@ -36,9 +37,9 @@ if TYPE_CHECKING:
         RunManifest,
         ToolInvocation,
         ToolInvocationStatus,
+        ToolSpec,
     )
     from app.agent_runtime.events import AgentEvent
-    from app.investigations.models import InvestigationMemory
 
 
 class AgentEventSequenceConflict(RuntimeError):
@@ -93,6 +94,23 @@ class RunLeaseConflict(RuntimeError):
         super().__init__(f"Run lease conflict for {run_id}: {detail}")
 
 
+class RunCancellationConflict(RuntimeError):
+    """A cancellation request conflicts with the run's persisted state."""
+
+    def __init__(self, run_id: str, status: str) -> None:
+        self.run_id = run_id
+        self.status = status
+        super().__init__(f"Run cancellation conflict for {run_id}: status is {status}")
+
+
+class RunCancellationRequested(RuntimeError):
+    """The active run has a durable cancellation request."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"Run cancellation requested for {run_id}")
+
+
 class AlertSourceAdapter(Protocol):
     @property
     def source(self) -> str: ...
@@ -102,8 +120,6 @@ class AlertSourceAdapter(Protocol):
 
 class AlertDetailEnricher(Protocol):
     """Load the authoritative detail view used by an investigation."""
-
-    read_only: bool
 
     async def enrich(self, alert: NormalizedAlert) -> NormalizedAlert: ...
 
@@ -121,6 +137,20 @@ class RunbookStore(Protocol):
 
 
 class AIAdvisor(Protocol):
+    async def decide_investigation(
+        self,
+        *,
+        alert: NormalizedAlert,
+        runbooks: list[RunbookExcerpt],
+        external_knowledge: list[ExternalKnowledgeExcerpt],
+        knowledge_match_summary: str,
+        evidence: list[EvidenceRecord],
+        available_tools: list[ToolSpec],
+        react_round: int,
+        react_max_rounds: int,
+        reasoning_callback: ReasoningTraceCallback | None = None,
+    ) -> InvestigationDecisionResult: ...
+
     async def advise(
         self,
         alert: NormalizedAlert,
@@ -128,15 +158,14 @@ class AIAdvisor(Protocol):
         evidence: list[EvidenceRecord] | None = None,
         external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
-        strategy: InvestigationStrategy | None = None,
-        investigation_memory: InvestigationMemory | None = None,
+        reasoning_callback: ReasoningTraceCallback | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]: ...
 
 
 class ToolResultAnalyzer(Protocol):
     """Project a complete sanitized result into traceable facts and anomalies.
 
-    This child-session boundary does not authorize causal or root-cause decisions.
+    Program-side projection does not authorize causal or root-cause decisions.
     """
 
     async def analyze(
@@ -160,22 +189,9 @@ class InvestigationTool(Protocol):
     @property
     def source_system(self) -> str: ...
 
-    @property
-    def read_only(self) -> bool: ...
-
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
     ) -> tuple[str, dict[str, Any]] | ToolExecutionResult: ...
-
-
-class InvestigationStrategyProvider(Protocol):
-    async def select(
-        self,
-        alert: NormalizedAlert,
-        runbooks: list[RunbookExcerpt] | None = None,
-        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
-        knowledge_match_summary: str = "",
-    ) -> InvestigationStrategy: ...
 
 
 class ConclusionValidator(Protocol):
@@ -186,7 +202,6 @@ class ConclusionValidator(Protocol):
         recommendation: Recommendation,
         evidence: list[EvidenceRecord],
         runbooks: list[RunbookExcerpt],
-        investigation_memory: InvestigationMemory | None = None,
     ) -> ValidationRecord: ...
 
 
@@ -321,6 +336,21 @@ class AlertRepository(Protocol):
         lease_seconds: int,
     ) -> bool: ...
 
+    async def request_run_cancellation(
+        self,
+        alert_id: str,
+        run_id: str,
+        requested_by: str,
+    ) -> InvestigationRun | None: ...
+
+    async def is_run_cancellation_requested(self, run_id: str) -> bool: ...
+
+    async def finalize_requested_cancellation(
+        self,
+        alert_id: str,
+        run_id: str,
+    ) -> InvestigationRun | None: ...
+
     async def get_run_manifest(self, run_id: str) -> RunManifest | None: ...
 
     async def append_agent_events(
@@ -338,6 +368,7 @@ class AlertRepository(Protocol):
         run_id: str,
         *,
         after_sequence: int = 0,
+        limit: int | None = None,
     ) -> list[AgentEvent]: ...
 
     async def get_agent_event_sequence(self, run_id: str) -> int: ...
@@ -433,7 +464,6 @@ class AlertRepository(Protocol):
         run_id: str,
         *,
         stage: InvestigationStage | None = None,
-        strategy_id: str | None = None,
         error: str | None = None,
         lease_owner: str,
         fencing_token: int,

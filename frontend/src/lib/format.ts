@@ -13,6 +13,7 @@ export const statusLabel: Record<AlertStatus, string> = {
   COMPLETED: "已完成",
   INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",
+  CANCELLED: "已取消",
 };
 
 export const stageLabel: Record<InvestigationStage, string> = {
@@ -27,6 +28,7 @@ export const stageLabel: Record<InvestigationStage, string> = {
   COMPLETED: "分析完成",
   INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",
+  CANCELLED: "分析已取消",
 };
 
 export const toolStatusLabel = {

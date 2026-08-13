@@ -51,17 +51,19 @@ JSONL 固定达到 100 条，也不要求逐条修改 `review_status`。但诊�
 持续积累困难负样本、同告警不同根因和反事实样本，并按事故与时间隔离；这些数据用于衡量真实
 效果，不会在 `--sync` 时被覆盖。
 
-当前评测工具只测确定性的检索和诊断知识覆盖。生成模型的根因三态、证据忠实性和安全性应通过
-带预期结果的离线场景集、回放与按时间隔离的历史事件结果统计。评测报告必须在顶层 `violations` 中显式给出
+当前评测工具只测确定性的检索和诊断知识覆盖。主 Agent 的 `SUPPORTED`/不确定结论、证据忠实性
+和行为边界应通过带预期结果的离线场景集、回放与按时间隔离的历史事件结果统计。评测报告必须在
+顶层 `violations` 中显式给出
 `policies/production-gates.json` 所列每个零容忍项的非负整数计数；任意非零、缺失或非法计数都会
 使生产门槛失败。检索评测产生的零值只表示其执行范围内没有观察到违规，不替代完整 Agent 场景
 评测。
 
 ## Agent harness 场景报告
 
-Agent harness 有两层验证。第一层是使用 `ReplayMCPConnector`、fake client 和临时 SQLite 的离线
-replay/fault injection 单元测试，验证 repair、拒绝、超时、断线重连、部分证据、预算、checkpoint
-恢复和 fencing；这些测试不访问公司内网。第二层是下面的发布门槛场景报告，用于汇总端到端场景
+Agent 运行时有两层验证。第一层使用 `ReplayMCPConnector`、fake client 和临时 SQLite 进行离线
+replay/fault injection，验证 ReAct `finish`、轮次上限、整次分析超时、主动取消、MCP 超时、断线
+重连、部分证据、checkpoint 恢复和 fencing；这些测试不访问公司内网。第二层是下面的发布门槛场景
+报告，用于汇总端到端场景
 运行结果，不能由单元测试的通过状态代替。
 
 `harness_policy` 已支持独立 Agent harness 报告输入。当前默认关闭，是因为 CI/发布流程尚未接入
@@ -74,19 +76,22 @@ replay/fault injection 单元测试，验证 repair、拒绝、超时、断线�
   --enforce-gates
 ```
 
-报告格式如下；每个必需故障族的数量至少为 `1`。必需故障族为 `model_no_tool_call`、
-`mcp_timeout`、`mcp_reconnect`、`partial_evidence`、`budget_exhaustion` 和 `checkpoint_resume`：
+报告格式如下；每个必需场景族的数量至少为 `1`。场景族包括 `react_finish`、
+`react_round_limit`、`analysis_timeout`、`analysis_cancel`、`mcp_timeout`、`mcp_reconnect`、
+`partial_evidence` 和 `checkpoint_resume`：
 
 ```json
 {
-  "scenario_count": 18,
+  "scenario_count": 22,
   "fault_families": {
-    "model_no_tool_call": 2,
+    "react_finish": 2,
+    "react_round_limit": 2,
+    "analysis_timeout": 2,
+    "analysis_cancel": 2,
     "mcp_timeout": 3,
     "mcp_reconnect": 3,
     "partial_evidence": 3,
-    "budget_exhaustion": 3,
-    "checkpoint_resume": 4
+    "checkpoint_resume": 5
   },
   "violations": {
     "fabricated_runbook_references": 0,

@@ -16,12 +16,7 @@ def _write_prompts(directory: Path, *, prefix: str = "server") -> dict[str, str]
     references: dict[str, str] = {}
     for prompt_name in ("role", "purpose", "workflow", "safety"):
         prompt_path = prompt_directory / f"{prompt_name}.md"
-        content = (
-            f"{prefix} {prompt_name}\nread_only: true\n"
-            if prompt_name == "safety"
-            else f"{prefix} {prompt_name}\n"
-        )
-        prompt_path.write_text(content, encoding="utf-8")
+        prompt_path.write_text(f"{prefix} {prompt_name}\n", encoding="utf-8")
         references[prompt_name] = str(prompt_path.relative_to(directory))
     return references
 
@@ -37,11 +32,9 @@ def _write_settings(directory: Path, servers: dict[str, object]) -> Path:
 
 def _server_config(directory: Path, **overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
-        "readOnly": True,
         "url": "${EXAMPLE_MCP_URL}",
         "headers": {"Authorization": "${EXAMPLE_MCP_API_KEY}"},
         "prompts": _write_prompts(directory),
-        "toolPolicies": {"query": {"capability": "range_query"}},
     }
     config.update(overrides)
     return config
@@ -56,7 +49,7 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     )
     candidates = catalog.selection_candidates()
     assert tuple(candidate.name for candidate in candidates) == ("archery", "prometheus")
-    assert all(candidate.read_only for candidate in candidates)
+    assert all(not hasattr(candidate, "read_only") for candidate in candidates)
     assert all(not hasattr(candidate, "url_template") for candidate in candidates)
 
     archery = catalog.require("archery")
@@ -68,10 +61,11 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
         "ARCHERY_MCP_URL",
         "ARCHERY_MCP_TOKEN",
     )
-    assert "查询慢查询日志" in archery.prompts.purpose
+    assert "慢查询日志" in archery.prompts.purpose
     assert "t_instance_member" in archery.prompts.workflow
     assert "mysql_slow_query_review_history" in archery.prompts.workflow
     assert "read_only: true" in archery.prompts.safety
+    assert not hasattr(archery, "read_only")
 
     prometheus = catalog.require("prometheus")
     assert prometheus.url_template == "${PROMETHEUS_MCP_SSE_URL}"
@@ -88,23 +82,32 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     )
     assert "occurred_at - 5 分钟" in prometheus.prompts.workflow
     assert "database_not_monitored" in prometheus.prompts.workflow
-    assert "toolPolicies" in prometheus.provider_options
+    assert prometheus.provider_options == {}
 
 
-@pytest.mark.parametrize("read_only", [None, False, "true", 1])
-def test_enabled_server_requires_literal_read_only_true(
-    tmp_path: Path, read_only: object
+def test_enabled_server_needs_only_connection_and_prompt_configuration(
+    tmp_path: Path,
+) -> None:
+    descriptor = load_mcp_catalog(
+        _write_settings(tmp_path, {"example": _server_config(tmp_path)})
+    ).require("example")
+
+    assert not hasattr(descriptor, "read_only")
+    assert descriptor.provider_options == {}
+
+
+@pytest.mark.parametrize("legacy_field", ["readOnly", "maxAgentSteps", "toolPolicies"])
+def test_removed_policy_and_step_fields_are_rejected(
+    tmp_path: Path,
+    legacy_field: str,
 ) -> None:
     server = _server_config(tmp_path)
-    if read_only is None:
-        server.pop("readOnly")
-    else:
-        server["readOnly"] = read_only
+    server[legacy_field] = True if legacy_field == "readOnly" else 8
     path = _write_settings(tmp_path, {"example": server})
 
     with pytest.raises(
         MCPCatalogConfigurationError,
-        match="must explicitly declare readOnly: true",
+        match=f"unsupported configuration fields: {legacy_field}",
     ):
         load_mcp_catalog(path)
 
@@ -203,67 +206,6 @@ def test_disabled_catalog_server_uses_the_same_strict_top_level_allowlist(
 
     with pytest.raises(MCPCatalogConfigurationError, match="unsupported configuration fields"):
         load_mcp_catalog(path)
-
-
-@pytest.mark.parametrize(
-    "fixed_arguments",
-    [
-        {"endpoint": "internal-service"},
-        {"nested": {"apiKey": "literal-secret"}},
-        {"target": "https://private.example.test/mcp"},
-        {"header": "Bearer literal-secret"},
-    ],
-)
-def test_tool_policy_rejects_nested_connection_or_credential_values(
-    tmp_path: Path,
-    fixed_arguments: dict[str, object],
-) -> None:
-    path = _write_settings(
-        tmp_path,
-        {
-            "example": _server_config(
-                tmp_path,
-                toolPolicies={
-                    "query": {
-                        "capability": "catalog",
-                        "fixedArguments": fixed_arguments,
-                    }
-                },
-            )
-        },
-    )
-
-    with pytest.raises(
-        MCPCatalogConfigurationError,
-        match="connection or credential|connection URL or inline credential",
-    ):
-        load_mcp_catalog(path)
-
-
-def test_tool_policy_allows_existing_non_secret_fixed_arguments(tmp_path: Path) -> None:
-    path = _write_settings(
-        tmp_path,
-        {
-            "example": _server_config(
-                tmp_path,
-                toolPolicies={
-                    "query": {
-                        "capability": "range_query",
-                        "startArgument": "window.start",
-                        "endArgument": "window.end",
-                        "timestampEncoding": "rfc3339",
-                        "fixedArguments": {"operation": "query", "limit": 100},
-                    }
-                },
-            )
-        },
-    )
-
-    descriptor = load_mcp_catalog(path).require("example")
-    assert descriptor.provider_options["toolPolicies"]["query"]["fixedArguments"] == {
-        "operation": "query",
-        "limit": 100,
-    }
 
 
 def test_optional_header_is_omitted_when_name_and_credential_are_empty(
@@ -420,7 +362,6 @@ def test_prompt_path_cannot_escape_mcp_config_directory(tmp_path: Path) -> None:
         settings_directory,
         {
             "example": {
-                "readOnly": True,
                 "url": "${EXAMPLE_MCP_URL}",
                 "prompts": prompts,
             }
@@ -438,7 +379,6 @@ def test_each_prompt_requires_a_distinct_non_empty_file(tmp_path: Path) -> None:
         tmp_path,
         {
             "example": {
-                "readOnly": True,
                 "url": "${EXAMPLE_MCP_URL}",
                 "prompts": prompts,
             }
@@ -449,22 +389,22 @@ def test_each_prompt_requires_a_distinct_non_empty_file(tmp_path: Path) -> None:
         load_mcp_catalog(path)
 
 
-def test_safety_prompt_must_explicitly_declare_read_only(tmp_path: Path) -> None:
+def test_safety_prompt_does_not_require_read_only_marker(tmp_path: Path) -> None:
     prompts = _write_prompts(tmp_path)
     (tmp_path / prompts["safety"]).write_text(
-        "All tools should probably be safe.\n",
+        "Use the server according to its configured role.\n",
         encoding="utf-8",
     )
     path = _write_settings(
         tmp_path,
         {
             "example": {
-                "readOnly": True,
                 "url": "${EXAMPLE_MCP_URL}",
                 "prompts": prompts,
             }
         },
     )
 
-    with pytest.raises(MCPCatalogConfigurationError, match="read_only: true"):
-        load_mcp_catalog(path)
+    descriptor = load_mcp_catalog(path).require("example")
+
+    assert descriptor.prompts.safety == "Use the server according to its configured role."
