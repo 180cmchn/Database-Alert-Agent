@@ -4,6 +4,9 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
 所选知识来源和按需查询的 MCP 证据分析根因。系统只输出两种根因结论：证据建立因果机制时返回
 `SUPPORTED`；否则返回 `现有结果无法得出根因`。
 
+项目介绍、全局组件关系、Agent 运行机制、MCP 接入和提示词维护方式见
+[项目架构与运行机制](docs/project-architecture.md)。
+
 ## 分析流程
 
 1. 后台轮询由 `FLASHDUTY_POLLING_ENABLED` 控制，默认关闭。轮询器按
