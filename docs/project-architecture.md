@@ -1,90 +1,54 @@
-# Database Alert Agent 项目架构与运行机制
+# Database Alert Agent 项目思维导图与运行机制
 
 本文用于项目介绍、技术评审和后续维护。它重点回答四个问题：系统如何接收并分析告警、主 Agent 如何工作、MCP 如何声明式接入、提示词与证据契约如何维护。
 
 > 一句话概括：系统先取得权威告警详情和参考知识，再由唯一主 Agent 通过 ReAct 按需调用只读工具；MCP 原始结果经确定性程序投影后才回到主 Agent，最终只输出“已被实时证据支持的根因”或“现有结果无法得出根因”。
 
-## 1. 全局架构图
+## 1. 项目总览思维导图
 
 ```mermaid
-flowchart TB
-    subgraph ingress[告警接入层]
-        FD[FlashDuty Open API]
-        Poller[FlashDuty 轮询器<br/>固定窗口与游标分页]
-        Other[其它告警源<br/>HTTP API]
-        Normalize[来源适配与标准化]
-        Dedupe[去重入库<br/>source + alert_id]
-    end
-
-    subgraph dispatch[调度与执行层]
-        Scheduler[任务调度器<br/>Kafka / In-memory / Manual]
-        Kafka[(Kafka)]
-        Worker[Analysis Worker]
-        Service[AlertAnalysisService<br/>运行快照、租约、超时、取消]
-    end
-
-    subgraph agent[Agent 编排层]
-        Graph[LangGraph 主流程]
-        MainAgent[唯一主 Agent<br/>ReAct 决策与根因综合]
-        Registry[InvestigationToolRegistry<br/>模型可见 ToolSpec]
-        Validator[确定性契约校验<br/>不调用第二个模型]
-    end
-
-    subgraph evidence[知识与实时证据层]
-        Detail[FlashDuty /alert/info<br/>权威告警详情]
-        PDF[本地 PDF Runbook<br/>结构化 index.json]
-        Knowledge[External KnowledgePack]
-        MCPHost[MCP Host / Adapter<br/>连接、发现、调用、恢复]
-        Archery[Archery MCP<br/>慢查询日志]
-        Prometheus[Prometheus MCP<br/>监控时序]
-        Generic[声明式通用 MCP]
-        AI[OpenAI-compatible / Responses<br/>模型服务]
-    end
-
-    subgraph data[持久化与审计层]
-        DB[(SQL 数据库<br/>告警、运行、证据、事件)]
-        Checkpoint[(Checkpoint / Manifest<br/>租约与 fencing token)]
-        Artifact[(内部 Artifact<br/>完整原始工具结果)]
-    end
-
-    subgraph presentation[展示与通知层]
-        API[FastAPI]
-        UI[React 前端<br/>告警、结果、实时轨迹]
-        WeCom[企业微信通知]
-        Operator[运维人员]
-    end
-
-    FD -->|/alert/list| Poller --> Normalize
-    Other --> Normalize --> Dedupe --> DB
-    Poller --> Dedupe
-    Dedupe -->|仅新告警| Scheduler
-    Scheduler --> Kafka --> Worker
-    Scheduler -->|本地模式| Worker
-    Worker --> Service --> Graph
-
-    Graph --> Detail
-    Graph --> PDF
-    Graph --> Knowledge
-    Graph <--> MainAgent
-    MainAgent <--> AI
-    MainAgent --> Registry --> MCPHost
-    MCPHost --> Archery
-    MCPHost --> Prometheus
-    MCPHost --> Generic
-    Graph --> Validator
-
-    Service <--> DB
-    Graph <--> Checkpoint
-    MCPHost --> Artifact
-    Graph --> Artifact
-
-    Operator <--> UI <--> API
-    API <--> Service
-    API <--> DB
-    Service --> WeCom
+mindmap
+  root((Database Alert Agent))
+    接入与调度
+      FlashDuty 轮询
+      其它来源 HTTP API
+      标准化 去重 入队
+      Kafka 和 Analysis Worker
+    Agent 分析
+      FlashDuty 权威详情
+      本地与外部知识
+      LangGraph 和 ReAct
+      唯一主 Agent 判断根因
+      确定性契约校验
+    MCP 工具
+      Tool Registry
+      Archery 慢查询
+      Prometheus 指标
+      声明式通用 MCP
+      内部 Agent 动态调用
+    提示词体系
+      REACT_PROMPT
+      SYSTEM_PROMPT
+      role purpose workflow safety
+      Schema 版本与测试
+    证据治理
+      原始响应进 Artifact
+      程序投影事实与来源
+      主 Agent 看有界 observation
+      知识不能单独证明根因
+    运行保障
+      Snapshot 和 Manifest
+      Lease 和 fencing token
+      Checkpoint 和 Durable Dispatch
+      超时 取消 恢复
+    展示与输出
+      FastAPI 和 React
+      实时 Agent 轨迹
+      企业微信通知
+      SUPPORTED 或 INCONCLUSIVE
 ```
 
-讲解这张图时，可以把系统分成三条主线：
+图上的七个一级主题，可以归并成三条讲解线：
 
 1. **事件线**：FlashDuty 轮询或其它来源接入，经标准化、去重、调度后交给 Worker。
 2. **分析线**：LangGraph 先补齐详情和知识，再由主 Agent 循环选择工具并形成结论。
@@ -93,34 +57,57 @@ flowchart TB
 ## 2. 一次告警分析如何运行
 
 ```mermaid
-flowchart TD
-    Start([Worker 领取任务])
-    Snapshot[冻结本次运行配置<br/>Config Snapshot + Run Manifest]
-    Lease[建立运行租约<br/>heartbeat + fencing token]
-    Enrich[enrich_alert<br/>调用 FlashDuty /alert/info]
-    Fingerprint[fingerprint<br/>生成问题指纹]
-    Knowledge[runbook<br/>并行检索本地 PDF 与外部知识]
-    Decide{react_decide<br/>主 Agent 第 N 轮决策}
-    Tool[选择一个外层工具<br/>action = tool]
-    Dispatch[DurableOuterToolDispatcher<br/>持久化 PENDING / STARTED]
-    Execute[执行只读工具或 MCP 调查]
-    Raw[保存完整原始结果<br/>internal-only artifact]
-    Project[确定性过滤、聚合、排序<br/>生成可追溯 observation]
-    Evidence[保存 EvidenceRecord<br/>回到主 Agent 上下文]
-    Finish[finish 或达到<br/>REACT_MAX_ROUNDS]
-    Advise[advise<br/>主 Agent 统一综合全部输入]
-    Contract[validate<br/>结构、引用、来源资格校验]
-    Report[report<br/>持久化结果并通知]
-    Supported([COMPLETED<br/>SUPPORTED 根因])
-    Inconclusive([INCONCLUSIVE<br/>现有结果无法得出根因])
-    Failed([FAILED / CANCELLED])
-
-    Start --> Snapshot --> Lease --> Enrich --> Fingerprint --> Knowledge --> Decide
-    Decide -->|每轮至多一个工具| Tool --> Dispatch --> Execute --> Raw --> Project --> Evidence --> Decide
-    Decide -->|主动结束或轮次上限| Finish --> Advise --> Contract --> Report
-    Report -->|契约通过且证据充分| Supported
-    Report -->|未建立因果机制| Inconclusive
-    Lease -.超时、取消或租约丢失.-> Failed
+mindmap
+  root((主 Agent 工作机制))
+    1 领取任务
+      Worker 领取告警
+      冻结 Config Snapshot
+      创建 Run Manifest
+      建立租约和心跳
+    2 准备上下文
+      enrich_alert
+        调用 FlashDuty alert info
+        只信任权威 host 和 port
+      fingerprint
+        生成问题指纹
+      runbook
+        并行检索本地 PDF
+        并行检索外部知识
+    3 ReAct 决策
+      thought
+        使用模型真实 reasoning
+      action
+        每轮至多一个外层工具
+        或输出 finish
+      observation
+        接收工具程序投影
+        带事实 异常 限制和来源
+      再进入下一轮 thought
+    4 工具执行
+      Durable Outer Dispatch
+      MCP 或其它只读工具
+      原始结果存 Artifact
+      确定性投影为 EvidenceRecord
+    5 最终汇总
+      finish 或达到轮次上限
+      advise 统一审阅全部输入
+      只有主 Agent 判断根因
+    6 校验与报告
+      validate
+        检查结构 引用和来源资格
+        不调用第二个模型
+      report
+        持久化结果
+        发送通知
+      最终状态
+        COMPLETED 和 SUPPORTED
+        INCONCLUSIVE
+    运行控制
+      REACT_MAX_ROUNDS
+      ANALYSIS_TIMEOUT_SECONDS
+      主动取消
+      Checkpoint 恢复
+      租约丢失即停止
 ```
 
 对应的 LangGraph 主路径是：
@@ -165,30 +152,62 @@ START -> enrich_alert -> fingerprint -> runbook -> react_decide
 
 MCP 接入分成“启动时装配”和“运行时调查”两个阶段。
 
-### 3.1 启动时装配
+### 3.1 接入与运行思维导图
 
 ```mermaid
-flowchart LR
-    Settings[config/mcp/settings.json]
-    PromptFiles[config/mcp/prompts/provider/<br/>role.md<br/>purpose.md<br/>workflow.md<br/>safety.md]
-    Env[.env / 部署环境<br/>URL、Header、Key]
-    Catalog[load_mcp_catalog<br/>严格校验配置与提示词路径]
-    Descriptor[MCPServerDescriptor<br/>连接模板 + PromptBundle]
-    Resolve[传输边界解析环境变量<br/>生产环境要求 HTTPS]
-    Adapter{provider 类型}
-    Specialized[专用 Adapter / Harness<br/>Archery、Prometheus]
-    Generic[GenericMCPEvidenceTool<br/>其它声明式 MCP]
-    Registry[InvestigationToolRegistry]
-    Spec[ToolSpec 暴露给主 Agent<br/>role + purpose + workflow + safety]
-
-    Settings --> Catalog
-    PromptFiles --> Catalog
-    Catalog --> Descriptor
-    Env --> Resolve
-    Descriptor --> Resolve --> Adapter
-    Adapter -->|内置 provider| Specialized --> Registry
-    Adapter -->|新增 provider| Generic --> Registry
-    Registry --> Spec
+mindmap
+  root((MCP 接入机制))
+    配置入口
+      config mcp settings.json
+        provider 名称
+        URL 环境变量引用
+        Header 环境变量引用
+        transport 和 timeout
+      env 或部署环境
+        真实 URL
+        Header 和 Key
+        秘密不进入 Git
+    四类提示词
+      role
+        它是谁
+      purpose
+        什么时候有用
+      workflow
+        选中后如何调查
+      safety
+        read_only 行为边界
+    启动装配
+      load_mcp_catalog
+        严格校验配置
+        加载 PromptBundle
+      传输边界解析秘密
+      构造 Adapter
+      注册 ToolSpec
+        暴露给主 Agent
+    两种适配模式
+      专用 MCP
+        Archery Harness
+        Prometheus Harness
+        领域化程序投影
+      通用 MCP
+        GenericMCPEvidenceTool
+        动态发现工具和 Schema
+        新 provider 默认走此路径
+    运行时选择
+      主 Agent 判断是否相关
+      每轮选择一个外层 MCP 工具
+      不按告警类型硬编码必调表
+    内部调查
+      建立 MCP 会话
+      list tools
+      内部 Agent 逐步调用
+      每次根据真实返回决定下一步
+      内部调用不消耗主 ReAct 轮次
+    结果边界
+      原始响应存 Artifact
+      程序投影事实和 source paths
+      observation 回到主 Agent
+      MCP 内部不判断根因
 ```
 
 `config/mcp/settings.json` 只保存环境变量引用，不保存真实 URL、Header 值或 Key。Catalog 会拒绝未知字段、内联连接信息、越界提示词路径、重复 JSON key、缺失或空提示词文件。真正的秘密只在构造传输客户端时解析。
@@ -198,37 +217,14 @@ flowchart LR
 - **专用 MCP**：Archery 和 Prometheus 有领域化 Adapter、Harness 与程序投影，用于精确处理慢查询日志和监控时序。
 - **通用 MCP**：其它 provider 默认由 `GenericMCPEvidenceTool` 接入，动态发现远端工具和 Schema，不需要增加按告警类型选择 MCP 的 Python 分支。
 
-### 3.2 运行时调查与数据边界
+### 3.2 运行时调用链
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Main as 主 Agent
-    participant Reg as Tool Registry
-    participant Dispatch as Durable Dispatcher
-    participant Internal as MCP 内部调查 Agent
-    participant Server as 远端 MCP Server
-    participant Audit as Artifact Store
-    participant Projection as 确定性投影器
-    participant Evidence as Evidence Store
-
-    Main->>Reg: 读取可用 ToolSpec
-    Main->>Dispatch: 每轮选择一个外层 MCP 工具
-    Dispatch->>Evidence: 持久化调用状态 PENDING / STARTED
-    Dispatch->>Internal: 传入告警详情、五分钟窗口和只读目标
-    Internal->>Server: 建立会话并 list_tools
-    loop 直到取得所需事实或无可用调用
-        Internal->>Server: 按远端 Schema 调用一个工具
-        Server-->>Internal: 返回完整原始响应
-        Internal->>Audit: 暂存并持久化原始响应
-        Internal->>Internal: 根据真实返回决定下一步
-    end
-    Internal-->>Dispatch: 返回外层工具结果
-    Dispatch->>Audit: 保存完整外层原始结果
-    Dispatch->>Projection: 传入原始结果及 artifact 来源
-    Projection-->>Evidence: 保存事实、异常、限制和 source paths
-    Evidence-->>Main: 下一轮只提供有界 observation
-```
+1. 主 Agent 从 Tool Registry 读取可用 `ToolSpec`，按 `role/purpose/workflow/safety` 判断当前告警是否需要某个 MCP。
+2. 主 Agent 每轮至多选择一个外层 MCP 工具，Durable Dispatcher 先持久化 `PENDING / STARTED` 状态。
+3. MCP Adapter 接收权威告警详情、固定五分钟窗口和只读调查目标，建立会话并动态发现远端工具。
+4. MCP 内部调查 Agent 按远端真实 Schema 逐次调用工具，每次根据返回决定继续或结束。
+5. 完整远端响应和完整外层结果进入内部 Artifact；确定性投影器生成事实、异常、限制和 source paths。
+6. 有界 `EvidenceRecord` 作为 observation 返回主 Agent，供下一轮 ReAct 决策使用。
 
 关键边界如下：
 
@@ -252,48 +248,59 @@ sequenceDiagram
 项目提示词分为“主 Agent 提示词”和“provider MCP 提示词”两层，职责不能混用。
 
 ```mermaid
-flowchart TB
-    subgraph mainPrompt[主 Agent 提示词]
-        React[REACT_PROMPT<br/>每轮工具或 finish 决策]
-        Final[SYSTEM_PROMPT<br/>最终根因与建议生成]
-        Version[PROMPT_VERSION]
-        DecisionSchema[InvestigationDecision<br/>Pydantic JSON Schema]
-        ResultSchema[Recommendation<br/>Pydantic JSON Schema]
-    end
-
-    subgraph providerPrompt[Provider MCP 提示词]
-        Role[role.md<br/>它是谁、负责哪类证据]
-        Purpose[purpose.md<br/>什么时候可能有用]
-        Workflow[workflow.md<br/>选中后如何调查]
-        Safety[safety.md<br/>read_only 与行为边界]
-    end
-
-    subgraph consumers[运行时消费者]
-        ToolSpec[主 Agent ToolSpec<br/>provider 能力与边界]
-        ReactCall[主 Agent ReAct 调用<br/>判断是否选择该 MCP]
-        FinalCall[主 Agent最终汇总调用]
-        Inner[内部 MCP system prompt<br/>指导远端工具调用]
-        Manifest[Run Manifest / Config Snapshot<br/>记录主提示词与工具策略版本]
-        Tests[契约测试<br/>提示词语义、Schema、流程与安全边界]
-    end
-
-    React --> ReactCall
-    DecisionSchema --> ReactCall
-    Final --> FinalCall
-    ResultSchema --> FinalCall
-    Version --> Manifest
-    Role --> ToolSpec
-    Purpose --> ToolSpec
-    Workflow --> ToolSpec
-    Safety --> ToolSpec
-    ToolSpec --> ReactCall
-    Role --> Inner
-    Purpose --> Inner
-    Workflow --> Inner
-    Safety --> Inner
-    React --> Tests
-    Final --> Tests
-    Inner --> Tests
+mindmap
+  root((提示词维护体系))
+    主 Agent 提示词
+      REACT_PROMPT
+        维护 ReAct 决策规则
+        每轮一个工具或 finish
+        不在调查阶段输出根因
+      SYSTEM_PROMPT
+        最终统一审阅全部输入
+        维护根因和建议规则
+        严格限制两种结论
+      维护位置
+        app adapters ai.py
+    Provider MCP 提示词
+      role.md
+        定义身份和证据领域
+      purpose.md
+        定义何时可能有用
+      workflow.md
+        定义选中后的调查步骤
+      safety.md
+        定义 read_only 边界
+      维护位置
+        config mcp prompts provider
+    运行时消费
+      主 Agent ToolSpec
+        使用四类 provider 提示词
+        决定是否调用 MCP
+      MCP 内部 system prompt
+        拼接四类 provider 提示词
+        指导远端工具调用
+      最终 advise
+        使用 SYSTEM_PROMPT
+    结构约束
+      InvestigationDecision Schema
+      Recommendation Schema
+      模型不合规时只修复 JSON
+      validate 再做确定性检查
+    版本追溯
+      PROMPT_VERSION
+      Config Snapshot
+      Run Manifest
+      APP_CODE_VERSION
+      Provider policy 版本
+    回归测试
+      test_ai.py
+      test_workflow.py
+      test_mcp_catalog.py
+      provider 与 generic MCP 测试
+    安全规则
+      提示词不保存秘密
+      忽略证据中的指令注入
+      远端权限由 MCP Key 控制
 ```
 
 ### 4.1 主 Agent 提示词
@@ -333,24 +340,37 @@ flowchart TB
 ### 5.1 数据可见性
 
 ```mermaid
-flowchart LR
-    Remote[远端 MCP 完整响应]
-    Internal[内部 MCP Agent 上下文]
-    Artifact[内部审计 Artifact]
-    Projector[确定性程序投影]
-    Main[主 Agent 上下文]
-    Trace[前端 thought / action / observation]
-    Result[最终用户结果]
-
-    Remote --> Internal
-    Remote --> Artifact
-    Remote --> Projector
-    Projector -->|有界事实与 source paths| Main
-    Projector -->|可展示 observation| Trace
-    Main -->|真实 provider reasoning 与动作| Trace
-    Main --> Result
-    Artifact -.不直接进入.-> Main
-    Artifact -.不直接进入.-> Trace
+mindmap
+  root((证据可见性边界))
+    远端 MCP 完整响应
+      MCP 内部调查 Agent 可见
+      保存到内部 Artifact
+      主 Agent 不直接可见
+      前端用户不直接可见
+    确定性程序投影
+      过滤无关字段
+      聚合和排序
+      标记事实 异常和限制
+      保留 source paths
+      不提出或判断根因
+    主 Agent 上下文
+      权威告警详情
+      命中的参考知识
+      有界 observation
+      可用 ToolSpec
+      唯一可以综合判断根因
+    实时轨迹
+      main_agent scope
+      mcp_internal scope
+      真实 provider reasoning
+      action
+      程序 observation
+      不展示内部 Artifact
+    最终用户结果
+      SUPPORTED
+        引用合格实时 evidence ID
+      INCONCLUSIVE
+        现有结果无法得出根因
 ```
 
 ### 5.2 最终只允许两种业务结论
@@ -412,12 +432,12 @@ tests/                   unit / integration / live 测试
 
 ## 8. 推荐讲解顺序
 
-1. 从全局架构图说明“告警接入、异步调度、Agent 分析、证据来源、审计展示”五层。
-2. 用主流程图强调 `/alert/info` 和知识检索都发生在 MCP 选择之前。
+1. 从项目总览思维导图的中心向外展开，先讲接入、Agent、MCP、提示词、证据、运行保障和输出七个主题。
+2. 用 Agent 工作机制思维导图强调 `/alert/info` 和知识检索都发生在 MCP 选择之前。
 3. 展开 ReAct 循环：主 Agent 每轮只选择一个外层工具，工具返回 observation 后再决定下一步。
-4. 用 MCP 时序图解释外层主 Agent 与 MCP 内部调查 Agent 的职责差异。
+4. 用 MCP 接入思维导图解释配置、装配、主 Agent 选择、内部调查和结果投影五个环节。
 5. 强调原始响应只进 artifact，程序投影才进入主 Agent，投影器不判断根因。
-6. 用提示词图说明主提示词、四类 provider 提示词、Schema、版本和测试如何共同维护行为。
+6. 用提示词维护思维导图说明主提示词、四类 provider 提示词、Schema、版本和测试如何共同维护行为。
 7. 用两种结论契约收束：有合格实时证据才 `SUPPORTED`，否则明确 `INCONCLUSIVE`。
 8. 最后展示新增 MCP 的六步清单，说明项目可以通过配置和提示词扩展，而不需要增加告警类型分支。
 

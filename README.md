@@ -5,7 +5,7 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
 `SUPPORTED`；否则返回 `现有结果无法得出根因`。
 
 项目介绍、全局组件关系、Agent 运行机制、MCP 接入和提示词维护方式见
-[项目架构与运行机制](docs/project-architecture.md)。
+[项目思维导图与运行机制](docs/project-architecture.md)。
 
 ## 分析流程
 
