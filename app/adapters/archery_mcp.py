@@ -79,6 +79,33 @@ _SLOW_QUERY_NUMERIC_PREFIXES: Final = (
 
 _ARCHERY_TRACE_SELECTED_ROWS: Final = 3
 _ARCHERY_TRACE_TEXT_CHARS: Final = 400
+_ARCHERY_AUXILIARY_SELECTED_ROWS: Final = 20
+_ARCHERY_AUXILIARY_SELECTED_FIELDS: Final = 20
+_ARCHERY_AUXILIARY_SCALAR_CHARS: Final = 500
+_ARCHERY_TABULAR_ROW_KEYS: Final = ("rows", "result", "results", "data")
+_ARCHERY_AUXILIARY_IDENTITY_FIELDS: Final = {
+    "column",
+    "columnname",
+    "databasename",
+    "dbname",
+    "field",
+    "finstanceid",
+    "fip",
+    "fport",
+    "host",
+    "hostname",
+    "id",
+    "instanceid",
+    "instancename",
+    "ip",
+    "name",
+    "port",
+    "resourcegroupid",
+    "resourcegroupname",
+    "table",
+    "tablename",
+    "tbname",
+}
 
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _QUERY_TIMEOUT_TEXT: Final = re.compile(
@@ -101,6 +128,7 @@ _QUERY_RESULT_KEYS: Final = {
     "columns",
     "data",
     "result",
+    "results",
     "rowCount",
     "row_count",
     "rows",
@@ -812,10 +840,9 @@ class ArcheryMCPClient:
 
     @staticmethod
     def payload_row_count(payload: Mapping[str, Any]) -> int | None:
-        for key in ("rows", "result"):
-            rows = payload.get(key)
-            if isinstance(rows, list):
-                return len(rows)
+        rows = ArcheryMCPClient._tabular_row_list(payload)
+        if rows is not None:
+            return len(rows)
         for key in ("rowCount", "row_count", "total"):
             value = payload.get(key)
             if type(value) is int and value >= 0:
@@ -1039,7 +1066,25 @@ class ArcheryMCPClient:
         return bool(re.search(r"(?i)(?:host|hostname|hostip|ip)", selected)) and "port" in selected
 
     @staticmethod
-    def _tabular_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _tabular_row_list(container: Mapping[str, Any]) -> list[Any] | None:
+        for key in _ARCHERY_TABULAR_ROW_KEYS:
+            value = container.get(key)
+            if isinstance(value, list):
+                return value
+        return None
+
+    @staticmethod
+    def _auxiliary_field_sort_key(item: tuple[Any, Any]) -> tuple[int, str, str]:
+        field = sanitize_text(str(item[0]))
+        normalized = re.sub(r"[^a-z0-9]+", "", field.casefold())
+        return (
+            0 if normalized in _ARCHERY_AUXILIARY_IDENTITY_FIELDS else 1,
+            normalized,
+            field,
+        )
+
+    @classmethod
+    def _tabular_rows(cls, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Read common Archery tabular result shapes without trusting prose fields."""
 
         containers: list[Mapping[str, Any]] = [payload]
@@ -1048,8 +1093,8 @@ class ArcheryMCPClient:
             containers.append(data)
         for container in containers:
             columns = container.get("columns") or container.get("column_list")
-            rows = container.get("rows") or container.get("result")
-            if not isinstance(rows, list):
+            rows = cls._tabular_row_list(container)
+            if rows is None:
                 continue
             if all(isinstance(row, Mapping) for row in rows):
                 return [dict(row) for row in rows if isinstance(row, Mapping)]
@@ -1154,17 +1199,50 @@ class ArcheryMCPClient:
         if tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME:
             projection["columns"] = sorted(cls.table_columns_from_payload(payload))
 
+        source_rows = cls._tabular_rows(payload)
         rows: list[dict[str, Any]] = []
-        for row in cls._tabular_rows(payload):
-            facts = {
-                sanitize_text(str(key)): sanitize(value)
-                for key, value in row.items()
-                if isinstance(value, (str, int, float, bool)) or value is None
-            }
+        omitted_field_count = 0
+        truncated_field_name_count = 0
+        truncated_scalar_count = 0
+        for row in source_rows[:_ARCHERY_AUXILIARY_SELECTED_ROWS]:
+            sanitized_row = sanitize(dict(row))
+            assert isinstance(sanitized_row, dict)
+            scalar_items: list[tuple[str, Any]] = []
+            for key, value in sorted(
+                sanitized_row.items(),
+                key=cls._auxiliary_field_sort_key,
+            ):
+                if not (isinstance(value, (str, int, float, bool)) or value is None):
+                    omitted_field_count += 1
+                    continue
+                field = sanitize_text(str(key))
+                if len(field) > _ARCHERY_AUXILIARY_SCALAR_CHARS:
+                    field = field[:_ARCHERY_AUXILIARY_SCALAR_CHARS]
+                    truncated_field_name_count += 1
+                scalar_items.append((field, value))
+            omitted_field_count += max(
+                0,
+                len(scalar_items) - _ARCHERY_AUXILIARY_SELECTED_FIELDS,
+            )
+            facts: dict[str, Any] = {}
+            for key, value in scalar_items[:_ARCHERY_AUXILIARY_SELECTED_FIELDS]:
+                if isinstance(value, str) and len(value) > _ARCHERY_AUXILIARY_SCALAR_CHARS:
+                    value = value[:_ARCHERY_AUXILIARY_SCALAR_CHARS]
+                    truncated_scalar_count += 1
+                facts[key] = value
             if facts:
                 rows.append(facts)
         if rows:
             projection["rows"] = rows
+        if source_rows:
+            projection["projected_row_count"] = len(rows)
+            projection["rows_truncated"] = len(source_rows) > len(rows)
+        if omitted_field_count:
+            projection["omitted_field_count"] = omitted_field_count
+        if truncated_field_name_count:
+            projection["truncated_field_name_count"] = truncated_field_name_count
+        if truncated_scalar_count:
+            projection["truncated_scalar_count"] = truncated_scalar_count
         return sanitize(projection)
 
     @classmethod
@@ -1189,8 +1267,8 @@ class ArcheryMCPClient:
         if not final_history:
             projection["fields"] = sorted(
                 {
-                    sanitize_text(str(key))
-                    for row in rows
+                    sanitize_text(str(key))[:_ARCHERY_AUXILIARY_SCALAR_CHARS]
+                    for row in rows[:_ARCHERY_AUXILIARY_SELECTED_ROWS]
                     for key in row
                 }
             )[:50]

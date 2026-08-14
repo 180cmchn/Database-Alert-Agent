@@ -1313,6 +1313,60 @@ async def test_archery_mcp_parses_wrapped_json_array_as_slow_log_rows() -> None:
     assert structured_data["rows"][0]["sample"] == "select 0"
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_rows", "expected_count"),
+    [
+        (
+            {"rows": [], "results": [{"id": 17}]},
+            [],
+            0,
+        ),
+        (
+            {"data": {"results": [{"id": 17, "name": "archery-production"}]}},
+            [{"id": 17, "name": "archery-production"}],
+            1,
+        ),
+    ],
+)
+def test_archery_tabular_row_shapes_use_consistent_precedence(
+    payload: dict[str, Any],
+    expected_rows: list[dict[str, Any]],
+    expected_count: int,
+) -> None:
+    assert ArcheryMCPClient._tabular_rows(payload) == expected_rows
+    assert ArcheryMCPClient.payload_row_count(payload) == expected_count
+
+
+def test_archery_auxiliary_projection_is_bounded_and_key_sanitized() -> None:
+    opaque_credential = "v-7Qx9P3mN-opaque"
+    rows = [
+        {
+            "id": index,
+            "access_token": opaque_credential,
+            "description": "x" * 600,
+            **{f"field_{field}": field for field in range(25)},
+        }
+        for index in range(25)
+    ]
+
+    projection = ArcheryMCPClient.auxiliary_model_projection(
+        ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        {"status": "ok", "results": rows},
+    )
+
+    assert projection["row_count"] == 25
+    assert projection["projected_row_count"] == 20
+    assert projection["rows_truncated"] is True
+    assert projection["omitted_field_count"] == 160
+    assert projection["truncated_scalar_count"] == 20
+    assert len(projection["rows"]) == 20
+    assert all(len(row) == 20 for row in projection["rows"])
+    assert [row["id"] for row in projection["rows"]] == list(range(20))
+    assert all(row["access_token"] == "***REDACTED***" for row in projection["rows"])
+    assert all(len(row["description"]) == 500 for row in projection["rows"])
+    assert opaque_credential not in json.dumps(projection, ensure_ascii=False)
+
+
 @pytest.mark.asyncio
 async def test_archery_mcp_recovers_complete_rows_from_truncated_wrapped_json() -> None:
     history_sql = (

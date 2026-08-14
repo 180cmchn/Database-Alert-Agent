@@ -948,6 +948,180 @@ async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("row_key", ["results", "data"])
+async def test_instance_discovery_row_lists_are_projected_to_model_messages(
+    row_key: str,
+) -> None:
+    class ProjectionDrivenModel:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+            self.discovered_instance_id: int | None = None
+            self.discovered_member_id: int | None = None
+            self.discovered_endpoint: str | None = None
+            self.discovery_feedback = ""
+
+        @staticmethod
+        def projection(messages: list[dict[str, Any]]) -> dict[str, Any]:
+            content = messages[-1].get("content")
+            assert isinstance(content, str)
+            return json.loads(content.rsplit("\n", 1)[-1])
+
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            self.requests.append(
+                {
+                    "messages": deepcopy(messages),
+                    "tools": deepcopy(tools),
+                }
+            )
+            turn = len(self.requests)
+            if turn == 1:
+                return MCPModelToolCall(
+                    call_id="discover-instance",
+                    name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                    arguments=discovery_arguments,
+                    request_id="request-discover-instance",
+                )
+
+            projection = self.projection(messages)
+            if turn == 2:
+                self.discovery_feedback = str(messages[-1]["content"])
+                self.discovered_instance_id = int(projection["rows"][0]["id"])
+                return MCPModelToolCall(
+                    call_id="query-member",
+                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                    arguments={
+                        **TARGET_ARGUMENTS,
+                        "instance_id": self.discovered_instance_id,
+                        "sql_content": MEMBER_SQL,
+                    },
+                    request_id="request-query-member",
+                )
+            if turn == 3:
+                self.discovered_member_id = int(projection["rows"][0]["f_instance_id"])
+                return MCPModelToolCall(
+                    call_id="query-instance",
+                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                    arguments={
+                        **TARGET_ARGUMENTS,
+                        "instance_id": self.discovered_instance_id,
+                        "sql_content": (
+                            "SELECT host, port FROM sql_instance "
+                            f"WHERE id = {self.discovered_member_id} LIMIT 1"
+                        ),
+                    },
+                    request_id="request-query-instance",
+                )
+            if turn == 4:
+                endpoint_row = projection["rows"][0]
+                self.discovered_endpoint = f"{endpoint_row['host']}:{endpoint_row['port']}"
+                return MCPModelToolCall(
+                    call_id="query-history",
+                    name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                    arguments={
+                        **TARGET_ARGUMENTS,
+                        "instance_id": self.discovered_instance_id,
+                        "sql_content": FINAL_SQL.replace(
+                            "db-1.example:3306",
+                            self.discovered_endpoint,
+                        ),
+                    },
+                    request_id="request-query-history",
+                )
+            return _finish(reason="Projection-driven Archery investigation completed")
+
+    discovery_arguments = {
+        "resource_group_id": 9,
+        "instance_ref": "archery-production",
+        "page": 1,
+        "size": 200,
+    }
+    discovery_secret = "v-7Qx9P3mN-opaque"
+    model = ProjectionDrivenModel()
+    tools = [
+        *_tools(),
+        DiscoveredMCPTool(
+            name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            description="List Archery database instances",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "resource_group_id": {"type": "integer"},
+                    "instance_ref": {"type": "string"},
+                    "page": {"type": "integer"},
+                    "size": {"type": "integer"},
+                },
+                "required": ["resource_group_id"],
+            },
+        ),
+    ]
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id=f"archery-instance-discovery-{row_key}",
+                tools=tools,
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                        expected_arguments=discovery_arguments,
+                        result={
+                            "structuredContent": {
+                                "status": "ok",
+                                row_key: [
+                                    {
+                                        "id": 17,
+                                        "name": "archery-production",
+                                        "access_token": discovery_secret,
+                                    }
+                                ],
+                            }
+                        },
+                    ),
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sample": "SELECT projection_driven",
+                                "query_time_max": 3.5,
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert len(model.requests) == 5
+    assert model.discovered_instance_id == 17
+    assert model.discovered_member_id == 53
+    assert model.discovered_endpoint == "db-1.example:3306"
+    assert result.instance_id == 17
+    assert '"row_count":1' in model.discovery_feedback
+    assert '"id":17' in model.discovery_feedback
+    assert '"name":"archery-production"' in model.discovery_feedback
+    assert discovery_secret not in model.discovery_feedback
+    assert "***REDACTED***" in model.discovery_feedback
+    assert "internal_audit_artifact_only" in model.discovery_feedback
+
+
+@pytest.mark.asyncio
 async def test_shared_archery_harness_replays_responses_items_for_next_tool_call() -> None:
     base_call = _call("responses-member", MEMBER_SQL)
     first = MCPModelToolCall(
