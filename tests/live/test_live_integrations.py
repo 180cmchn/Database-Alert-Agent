@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.adapters.ai import OpenAICompatibleAdvisor
+from app.adapters.ai import OpenAICompatibleAdvisor, OpenAIResponsesAdvisor
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.flashduty import (
     FlashDutyAlertContextTool,
@@ -18,7 +18,7 @@ from app.adapters.flashduty import (
 )
 from app.adapters.notification import LogManagementNotifier
 from app.application.factory import build_runtime
-from app.config import Settings
+from app.config import REAL_AI_PROVIDERS, Settings
 from app.domain.models import (
     AlertStatus,
     InvestigationContext,
@@ -48,8 +48,8 @@ def live_settings() -> Settings:
 
     settings = Settings()
     missing: list[str] = []
-    if settings.ai_provider != "openai_compatible":
-        missing.append("AI_PROVIDER=openai_compatible")
+    if settings.ai_provider not in REAL_AI_PROVIDERS:
+        missing.append("AI_PROVIDER=openai_compatible or openai_responses")
     if not settings.ai_api_key.strip():
         missing.append("AI_API_KEY")
     if not settings.ai_model.strip():
@@ -136,7 +136,12 @@ async def _latest_alert_in_channels(
 async def test_live_ai_provider_returns_valid_schema_and_request_id(
     live_settings: Settings,
 ) -> None:
-    advisor = OpenAICompatibleAdvisor(
+    advisor_type = (
+        OpenAIResponsesAdvisor
+        if live_settings.ai_provider == "openai_responses"
+        else OpenAICompatibleAdvisor
+    )
+    advisor = advisor_type(
         api_key=live_settings.ai_api_key,
         base_url=live_settings.ai_base_url,
         model=live_settings.ai_model,
@@ -157,7 +162,7 @@ async def test_live_ai_provider_returns_valid_schema_and_request_id(
 
     recommendation, metadata = await advisor.advise(alert, [])
 
-    assert metadata.provider == "openai_compatible"
+    assert metadata.provider == live_settings.ai_provider
     assert metadata.model == live_settings.ai_model
     assert metadata.request_id
     assert recommendation.summary.strip()

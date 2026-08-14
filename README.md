@@ -269,6 +269,8 @@ FLASHDUTY_POLL_INTEGRATION_IDS=[]
 关键分析配置：
 
 ```dotenv
+# 可选：openai_compatible（默认，Chat Completions 兼容协议）或
+# openai_responses（OpenAI Responses 协议）
 AI_PROVIDER=openai_compatible
 AI_BASE_URL=https://api.openai.com/v1
 AI_API_KEY=replace-me
@@ -279,6 +281,11 @@ REACT_MAX_ROUNDS=8
 ANALYSIS_TIMEOUT_SECONDS=1800
 SCHEDULER_WORKERS=1
 ```
+
+`AI_PROVIDER` 默认保持为 `openai_compatible`，通过 OpenAI SDK 的 Chat Completions 接口调用 OpenAI、
+DeepSeek 或内部兼容网关。使用 OpenAI Responses API 时设置为 `openai_responses`。两种真实 provider
+都要求配置 `AI_API_KEY` 和 `AI_MODEL`；`AI_BASE_URL` 始终填写 API 根地址（例如
+`https://api.openai.com/v1`），不要追加 `/chat/completions` 或 `/responses`。
 
 `REACT_MAX_ROUNDS` 范围 1–100，默认 8；`ANALYSIS_TIMEOUT_SECONDS` 范围 30–86400，默认 1800。
 `AI_MAX_TOKENS` 应为 reasoning 和结构化输出预留足够空间。模型超时或结构化输出不可用时，保守降级

@@ -3,6 +3,10 @@ from pathlib import Path
 
 import pytest
 
+from app.adapters.ai import (
+    OpenAICompatibleAdvisor,
+    OpenAIResponsesAdvisor,
+)
 from app.adapters.archery_mcp import (
     ARCHERY_SLOW_LOG_TOOL_NAME,
     ArcherySlowLogEvidenceTool,
@@ -12,7 +16,7 @@ from app.adapters.prometheus_mcp import (
     PROMETHEUS_METRICS_TOOL_NAME,
     PrometheusMCPEvidenceTool,
 )
-from app.application.factory import build_runtime
+from app.application.factory import _build_advisor, build_runtime
 from app.config import Settings
 
 
@@ -68,12 +72,16 @@ def _write_mcp_catalog(tmp_path: Path, *, include_custom: bool = False) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_special_mcp_tools_use_configured_outer_timeouts(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ai_provider", ["openai_compatible", "openai_responses"])
+async def test_special_mcp_tools_use_configured_outer_timeouts(
+    tmp_path: Path,
+    ai_provider: str,
+) -> None:
     runbook_dir = tmp_path / "runbooks"
     runbook_dir.mkdir()
     settings = Settings(
         _env_file=None,
-        ai_provider="openai_compatible",
+        ai_provider=ai_provider,
         ai_api_key="test-key",
         ai_model="test-model",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
@@ -103,16 +111,18 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ai_provider", ["openai_compatible", "openai_responses"])
 async def test_declarative_mcp_uses_full_catalog_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    ai_provider: str,
 ) -> None:
     runbook_dir = tmp_path / "runbooks"
     runbook_dir.mkdir()
     monkeypatch.setenv("CUSTOM_MCP_URL", "https://custom.example.test/mcp")
     settings = Settings(
         _env_file=None,
-        ai_provider="openai_compatible",
+        ai_provider=ai_provider,
         ai_api_key="test-key",
         ai_model="test-model",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
@@ -129,3 +139,42 @@ async def test_declarative_mcp_uses_full_catalog_timeout(
         assert runtime.service.tool_registry.spec("query_mcp_custom").timeout == 611
     finally:
         await runtime.service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ai_provider", "advisor_type"),
+    [
+        ("openai_compatible", OpenAICompatibleAdvisor),
+        ("openai_responses", OpenAIResponsesAdvisor),
+    ],
+)
+async def test_factory_builds_the_explicit_real_ai_protocol(
+    ai_provider: str,
+    advisor_type: type[OpenAICompatibleAdvisor] | type[OpenAIResponsesAdvisor],
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider=ai_provider,
+        ai_api_key="test-key",
+        ai_model="test-model",
+        knowledge_sources=["external_knowledge"],
+    )
+
+    advisor = _build_advisor(settings)
+    try:
+        assert isinstance(advisor, advisor_type)
+        assert advisor.provider == ai_provider  # type: ignore[attr-defined]
+    finally:
+        await advisor.aclose()  # type: ignore[attr-defined]
+
+
+def test_factory_rejects_an_unknown_ai_provider() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="unknown_protocol",
+        knowledge_sources=["external_knowledge"],
+    )
+
+    with pytest.raises(ValueError, match="Unsupported AI_PROVIDER: unknown_protocol"):
+        _build_advisor(settings)

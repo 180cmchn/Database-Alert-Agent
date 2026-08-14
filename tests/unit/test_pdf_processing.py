@@ -663,7 +663,10 @@ async def test_auto_index_reuses_unchanged_cached_annotation_without_ai(
     monkeypatch.setattr(
         process_module,
         "get_settings",
-        lambda: SimpleNamespace(ai_provider="fake", ai_model="index-model"),
+        lambda: SimpleNamespace(
+            ai_provider="openai_compatible",
+            ai_model="index-model",
+        ),
     )
 
     generated, report = await process_module._generate_auto_annotations(
@@ -674,6 +677,91 @@ async def test_auto_index_reuses_unchanged_cached_annotation_without_ai(
 
     assert generated["shared-guide"]["alert_types"] == ["replica_lag"]
     assert report == {"cache_hits": 1, "model_indexed_pdfs": 0}
+
+
+@pytest.mark.asyncio
+async def test_auto_index_does_not_reuse_cache_from_another_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "flat"
+    source.mkdir()
+    pdf_path = source / "shared-guide.pdf"
+    _write_text_pdf(
+        pdf_path,
+        "Shared database troubleshooting guide with diagnostic steps.",
+    )
+    output = tmp_path / "typed"
+    annotation = {
+        "runbook_id": "shared-guide",
+        "alert_types": ["replica_lag"],
+        "metadata": {
+            "auto_index": {
+                "generator": "openai_compatible",
+                "model": "index-model",
+                "prompt_version": "runbook-auto-index-v2",
+                "content_sha256": _content_sha256(_extract_pages(pdf_path)),
+            }
+        },
+    }
+    process_pdf_runbooks(
+        source,
+        None,
+        output,
+        generated_annotations={"shared-guide": annotation},
+    )
+    settings = SimpleNamespace(
+        ai_provider="openai_responses",
+        ai_api_key="test-key",
+        ai_base_url="https://models.example.test/v1",
+        ai_model="index-model",
+        ai_max_tokens=4096,
+        ai_timeout_seconds=30,
+        ai_max_retries=1,
+        ai_json_mode=True,
+    )
+    constructed: list[dict[str, object]] = []
+
+    class FakeIndexer:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+        async def generate_annotation(
+            self,
+            runbook_id: str,
+            pages: list[str],
+        ) -> dict[str, object]:
+            assert runbook_id == "shared-guide"
+            assert pages
+            return {
+                "runbook_id": runbook_id,
+                "alert_types": ["connections_high"],
+                "metadata": {
+                    "auto_index": {
+                        "generator": "openai_responses",
+                    }
+                },
+            }
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(process_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        process_module,
+        "OpenAICompatibleRunbookIndexer",
+        FakeIndexer,
+    )
+
+    generated, report = await process_module._generate_auto_annotations(
+        source,
+        None,
+        output,
+    )
+
+    assert generated["shared-guide"]["alert_types"] == ["connections_high"]
+    assert report == {"cache_hits": 0, "model_indexed_pdfs": 1}
+    assert constructed[0]["provider"] == "openai_responses"
 
 
 def test_processing_rejects_an_explicit_missing_source_index(tmp_path: Path) -> None:

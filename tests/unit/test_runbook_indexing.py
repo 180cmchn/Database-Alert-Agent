@@ -72,6 +72,7 @@ def test_build_auto_annotation_merges_multiple_types_and_structured_content() ->
         [first, second],
         page_count=2,
         content_sha256="a" * 64,
+        provider="openai_compatible",
         model="index-model",
     )
 
@@ -114,6 +115,7 @@ def test_build_auto_annotation_rejects_out_of_range_pages() -> None:
             [draft],
             page_count=1,
             content_sha256="b" * 64,
+            provider="openai_compatible",
             model="index-model",
         )
 
@@ -170,6 +172,7 @@ async def test_openai_indexer_extracts_multiple_alert_profiles(
         lambda _: object(),
     )
     indexer = OpenAICompatibleRunbookIndexer(
+        provider="openai_compatible",
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="index-model",
@@ -190,6 +193,93 @@ async def test_openai_indexer_extracts_multiple_alert_profiles(
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert calls[0]["temperature"] == 0
     assert closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_output_text_helper", [True, False])
+async def test_openai_responses_indexer_uses_responses_protocol_and_records_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    use_output_text_helper: bool,
+) -> None:
+    calls: list[dict[str, object]] = []
+    content = (
+        '{"alert_profiles":[{'
+        '"alert_type":"replica_lag",'
+        '"alert_names":["Replica Lag"],'
+        '"evidence_pages":[1]}]}'
+    )
+
+    class FakeResponses:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            if use_output_text_helper:
+                return SimpleNamespace(
+                    id="responses-index-request-1",
+                    output_text=content,
+                    output=[],
+                )
+            return SimpleNamespace(
+                id="responses-index-request-1",
+                output_text="",
+                output=[
+                    SimpleNamespace(type="reasoning", summary=[]),
+                    SimpleNamespace(
+                        type="message",
+                        content=[
+                            SimpleNamespace(type="output_text", text=content)
+                        ],
+                    ),
+                ],
+            )
+
+    class UnexpectedCompletions:
+        async def create(self, **kwargs: object) -> None:
+            raise AssertionError(f"Chat Completions must not be called: {kwargs}")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+            self.chat = SimpleNamespace(completions=UnexpectedCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runbook_indexing, "AsyncOpenAI", lambda **_: FakeClient())
+    monkeypatch.setattr(
+        runbook_indexing,
+        "_system_trust_http_client",
+        lambda _: object(),
+    )
+    indexer = OpenAICompatibleRunbookIndexer(
+        provider="openai_responses",
+        api_key="test-key",
+        base_url="https://models.example.test/v1",
+        model="index-model",
+        max_tokens=4096,
+        timeout_seconds=30,
+        max_retries=1,
+        json_mode=True,
+    )
+
+    annotation = await indexer.generate_annotation(
+        "replica-guide",
+        ["Replica Lag diagnostic and handling steps."],
+    )
+    await indexer.aclose()
+
+    assert annotation["alert_types"] == ["replica_lag"]
+    assert annotation["metadata"]["auto_index"]["generator"] == "openai_responses"
+    assert len(calls) == 1
+    request = calls[0]
+    assert request["model"] == "index-model"
+    assert request["max_output_tokens"] == 4096
+    assert request["store"] is False
+    assert request["text"] == {"format": {"type": "json_object"}}
+    assert isinstance(request["input"], list)
+    assert "temperature" not in request
+    assert "messages" not in request
+    assert "max_tokens" not in request
+    assert "response_format" not in request
 
 
 def _install_index_responses(
@@ -231,6 +321,7 @@ def _install_index_responses(
 
 def _test_indexer() -> OpenAICompatibleRunbookIndexer:
     return OpenAICompatibleRunbookIndexer(
+        provider="openai_compatible",
         api_key="test-key",
         base_url="https://models.example.test/v1",
         model="index-model",

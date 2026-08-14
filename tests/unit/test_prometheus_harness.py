@@ -262,6 +262,70 @@ def test_prometheus_harness_forwards_model_arguments_unchanged() -> None:
     assert prepared.effective_arguments == arguments
 
 
+def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() -> None:
+    client = _client(_SequenceModel([]))
+    scenario = prometheus_harness_module.PrometheusHarnessScenario(
+        client=client,
+        context=_context(),
+        window_start=_ALERT_TIME.replace(minute=55),
+        window_end=_ALERT_TIME,
+    )
+    scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="query_range",
+                input_schema={"type": "object", "additionalProperties": True},
+            )
+        ]
+    )
+    arguments = {"query": "mysql_up"}
+    native_items = (
+        {
+            "type": "reasoning",
+            "id": "prom-reasoning",
+            "encrypted_content": "encrypted-prom",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "id": "prom-function-item",
+            "call_id": "prom-function-call",
+            "name": "query_range",
+            "arguments": json.dumps(arguments),
+            "status": "completed",
+        },
+    )
+    scenario.register_model_call(
+        MCPModelToolCall(
+            call_id="prom-function-call",
+            name="query_range",
+            arguments=arguments,
+            provider_output_items=native_items,
+        )
+    )
+    action = type(
+        "Action",
+        (),
+        {
+            "tool_name": "query_range",
+            "objective": "query",
+            "hypothesis_ids": [],
+            "arguments": arguments,
+        },
+    )()
+
+    prepared = scenario.prepare_call(action, state=scenario.initial_state())
+    restored = prometheus_harness_module.PrometheusHarnessScenario._model_call_from_prepared(
+        prepared
+    )
+    messages = client.completed_tool_messages(restored, {"value": 1})
+
+    assert restored.provider_output_items == native_items
+    assert messages[:2] == list(native_items)
+    assert messages[-1]["type"] == "function_call_output"
+    assert messages[-1]["call_id"] == "prom-function-call"
+
+
 async def _durable_context(
     repository: SQLAlchemyAlertRepository,
     *,
@@ -652,6 +716,28 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
         transport_error,
         {"structuredContent": {"series": [{"value": 2}]}},
     ]
+    retried_arguments = {
+        "query": "rate(mysql_global_status_slow_queries[5m])",
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+        "operation": "query",
+    }
+    retried_provider_items = (
+        {
+            "type": "reasoning",
+            "id": "retry-reasoning-item",
+            "encrypted_content": "encrypted-retry-reasoning",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "id": "retry-function-item",
+            "call_id": "query-2",
+            "name": "query_range",
+            "arguments": json.dumps(retried_arguments),
+            "status": "completed",
+        },
+    )
     model = _SequenceModel(
         [
             MCPModelToolCall(
@@ -668,13 +754,9 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
             MCPModelToolCall(
                 call_id="query-2",
                 name="query_range",
-                arguments={
-                    "query": "rate(mysql_global_status_slow_queries[5m])",
-                    "start": "2026-08-07T01:55:00+00:00",
-                    "end": "2026-08-07T02:00:00+00:00",
-                    "operation": "query",
-                },
+                arguments=retried_arguments,
                 request_id="request-query-2",
+                provider_output_items=retried_provider_items,
             ),
             MCPModelToolCall(
                 call_id="finish-1",
@@ -703,6 +785,14 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
     assert result.tool_attempts[1]["is_contradiction"] is False
     assert "request-query-1" in result.model_request_ids
     assert "request-query-2" in result.model_request_ids
+    finish_messages = model.messages[2]
+    assert sum(item.get("id") == "retry-reasoning-item" for item in finish_messages) == 1
+    assert sum(item.get("id") == "retry-function-item" for item in finish_messages) == 1
+    assert sum(
+        item.get("type") == "function_call_output"
+        and item.get("call_id") == "query-2"
+        for item in finish_messages
+    ) == 1
 
 
 @pytest.mark.asyncio

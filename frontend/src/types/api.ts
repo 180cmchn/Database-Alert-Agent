@@ -208,6 +208,8 @@ export interface ValidationRecord {
   created_at: string;
 }
 
+export type AIProvider = "openai_compatible" | "openai_responses" | "fake";
+
 export interface AnalysisConfigSnapshot {
   knowledge_sources: string[];
   external_knowledge_enabled: boolean;
@@ -407,7 +409,7 @@ export interface AdminSettings {
 
 export interface AdminSettingsPatch {
   expected_revision: string;
-  ai_provider?: string;
+  ai_provider?: AIProvider;
   ai_base_url?: string;
   ai_model?: string;
   ai_timeout_seconds?: number;

@@ -684,11 +684,7 @@ class AlertAnalysisService:
             validation_enabled=True,
             ai_fallback_enabled=self.ai_fallback_enabled,
             ai_model=getattr(self.advisor, "model", ""),
-            ai_provider=(
-                "fake"
-                if self.advisor.__class__.__name__ == "FakeAIAdvisor"
-                else "openai_compatible"
-            ),
+            ai_provider=getattr(self.advisor, "provider", ""),
             ai_timeout_seconds=float(
                 self.runtime_manifest_config.get("ai_timeout_seconds", 300)
             ),

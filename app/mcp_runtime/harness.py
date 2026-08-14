@@ -365,23 +365,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if durable_pending is not None:
                 prepared = self._active_or_reconstructed_call(ctx, durable_pending)
             elif ctx.pending_retry is None:
-                action_or_finish = await self._next_action(ctx)
-                if isinstance(action_or_finish, Finish):
-                    return action_or_finish
-                scenario_prepared = self.scenario.prepare_call(
-                    action_or_finish,
-                    state=ctx.state,
-                )
-                prepared = scenario_prepared.model_copy(
-                    update={
-                        "tool_name": action_or_finish.tool_name,
-                        "objective": action_or_finish.objective,
-                        "hypothesis_ids": list(action_or_finish.hypothesis_ids),
-                        "model_arguments": deepcopy(action_or_finish.arguments),
-                        "effective_arguments": deepcopy(action_or_finish.arguments),
-                    },
-                    deep=True,
-                )
+                prepared_or_finish = await self._next_action(ctx)
+                if isinstance(prepared_or_finish, Finish):
+                    return prepared_or_finish
+                prepared = prepared_or_finish
             else:
                 retry_finish = await self._wait_for_pending_retry(ctx)
                 if retry_finish is not None:
@@ -526,10 +513,11 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
     async def _next_action(
         self,
         ctx: _RunContext[StateT, ObservationT],
-    ) -> CallToolAction | Finish:
+    ) -> PreparedCall | Finish:
         last_error = "planner returned no action"
         while True:
             action = None
+            prepared: PreparedCall | None = None
             reasoning: str | None = None
             streamed_reasoning = False
             decision_key = self._decision_key(ctx)
@@ -594,6 +582,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         )
                 else:
                     await self._debit(ctx, accepted_decisions=1)
+                    if isinstance(action, CallToolAction):
+                        prepared = self._prepare_call(ctx, action)
                     await self._emit_idempotent(
                         ctx,
                         AgentEventKind.MODEL_DECISION,
@@ -603,11 +593,16 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                             "decision": action.model_dump(mode="json"),
                             "reasoning": reasoning,
                             "decision_key": decision_key,
+                            "prepared_call": (
+                                prepared.model_dump(mode="json")
+                                if prepared is not None
+                                else None
+                            ),
                         },
                         idempotency_key=f"decision:{decision_key}",
                     )
             else:
-                action, reasoning = recovered
+                action, reasoning, prepared = recovered
 
             if action is not None:
                 if reasoning is not None:
@@ -639,7 +634,11 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     }
                 )
                 if isinstance(action, CallToolAction):
-                    return action
+                    if prepared is None:
+                        raise HarnessInfrastructureError(
+                            "durable MCP call decision has no prepared invocation"
+                        )
+                    return prepared
                 if isinstance(action, FinishAction):
                     return Finish(
                         reason=action.reason,
@@ -917,7 +916,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 error=error,
             )
         )
-        self._append_observation_message(ctx, transition, completed)
         ctx.active_call = None
         retry_scheduled = self._schedule_retry(
             ctx,
@@ -926,6 +924,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             error=error,
             directive=directive,
         )
+        if not retry_scheduled:
+            self._append_observation_message(ctx, transition, completed)
         await self._checkpoint(ctx)
         await self._emit_observation_trace(ctx, completed, transition.observation)
         await self._persist_invocation(ctx, completed)
@@ -1027,7 +1027,6 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         error=error,
                     )
                 )
-                self._append_observation_message(ctx, transition, completed)
             if self._call_fingerprint(prepared) == completed.fingerprint:
                 ctx.active_call = None
             retry_scheduled = self._schedule_retry(
@@ -1037,6 +1036,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 error=error,
                 directive=directive,
             )
+            if completed.invocation_id not in observed_invocations and not retry_scheduled:
+                self._append_observation_message(ctx, transition, completed)
             await self._checkpoint(ctx)
             await self._persist_invocation(ctx, completed)
             await self._emit_invocation(
@@ -1680,11 +1681,28 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         )
         return sha256(canonical.encode("utf-8")).hexdigest()
 
+    def _prepare_call(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        action: CallToolAction,
+    ) -> PreparedCall:
+        scenario_prepared = self.scenario.prepare_call(action, state=ctx.state)
+        return scenario_prepared.model_copy(
+            update={
+                "tool_name": action.tool_name,
+                "objective": action.objective,
+                "hypothesis_ids": list(action.hypothesis_ids),
+                "model_arguments": deepcopy(action.arguments),
+                "effective_arguments": deepcopy(action.arguments),
+            },
+            deep=True,
+        )
+
     async def _load_durable_decision(
         self,
         ctx: _RunContext[StateT, ObservationT],
         decision_key: str,
-    ) -> tuple[Any, str | None] | None:
+    ) -> tuple[Any, str | None, PreparedCall | None] | None:
         for event in reversed(await self.event_sink.read(ctx.run_id)):
             if (
                 event.kind != AgentEventKind.MODEL_DECISION
@@ -1706,7 +1724,40 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 if isinstance(raw_reasoning, str) and raw_reasoning.strip()
                 else None
             )
-            return action, reasoning
+            raw_prepared = event.payload.get("prepared_call")
+            if isinstance(action, CallToolAction):
+                if raw_prepared is None:
+                    # Checkpoints written before prepared_call became durable can
+                    # still resume, albeit without provider-native call context.
+                    prepared = self._prepare_call(ctx, action)
+                else:
+                    try:
+                        prepared = PreparedCall.model_validate(raw_prepared)
+                    except Exception as exc:
+                        raise HarnessInfrastructureError(
+                            "durable MCP prepared-call payload is invalid"
+                        ) from exc
+                    if (
+                        prepared.tool_name != action.tool_name
+                        or prepared.objective != action.objective
+                        or prepared.hypothesis_ids != list(action.hypothesis_ids)
+                        or prepared.model_arguments != action.arguments
+                        or prepared.effective_arguments != action.arguments
+                    ):
+                        raise HarnessInfrastructureError(
+                            "durable MCP prepared call does not match its decision"
+                        )
+                    # prepare_call may update deterministic scenario state (for
+                    # example, an Archery query trace). Replay those effects
+                    # once, but retain the durable provider-native call context.
+                    self._prepare_call(ctx, action)
+            else:
+                if raw_prepared is not None:
+                    raise HarnessInfrastructureError(
+                        "non-call durable MCP decision contains a prepared invocation"
+                    )
+                prepared = None
+            return action, reasoning, prepared
         return None
 
     async def _emit_trace(

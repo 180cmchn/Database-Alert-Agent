@@ -703,6 +703,9 @@ class PrometheusHarnessScenario:
                 "call_id": call.call_id,
                 "request_id": call.request_id,
                 "capability": "remote_tool",
+                "provider_output_items": [
+                    deepcopy(item) for item in call.provider_output_items
+                ],
             },
         )
 
@@ -935,6 +938,7 @@ class PrometheusHarnessScenario:
     def _model_call_from_prepared(call: PreparedCall) -> MCPModelToolCall:
         call_id = call.metadata.get("call_id")
         request_id = call.metadata.get("request_id")
+        provider_output_items = call.metadata.get("provider_output_items")
         return MCPModelToolCall(
             call_id=(
                 call_id
@@ -944,6 +948,13 @@ class PrometheusHarnessScenario:
             name=call.tool_name,
             arguments=deepcopy(call.model_arguments),
             request_id=request_id if isinstance(request_id, str) else None,
+            provider_output_items=tuple(
+                deepcopy(item)
+                for item in provider_output_items
+                if isinstance(item, dict)
+            )
+            if isinstance(provider_output_items, list)
+            else (),
         )
 
     @staticmethod

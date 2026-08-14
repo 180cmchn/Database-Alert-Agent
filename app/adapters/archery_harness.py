@@ -627,6 +627,9 @@ class ArcheryHarnessScenario:
             metadata = {
                 "call_id": model_call.call_id,
                 "request_id": model_call.request_id,
+                "provider_output_items": [
+                    deepcopy(item) for item in model_call.provider_output_items
+                ],
             }
 
         if isinstance(action.arguments.get("sql_content"), str):
@@ -765,16 +768,16 @@ class ArcheryHarnessScenario:
                 normalized_payload,
                 final_history=True,
             ),
-            message={
-                "role": "user",
-                "content": self.client.model_tool_result(
+            message=self._tool_result_messages(
+                call,
+                self.client.model_tool_result(
                     self.client.trace_projection(
                         call.tool_name,
                         normalized_payload,
                         final_history=True,
                     )
                 ),
-            },
+            ),
             status=(
                 ToolInvocationStatus.NO_DATA
                 if self.client.payload_row_count(normalized_payload) == 0
@@ -827,7 +830,7 @@ class ArcheryHarnessScenario:
                 "evidence_disposition": "MISSING",
                 "is_contradiction": False,
             },
-            message={"role": "user", "content": canonical},
+            message=self._tool_result_messages(call, canonical),
         )
 
     def retry_directive(
@@ -887,8 +890,32 @@ class ArcheryHarnessScenario:
         return ScenarioTransition(
             state=state,
             observation=dict(projection),
-            message={"role": "user", "content": self.client.model_tool_result(projection)},
+            message=self._tool_result_messages(
+                call,
+                self.client.model_tool_result(projection),
+            ),
         )
+
+    @staticmethod
+    def _tool_result_messages(
+        call: PreparedCall,
+        content: str,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        provider_output_items = call.metadata.get("provider_output_items")
+        if not isinstance(provider_output_items, list) or not provider_output_items:
+            return {"role": "user", "content": content}
+        return [
+            *(
+                deepcopy(item)
+                for item in provider_output_items
+                if isinstance(item, dict)
+            ),
+            {
+                "type": "function_call_output",
+                "call_id": str(call.metadata.get("call_id") or ""),
+                "output": content,
+            },
+        ]
 
     def _record_remote_call(
         self,

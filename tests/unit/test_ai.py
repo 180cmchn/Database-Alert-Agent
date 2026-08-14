@@ -1589,3 +1589,524 @@ async def test_advisor_no_choices_error_contains_request_shape() -> None:
         "(request_id=no-choice-request-1, input_chars=5, "
         "max_tokens=16384, json_mode=True)"
     )
+
+
+@pytest.mark.asyncio
+async def test_responses_completion_maps_request_and_actual_reasoning() -> None:
+    calls: list[dict[str, object]] = []
+
+    class Responses:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                id="resp-completion-1",
+                status="completed",
+                error=None,
+                incomplete_details=None,
+                output=[
+                    {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [
+                            {"type": "summary_text", "text": "provider reasoning"}
+                        ],
+                        "encrypted_content": "opaque-replay-state",
+                    },
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '{"action":"finish","reason":"done"}',
+                            }
+                        ],
+                    },
+                ],
+                usage={"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+            )
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._model = "responses-model"
+    advisor._max_tokens = 16_384
+    advisor._json_mode = True
+    advisor._client = SimpleNamespace(responses=Responses())
+
+    content, metadata = await advisor._complete(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "return JSON"},
+        ]
+    )
+
+    assert content == '{"action":"finish","reason":"done"}'
+    assert metadata.provider == "openai_responses"
+    assert metadata.request_id == "resp-completion-1"
+    assert metadata.reasoning_content == "provider reasoning"
+    assert metadata.usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+    assert calls == [
+        {
+            "model": "responses-model",
+            "input": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "return JSON"},
+            ],
+            "max_output_tokens": 16_384,
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "stream": True,
+            "text": {"format": {"type": "json_object"}},
+        }
+    ]
+    assert "reasoning" not in calls[0]
+    assert "temperature" not in calls[0]
+    assert "messages" not in calls[0]
+    assert "max_tokens" not in calls[0]
+    assert "response_format" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_responses_streams_reasoning_and_preserves_native_tool_replay() -> None:
+    calls: list[dict[str, object]] = []
+    reasoning_deltas: list[tuple[str, int]] = []
+    terminal_response = SimpleNamespace(
+        id="resp-stream-1",
+        status="completed",
+        error=None,
+        incomplete_details=None,
+        output=[
+            {
+                "id": "rs_stream",
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "inspect target"},
+                    {"type": "summary_text", "text": " then query"},
+                ],
+                "encrypted_content": "encrypted-provider-state",
+            },
+            {
+                "id": "fc_stream",
+                "type": "function_call",
+                "call_id": "call-stream-1",
+                "name": "monitoring_query",
+                "arguments": '{"host":"db.example"}',
+                "status": "completed",
+            },
+        ],
+        usage={"input_tokens": 30, "output_tokens": 9, "total_tokens": 39},
+    )
+    events = [
+        SimpleNamespace(
+            type="response.created",
+            response=SimpleNamespace(id="resp-stream-1"),
+        ),
+        SimpleNamespace(
+            type="response.reasoning_summary_text.delta",
+            response_id="resp-stream-1",
+            delta="inspect target",
+        ),
+        SimpleNamespace(
+            type="response.reasoning_text.delta",
+            response_id="resp-stream-1",
+            delta=" then query",
+        ),
+        SimpleNamespace(
+            type="response.output_item.added",
+            response_id="resp-stream-1",
+            output_index=1,
+            item={
+                "type": "function_call",
+                "call_id": "call-stream-1",
+                "name": "monitoring_query",
+                "arguments": "",
+            },
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            response_id="resp-stream-1",
+            output_index=1,
+            delta='{"host":',
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            response_id="resp-stream-1",
+            output_index=1,
+            delta='"db.example"}',
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.done",
+            response_id="resp-stream-1",
+            output_index=1,
+            name="monitoring_query",
+            arguments='{"host":"db.example"}',
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            response_id="resp-stream-1",
+            output_index=1,
+            item=terminal_response.output[1],
+        ),
+        SimpleNamespace(type="response.completed", response=terminal_response),
+    ]
+
+    class Stream:
+        def __aiter__(self):
+            async def iterate():
+                for event in events:
+                    yield event
+
+            return iterate()
+
+    class Responses:
+        async def create(self, **kwargs: object) -> Stream:
+            calls.append(kwargs)
+            return Stream()
+
+    async def capture_reasoning(content: str, index: int) -> None:
+        reasoning_deltas.append((content, index))
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "responses-tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(responses=Responses())
+    previous_reasoning = {
+        "id": "rs_previous",
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "previous-encrypted-state",
+    }
+    previous_call = {
+        "id": "fc_previous",
+        "type": "function_call",
+        "call_id": "call-previous",
+        "name": "list_targets",
+        "arguments": "{}",
+    }
+    previous_output = {
+        "type": "function_call_output",
+        "call_id": "call-previous",
+        "output": '{"targets":["db.example"]}',
+    }
+    synthetic_action = {
+        "role": "assistant",
+        "content": '{"action":"call_tool","tool_name":"list_targets"}',
+    }
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "monitoring_query",
+            "description": "Query one monitoring target",
+            "parameters": {
+                "type": "object",
+                "properties": {"host": {"type": "string"}},
+                "required": ["host"],
+            },
+        },
+    }
+
+    result = await advisor.request_mcp_tool_call(
+        messages=[
+            {"role": "system", "content": "read only"},
+            synthetic_action,
+            previous_reasoning,
+            previous_call,
+            previous_output,
+            {"role": "user", "content": "choose the next query"},
+        ],
+        tools=[tool],
+        reasoning_callback=capture_reasoning,
+    )
+
+    assert result.call_id == "call-stream-1"
+    assert result.name == "monitoring_query"
+    assert result.arguments == {"host": "db.example"}
+    assert result.request_id == "resp-stream-1"
+    assert result.reasoning_content == "inspect target then query"
+    assert reasoning_deltas == [("inspect target", 0), (" then query", 1)]
+    assert result.provider_output_items == tuple(terminal_response.output)
+    request = calls[0]
+    assert request["input"] == [
+        {"role": "system", "content": "read only"},
+        previous_reasoning,
+        previous_call,
+        previous_output,
+        {"role": "user", "content": "choose the next query"},
+    ]
+    assert synthetic_action not in request["input"]
+    assert request["tools"] == [
+        {
+            "type": "function",
+            "name": "monitoring_query",
+            "description": "Query one monitoring target",
+            "parameters": tool["function"]["parameters"],
+            "strict": False,
+        }
+    ]
+    assert request["tool_choice"] == "required"
+    assert request["parallel_tool_calls"] is False
+    assert request["store"] is False
+    assert request["include"] == ["reasoning.encrypted_content"]
+    assert "reasoning" not in request
+    assert "temperature" not in request
+
+
+@pytest.mark.asyncio
+async def test_responses_recovers_reasoning_from_done_item_without_deltas() -> None:
+    reasoning_item = {
+        "id": "rs_done",
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "done-only reasoning"}],
+        "encrypted_content": "done-only-encrypted-state",
+    }
+    function_item = {
+        "id": "fc_done",
+        "type": "function_call",
+        "call_id": "call-done-only",
+        "name": "monitoring_query",
+        "arguments": "{}",
+        "status": "completed",
+    }
+    events = [
+        SimpleNamespace(
+            type="response.created",
+            response=SimpleNamespace(id="resp-done-only"),
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            response_id="resp-done-only",
+            output_index=0,
+            item=reasoning_item,
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            response_id="resp-done-only",
+            output_index=1,
+            item=function_item,
+        ),
+    ]
+
+    class Stream:
+        def __aiter__(self):
+            async def iterate():
+                for event in events:
+                    yield event
+
+            return iterate()
+
+    class Responses:
+        async def create(self, **kwargs: object) -> Stream:
+            del kwargs
+            return Stream()
+
+    reasoning_deltas: list[tuple[str, int]] = []
+
+    async def capture_reasoning(content: str, index: int) -> None:
+        reasoning_deltas.append((content, index))
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._api_key = "test-key"
+    advisor._model = "responses-tool-model"
+    advisor._max_tokens = 16_384
+    advisor._client = SimpleNamespace(responses=Responses())
+
+    result = await advisor.request_mcp_tool_call(
+        messages=[{"role": "user", "content": "choose a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "monitoring_query",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        reasoning_callback=capture_reasoning,
+    )
+
+    assert result.request_id == "resp-done-only"
+    assert result.call_id == "call-done-only"
+    assert result.reasoning_content == "done-only reasoning"
+    assert reasoning_deltas == [("done-only reasoning", 0)]
+    assert result.provider_output_items == (reasoning_item, function_item)
+
+
+@pytest.mark.asyncio
+async def test_responses_reads_legacy_reasoning_summary_shape() -> None:
+    class Responses:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="resp-legacy-reasoning",
+                status="completed",
+                error=None,
+                incomplete_details=None,
+                output=[
+                    {
+                        "id": "legacy-rs",
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [
+                            {
+                                "type": "reasoning_summary",
+                                "summary": "legacy provider reasoning",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": '{"status":"ok"}'}
+                        ],
+                    },
+                ],
+                usage=None,
+            )
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._model = "legacy-responses-model"
+    advisor._max_tokens = 16_384
+    advisor._json_mode = False
+    advisor._client = SimpleNamespace(responses=Responses())
+
+    _, metadata = await advisor._complete([{"role": "user", "content": "inspect"}])
+
+    assert metadata.reasoning_content == "legacy provider reasoning"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error", "incomplete_details", "expected"),
+    [
+        (
+            "failed",
+            {
+                "type": "invalid_request_error",
+                "code": "unsupported_parameter",
+                "message": "token=provider-secret-must-not-leak",
+            },
+            None,
+            "code=unsupported_parameter",
+        ),
+        (
+            "incomplete",
+            None,
+            {"reason": "max_output_tokens"},
+            "reason=max_output_tokens",
+        ),
+    ],
+)
+async def test_responses_terminal_failures_are_safe_and_not_accepted(
+    status: str,
+    error: dict[str, str] | None,
+    incomplete_details: dict[str, str] | None,
+    expected: str,
+) -> None:
+    class Responses:
+        async def create(self, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                id="resp-terminal-error",
+                status=status,
+                error=error,
+                incomplete_details=incomplete_details,
+                output=[],
+                usage=None,
+            )
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._model = "responses-model"
+    advisor._max_tokens = 16_384
+    advisor._json_mode = False
+    advisor._client = SimpleNamespace(responses=Responses())
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._complete([{"role": "user", "content": "inspect"}])
+
+    rendered = str(caught.value)
+    assert "OpenAI Responses request failed" in rendered
+    assert "request_id=resp-terminal-error" in rendered
+    assert f"status={status}" in rendered
+    assert expected in rendered
+    assert "provider-secret-must-not-leak" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    id="resp-stream-failed",
+                    status="failed",
+                    error={
+                        "type": "server_error",
+                        "code": "stream_failed",
+                        "message": "token=stream-secret-must-not-leak",
+                    },
+                    incomplete_details=None,
+                    output=[],
+                ),
+            ),
+            "code=stream_failed",
+        ),
+        (
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(
+                    id="resp-stream-incomplete",
+                    status="incomplete",
+                    error=None,
+                    incomplete_details={"reason": "max_output_tokens"},
+                    output=[],
+                ),
+            ),
+            "reason=max_output_tokens",
+        ),
+        (
+            SimpleNamespace(
+                type="response.error",
+                response_id="resp-stream-error",
+                error={
+                    "type": "invalid_request_error",
+                    "code": "bad_stream_request",
+                    "message": "token=stream-secret-must-not-leak",
+                },
+            ),
+            "code=bad_stream_request",
+        ),
+    ],
+)
+async def test_responses_stream_terminal_errors_are_safe(
+    event: SimpleNamespace,
+    expected: str,
+) -> None:
+    class Stream:
+        def __aiter__(self):
+            async def iterate():
+                yield event
+
+            return iterate()
+
+    class Responses:
+        async def create(self, **kwargs: object) -> Stream:
+            del kwargs
+            return Stream()
+
+    advisor = object.__new__(ai_module.OpenAIResponsesAdvisor)
+    advisor._model = "responses-model"
+    advisor._max_tokens = 16_384
+    advisor._json_mode = False
+    advisor._client = SimpleNamespace(responses=Responses())
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._complete([{"role": "user", "content": "inspect"}])
+
+    rendered = str(caught.value)
+    assert "OpenAI Responses request failed" in rendered
+    assert expected in rendered
+    assert "stream-secret-must-not-leak" not in rendered

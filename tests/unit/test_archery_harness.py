@@ -36,13 +36,22 @@ from app.adapters.persistence import (
     SQLAlchemyAlertRepository,
     ToolInvocationRow,
 )
-from app.agent_runtime import AgentEventKind, RunManifest, ToolInvocationStatus
+from app.agent_runtime import (
+    AgentEvent,
+    AgentEventKind,
+    BudgetLedger,
+    BudgetLimits,
+    InMemoryEventSink,
+    RunManifest,
+    ToolInvocationStatus,
+)
 from app.domain.models import InvestigationRun
 from app.domain.ports import RunLeaseConflict
 from app.domain.tool_calling import MCPModelToolCall
 from app.mcp_catalog import load_mcp_catalog
 from app.mcp_runtime import (
     DiscoveredMCPTool,
+    MCPAgentHarnessRuntime,
     ReplayCallFixture,
     ReplayCallOutcome,
     ReplayErrorFixture,
@@ -936,6 +945,198 @@ async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
     assert "internal_audit_artifact_only" in final_request_messages
     assert "authentication_token" not in final_request_messages
     assert "raw_metadata" not in final_request_messages
+
+
+@pytest.mark.asyncio
+async def test_shared_archery_harness_replays_responses_items_for_next_tool_call() -> None:
+    base_call = _call("responses-member", MEMBER_SQL)
+    first = MCPModelToolCall(
+        call_id=base_call.call_id,
+        name=base_call.name,
+        arguments=base_call.arguments,
+        request_id=base_call.request_id,
+        provider_output_items=(
+            {
+                "type": "reasoning",
+                "id": "responses-reasoning-member",
+                "encrypted_content": "encrypted-member",
+                "summary": [],
+            },
+            {
+                "type": "function_call",
+                "id": "responses-item-member",
+                "call_id": base_call.call_id,
+                "name": base_call.name,
+                "arguments": json.dumps(base_call.arguments, ensure_ascii=False),
+                "status": "completed",
+            },
+        ),
+    )
+    model = _ScriptedModel([first, _finish()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-responses-replay",
+                tools=_tools(),
+                calls=[_success(MEMBER_SQL, rows=[{"f_instance_id": 53}])],
+            )
+        ],
+    )
+
+    await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    second_input = model.requests[1]["messages"]
+    assert second_input[-3]["type"] == "reasoning"
+    assert second_input[-3]["encrypted_content"] == "encrypted-member"
+    assert second_input[-2]["type"] == "function_call"
+    assert second_input[-2]["call_id"] == base_call.call_id
+    assert second_input[-1]["type"] == "function_call_output"
+    assert second_input[-1]["call_id"] == base_call.call_id
+    assert "internal_audit_artifact_only" in second_input[-1]["output"]
+
+
+@pytest.mark.asyncio
+async def test_archery_resume_replays_prepared_state_and_responses_items() -> None:
+    class InterruptAfterDecisionSink(InMemoryEventSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.should_interrupt = True
+
+        async def append(
+            self,
+            event: AgentEvent,
+            *,
+            expected_version: int | None = None,
+        ) -> AgentEvent:
+            committed = await super().append(event, expected_version=expected_version)
+            if self.should_interrupt and event.kind == AgentEventKind.MODEL_DECISION:
+                self.should_interrupt = False
+                raise asyncio.CancelledError
+            return committed
+
+    base_call = _call("durable-responses-member", MEMBER_SQL)
+    provider_output_items = (
+        {
+            "type": "reasoning",
+            "id": "durable-archery-reasoning",
+            "encrypted_content": "encrypted-durable-archery",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "id": "durable-archery-function",
+            "call_id": base_call.call_id,
+            "name": base_call.name,
+            "arguments": json.dumps(base_call.arguments, ensure_ascii=False),
+            "status": "completed",
+        },
+    )
+    durable_call = MCPModelToolCall(
+        call_id=base_call.call_id,
+        name=base_call.name,
+        arguments=base_call.arguments,
+        request_id=base_call.request_id,
+        provider_output_items=provider_output_items,
+    )
+    first_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [ReplaySessionFixture(session_id="archery-before-decision-crash", tools=_tools())],
+    )
+    first_client = _client(_ScriptedModel([durable_call]), first_connector)
+    window_start, window_end = archery_harness_module.client_window(
+        first_client,
+        OCCURRED_AT,
+    )
+    first_state = archery_harness_module.ArcheryHarnessState(
+        window_start=window_start,
+        window_end=window_end,
+        occurred_at=OCCURRED_AT,
+        alert_context=dict(ALERT_CONTEXT),
+        alert_endpoint=ALERT_CONTEXT["alert_endpoint"],
+    )
+    first_registry = archery_harness_module._PlannerCallRegistry()
+    first_scenario = archery_harness_module.ArcheryHarnessScenario(
+        first_client,
+        first_state,
+        first_registry,
+    )
+    checkpoints: list[Any] = []
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    sink = InterruptAfterDecisionSink()
+    first_runtime = MCPAgentHarnessRuntime(
+        connector=first_connector,
+        planner=archery_harness_module.ArcheryHarnessPlanner(
+            first_client,
+            first_scenario,
+            first_registry,
+        ),
+        scenario=first_scenario,
+        event_sink=sink,
+        budget=BudgetLedger(BudgetLimits()),
+        checkpoint_hook=capture_checkpoint,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await first_runtime.run(run_id=uuid4(), initial_state=first_state)
+
+    stale_checkpoint = checkpoints[-1]
+    assert stale_checkpoint.state.query_trace == []
+    second_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-after-decision-crash",
+                tools=_tools(),
+                calls=[_success(MEMBER_SQL, rows=[{"f_instance_id": 53}])],
+            )
+        ],
+    )
+    resumed_model = _ScriptedModel([_finish("finish-after-durable-call")])
+    resumed_client = _client(resumed_model, second_connector)
+    resumed_registry = archery_harness_module._PlannerCallRegistry()
+    resumed_scenario = archery_harness_module.ArcheryHarnessScenario(
+        resumed_client,
+        deepcopy(stale_checkpoint.state),
+        resumed_registry,
+    )
+    result = await MCPAgentHarnessRuntime(
+        connector=second_connector,
+        planner=archery_harness_module.ArcheryHarnessPlanner(
+            resumed_client,
+            resumed_scenario,
+            resumed_registry,
+        ),
+        scenario=resumed_scenario,
+        event_sink=sink,
+        budget=BudgetLedger(BudgetLimits()),
+    ).resume(
+        stale_checkpoint,
+        restored_budget=BudgetLedger.from_snapshot(stale_checkpoint.budget),
+    )
+
+    assert len(result.state.query_trace) == 1
+    assert result.state.query_trace[0]["referenced_tables"] == ["t_instance_member"]
+    assert result.state.query_trace[0]["sent_to_mcp"] is True
+    assert result.state.query_trace[0]["outcome"] == "ok"
+    assert result.state.last_query_target == (17, "archery")
+    resumed_messages = resumed_model.requests[0]["messages"]
+    assert sum(
+        item.get("id") == "durable-archery-reasoning" for item in resumed_messages
+    ) == 1
+    assert sum(
+        item.get("id") == "durable-archery-function" for item in resumed_messages
+    ) == 1
+    assert sum(
+        item.get("type") == "function_call_output"
+        and item.get("call_id") == base_call.call_id
+        for item in resumed_messages
+    ) == 1
 
 
 @pytest.mark.asyncio

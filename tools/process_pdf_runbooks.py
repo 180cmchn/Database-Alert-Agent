@@ -20,7 +20,7 @@ from app.adapters.runbook_indexing import (
     RUNBOOK_INDEX_PROMPT_VERSION,
     OpenAICompatibleRunbookIndexer,
 )
-from app.config import get_settings
+from app.config import REAL_AI_PROVIDERS, get_settings
 from app.domain.errors import RunbookError
 
 _SAFE_RUNBOOK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -231,6 +231,7 @@ async def _generate_auto_annotations(
             and cached_auto_index.get("content_sha256") == digest
             and cached_auto_index.get("prompt_version")
             == RUNBOOK_INDEX_PROMPT_VERSION
+            and cached_auto_index.get("generator") == settings.ai_provider
             and (
                 not settings.ai_model
                 or cached_auto_index.get("model") == settings.ai_model
@@ -242,12 +243,14 @@ async def _generate_auto_annotations(
             continue
         pending.append((path, pages))
 
-    if pending and settings.ai_provider != "openai_compatible":
+    if pending and settings.ai_provider not in REAL_AI_PROVIDERS:
         raise RunbookError(
-            "Automatic PDF indexing requires AI_PROVIDER=openai_compatible"
+            "Automatic PDF indexing requires AI_PROVIDER=openai_compatible "
+            "or AI_PROVIDER=openai_responses"
         )
     if pending:
         indexer = OpenAICompatibleRunbookIndexer(
+            provider=settings.ai_provider,
             api_key=settings.ai_api_key,
             base_url=settings.ai_base_url,
             model=settings.ai_model,

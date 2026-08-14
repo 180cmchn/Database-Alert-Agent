@@ -10,7 +10,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from app.adapters.ai import OpenAICompatibleAdvisor
+from app.adapters.ai import OpenAICompatibleAdvisor, OpenAIResponsesAdvisor
 from app.adapters.notification import WeComManagementNotifier
 from app.agent_runtime import (
     AgentEvent,
@@ -243,6 +243,45 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert secret not in audit
     assert "ai_api_key" in audit
+
+
+def test_runtime_settings_switch_to_openai_responses_with_correct_run_metadata(
+    tmp_path: Path,
+) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    secret = "responses-key-that-must-never-be-returned"
+
+    with client:
+        initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        response = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": initial["revision"],
+                "ai_provider": "openai_responses",
+                "ai_base_url": "https://api.openai.com/v1",
+                "ai_api_key": secret,
+                "ai_model": "responses-test-model",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ai_provider"] == "openai_responses"
+        assert body["ai_api_key_configured"] is True
+        assert secret not in response.text
+        assert isinstance(runtime.service.advisor, OpenAIResponsesAdvisor)
+
+        snapshot = runtime.service._create_config_snapshot()
+        manifest = runtime.service._create_run_manifest(UUID(int=0), snapshot)
+        assert snapshot.ai_provider == "openai_responses"
+        assert snapshot.ai_model == "responses-test-model"
+        assert manifest.model_provider == "openai_responses"
+
+        current = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS)
+        assert current.status_code == 200
+        assert current.json()["ai_provider"] == "openai_responses"
+        assert secret not in current.text
 
 
 def test_wecom_settings_are_write_only_and_apply_notifier(tmp_path: Path) -> None:

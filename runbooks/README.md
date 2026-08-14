@@ -55,6 +55,9 @@ Windows 拒绝目录重命名时，`--sync` 会自动改用完整复制，失败
 python .\tools\process_pdf_runbooks.py --source-pdf-dir .\runbooks\pdfs --output-dir .\runbooks\pdfs-typed --auto-index --sync --enforce-gates
 ```
 
+`--auto-index` 遵循当前 `AI_PROVIDER`，支持 `openai_compatible`（Chat Completions）和
+`openai_responses`（Responses API）；切换协议后不会复用另一协议生成的自动索引缓存。
+
 自动模式不需要源索引。`--source-index` 仅用于显式覆盖；指定单个类型时使用 `alert_type`，一份
 PDF 覆盖多个类型时使用 `alert_types`，且显式传入的路径必须存在：
 

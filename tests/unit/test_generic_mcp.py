@@ -534,6 +534,90 @@ async def test_declarative_mcp_persists_reasoning_deltas_without_complete_duplic
 
 
 @pytest.mark.asyncio
+async def test_declarative_mcp_replays_responses_items_across_two_tool_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResponsesSequenceModel:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, Any]]] = []
+
+        async def request_mcp_tool_call(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            messages,
+            tools,
+        ):
+            del tools
+            self.messages.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+            index = len(self.messages) - 1
+            if index < 2:
+                call_id = f"responses-call-{index}"
+                return MCPModelToolCall(
+                    call_id=call_id,
+                    name="query_data",
+                    arguments={"query": f"round-{index + 1}"},
+                    provider_output_items=(
+                        {
+                            "type": "reasoning",
+                            "id": f"reasoning-{index}",
+                            "encrypted_content": f"encrypted-{index}",
+                            "summary": [],
+                        },
+                        {
+                            "type": "function_call",
+                            "id": f"function-item-{index}",
+                            "call_id": call_id,
+                            "name": "query_data",
+                            "arguments": json.dumps(
+                                {"query": f"round-{index + 1}"},
+                                ensure_ascii=False,
+                            ),
+                            "status": "completed",
+                        },
+                    ),
+                )
+            return MCPModelToolCall(
+                call_id="responses-finish",
+                name="finish_investigation",
+                arguments={"reason": "two rounds completed"},
+            )
+
+    model = ResponsesSequenceModel()
+    tool = GenericMCPEvidenceTool(_descriptor(), _connection(), model)
+    session = _Session(
+        [_RemoteTool()],
+        results=[
+            {"structuredContent": {"value": 1}},
+            {"structuredContent": {"value": 2}},
+        ],
+    )
+    _bind_session(monkeypatch, tool, session)
+
+    outcome = await tool.execute(_request(tool), _context())
+
+    assert outcome.status == ToolStatus.SUCCESS
+    assert session.calls == [
+        ("query_data", {"query": "round-1"}),
+        ("query_data", {"query": "round-2"}),
+    ]
+    second_input = model.messages[1]
+    assert second_input[-3]["type"] == "reasoning"
+    assert second_input[-3]["encrypted_content"] == "encrypted-0"
+    assert second_input[-2]["type"] == "function_call"
+    assert second_input[-2]["call_id"] == "responses-call-0"
+    assert second_input[-1]["type"] == "function_call_output"
+    assert second_input[-1]["call_id"] == "responses-call-0"
+    assert "program_fact_projection" in second_input[-1]["output"]
+    third_input = model.messages[2]
+    assert [item.get("call_id") for item in third_input if "call_id" in item] == [
+        "responses-call-0",
+        "responses-call-0",
+        "responses-call-1",
+        "responses-call-1",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_declarative_mcp_reasoning_retry_appends_new_request_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

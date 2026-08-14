@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -219,6 +220,47 @@ class _RewritingScenario(_Scenario):
                 "model_arguments": {"query": "rewritten"},
                 "effective_arguments": {"query": "rewritten"},
             }
+        )
+
+
+class _NativePreparedScenario(_Scenario):
+    def __init__(self, metadata: dict[str, Any] | None = None) -> None:
+        self._pending_metadata = deepcopy(metadata or {})
+
+    def prepare_call(
+        self,
+        action: Any,
+        *,
+        state: _ScenarioState,
+    ) -> PreparedCall:
+        prepared = super().prepare_call(action, state=state)
+        metadata = self._pending_metadata
+        self._pending_metadata = {}
+        return prepared.model_copy(update={"metadata": metadata}, deep=True)
+
+    def on_result(
+        self,
+        state: _ScenarioState,
+        call: PreparedCall,
+        result: Any,
+    ) -> ScenarioTransition[_ScenarioState, dict[str, Any]]:
+        transition = super().on_result(state, call, result)
+        provider_items = call.metadata.get("provider_output_items")
+        if not isinstance(provider_items, list) or not provider_items:
+            return transition
+        return ScenarioTransition(
+            state=transition.state,
+            observation=transition.observation,
+            message=[
+                *(deepcopy(item) for item in provider_items),
+                {
+                    "type": "function_call_output",
+                    "call_id": str(call.metadata.get("call_id") or ""),
+                    "output": json.dumps(result, sort_keys=True),
+                },
+            ],
+            status=transition.status,
+            artifact_ref=transition.artifact_ref,
         )
 
 
@@ -1710,6 +1752,22 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
     sink = _InterruptAfterDecisionSink()
     checkpoints: list[Any] = []
     first_planner = ScriptedPlanner([_call("durable-decision")])
+    provider_output_items = [
+        {
+            "type": "reasoning",
+            "id": "durable-reasoning-item",
+            "encrypted_content": "encrypted-durable-reasoning",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "id": "durable-function-item",
+            "call_id": "durable-function-call",
+            "name": "fixture.query",
+            "arguments": json.dumps({"query": "durable-decision"}),
+            "status": "completed",
+        },
+    ]
 
     async def capture_checkpoint(snapshot: Any) -> None:
         checkpoints.append(snapshot)
@@ -1717,7 +1775,13 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
     first_runtime = MCPAgentHarnessRuntime(
         connector=ReplayMCPConnector("fixture-mcp", [_session("session-1")]),
         planner=first_planner,
-        scenario=_Scenario(),
+        scenario=_NativePreparedScenario(
+            {
+                "call_id": "durable-function-call",
+                "request_id": "durable-response",
+                "provider_output_items": provider_output_items,
+            }
+        ),
         event_sink=sink,
         budget=_budget(),
         checkpoint_hook=capture_checkpoint,
@@ -1742,7 +1806,7 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
             ],
         ),
         planner=second_planner,
-        scenario=_Scenario(),
+        scenario=_NativePreparedScenario(),
         event_sink=sink,
         budget=_budget(),
     ).resume(
@@ -1753,6 +1817,14 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
     assert len(first_planner.requests) == 1
     assert len(second_planner.requests) == 1
     assert resumed.state.successful_queries == ["durable-decision"]
+    resumed_messages = second_planner.requests[0].messages
+    assert sum(item.get("id") == "durable-reasoning-item" for item in resumed_messages) == 1
+    assert sum(item.get("id") == "durable-function-item" for item in resumed_messages) == 1
+    assert sum(
+        item.get("type") == "function_call_output"
+        and item.get("call_id") == "durable-function-call"
+        for item in resumed_messages
+    ) == 1
     events = await sink.read(run_id)
     durable_decisions = [
         event
@@ -1771,6 +1843,11 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
         "call_tool",
         "finish",
     ]
+    assert durable_decisions[0].payload["prepared_call"]["metadata"] == {
+        "call_id": "durable-function-call",
+        "request_id": "durable-response",
+        "provider_output_items": provider_output_items,
+    }
     assert len(action_traces) == 2
     assert len(observation_traces) == 1
     assert all(event.payload["scope"] == "mcp_internal" for event in action_traces)

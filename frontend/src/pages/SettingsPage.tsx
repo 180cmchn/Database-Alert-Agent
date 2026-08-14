@@ -22,7 +22,13 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import type { AdminSettings, AdminSettingsPatch } from "../types/api";
+import type { AdminSettings, AdminSettingsPatch, AIProvider } from "../types/api";
+
+const AI_PROVIDERS = new Set<AIProvider>(["openai_compatible", "openai_responses", "fake"]);
+
+function isAIProvider(value: string): value is AIProvider {
+  return AI_PROVIDERS.has(value as AIProvider);
+}
 
 function numberField(form: FormData, name: string, fallback?: number): number {
   const rawValue = form.get(name);
@@ -97,9 +103,12 @@ export function SettingsPage() {
       if (!knowledgeSources.length) {
         throw new Error("请至少选择一种 Agent 知识参考来源。");
       }
+      if (!isAIProvider(selectedProvider)) {
+        throw new Error("请选择受支持的 AI Provider。");
+      }
       const patch: AdminSettingsPatch = {
         expected_revision: settings.revision,
-        ai_provider: String(form.get("ai_provider")),
+        ai_provider: selectedProvider,
         ai_base_url: String(form.get("ai_base_url")).trim(),
         ai_model: String(form.get("ai_model")).trim(),
         ai_timeout_seconds: numberField(form, "ai_timeout_seconds"),
@@ -153,6 +162,8 @@ export function SettingsPage() {
   if (loading && !settings) return <LoadingState label="正在读取 Agent 安全配置…" />;
   if (authError) return <ErrorState message="管理员令牌无效或已过期，请重新解锁。" onRetry={lock} />;
   if (!settings) return <ErrorState message={error || "设置数据不可用"} onRetry={() => void load()} />;
+  const realProviderSelected = selectedProvider !== "fake";
+  const unsupportedProviderSelected = !isAIProvider(selectedProvider);
 
   return (
     <div className="page-stack settings-page">
@@ -177,12 +188,12 @@ export function SettingsPage() {
       )}
 
       <form className="settings-form" key={settings.revision} onSubmit={save}>
-        <SectionCard eyebrow="AI PROVIDER" title="模型与兼容接口" description="支持 OpenAI 兼容 API；留空密钥输入框将保留当前密钥。" action={<span className={`configured-chip ${settings.ai_api_key_configured ? "yes" : "no"}`}>{settings.ai_api_key_configured ? <Check size={13} /> : <CircleAlert size={13} />}{settings.ai_api_key_configured ? "API Key 已配置" : "API Key 未配置"}</span>}>
+        <SectionCard eyebrow="AI PROVIDER" title="模型与接口协议" description="支持 Chat Completions 兼容协议和 OpenAI Responses 协议；留空密钥输入框将保留当前密钥。" action={<span className={`configured-chip ${settings.ai_api_key_configured ? "yes" : "no"}`}>{settings.ai_api_key_configured ? <Check size={13} /> : <CircleAlert size={13} />}{settings.ai_api_key_configured ? "API Key 已配置" : "API Key 未配置"}</span>}>
           <div className="form-grid two-cols">
-            <label className="field"><span>AI Provider</span><select name="ai_provider" value={selectedProvider} onChange={(event) => setSelectedProvider(event.target.value)}><option value="openai_compatible">OpenAI Compatible</option>{(settings.fake_provider_allowed || settings.ai_provider === "fake") && <option value="fake">Fake（仅开发测试）</option>}</select></label>
-            <label className="field"><span>Model {selectedProvider === "openai_compatible" && <b>*</b>}</span><input name="ai_model" defaultValue={settings.ai_model} required={selectedProvider === "openai_compatible"} placeholder={selectedProvider === "fake" ? "Fake 模式可留空" : "模型标识"} /></label>
+            <label className="field"><span>AI Provider</span><select name="ai_provider" value={selectedProvider} onChange={(event) => setSelectedProvider(event.target.value)}>{unsupportedProviderSelected && <option value={selectedProvider} disabled>不支持的 Provider（{selectedProvider}）</option>}<option value="openai_compatible">OpenAI Compatible (Chat Completions)</option><option value="openai_responses">OpenAI Responses</option>{(settings.fake_provider_allowed || settings.ai_provider === "fake") && <option value="fake">Fake（仅开发测试）</option>}</select></label>
+            <label className="field"><span>Model {realProviderSelected && <b>*</b>}</span><input name="ai_model" defaultValue={settings.ai_model} required={realProviderSelected} placeholder={selectedProvider === "fake" ? "Fake 模式可留空" : "模型标识"} /></label>
             <label className="field span-2"><span>Base URL <b>*</b></span><input name="ai_base_url" type="url" defaultValue={settings.ai_base_url} required placeholder="https://api.openai.com/v1" /></label>
-            <label className="field span-2"><span>API Key（只写） {selectedProvider === "openai_compatible" && !settings.ai_api_key_configured && <b>*</b>}</span><div className="secret-field"><input name="ai_api_key" type={showApiKey ? "text" : "password"} autoComplete="new-password" required={selectedProvider === "openai_compatible" && !settings.ai_api_key_configured} placeholder={settings.ai_api_key_configured ? "已配置 · 留空保持不变" : "输入新的 API Key"} /><button type="button" onClick={() => setShowApiKey((value) => !value)} aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
+            <label className="field span-2"><span>API Key（只写） {realProviderSelected && !settings.ai_api_key_configured && <b>*</b>}</span><div className="secret-field"><input name="ai_api_key" type={showApiKey ? "text" : "password"} autoComplete="new-password" required={realProviderSelected && !settings.ai_api_key_configured} placeholder={settings.ai_api_key_configured ? "已配置 · 留空保持不变" : "输入新的 API Key"} /><button type="button" onClick={() => setShowApiKey((value) => !value)} aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
             <label className="field"><span>请求超时（秒）</span><input name="ai_timeout_seconds" type="number" min="1" max="600" step="1" required defaultValue={settings.ai_timeout_seconds} /></label>
           </div>
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>

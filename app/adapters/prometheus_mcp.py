@@ -24,7 +24,11 @@ from app.domain.models import (
     ToolExecutionResult,
     ToolStatus,
 )
-from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
+from app.domain.tool_calling import (
+    MCPModelToolCall,
+    MCPToolCallingModel,
+    mcp_tool_result_messages,
+)
 from app.mcp_catalog import (
     MCPCatalogConfigurationError,
     MCPPromptBundle,
@@ -1033,22 +1037,26 @@ class PrometheusMCPClient:
             ensure_ascii=False,
             default=str,
         )
-        return [
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": call.call_id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": call.call_id, "content": content},
-        ]
+        return mcp_tool_result_messages(
+            call,
+            output=content,
+            fallback_messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call.call_id, "content": content},
+            ],
+        )
 
     def agent_messages(
         self,

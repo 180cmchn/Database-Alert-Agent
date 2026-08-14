@@ -11,6 +11,7 @@ from app.adapters.ai import (
     ConservativeFallbackAdvisor,
     FakeAIAdvisor,
     OpenAICompatibleAdvisor,
+    OpenAIResponsesAdvisor,
 )
 from app.adapters.alert_sources import AlertSourceRegistry, CanonicalAlertSourceAdapter
 from app.adapters.archery_harness import ArcheryHarnessRuntimeDependencies
@@ -100,7 +101,14 @@ def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
 def _build_advisor(settings: Settings) -> AIAdvisor:
     if settings.ai_provider == "fake":
         return FakeAIAdvisor()
-    return OpenAICompatibleAdvisor(
+    advisor_type: type[OpenAICompatibleAdvisor] | type[OpenAIResponsesAdvisor]
+    if settings.ai_provider == "openai_compatible":
+        advisor_type = OpenAICompatibleAdvisor
+    elif settings.ai_provider == "openai_responses":
+        advisor_type = OpenAIResponsesAdvisor
+    else:
+        raise ValueError(f"Unsupported AI_PROVIDER: {settings.ai_provider}")
+    return advisor_type(
         api_key=settings.ai_api_key,
         base_url=settings.ai_base_url,
         model=settings.ai_model,

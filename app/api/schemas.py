@@ -122,7 +122,7 @@ class RuntimeSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: str = Field(pattern=r"^[0-9a-f]{16}$")
-    ai_provider: Literal["openai_compatible", "fake"] | None = None
+    ai_provider: Literal["openai_compatible", "openai_responses", "fake"] | None = None
     ai_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
     ai_api_key: str | None = Field(default=None, max_length=8192, repr=False)
     ai_model: str | None = Field(default=None, max_length=300)

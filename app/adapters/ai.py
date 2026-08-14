@@ -7,6 +7,7 @@ import logging
 import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
@@ -72,6 +73,7 @@ class _StreamedChatResult:
     finish_reason: str | None = None
     had_choice: bool = False
     extra_keys: list[str] = field(default_factory=list)
+    output_items: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _value(value: Any, key: str, default: Any = None) -> Any:
@@ -88,6 +90,195 @@ def _model_dump(value: Any) -> dict[str, Any]:
         result = dump()
         return result if isinstance(result, dict) else {}
     return {}
+
+
+def _json_model_dump(value: Any) -> dict[str, Any]:
+    """Return a JSON-compatible provider item for stateless Responses replay."""
+
+    if isinstance(value, dict):
+        return dict(value)
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            result = dump(mode="json", exclude_none=True)
+        except TypeError:
+            result = dump()
+        return result if isinstance(result, dict) else {}
+    return {}
+
+
+_RESPONSES_REPLAY_ITEM_TYPES = frozenset(
+    {"reasoning", "function_call", "function_call_output"}
+)
+
+
+def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate Chat-style history while preserving native Responses replay items."""
+
+    items: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            items.append(deepcopy(message))
+            continue
+
+        item_type = message.get("type")
+        if item_type in _RESPONSES_REPLAY_ITEM_TYPES and "role" not in message:
+            items.append(deepcopy(dict(message)))
+            continue
+
+        role = message.get("role")
+        next_message = messages[index + 1] if index + 1 < len(messages) else None
+        next_type = (
+            next_message.get("type") if isinstance(next_message, Mapping) else None
+        )
+        if (
+            role == "assistant"
+            and not message.get("tool_calls")
+            and next_type in {"reasoning", "function_call"}
+        ):
+            # The shared Harness records a readable Agent action before it restores
+            # the provider-native output items. Replaying both would duplicate the
+            # same model turn in a stateless Responses request.
+            continue
+        if role == "tool":
+            output = message.get("content", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False, default=str)
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": output,
+                }
+            )
+            continue
+
+        tool_calls = message.get("tool_calls")
+        if role == "assistant" and isinstance(tool_calls, list):
+            content = message.get("content")
+            if content not in (None, ""):
+                items.append({"role": "assistant", "content": deepcopy(content)})
+            for raw_call in tool_calls:
+                function = _value(raw_call, "function", {})
+                arguments = _value(function, "arguments", "")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False, default=str)
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": _value(raw_call, "id", "") or "",
+                        "name": _value(function, "name", "") or "",
+                        "arguments": arguments,
+                    }
+                )
+            continue
+
+        items.append(
+            {
+                "role": role,
+                "content": deepcopy(message.get("content", "")),
+            }
+        )
+    return items
+
+
+def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten Chat Completions function definitions for the Responses API."""
+
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, Mapping) else None
+        if (
+            isinstance(tool, Mapping)
+            and tool.get("type") == "function"
+            and isinstance(function, Mapping)
+        ):
+            converted_tool = {"type": "function", **deepcopy(dict(function))}
+            converted_tool.setdefault("strict", False)
+            converted.append(converted_tool)
+        else:
+            converted.append(deepcopy(tool))
+    return converted
+
+
+def _responses_output_text(response: Any) -> str:
+    output_text = _value(response, "output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+
+    parts: list[str] = []
+    for item in _value(response, "output", []) or []:
+        if _value(item, "type") != "message":
+            continue
+        for content in _value(item, "content", []) or []:
+            if _value(content, "type") != "output_text":
+                continue
+            text = _value(content, "text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def _responses_reasoning_text(response: Any) -> str | None:
+    parts: list[str] = []
+    for item in _value(response, "output", []) or []:
+        if _value(item, "type") not in {"reasoning", "reasoning_summary"}:
+            continue
+        for field_name in ("summary", "content"):
+            for part in _value(item, field_name, []) or []:
+                if _value(part, "type") not in {
+                    "summary_text",
+                    "reasoning_text",
+                    "reasoning_summary",
+                }:
+                    continue
+                text = _value(part, "text")
+                if isinstance(text, str):
+                    parts.append(text)
+                    continue
+                legacy_summary = _value(part, "summary")
+                if isinstance(legacy_summary, str):
+                    parts.append(legacy_summary)
+                elif isinstance(legacy_summary, list):
+                    parts.extend(
+                        nested_text
+                        for nested in legacy_summary
+                        if isinstance((nested_text := _value(nested, "text")), str)
+                    )
+    return "".join(parts) or None
+
+
+def _responses_replay_items(response: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in _value(response, "output", []) or []:
+        if _value(item, "type") not in {"reasoning", "function_call"}:
+            continue
+        serialized = _json_model_dump(item)
+        if serialized:
+            items.append(serialized)
+    return items
+
+
+def _responses_failure_diagnostic(value: Any) -> str:
+    response = _value(value, "response", value)
+    error = _value(response, "error") or _value(value, "error")
+    details = ["type=ResponsesTerminalError"]
+    request_id = _value(response, "id") or _value(value, "response_id")
+    if isinstance(request_id, str) and request_id:
+        details.append(f"request_id={sanitize_text(request_id)[:200]}")
+    status = _value(response, "status")
+    if isinstance(status, str) and status:
+        details.append(f"status={sanitize_text(status)[:100]}")
+    reason = _value(_value(response, "incomplete_details"), "reason")
+    if isinstance(reason, str) and reason:
+        details.append(f"reason={sanitize_text(reason)[:100]}")
+    error_type = _value(error, "type") or _value(value, "type")
+    if isinstance(error_type, str) and error_type:
+        details.append(f"error_type={sanitize_text(error_type)[:100]}")
+    code = _value(error, "code") or _value(value, "code")
+    if isinstance(code, str) and code:
+        details.append(f"code={sanitize_text(code)[:100]}")
+    return ", ".join(details)
 
 
 _MODEL_EVIDENCE_FIELDS = (
@@ -1112,6 +1303,7 @@ class OpenAICompatibleAdvisor:
             request_id=request_id if isinstance(request_id, str) else None,
             reasoning_content=reasoning_content,
             usage=response.usage,
+            provider_output_items=tuple(deepcopy(response.output_items)),
         )
 
     async def _complete(
@@ -1165,13 +1357,271 @@ class OpenAICompatibleAdvisor:
                 f"json_mode={self._json_mode}, usage={usage})"
             )
         return content, AdvisorMetadata(
-            provider="openai_compatible",
+            provider=self.provider,
             model=self._model,
             prompt_version=PROMPT_VERSION,
             request_id=request_id,
             usage=usage,
             reasoning_content=reasoning,
         )
+
+
+class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
+    """OpenAI Responses protocol adapter with stateless reasoning replay."""
+
+    @property
+    def provider(self) -> str:
+        return "openai_responses"
+
+    @staticmethod
+    def _request_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        messages = kwargs.get("messages", [])
+        request: dict[str, Any] = {
+            "model": kwargs.get("model"),
+            "input": _responses_input(messages),
+            "max_output_tokens": kwargs.get("max_tokens"),
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "stream": True,
+        }
+        tools = kwargs.get("tools")
+        if isinstance(tools, list):
+            request["tools"] = _responses_tools(tools)
+        if "tool_choice" in kwargs:
+            tool_choice = kwargs["tool_choice"]
+            function = _value(tool_choice, "function")
+            if isinstance(tool_choice, Mapping) and isinstance(function, Mapping):
+                request["tool_choice"] = {
+                    "type": tool_choice.get("type", "function"),
+                    **deepcopy(dict(function)),
+                }
+            else:
+                request["tool_choice"] = deepcopy(tool_choice)
+        if "parallel_tool_calls" in kwargs:
+            request["parallel_tool_calls"] = kwargs["parallel_tool_calls"]
+        response_format = kwargs.get("response_format")
+        if isinstance(response_format, Mapping):
+            format_config = deepcopy(dict(response_format))
+            json_schema = format_config.pop("json_schema", None)
+            if format_config.get("type") == "json_schema" and isinstance(
+                json_schema, Mapping
+            ):
+                format_config.update(deepcopy(dict(json_schema)))
+            request["text"] = {"format": format_config}
+        return request
+
+    async def _aggregate_responses_response(
+        self,
+        response: Any,
+        *,
+        reasoning_callback: ReasoningDeltaCallback | None,
+    ) -> _StreamedChatResult:
+        output = _value(response, "output", []) or []
+        status = _value(response, "status")
+        incomplete_reason = _value(_value(response, "incomplete_details"), "reason")
+        error = _value(response, "error")
+        if status in {"failed", "incomplete", "cancelled"} or error not in (
+            None,
+            "",
+            {},
+            [],
+        ):
+            raise AdvisorError(
+                f"OpenAI Responses request failed ({_responses_failure_diagnostic(response)})"
+            )
+        reasoning = _responses_reasoning_text(response)
+        result = _StreamedChatResult(
+            request_id=_value(response, "id"),
+            content=_responses_output_text(response),
+            reasoning_content=reasoning,
+            usage=_model_dump(_value(response, "usage")),
+            finish_reason=(
+                incomplete_reason
+                if isinstance(incomplete_reason, str) and incomplete_reason
+                else status if isinstance(status, str) else None
+            ),
+            had_choice=bool(output),
+            output_items=_responses_replay_items(response),
+        )
+        for index, item in enumerate(output):
+            if _value(item, "type") != "function_call":
+                continue
+            result.tool_calls.append(
+                _StreamedToolCall(
+                    index=index,
+                    call_id=_value(item, "call_id", "") or "",
+                    name=_value(item, "name", "") or "",
+                    arguments=_value(item, "arguments", "") or "",
+                )
+            )
+        if reasoning is not None and reasoning_callback is not None:
+            await reasoning_callback(reasoning, 0)
+        return result
+
+    async def _stream_chat_completion(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        operation: str,
+        reasoning_callback: ReasoningDeltaCallback | None = None,
+    ) -> _StreamedChatResult:
+        """Map the shared advisor call shape onto one streamed Responses request."""
+
+        request_kwargs = self._request_kwargs(kwargs)
+        response = await self._request_provider(
+            lambda: self._client.responses.create(**request_kwargs),
+            operation=operation,
+        )
+        if not hasattr(response, "__aiter__"):
+            return await self._aggregate_responses_response(
+                response,
+                reasoning_callback=reasoning_callback,
+            )
+
+        result = _StreamedChatResult()
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: dict[int, _StreamedToolCall] = {}
+        output_items: dict[int, dict[str, Any]] = {}
+        terminal_response: Any = None
+        reasoning_delta_indices: set[int] = set()
+        reasoning_index = 0
+
+        async for event in response:
+            event_type = _value(event, "type")
+            response_id = _value(event, "response_id")
+            if isinstance(response_id, str) and response_id:
+                result.request_id = result.request_id or response_id
+
+            event_response = _value(event, "response")
+            if event_response is not None:
+                nested_id = _value(event_response, "id")
+                if isinstance(nested_id, str) and nested_id:
+                    result.request_id = result.request_id or nested_id
+            if event_type in {
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            }:
+                if event_type != "response.completed" and event_response is None:
+                    raise AdvisorError(
+                        "OpenAI Responses request failed "
+                        f"({_responses_failure_diagnostic(event)})"
+                    )
+                terminal_response = event_response
+                continue
+
+            if event_type in {"error", "response.error"}:
+                raise AdvisorError(
+                    f"OpenAI Responses request failed ({_responses_failure_diagnostic(event)})"
+                )
+
+            if event_type == "response.output_text.delta":
+                delta = _value(event, "delta")
+                if isinstance(delta, str):
+                    content_parts.append(delta)
+                    result.had_choice = True
+                continue
+
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary.delta",
+                "response.reasoning_text.delta",
+            }:
+                delta = _value(event, "delta")
+                if isinstance(delta, str):
+                    raw_index = _value(event, "output_index", 0)
+                    output_index = raw_index if isinstance(raw_index, int) else 0
+                    reasoning_delta_indices.add(output_index)
+                    reasoning_parts.append(delta)
+                    result.had_choice = True
+                    if reasoning_callback is not None:
+                        await reasoning_callback(delta, reasoning_index)
+                    reasoning_index += 1
+                continue
+
+            if event_type in {
+                "response.output_item.added",
+                "response.output_item.done",
+            }:
+                raw_index = _value(event, "output_index", 0)
+                index = raw_index if isinstance(raw_index, int) else 0
+                item = _value(event, "item")
+                item_type = _value(item, "type")
+                result.had_choice = True
+                if event_type == "response.output_item.done" and item_type in {
+                    "reasoning",
+                    "function_call",
+                }:
+                    serialized = _json_model_dump(item)
+                    if serialized:
+                        output_items[index] = serialized
+                if (
+                    event_type == "response.output_item.done"
+                    and item_type in {"reasoning", "reasoning_summary"}
+                    and index not in reasoning_delta_indices
+                ):
+                    completed_reasoning = _responses_reasoning_text({"output": [item]})
+                    if completed_reasoning is not None:
+                        reasoning_parts.append(completed_reasoning)
+                        if reasoning_callback is not None:
+                            await reasoning_callback(completed_reasoning, reasoning_index)
+                        reasoning_index += 1
+                if item_type == "function_call":
+                    call = tool_calls.setdefault(index, _StreamedToolCall(index=index))
+                    call.call_id = _value(item, "call_id", "") or call.call_id
+                    call.name = _value(item, "name", "") or call.name
+                    arguments = _value(item, "arguments")
+                    if isinstance(arguments, str) and (
+                        event_type == "response.output_item.done" or not call.arguments
+                    ):
+                        call.arguments = arguments
+                continue
+
+            if event_type == "response.function_call_arguments.delta":
+                raw_index = _value(event, "output_index", 0)
+                index = raw_index if isinstance(raw_index, int) else 0
+                delta = _value(event, "delta")
+                if isinstance(delta, str):
+                    call = tool_calls.setdefault(index, _StreamedToolCall(index=index))
+                    call.arguments += delta
+                    result.had_choice = True
+                continue
+
+            if event_type == "response.function_call_arguments.done":
+                raw_index = _value(event, "output_index", 0)
+                index = raw_index if isinstance(raw_index, int) else 0
+                call = tool_calls.setdefault(index, _StreamedToolCall(index=index))
+                name = _value(event, "name")
+                arguments = _value(event, "arguments")
+                if isinstance(name, str):
+                    call.name = name
+                if isinstance(arguments, str):
+                    call.arguments = arguments
+                result.had_choice = True
+
+        result.content = "".join(content_parts)
+        result.reasoning_content = "".join(reasoning_parts) or None
+        result.tool_calls = [tool_calls[index] for index in sorted(tool_calls)]
+        result.output_items = [output_items[index] for index in sorted(output_items)]
+
+        if terminal_response is not None:
+            completed = await self._aggregate_responses_response(
+                terminal_response,
+                reasoning_callback=None,
+            )
+            result.request_id = completed.request_id or result.request_id
+            result.content = result.content or completed.content
+            result.usage = completed.usage
+            result.finish_reason = completed.finish_reason
+            result.had_choice = result.had_choice or completed.had_choice
+            result.tool_calls = completed.tool_calls or result.tool_calls
+            result.output_items = completed.output_items or result.output_items
+            if result.reasoning_content is None and completed.reasoning_content is not None:
+                result.reasoning_content = completed.reasoning_content
+                if reasoning_callback is not None:
+                    await reasoning_callback(completed.reasoning_content, reasoning_index)
+        return result
 
 
 class FakeAIAdvisor:

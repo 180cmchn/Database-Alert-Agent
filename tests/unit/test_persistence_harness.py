@@ -834,7 +834,26 @@ async def test_mcp_checkpoint_store_round_trips_snapshot_and_budget(
             tool_name="query_range",
             objective="Collect the fixed alert window",
             effective_arguments={"query": "mysql_up"},
-            metadata={"call_id": "call-1", "capability": "range_query"},
+            metadata={
+                "call_id": "call-1",
+                "capability": "range_query",
+                "provider_output_items": [
+                    {
+                        "type": "reasoning",
+                        "id": "reasoning-1",
+                        "encrypted_content": "encrypted-checkpoint",
+                        "summary": [],
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "function-item-1",
+                        "call_id": "call-1",
+                        "name": "query_range",
+                        "arguments": '{"query":"mysql_up"}',
+                        "status": "completed",
+                    },
+                ],
+            },
         ),
     )
     store = RepositoryMCPCheckpointStore[dict[str, object], object](

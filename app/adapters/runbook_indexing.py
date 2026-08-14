@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from app.adapters.ai import AI_HTTP_USER_AGENT, _system_trust_http_client
 from app.adapters.pdf_runbooks import alert_type_directory_name
+from app.config import REAL_AI_PROVIDERS
 from app.domain.errors import RunbookError
 
 RUNBOOK_INDEX_PROMPT_VERSION = "runbook-auto-index-v2"
@@ -220,6 +221,40 @@ def _json_object(content: str) -> dict[str, Any]:
     return value
 
 
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    return (
+        value.get(name, default)
+        if isinstance(value, dict)
+        else getattr(value, name, default)
+    )
+
+
+def _responses_output_text(response: Any) -> str:
+    """Read Responses SDK output text, including compatible raw output items."""
+
+    output_text = _field(response, "output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+
+    parts: list[str] = []
+    for item in _field(response, "output", []) or []:
+        item_type = _field(item, "type")
+        if item_type == "output_text":
+            text = _field(item, "text")
+            if isinstance(text, str):
+                parts.append(text)
+            continue
+        if item_type != "message":
+            continue
+        for content in _field(item, "content", []) or []:
+            if _field(content, "type") != "output_text":
+                continue
+            text = _field(content, "text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
 def _evidence_signature(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     return "".join(character for character in normalized if character.isalnum())
@@ -305,9 +340,13 @@ def build_auto_annotation(
     *,
     page_count: int,
     content_sha256: str,
+    provider: str,
     model: str,
 ) -> dict[str, Any]:
     """Merge chunk-level model extractions into one deterministic annotation."""
+
+    if provider not in REAL_AI_PROVIDERS:
+        raise RunbookError(f"Unsupported automatic PDF index provider: {provider}")
 
     profile_values: dict[str, dict[str, Any]] = {}
     database_engines: list[str] = []
@@ -482,7 +521,7 @@ def build_auto_annotation(
         "actions": actions,
         "metadata": {
             "auto_index": {
-                "generator": "openai_compatible",
+                "generator": provider,
                 "model": model,
                 "prompt_version": RUNBOOK_INDEX_PROMPT_VERSION,
                 "content_sha256": content_sha256,
@@ -524,6 +563,7 @@ class OpenAICompatibleRunbookIndexer:
     def __init__(
         self,
         *,
+        provider: str,
         api_key: str,
         base_url: str,
         model: str,
@@ -533,10 +573,13 @@ class OpenAICompatibleRunbookIndexer:
         json_mode: bool,
         max_input_chars: int = 60_000,
     ) -> None:
+        if provider not in REAL_AI_PROVIDERS:
+            raise RunbookError(f"Unsupported automatic PDF index provider: {provider}")
         if not api_key or not model:
             raise RunbookError(
                 "AI_API_KEY and AI_MODEL are required for automatic PDF indexing"
             )
+        self._provider = provider
         self._model = model
         self._max_tokens = max_tokens
         self._json_mode = json_mode
@@ -585,6 +628,7 @@ class OpenAICompatibleRunbookIndexer:
             drafts,
             page_count=len(pages),
             content_sha256=content_sha256,
+            provider=self._provider,
             model=self._model,
         )
 
@@ -639,22 +683,36 @@ class OpenAICompatibleRunbookIndexer:
                 ) from exc
 
     async def _complete(self, messages: list[dict[str, str]]) -> str:
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": 0,
-            "max_tokens": self._max_tokens,
-        }
-        if self._json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
         try:
-            response = await self._client.chat.completions.create(**kwargs)
+            if self._provider == "openai_responses":
+                kwargs: dict[str, Any] = {
+                    "model": self._model,
+                    "input": messages,
+                    "max_output_tokens": self._max_tokens,
+                    "store": False,
+                }
+                if self._json_mode:
+                    kwargs["text"] = {"format": {"type": "json_object"}}
+                response = await self._client.responses.create(**kwargs)
+                content = _responses_output_text(response)
+            else:
+                kwargs = {
+                    "model": self._model,
+                    "messages": messages,
+                    "temperature": 0,
+                    "max_tokens": self._max_tokens,
+                }
+                if self._json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                response = await self._client.chat.completions.create(**kwargs)
+                choices = getattr(response, "choices", None) or []
+                content = getattr(choices[0].message, "content", None) if choices else None
         except Exception as exc:
             raise RunbookError(f"Automatic PDF index request failed: {exc}") from exc
         request_id = getattr(response, "id", None)
-        if not response.choices or not response.choices[0].message.content:
+        if not content:
             raise RunbookError(
                 "Automatic PDF index model returned no content "
                 f"(request_id={request_id})"
             )
-        return str(response.choices[0].message.content)
+        return str(content)

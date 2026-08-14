@@ -16,6 +16,9 @@ DEFAULT_ENVIRONMENT_ALIASES = {
     "development": ["dev", "development", "开发", "开发环境"],
 }
 
+REAL_AI_PROVIDERS = frozenset({"openai_compatible", "openai_responses"})
+SUPPORTED_AI_PROVIDERS = REAL_AI_PROVIDERS | {"fake"}
+
 # Only these settings may be changed through the administrative API. Bootstrap
 # controls such as the database URL, scheduler backend and admin credential
 # intentionally remain environment/file-deployment concerns.
@@ -403,12 +406,12 @@ class Settings(BaseSettings):
 
     def readiness_issues(self) -> list[str]:
         issues: list[str] = []
-        if self.ai_provider == "openai_compatible":
+        if self.ai_provider in REAL_AI_PROVIDERS:
             if not self.ai_api_key:
-                issues.append("AI_API_KEY is required for openai_compatible provider")
+                issues.append(f"AI_API_KEY is required for {self.ai_provider} provider")
             if not self.ai_model:
-                issues.append("AI_MODEL is required for openai_compatible provider")
-        elif self.ai_provider != "fake":
+                issues.append(f"AI_MODEL is required for {self.ai_provider} provider")
+        elif self.ai_provider not in SUPPORTED_AI_PROVIDERS:
             issues.append(f"Unsupported AI_PROVIDER: {self.ai_provider}")
 
         if self.wecom_enabled and not self.wecom_webhook_url:
@@ -459,9 +462,9 @@ class Settings(BaseSettings):
                 issues.append(
                     f"MCP settings file does not exist: {self.mcp_settings_path}"
                 )
-            elif self.ai_provider != "openai_compatible":
+            elif self.ai_provider not in REAL_AI_PROVIDERS:
                 issues.append(
-                    "Archery MCP requires an openai_compatible model with tool calling"
+                    "Archery MCP requires a real AI provider model with tool calling"
                 )
         prometheus_url_configured = bool(self.prometheus_mcp_sse_url.strip())
         prometheus_header_configured = bool(
@@ -494,10 +497,9 @@ class Settings(BaseSettings):
                     issues.append(
                         f"MCP settings file does not exist: {self.mcp_settings_path}"
                     )
-                elif self.ai_provider != "openai_compatible":
+                elif self.ai_provider not in REAL_AI_PROVIDERS:
                     issues.append(
-                        "Prometheus MCP requires an openai_compatible model with tool "
-                        "calling"
+                        "Prometheus MCP requires a real AI provider model with tool calling"
                     )
         if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")

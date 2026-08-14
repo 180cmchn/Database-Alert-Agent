@@ -34,7 +34,7 @@ from app.domain.models import (
     ToolStatus,
 )
 from app.domain.ports import AlertRepository
-from app.domain.tool_calling import MCPToolCallingModel
+from app.domain.tool_calling import MCPToolCallingModel, mcp_tool_result_messages
 from app.mcp_catalog import MCPServerDescriptor, ResolvedMCPConnection
 
 _FINISH_TOOL_PREFIX = "finish_investigation"
@@ -555,25 +555,27 @@ class GenericMCPEvidenceTool:
                     provider=self.source_system,
                     trace_key=f"{trace_prefix}:observation",
                 )
-                messages.append(
+                model_observation = json.dumps(
                     {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "observation_type": "program_fact_projection",
-                                "tool_name": call.name,
-                                "arguments": sanitize(call.arguments),
-                                "projection": projection,
-                                "instruction": (
-                                    "Use only these program-projected facts when choosing the "
-                                    "next action. The complete response is retained only in the "
-                                    "internal audit artifact."
-                                ),
-                            },
-                            ensure_ascii=False,
-                            default=str,
+                        "observation_type": "program_fact_projection",
+                        "tool_name": call.name,
+                        "arguments": sanitize(call.arguments),
+                        "projection": projection,
+                        "instruction": (
+                            "Use only these program-projected facts when choosing the "
+                            "next action. The complete response is retained only in the "
+                            "internal audit artifact."
                         ),
-                    }
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                messages.extend(
+                    mcp_tool_result_messages(
+                        call,
+                        output=model_observation,
+                        fallback_messages=[{"role": "user", "content": model_observation}],
+                    )
                 )
 
         if not observations:

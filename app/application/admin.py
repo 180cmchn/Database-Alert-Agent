@@ -12,7 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from app.config import RUNTIME_SETTINGS_KEYS, Settings, load_runtime_overrides
+from app.config import (
+    REAL_AI_PROVIDERS,
+    RUNTIME_SETTINGS_KEYS,
+    Settings,
+    load_runtime_overrides,
+)
 
 try:  # Unix file locking.
     import fcntl as _fcntl
@@ -72,11 +77,11 @@ def runtime_configuration_issues(settings: Settings) -> list[str]:
     """Return non-sensitive issues that prevent a usable runtime configuration."""
 
     issues = list(settings.readiness_issues())
-    if settings.ai_provider == "openai_compatible":
+    if settings.ai_provider in REAL_AI_PROVIDERS:
         if not settings.ai_api_key.strip():
-            issues.append("AI_API_KEY is required for openai_compatible provider")
+            issues.append(f"AI_API_KEY is required for {settings.ai_provider} provider")
         if not settings.ai_model.strip():
-            issues.append("AI_MODEL is required for openai_compatible provider")
+            issues.append(f"AI_MODEL is required for {settings.ai_provider} provider")
     if settings.app_env.lower() in {"production", "prod"} and settings.ai_provider == "fake":
         issues.append("AI_PROVIDER=fake is not allowed in production")
     return list(dict.fromkeys(issues))
@@ -264,11 +269,15 @@ class RuntimeSettingsManager:
     @staticmethod
     def _validate_runnable(settings: Settings) -> None:
         blocking: list[str] = []
-        if settings.ai_provider == "openai_compatible":
+        if settings.ai_provider in REAL_AI_PROVIDERS:
             if not settings.ai_api_key.strip():
-                blocking.append("AI API key is required for openai_compatible provider")
+                blocking.append(
+                    f"AI API key is required for {settings.ai_provider} provider"
+                )
             if not settings.ai_model.strip():
-                blocking.append("AI model is required for openai_compatible provider")
+                blocking.append(
+                    f"AI model is required for {settings.ai_provider} provider"
+                )
         if settings.wecom_enabled and not settings.wecom_webhook_url.strip():
             blocking.append(
                 "WeCom webhook URL is required when WeCom notifications are enabled"

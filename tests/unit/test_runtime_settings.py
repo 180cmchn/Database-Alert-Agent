@@ -115,6 +115,29 @@ def test_fake_provider_is_rejected_in_production() -> None:
         )
 
 
+def test_openai_responses_provider_is_normalized_and_requires_credentials() -> None:
+    configured = Settings(
+        _env_file=None,
+        ai_provider=" OPENAI_RESPONSES ",
+        ai_api_key="test-key",
+        ai_model="test-model",
+        knowledge_sources=["external_knowledge"],
+    )
+
+    assert configured.ai_provider == "openai_responses"
+    assert not any("AI_API_KEY" in issue for issue in configured.readiness_issues())
+    assert not any("AI_MODEL" in issue for issue in configured.readiness_issues())
+
+    incomplete = configured.model_copy(update={"ai_api_key": "", "ai_model": ""})
+    assert {
+        "AI_API_KEY is required for openai_responses provider",
+        "AI_MODEL is required for openai_responses provider",
+    }.issubset(incomplete.readiness_issues())
+
+    unsupported = configured.model_copy(update={"ai_provider": "unknown_protocol"})
+    assert "Unsupported AI_PROVIDER: unknown_protocol" in unsupported.readiness_issues()
+
+
 def test_ai_max_tokens_has_reasoning_safe_default_and_bounds() -> None:
     settings = Settings(_env_file=None, ai_provider="fake")
     assert settings.ai_max_tokens == 16_384
@@ -419,6 +442,29 @@ def test_archery_mcp_connection_is_deployment_only_and_target_comes_from_alert(
         )
 
 
+def test_openai_responses_is_eligible_for_mcp_tool_calling_readiness(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "settings.json"
+    catalog_path.write_text("{}", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        ai_provider="openai_responses",
+        ai_api_key="test-key",
+        ai_model="test-model",
+        knowledge_sources=["external_knowledge"],
+        mcp_settings_path=catalog_path,
+        archery_mcp_url="https://archery.example.test/mcp",
+        archery_mcp_token="test-token",
+        prometheus_mcp_sse_url="https://prometheus.example.test/sse",
+    )
+
+    assert not any(
+        "requires a real AI provider model with tool calling" in issue
+        for issue in settings.readiness_issues()
+    )
+
+
 def runtime_test_settings(tmp_path: Path) -> Settings:
     runbooks = tmp_path / "runbooks"
     create_tikv_runbook_pdf(runbooks)
@@ -455,6 +501,16 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         "scheduler_workers": 4,
         "analysis_timeout_seconds": 2400,
     }
+    responses_patch = RuntimeSettingsPatch(
+        expected_revision="0123456789abcdef",
+        ai_provider="openai_responses",
+    )
+    assert responses_patch.updates() == {"ai_provider": "openai_responses"}
+    with pytest.raises(ValidationError):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            ai_provider="unknown_protocol",  # type: ignore[arg-type]
+        )
     with pytest.raises(ValidationError, match="extra_forbidden"):
         RuntimeSettingsPatch(
             expected_revision="0123456789abcdef",
@@ -515,12 +571,13 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_removed_notifier_fi
     settings = runtime_test_settings(tmp_path)
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
-    with pytest.raises(ValueError, match="AI API key.*AI model"):
-        await manager.patch(
-            settings,
-            {"ai_provider": "openai_compatible", "ai_api_key": "", "ai_model": ""},
-            expected_revision=manager.revision,
-        )
+    for provider in ("openai_compatible", "openai_responses"):
+        with pytest.raises(ValueError, match="AI API key.*AI model"):
+            await manager.patch(
+                settings,
+                {"ai_provider": provider, "ai_api_key": "", "ai_model": ""},
+                expected_revision=manager.revision,
+            )
     with pytest.raises(ValueError, match="not editable: management_webhook_url"):
         await manager.patch(
             settings,
