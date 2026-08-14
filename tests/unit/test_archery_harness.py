@@ -196,6 +196,35 @@ def _success(sql: str, *, rows: list[dict[str, Any]] | None = None) -> ReplayCal
     )
 
 
+def _response_result_success(
+    sql: str,
+    *,
+    columns: list[str],
+    rows: list[list[Any]],
+) -> ReplayCallFixture:
+    payload = {
+        "full_sql": sql,
+        "rows": rows,
+        "column_list": columns,
+        "affected_rows": len(rows),
+    }
+    return ReplayCallFixture(
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        expected_arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        result={
+            "structuredContent": {
+                "response": {
+                    "result": (
+                        f"SQL 查询已执行。\n执行的SQL：{sql}\n\n"
+                        f"返回 {len(rows)} 行。\n结果：\n"
+                        + json.dumps(payload, ensure_ascii=False)
+                    )
+                }
+            }
+        },
+    )
+
+
 def _client(
     model: _ScriptedModel,
     connector: ReplayMCPConnector,
@@ -673,6 +702,70 @@ async def test_unknown_dynamic_tool_can_return_final_history_by_actual_sql() -> 
 
 
 @pytest.mark.asyncio
+async def test_harness_parses_structured_response_result_history_rows() -> None:
+    rows = [
+        ["db-1.example:3306", "2026-07-23T15:59:10", "SELECT fixture one"],
+        ["db-1.example:3306", "2026-07-23T15:59:20", "SELECT fixture two"],
+    ]
+    wrapped_result = (
+        f"SQL 查询已执行。\n执行的SQL：{FINAL_SQL}\n\n返回 2 行。\n结果：\n"
+        + json.dumps(
+            {
+                "full_sql": FINAL_SQL,
+                "rows": rows,
+                "column_list": ["hostname_max", "ts_min", "sql_text"],
+                "affected_rows": 2,
+            },
+            ensure_ascii=False,
+        )
+    )
+    model = _ScriptedModel([_call("wrapped-history", FINAL_SQL), _finish()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-response-result-history",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
+                        result={
+                            "structuredContent": {
+                                "response": {"result": wrapped_result},
+                            }
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.executed_sql == FINAL_SQL
+    assert result.actual_sql_verified is True
+    assert ArcheryMCPClient.payload_row_count(result.payload) == 2
+    assert ArcheryMCPClient._tabular_rows(result.payload) == [
+        {
+            "hostname_max": "db-1.example:3306",
+            "ts_min": "2026-07-23T15:59:10",
+            "sql_text": "SELECT fixture one",
+        },
+        {
+            "hostname_max": "db-1.example:3306",
+            "ts_min": "2026-07-23T15:59:20",
+            "sql_text": "SELECT fixture two",
+        },
+    ]
+    assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
 async def test_actual_response_sql_overrides_requested_history_for_classification() -> None:
     actual_sql = "SELECT index_name FROM information_schema.statistics"
     model = _ScriptedModel([_call("mismatched-sql", FINAL_SQL), _finish()])
@@ -1103,9 +1196,14 @@ async def test_business_error_raw_payload_is_replayed_to_internal_model() -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row_key", ["results", "data"])
+@pytest.mark.parametrize(
+    ("row_key", "response_result_wrapped"),
+    [("results", False), ("data", False), ("instances", True)],
+    ids=["results", "data", "response-result"],
+)
 async def test_instance_discovery_raw_response_drives_followup_queries(
     row_key: str,
+    response_result_wrapped: bool,
 ) -> None:
     class RawResponseDrivenModel:
         def __init__(self) -> None:
@@ -1120,6 +1218,30 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
             content = messages[-1].get("content")
             assert isinstance(content, str)
             return json.loads(content)
+
+        @staticmethod
+        def structured_payload(raw_response: dict[str, Any]) -> dict[str, Any]:
+            structured = raw_response["structuredContent"]
+            response = structured.get("response")
+            if not isinstance(response, dict) or not isinstance(response.get("result"), str):
+                return structured
+            text = response["result"]
+            marker = "结果：\n"
+            payload = json.loads(text.split(marker, 1)[1] if marker in text else text)
+            columns = payload.get("column_list")
+            rows = payload.get("rows")
+            if (
+                isinstance(columns, list)
+                and all(isinstance(column, str) for column in columns)
+                and isinstance(rows, list)
+            ):
+                payload["rows"] = [
+                    dict(zip(columns, row, strict=True))
+                    if isinstance(row, list) and len(row) == len(columns)
+                    else row
+                    for row in rows
+                ]
+            return payload
 
         async def request_mcp_tool_call(
             self,
@@ -1143,7 +1265,7 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
                 )
 
             raw_response = self.raw_response(messages)
-            structured = raw_response["structuredContent"]
+            structured = self.structured_payload(raw_response)
             if turn == 2:
                 self.discovery_feedback = str(messages[-1]["content"])
                 self.discovered_instance_id = int(structured[row_key][0]["id"])
@@ -1215,6 +1337,63 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
             },
         ),
     ]
+    discovery_rows = [
+        {
+            "id": 17,
+            "name": "archery-production",
+            "access_token": discovery_secret,
+        }
+    ]
+    discovery_result = (
+        {
+            "structuredContent": {
+                "response": {
+                    "result": json.dumps({row_key: discovery_rows}, ensure_ascii=False),
+                }
+            }
+        }
+        if response_result_wrapped
+        else {
+            "structuredContent": {
+                "status": "ok",
+                row_key: discovery_rows,
+            }
+        }
+    )
+    query_calls = (
+        [
+            _response_result_success(
+                MEMBER_SQL,
+                columns=["f_instance_id"],
+                rows=[[53]],
+            ),
+            _response_result_success(
+                INSTANCE_SQL,
+                columns=["host", "port"],
+                rows=[["db-1.example", 3306]],
+            ),
+            _response_result_success(
+                FINAL_SQL,
+                columns=["hostname_max", "sample", "query_time_max"],
+                rows=[["db-1.example:3306", "SELECT projection_driven", 3.5]],
+            ),
+        ]
+        if response_result_wrapped
+        else [
+            _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+            _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
+            _success(
+                FINAL_SQL,
+                rows=[
+                    {
+                        "hostname_max": "db-1.example:3306",
+                        "sample": "SELECT projection_driven",
+                        "query_time_max": 3.5,
+                    }
+                ],
+            ),
+        ]
+    )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
@@ -1225,34 +1404,9 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
                         expected_arguments=discovery_arguments,
-                        result={
-                            "structuredContent": {
-                                "status": "ok",
-                                row_key: [
-                                    {
-                                        "id": 17,
-                                        "name": "archery-production",
-                                        "access_token": discovery_secret,
-                                    }
-                                ],
-                            }
-                        },
+                        result=discovery_result,
                     ),
-                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
-                    _success(
-                        INSTANCE_SQL,
-                        rows=[{"host": "db-1.example", "port": 3306}],
-                    ),
-                    _success(
-                        FINAL_SQL,
-                        rows=[
-                            {
-                                "hostname_max": "db-1.example:3306",
-                                "sample": "SELECT projection_driven",
-                                "query_time_max": 3.5,
-                            }
-                        ],
-                    ),
+                    *query_calls,
                 ],
             )
         ],
@@ -1269,12 +1423,16 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
     assert model.discovered_member_id == 53
     assert model.discovered_endpoint == "db-1.example:3306"
     assert result.instance_id == 17
+    assert result.metadata_resolution_tables == ("t_instance_member", "sql_instance")
     assert '"structuredContent"' in model.discovery_feedback
-    assert '"id":17' in model.discovery_feedback
-    assert '"name":"archery-production"' in model.discovery_feedback
+    discovery_payload = model.structured_payload(json.loads(model.discovery_feedback))
+    assert discovery_payload[row_key][0]["id"] == 17
+    assert discovery_payload[row_key][0]["name"] == "archery-production"
     assert discovery_secret in model.discovery_feedback
     assert "***REDACTED***" not in model.discovery_feedback
     assert "internal_audit_artifact_only" not in model.discovery_feedback
+    assert ArcheryMCPClient.payload_row_count(result.payload) == 1
+    assert discovery_secret not in json.dumps(result.payload, ensure_ascii=False)
 
 
 @pytest.mark.asyncio

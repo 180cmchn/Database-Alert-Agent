@@ -1266,6 +1266,68 @@ def test_archery_mcp_parses_wrapped_positional_rows_without_post_query_checks(
 
 
 @pytest.mark.asyncio
+async def test_archery_mcp_parses_response_result_wrapped_tabular_payload() -> None:
+    history_sql = (
+        "SELECT hostname_max, sample, Query_time_sum "
+        "FROM mysql_slow_query_review_history LIMIT 2"
+    )
+    rows = [
+        ["db-a.example:3306", "select 1", 1.25],
+        ["db-a.example:3306", "select 2", 0.75],
+    ]
+    wrapped_result = (
+        f"SQL 查询已执行。\n执行的SQL：{history_sql}\n\n返回 2 行。\n结果：\n"
+        + json.dumps(
+            {
+                "full_sql": history_sql + ";",
+                "rows": rows,
+                "column_list": ["hostname_max", "sample", "Query_time_sum"],
+                "affected_rows": 2,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"response": {"result": wrapped_result}},
+        requested_sql=history_sql,
+    )
+
+    assert payload["rows"] == rows
+    assert ArcheryMCPClient.payload_row_count(payload) == 2
+    assert ArcheryMCPClient._tabular_rows(payload) == [
+        {
+            "hostname_max": "db-a.example:3306",
+            "sample": "select 1",
+            "Query_time_sum": 1.25,
+        },
+        {
+            "hostname_max": "db-a.example:3306",
+            "sample": "select 2",
+            "Query_time_sum": 0.75,
+        },
+    ]
+    assert executed_sql is not None
+    assert executed_sql.rstrip(";") == history_sql
+    assert actual_sql_verified is True
+
+    outcome = await ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload=payload)
+    ).execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context("database_latency", title="MySQL/mysql_slow_query_400/db-a.example:3306"),
+    )
+
+    assert isinstance(outcome, tuple)
+    _summary, structured_data = outcome
+    assert structured_data["reported_row_count"] == 2
+    assert structured_data["parsed_row_count"] == 2
+    assert structured_data["included_row_count"] == 2
+    assert structured_data["omitted_row_count"] == 0
+    assert structured_data["root_cause_eligible"] is True
+
+
+@pytest.mark.asyncio
 async def test_archery_mcp_parses_wrapped_json_array_as_slow_log_rows() -> None:
     history_sql = (
         "SELECT hostname_max, sample, ts_min FROM mysql_slow_query_review_history "
@@ -1338,6 +1400,13 @@ def test_archery_tabular_row_shapes_use_consistent_precedence(
 ) -> None:
     assert ArcheryMCPClient._tabular_rows(payload) == expected_rows
     assert ArcheryMCPClient.payload_row_count(payload) == expected_count
+
+
+def test_archery_select_row_count_does_not_use_affected_rows_without_rows() -> None:
+    payload = {"response": {"result": {"affected_rows": 0}}}
+
+    assert ArcheryMCPClient.payload_row_count(payload) is None
+    assert ArcherySlowLogEvidenceTool._reported_row_count(payload) is None
 
 
 @pytest.mark.asyncio

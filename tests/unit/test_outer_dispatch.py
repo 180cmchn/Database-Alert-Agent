@@ -617,8 +617,13 @@ async def test_frozen_outer_deadline_bounds_handler_execution(tmp_path: Path) ->
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-handler-timeout")
     executor = SlowExecutor()
+    processor = RecordingResultProcessor()
 
-    evidence = await DurableOuterToolDispatcher(repository, executor).execute(
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=processor,
+    ).execute(
         alert_id=alert_id,
         request=_request(timeout_seconds=0.01),
         context=context,
@@ -626,10 +631,22 @@ async def test_frozen_outer_deadline_bounds_handler_execution(tmp_path: Path) ->
     )
 
     assert len(executor.calls) == 1
+    assert processor.calls == []
     assert evidence.status == ToolStatus.TIMEOUT
+    assert evidence.summary == "调查工具 test_probe 已达到持久化调用期限。"
     assert (
         evidence.structured_data["reason_code"]
         == "outer_invocation_deadline_exceeded"
+    )
+    assert evidence.structured_data["processing_status"] == "unavailable"
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.structured_data["root_cause_ineligible_reason"] == (
+        "tool_status_not_success"
+    )
+    assert evidence.duration_ms > 0
+    assert evidence.duration_ms == max(
+        0,
+        int((evidence.collected_at - evidence.started_at).total_seconds() * 1000),
     )
     rows = await _invocation_rows(repository, str(context.run_id))
     assert [row.status for row in rows] == [ToolInvocationStatus.TIMED_OUT.value]
@@ -1151,9 +1168,9 @@ async def test_program_projection_ignores_provider_partial_sentinels(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
-    [ToolStatus.SKIPPED, ToolStatus.FAILED, ToolStatus.TIMEOUT],
+    [ToolStatus.FAILED, ToolStatus.TIMEOUT],
 )
-async def test_large_non_success_result_is_projected_without_changing_status(
+async def test_failed_or_timed_out_result_bypasses_projection(
     tmp_path: Path,
     status: ToolStatus,
 ) -> None:
@@ -1189,11 +1206,17 @@ async def test_large_non_success_result_is_projected_without_changing_status(
         tool_spec=_spec(),
     )
 
-    assert len(processor.calls) == 1
+    assert processor.calls == []
     assert evidence.status == status
-    assert evidence.structured_data["processing_status"] == "completed"
+    assert evidence.summary == "collected"
+    assert evidence.structured_data["processing_status"] == "unavailable"
     assert evidence.structured_data["reason_code"] == "database_not_monitored"
     assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.structured_data["root_cause_ineligible_reason"] == (
+        "tool_status_not_success"
+    )
+    assert "tool_result_analysis" not in evidence.structured_data
+    assert "payload" not in evidence.structured_data
     assert evidence.is_root_cause_support_eligible() is False
     assert "x" * 1_000 not in str(evidence.structured_data)
     rows = await _invocation_rows(repository, str(context.run_id))

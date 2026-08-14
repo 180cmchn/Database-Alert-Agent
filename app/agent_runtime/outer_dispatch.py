@@ -718,6 +718,21 @@ class DurableOuterToolDispatcher:
         request: ToolExecutionRequest,
         artifact_ref: ArtifactRef,
     ) -> EvidenceRecord:
+        if evidence.status in {ToolStatus.FAILED, ToolStatus.TIMEOUT}:
+            projected_data = self._status_metadata(evidence)
+            projected_data.update(
+                {
+                    "processing_status": "unavailable",
+                    "root_cause_eligible": False,
+                    "root_cause_ineligible_reason": "tool_status_not_success",
+                }
+            )
+            return evidence.model_copy(
+                update={
+                    "structured_data": projected_data,
+                    "truncated": False,
+                }
+            )
         raw_result = evidence.model_dump(mode="json")
         if self.result_analyzer is None:
             projected_data = self._status_metadata(evidence)
@@ -954,6 +969,8 @@ class DurableOuterToolDispatcher:
         request: ToolExecutionRequest,
         error: TimeoutError,
     ) -> EvidenceRecord:
+        collected_at = datetime.now(UTC)
+        started_at = invocation.started_at or invocation.created_at
         return EvidenceRecord(
             id=cls.build_evidence_id(invocation.invocation_id),
             run_id=invocation.run_id,
@@ -967,8 +984,12 @@ class DurableOuterToolDispatcher:
                 "root_cause_eligible": False,
             },
             error=sanitize_text(f"{type(error).__name__}: {error}")[:4000],
-            started_at=invocation.started_at or invocation.created_at,
-            collected_at=datetime.now(UTC),
+            started_at=started_at,
+            collected_at=collected_at,
+            duration_ms=max(
+                0,
+                int((collected_at - started_at).total_seconds() * 1000),
+            ),
         )
 
     @classmethod

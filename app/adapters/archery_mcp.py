@@ -111,6 +111,8 @@ _QUERY_RESULT_KEYS: Final = {
 _PAYLOAD_CONTAINER_KEYS: Final = {
     "data",
     "result",
+    "response",
+    "payload",
     "query",
     "execution",
     "meta",
@@ -814,18 +816,15 @@ class ArcheryMCPClient:
 
     @staticmethod
     def payload_row_count(payload: Mapping[str, Any]) -> int | None:
-        rows = ArcheryMCPClient._tabular_row_list(payload)
-        if rows is not None:
-            return len(rows)
-        for key in ("rowCount", "row_count", "total"):
-            value = payload.get(key)
-            if type(value) is int and value >= 0:
-                return value
-        data = payload.get("data")
-        if isinstance(data, Mapping):
-            return ArcheryMCPClient.payload_row_count(data)
-        affected_rows = payload.get("affected_rows")
-        return affected_rows if type(affected_rows) is int and affected_rows >= 0 else None
+        for container in ArcheryMCPClient._metadata_containers(payload):
+            rows = ArcheryMCPClient._tabular_row_list(container)
+            if rows is not None:
+                return len(rows)
+            for key in ("rowCount", "row_count", "total"):
+                value = container.get(key)
+                if type(value) is int and value >= 0:
+                    return value
+        return None
 
     @classmethod
     def _member_instance_ids_from_payload(cls, payload: Mapping[str, Any]) -> set[int]:
@@ -1051,11 +1050,7 @@ class ArcheryMCPClient:
     def _tabular_rows(cls, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Read common Archery tabular result shapes without trusting prose fields."""
 
-        containers: list[Mapping[str, Any]] = [payload]
-        data = payload.get("data")
-        if isinstance(data, Mapping):
-            containers.append(data)
-        for container in containers:
+        for container in cls._metadata_containers(payload):
             columns = container.get("columns") or container.get("column_list")
             rows = cls._tabular_row_list(container)
             if rows is None:
@@ -1068,11 +1063,7 @@ class ArcheryMCPClient:
                     for row in rows
                     if isinstance(row, (list, tuple))
                 ]
-            return [
-                ({"f_instance_id": row[0]} if len(row) == 1 else {"host": row[0], "port": row[1]})
-                for row in rows
-                if isinstance(row, (list, tuple)) and row
-            ]
+            return []
         return []
 
     @staticmethod
@@ -1272,8 +1263,9 @@ class ArcheryMCPClient:
         executed_sql = next(
             (
                 value.strip()
+                for container in cls._metadata_containers(normalized_payload)
                 for key in ("full_sql", "executed_sql", "sql_content")
-                if isinstance((value := normalized_payload.get(key)), str) and value.strip()
+                if isinstance((value := container.get(key)), str) and value.strip()
             ),
             echoed_sql,
         )
@@ -1321,9 +1313,9 @@ class ArcheryMCPClient:
             normalized["columns"] = list(projected_columns)
             normalized["columns_source"] = "verified_sql_projection"
             return normalized
-        data = normalized.get("data")
-        if isinstance(data, Mapping):
-            normalized["data"] = cls._with_inferred_query_columns(data, sql=sql)
+        for key, value in list(normalized.items()):
+            if str(key).casefold() in _PAYLOAD_CONTAINER_KEYS and isinstance(value, Mapping):
+                normalized[key] = cls._with_inferred_query_columns(value, sql=sql)
         return normalized
 
     @staticmethod
@@ -1849,20 +1841,20 @@ class ArcherySlowLogEvidenceTool:
 
     @staticmethod
     def _reported_row_count(result: Mapping[str, Any]) -> int | None:
-        for key in (
-            "mcp_reported_row_count",
-            "rowCount",
-            "row_count",
-            "total",
-            "affected_rows",
-        ):
-            value = result.get(key)
-            if type(value) is int and value >= 0:
-                return value
-        data = result.get("data")
-        if isinstance(data, Mapping):
-            return ArcherySlowLogEvidenceTool._reported_row_count(data)
-        return ArcherySlowLogEvidenceTool._row_count(result)
+        for container in ArcheryMCPClient._metadata_containers(result):
+            for key in (
+                "mcp_reported_row_count",
+                "rowCount",
+                "row_count",
+                "total",
+            ):
+                value = container.get(key)
+                if type(value) is int and value >= 0:
+                    return value
+            rows = ArcheryMCPClient._tabular_row_list(container)
+            if rows is not None:
+                return len(rows)
+        return None
 
     @staticmethod
     def _alert_target_context(alert: NormalizedAlert) -> dict[str, Any]:
