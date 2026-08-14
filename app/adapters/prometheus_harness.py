@@ -32,7 +32,6 @@ from app.adapters.prometheus_mcp import (
     PrometheusMCPProtocolError,
     PrometheusMCPQueryResult,
     PrometheusMCPToolError,
-    has_monitoring_observation,
 )
 from app.agent_runtime import (
     AgentEventKind,
@@ -68,13 +67,11 @@ class PrometheusHarnessRuntimeDependencies:
     repository: AlertRepository
 
 
-_PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT = (
-    "prometheus-mcp-remote-response/v1"
-)
+_PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT = "prometheus-mcp-remote-response/v2"
 
 
 class RepositoryPrometheusRemoteResponseStore:
-    """Persist every complete MCP response before Prometheus result processing."""
+    """Persist complete MCP responses after the Prometheus investigation ends."""
 
     def __init__(
         self,
@@ -92,11 +89,11 @@ class RepositoryPrometheusRemoteResponseStore:
         self.fencing_token = fencing_token
 
     @staticmethod
-    def artifact_id(invocation_id: UUID) -> UUID:
-        return uuid5(
-            invocation_id,
-            _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
-        )
+    def artifact_id(
+        invocation_id: UUID,
+        contract: str = _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
+    ) -> UUID:
+        return uuid5(invocation_id, contract)
 
     async def save(
         self,
@@ -108,7 +105,7 @@ class RepositoryPrometheusRemoteResponseStore:
         response: Any,
     ) -> None:
         raw = (
-            response.model_dump(mode="json", by_alias=True)
+            response.model_dump(mode="json", by_alias=True, exclude_none=False)
             if hasattr(response, "model_dump")
             else response
         )
@@ -116,10 +113,21 @@ class RepositoryPrometheusRemoteResponseStore:
             "contract": _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
             "provider": PROMETHEUS_MCP_SERVER_NAME,
             "run_id": str(run_id),
+            "invocation_id": str(invocation_id),
+            "outer_dispatch_id": (
+                str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
+            ),
             "tool_name": tool_name,
             "arguments": sanitize(arguments),
-            "response": sanitize(raw),
+            "response": raw,
         }
+        content_bytes = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
         artifact_id = self.artifact_id(invocation_id)
         artifact = ArtifactRef(
             artifact_id=artifact_id,
@@ -137,14 +145,15 @@ class RepositoryPrometheusRemoteResponseStore:
                     if self.outer_dispatch_id is not None
                     else None
                 ),
-                "sanitized": True,
+                "sanitized": False,
+                "raw_response_unmodified": True,
                 "internal_only": True,
             },
         )
         await self.repository.save_agent_artifact(
             str(run_id),
             artifact,
-            content,
+            content_bytes,
             invocation_id=str(invocation_id),
             lease_owner=self.lease_owner,
             fencing_token=self.fencing_token,
@@ -162,7 +171,8 @@ class RepositoryPrometheusRemoteResponseStore:
         stored = await self.repository.get_agent_artifact(str(artifact_id))
         if stored is None:
             return None
-        artifact, content = stored
+        artifact, stored_content = stored
+        content = self._decode_artifact_content(stored_content, artifact_id)
         expected_outer_dispatch_id = (
             str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
         )
@@ -178,16 +188,19 @@ class RepositoryPrometheusRemoteResponseStore:
             or metadata.get("tool_name") != tool_name
             or metadata.get("invocation_id") != str(invocation_id)
             or metadata.get("outer_dispatch_id") != expected_outer_dispatch_id
+            or metadata.get("sanitized") is not False
+            or metadata.get("raw_response_unmodified") is not True
             or metadata.get("internal_only") is not True
         ):
             raise RuntimeError(
                 f"Prometheus remote-response artifact metadata is invalid: {artifact_id}"
             )
         if (
-            not isinstance(content, dict)
-            or content.get("contract") != _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            content.get("contract") != _PROMETHEUS_REMOTE_RESPONSE_ARTIFACT_CONTRACT
             or content.get("provider") != PROMETHEUS_MCP_SERVER_NAME
             or content.get("run_id") != str(run_id)
+            or content.get("invocation_id") != str(invocation_id)
+            or content.get("outer_dispatch_id") != expected_outer_dispatch_id
             or content.get("tool_name") != tool_name
             or content.get("arguments") != sanitize(arguments)
             or "response" not in content
@@ -196,6 +209,31 @@ class RepositoryPrometheusRemoteResponseStore:
                 f"Prometheus remote-response artifact content is invalid: {artifact_id}"
             )
         return deepcopy(content["response"])
+
+    @staticmethod
+    def _decode_artifact_content(
+        content: bytes | str | dict[str, Any],
+        artifact_id: UUID,
+    ) -> dict[str, Any]:
+        if isinstance(content, bytes):
+            try:
+                content = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Prometheus remote-response artifact content is invalid: {artifact_id}"
+                ) from exc
+        elif isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Prometheus remote-response artifact content is invalid: {artifact_id}"
+                ) from exc
+        if not isinstance(content, dict):
+            raise RuntimeError(
+                f"Prometheus remote-response artifact content is invalid: {artifact_id}"
+            )
+        return content
 
 
 @dataclass(slots=True)
@@ -720,22 +758,30 @@ class PrometheusHarnessScenario:
         result = decoded.payload
         model_call = self._model_call_from_prepared(call)
         updated.executed_calls.append(model_call)
-        has_observation = has_monitoring_observation(result)
-        outcome = "no_data" if result is None else "result"
-        projected = self.client.project_model_observation(
+        trace_projection = self.client.project_alert_window_range(
             result,
+            arguments=call.effective_arguments,
             alert=self.context.alert,
+            window_start=updated.window_start,
+            window_end=updated.window_end,
         )
+        outcome = "no_data" if result is None else "result"
+        qualified = trace_projection is not None
         response = {
             "tool_name": call.tool_name,
             "model_arguments": sanitize(call.model_arguments),
             "arguments": sanitize(call.effective_arguments),
             "capability": "remote_tool",
-            "has_monitoring_observation": has_observation,
-            "root_cause_eligible": has_observation,
-            "root_cause_ineligible_reason": "" if has_observation else "no_observation",
+            "projection_kind": (
+                "alert_window_range" if qualified else "auxiliary"
+            ),
+            "has_monitoring_observation": qualified,
+            "root_cause_eligible": qualified,
+            "root_cause_ineligible_reason": "" if qualified else "auxiliary_response",
             "result": sanitize(result),
         }
+        if trace_projection is not None:
+            response["projection"] = deepcopy(trace_projection)
         if result is not None:
             updated.responses.append(response)
         status = (
@@ -759,25 +805,20 @@ class PrometheusHarnessScenario:
             )
         updated.tool_attempts.append(attempt)
         self._state = updated
-        observation = {
-            "tool_name": call.tool_name,
-            "outcome": outcome,
-            "has_monitoring_observation": has_observation,
-            "projection": deepcopy(projected),
-        }
-        if status == ToolInvocationStatus.NO_DATA:
-            observation.update(
-                {
-                    "evidence_disposition": "MISSING",
-                    "is_contradiction": False,
-                }
-            )
+        observation = None
+        if trace_projection is not None:
+            observation = {
+                "tool_name": call.tool_name,
+                "outcome": outcome,
+                "projection_kind": "alert_window_range",
+                "projection": deepcopy(trace_projection),
+            }
         return ScenarioTransition(
             state=updated,
             observation=observation,
             message=self.client.completed_tool_messages(
                 model_call,
-                projected,
+                decoded.raw_call_result,
                 host_control=self.client.host_control_feedback(
                     remote_calls_used=len(updated.executed_calls),
                     outcome=outcome,
@@ -813,6 +854,8 @@ class PrometheusHarnessScenario:
         is_tool_error = error.code == PrometheusMCPToolError.__name__
         outcome = "tool_error" if is_tool_error else "transport_error"
         detail = sanitize_text(error.message)[:500]
+        has_raw_call_result = "mcp_raw_response" in call.metadata
+        raw_call_result = call.metadata.get("mcp_raw_response")
         updated.tool_attempts.append(
             {
                 "tool_name": call.tool_name,
@@ -846,7 +889,11 @@ class PrometheusHarnessScenario:
             },
             message=self.client.completed_tool_messages(
                 model_call,
-                {"tool_error": error.code, "detail": detail},
+                (
+                    raw_call_result
+                    if has_raw_call_result
+                    else {"tool_error": error.code, "detail": detail}
+                ),
                 host_control=self.client.host_control_feedback(
                     remote_calls_used=len(updated.executed_calls),
                     outcome=outcome,

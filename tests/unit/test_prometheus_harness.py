@@ -4,8 +4,9 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 import httpx
 import pytest
@@ -35,6 +36,7 @@ from app.agent_runtime import (
     ToolInvocationStatus,
 )
 from app.domain.models import (
+    DatabaseTarget,
     InvestigationContext,
     InvestigationRun,
     NormalizedAlert,
@@ -318,12 +320,72 @@ def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() 
     restored = prometheus_harness_module.PrometheusHarnessScenario._model_call_from_prepared(
         prepared
     )
-    messages = client.completed_tool_messages(restored, {"value": 1})
+    messages = client.completed_tool_messages(
+        restored,
+        {"value": 1},
+        host_control={"instruction": "continue"},
+    )
 
     assert restored.provider_output_items == native_items
     assert messages[:2] == list(native_items)
-    assert messages[-1]["type"] == "function_call_output"
-    assert messages[-1]["call_id"] == "prom-function-call"
+    assert messages[-2]["type"] == "function_call_output"
+    assert messages[-2]["call_id"] == "prom-function-call"
+    assert json.loads(messages[-2]["output"]) == {"value": 1}
+    assert json.loads(messages[-1]["content"]) == {
+        "host_control": {"instruction": "continue"}
+    }
+
+
+def test_prometheus_protocol_failure_returns_complete_raw_response_to_model() -> None:
+    client = _client(_SequenceModel([]))
+    scenario = prometheus_harness_module.PrometheusHarnessScenario(
+        client=client,
+        context=_context(),
+        window_start=_ALERT_TIME.replace(minute=55),
+        window_end=_ALERT_TIME,
+    )
+    scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="query_range",
+                input_schema={"type": "object", "additionalProperties": True},
+            )
+        ]
+    )
+    arguments = {"query": "up"}
+    scenario.register_model_call(
+        MCPModelToolCall(
+            call_id="protocol-error-call",
+            name="query_range",
+            arguments=arguments,
+        )
+    )
+    state = scenario.initial_state()
+    prepared = scenario.prepare_call(
+        type(
+            "Action",
+            (),
+            {
+                "tool_name": "query_range",
+                "objective": "query",
+                "hypothesis_ids": [],
+                "arguments": arguments,
+            },
+        )(),
+        state=state,
+    )
+    raw_response = ["malformed-envelope", {"secret_key": "mcp-owned-secret"}]
+    prepared.metadata["mcp_raw_response"] = raw_response
+
+    transition = scenario.on_failure(
+        state,
+        prepared,
+        SimpleNamespace(code="host_result_processing_error", message="invalid envelope"),
+        ToolInvocationStatus.FAILED,
+    )
+
+    tool_message = next(item for item in transition.message if item.get("role") == "tool")
+    assert json.loads(tool_message["content"]) == raw_response
 
 
 async def _durable_context(
@@ -532,7 +594,8 @@ async def test_shared_harness_recovers_from_temporary_missing_model_tool_call() 
 
     assert any("上一轮没有形成有效的单工具调用" in str(messages) for messages in model.messages)
     assert result.finished_by_model is True
-    assert result.has_monitoring_data is True
+    assert result.has_monitoring_data is False
+    assert result.responses[0]["projection_kind"] == "auxiliary"
     assert result.model_request_ids == ("request-query-1",)
     assert result.termination_error_type is None
 
@@ -585,12 +648,18 @@ async def test_shared_harness_forwards_window_and_operation_arguments_unchanged(
 
 @pytest.mark.asyncio
 async def test_shared_harness_returns_raw_result_without_window_gate_feedback() -> None:
-    _HarnessSession.results = [
-        {
-            "structuredContent": {
-                "data": {"result": [{"values": [[1_893_456_000, "1"]]}]}
-            }
+    raw_response = {
+        "_meta": {
+            "trace_id": "raw-response-trace",
+            "api_key": "mcp-owned-secret",
         },
+        "structuredContent": {
+            "data": {"result": [{"values": [[1_893_456_000, "1"]]}]}
+        },
+        "isError": False,
+    }
+    _HarnessSession.results = [
+        raw_response,
         {"structuredContent": {"series": [{"value": 1}]}},
     ]
     model = _SequenceModel(
@@ -629,22 +698,19 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
         message for message in reversed(model.messages[1]) if message["role"] == "tool"
     )
     feedback = json.loads(tool_message["content"])
-    assert feedback["monitoring_result"]["has_numeric_samples"] is True
-    assert feedback["monitoring_result"]["sample_count"] == 1
-    assert feedback["monitoring_result"]["series"] == [
-        {
-            "metric": {},
-            "sample_count": 1,
-            "min": 1,
-            "max": 1,
-            "avg": 1,
-            "latest": 1,
-            "delta": 0,
-        }
-    ]
-    assert "data" not in feedback["monitoring_result"]
-    assert "1893456000" not in tool_message["content"]
-    assert "host_window_verification" not in feedback["monitoring_result"]
+    assert feedback == raw_response
+    assert feedback["_meta"]["api_key"] == "mcp-owned-secret"
+    assert "1893456000" in tool_message["content"]
+    assert "host_window_verification" not in feedback
+    host_control = next(
+        payload
+        for message in model.messages[1]
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        for payload in [json.loads(message["content"])]
+        if "host_control" in payload
+    )
+    assert host_control["host_control"]["instruction"]
     assert result.finished_by_model is True
     assert len(result.responses) == 2
 
@@ -773,7 +839,10 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
         "rate(mysql_global_status_slow_queries[5m])"
     )
     assert len(result.responses) == 2
-    assert result.has_monitoring_data is True
+    assert result.has_monitoring_data is False
+    assert all(
+        item["projection_kind"] == "auxiliary" for item in result.responses
+    )
     assert result.finished_by_model is True
     assert [attempt["outcome"] for attempt in result.tool_attempts] == [
         "result",
@@ -916,7 +985,60 @@ async def test_model_repair_checkpoint_resume_allows_further_selection(
 
 
 @pytest.mark.asyncio
-async def test_remote_response_artifact_survives_later_planner_interruption(
+async def test_prometheus_raw_response_store_ignores_legacy_sanitized_artifact() -> None:
+    invocation_id = uuid4()
+    run_id = uuid4()
+    arguments = {"query": "legacy"}
+    legacy_id = uuid5(invocation_id, "prometheus-mcp-remote-response/v1")
+    legacy_artifact = SimpleNamespace(
+        artifact_id=legacy_id,
+        kind="prometheus_mcp_remote_response",
+        media_type="application/json",
+        uri=f"agent-artifact://{legacy_id}",
+        metadata={
+            "contract": "prometheus-mcp-remote-response/v1",
+            "provider": PROMETHEUS_MCP_SERVER_NAME,
+            "run_id": str(run_id),
+            "tool_name": "legacy_tool",
+            "invocation_id": str(invocation_id),
+            "outer_dispatch_id": None,
+            "internal_only": True,
+        },
+    )
+
+    class LegacyOnlyRepository:
+        def __init__(self) -> None:
+            self.requested_ids: list[str] = []
+
+        async def get_agent_artifact(self, artifact_id: str) -> Any:
+            self.requested_ids.append(artifact_id)
+            if artifact_id == str(legacy_id):
+                return legacy_artifact, {
+                    "contract": "prometheus-mcp-remote-response/v1",
+                    "provider": PROMETHEUS_MCP_SERVER_NAME,
+                    "run_id": str(run_id),
+                    "tool_name": "legacy_tool",
+                    "arguments": arguments,
+                    "response": {"secret_key": "[REDACTED]"},
+                }
+            return None
+
+    repository = LegacyOnlyRepository()
+    store = prometheus_harness_module.RepositoryPrometheusRemoteResponseStore(repository)
+
+    recovered = await store.load(
+        run_id=run_id,
+        invocation_id=invocation_id,
+        tool_name="legacy_tool",
+        arguments=arguments,
+    )
+
+    assert recovered is None
+    assert repository.requested_ids == [str(store.artifact_id(invocation_id))]
+
+
+@pytest.mark.asyncio
+async def test_raw_response_is_artifacted_when_investigation_is_cancelled(
     tmp_path: Path,
 ) -> None:
     class InterruptAfterQueryModel(_SequenceModel):
@@ -945,7 +1067,10 @@ async def test_remote_response_artifact_survives_later_planner_interruption(
     )
     outer_dispatch_id = uuid4()
     raw_response = {
-        "_meta": {"trace_id": "complete-response"},
+        "_meta": {
+            "trace_id": "complete-response",
+            "api_key": "mcp-owned-secret",
+        },
         "content": [{"type": "text", "text": "x" * 50_000}],
         "structuredContent": {"series": [{"value": 1}]},
         "isError": False,
@@ -964,8 +1089,9 @@ async def test_remote_response_artifact_survives_later_planner_interruption(
     followup_context = json.dumps(model.messages[1], ensure_ascii=False)
     assert "agent-artifact://" not in followup_context
     assert "prometheus_mcp_remote_response" not in followup_context
-    assert "complete-response" not in followup_context
-    assert "x" * 50_000 not in followup_context
+    assert "complete-response" in followup_context
+    assert "mcp-owned-secret" in followup_context
+    assert "x" * 50_000 in followup_context
 
     async with repository.session_factory() as session:
         rows = (
@@ -979,20 +1105,41 @@ async def test_remote_response_artifact_survives_later_planner_interruption(
     stored = await repository.get_agent_artifact(rows[0].id)
     assert stored is not None
     artifact, content = stored
-    assert artifact.kind == "prometheus_mcp_remote_response"
     assert artifact.metadata["internal_only"] is True
-    assert artifact.metadata["outer_dispatch_id"] == str(outer_dispatch_id)
-    assert artifact.metadata["invocation_id"] == rows[0].invocation_id
-    assert isinstance(content, dict)
-    assert content["response"] == raw_response
+    assert artifact.metadata["sanitized"] is False
+    assert isinstance(content, bytes)
+    decoded_artifact = json.loads(content)
+    assert decoded_artifact["response"] == raw_response
+    assert decoded_artifact["invocation_id"] == artifact.metadata["invocation_id"]
+    assert decoded_artifact["outer_dispatch_id"] == artifact.metadata["outer_dispatch_id"]
     await repository.close()
 
 
 @pytest.mark.asyncio
-async def test_recovery_replays_persisted_response_without_remote_recall(
+async def test_recovery_replays_checkpointed_response_without_remote_recall(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class InterruptAfterQueryModel(_SequenceModel):
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+        ) -> MCPModelToolCall:
+            self.messages.append(messages)
+            self.tools.append(tools)
+            if len(self.messages) == 1:
+                return MCPModelToolCall(
+                    call_id="query-before-response-replay",
+                    name="query_range",
+                    arguments={
+                        "query": 'mysql_up{instance="mysql-17:3306"}',
+                        "start": "2026-08-07T01:55:00+00:00",
+                        "end": "2026-08-07T02:00:00+00:00",
+                    },
+                )
+            raise asyncio.CancelledError
+
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'prometheus-response-replay.db'}"
     repository = SQLAlchemyAlertRepository(database_url)
     await repository.initialize()
@@ -1002,13 +1149,29 @@ async def test_recovery_replays_persisted_response_without_remote_recall(
     )
     outer_dispatch_id = uuid4()
     scoped_context = context.model_copy(
-        update={"outer_dispatch_id": outer_dispatch_id}
+        update={
+            "outer_dispatch_id": outer_dispatch_id,
+            "alert": context.alert.model_copy(
+                update={
+                    "database": DatabaseTarget(
+                        engine="mysql",
+                        instance="mysql-17:3306",
+                        host="mysql-17",
+                        port=3306,
+                    )
+                }
+            ),
+        }
     )
     raw_response = {
         "structuredContent": {
             "series": [
                 {
-                    "metric": {"job": "mysql"},
+                    "metric": {
+                        "__name__": "mysql_up",
+                        "job": "mysql",
+                        "instance": "mysql-17:3306",
+                    },
                     "values": [[1786067700, "1"], [1786068000, "2"]],
                 }
             ]
@@ -1016,46 +1179,30 @@ async def test_recovery_replays_persisted_response_without_remote_recall(
         "isError": False,
     }
     _HarnessSession.results = [raw_response]
-    original_save = (
-        prometheus_harness_module.RepositoryPrometheusRemoteResponseStore.save
-    )
-    interrupted = False
-
-    async def interrupt_after_save(
-        store: Any,
-        **kwargs: Any,
-    ) -> None:
-        nonlocal interrupted
-        await original_save(store, **kwargs)
-        if not interrupted:
-            interrupted = True
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        prometheus_harness_module.RepositoryPrometheusRemoteResponseStore,
-        "save",
-        interrupt_after_save,
-    )
     with pytest.raises(asyncio.CancelledError):
         await _client(
-            _SequenceModel(
-                [
-                    MCPModelToolCall(
-                        call_id="query-before-response-replay",
-                        name="query_range",
-                        arguments={"query": "mysql_up"},
-                    )
-                ]
-            ),
+            InterruptAfterQueryModel([]),
             repository=repository,
         ).collect_alert_window(scoped_context)
 
     assert len(_HarnessSession.calls) == 1
-    monkeypatch.setattr(
-        prometheus_harness_module.RepositoryPrometheusRemoteResponseStore,
-        "save",
-        original_save,
+    async with repository.session_factory() as session:
+        artifacts_before_finish = (
+            await session.execute(
+                select(AgentArtifactRow).where(
+                    AgentArtifactRow.run_id == str(run.id)
+                )
+            )
+        ).scalars().all()
+    assert len(artifacts_before_finish) == 1
+    stored_before_finish = await repository.get_agent_artifact(
+        artifacts_before_finish[0].id
     )
+    assert stored_before_finish is not None
+    artifact_before_finish, content_before_finish = stored_before_finish
+    assert artifact_before_finish.metadata["internal_only"] is True
+    assert isinstance(content_before_finish, bytes)
+    assert json.loads(content_before_finish)["response"] == raw_response
     resumed_model = _SequenceModel(
         [
             MCPModelToolCall(
@@ -1098,11 +1245,18 @@ async def test_recovery_replays_persisted_response_without_remote_recall(
     assert len(artifacts) == 1
     assert len(invocations) == 1
     assert invocations[0].status == ToolInvocationStatus.SUCCEEDED.value
+    stored = await repository.get_agent_artifact(artifacts[0].id)
+    assert stored is not None
+    artifact, content = stored
+    assert artifact.metadata["internal_only"] is True
+    assert artifact.metadata["sanitized"] is False
+    assert isinstance(content, bytes)
+    assert json.loads(content)["response"] == raw_response
     await repository.close()
 
 
 @pytest.mark.asyncio
-async def test_is_error_response_is_persisted_before_tool_error_processing(
+async def test_is_error_response_is_persisted_after_investigation_completion(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(
@@ -1153,8 +1307,9 @@ async def test_is_error_response_is_persisted_before_tool_error_processing(
     assert stored is not None
     artifact, content = stored
     assert artifact.metadata["internal_only"] is True
-    assert isinstance(content, dict)
-    assert content["response"] == raw_error
+    assert artifact.metadata["sanitized"] is False
+    assert isinstance(content, bytes)
+    assert json.loads(content)["response"] == raw_error
     await repository.close()
 
 
@@ -1255,6 +1410,154 @@ async def test_prometheus_planner_streams_provider_reasoning_in_delta_order(
         for event in reasoning
     )
     await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_only_target_matched_alert_window_projection_is_persisted_to_trace(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'prometheus-public-trace.db'}"
+    )
+    await repository.initialize()
+    try:
+        context, _, run = await _durable_context(
+            repository,
+            external_id="prometheus-public-trace",
+        )
+        context = context.model_copy(
+            update={
+                "alert": context.alert.model_copy(
+                    update={
+                        "cluster": "mysql-prod",
+                        "database": DatabaseTarget(
+                            engine="mysql",
+                            instance="mysql-17:3306",
+                            host="mysql-17",
+                            port=3306,
+                        ),
+                    }
+                )
+            }
+        )
+        discovery_response = {
+            "_meta": {"api_key": "discovery-secret"},
+            "structuredContent": {
+                "activeTargets": [
+                    {
+                        "labels": {"instance": "mysql-17:3306"},
+                        "scrapeUrl": "http://mysql-17:9104/metrics",
+                    }
+                ]
+            },
+            "isError": False,
+        }
+        range_response = {
+            "_meta": {"api_key": "range-secret"},
+            "structuredContent": {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {
+                                "__name__": "mysql_threads_running",
+                                "instance": "mysql-17:3306",
+                                "api_key": "metric-label-secret",
+                            },
+                            "values": [
+                                [1_786_067_700, "8"],
+                                [1_786_068_000, "15"],
+                            ],
+                        }
+                    ]
+                }
+            },
+            "isError": False,
+        }
+        _HarnessSession.results = [discovery_response, range_response]
+        model = _SequenceModel(
+            [
+                MCPModelToolCall(
+                    call_id="discover-targets",
+                    name="query_range",
+                    arguments={"operation": "targets"},
+                ),
+                MCPModelToolCall(
+                    call_id="qualified-range",
+                    name="query_range",
+                    arguments={
+                        "query": 'mysql_threads_running{instance="mysql-17:3306"}',
+                        "start": "2026-08-07T01:55:00+00:00",
+                        "end": "2026-08-07T02:00:00+00:00",
+                        "operation": "query_range",
+                    },
+                ),
+                MCPModelToolCall(
+                    call_id="finish-qualified-range",
+                    name="finish_prometheus_investigation",
+                    arguments={
+                        "monitoring_scope_status": "in_scope",
+                        "reason": "目标已匹配并完成范围查询。",
+                    },
+                ),
+            ]
+        )
+
+        result = await _client(model, repository=repository).collect_alert_window(
+            context
+        )
+
+        assert result.has_monitoring_data is True
+        assert len(result.responses) == 2
+        assert [item["projection_kind"] for item in result.responses] == [
+            "auxiliary",
+            "alert_window_range",
+        ]
+        internal_context = json.dumps(model.messages, ensure_ascii=False)
+        assert "discovery-secret" in internal_context
+        assert "range-secret" in internal_context
+        assert "metric-label-secret" in internal_context
+
+        events = await repository.list_agent_events(str(run.id))
+        observations = [
+            event
+            for event in events
+            if event.kind == AgentEventKind.TRACE_OBSERVATION
+            and event.payload.get("provider") == PROMETHEUS_MCP_SERVER_NAME
+        ]
+        assert len(observations) == 1
+        trace_content = observations[0].payload["content"]
+        trace_observation = json.loads(trace_content)
+        assert trace_observation["projection_kind"] == "alert_window_range"
+        assert trace_observation["projection"]["timeseries"]["sample_count"] == 2
+        assert "mysql_threads_running" in trace_content
+        assert "activeTargets" not in trace_content
+        assert "discovery-secret" not in trace_content
+        assert "range-secret" not in trace_content
+        assert "metric-label-secret" not in trace_content
+        assert "mysql-17:3306" not in trace_content
+
+        async with repository.session_factory() as session:
+            artifacts = (
+                await session.execute(
+                    select(AgentArtifactRow).where(
+                        AgentArtifactRow.run_id == str(run.id)
+                    )
+                )
+            ).scalars().all()
+        assert len(artifacts) == 2
+        stored_responses = []
+        for row in artifacts:
+            stored = await repository.get_agent_artifact(row.id)
+            assert stored is not None
+            artifact, content = stored
+            assert artifact.metadata["internal_only"] is True
+            assert artifact.metadata["sanitized"] is False
+            assert isinstance(content, bytes)
+            stored_responses.append(json.loads(content)["response"])
+        assert discovery_response in stored_responses
+        assert range_response in stored_responses
+    finally:
+        await repository.close()
 
 
 @pytest.mark.asyncio

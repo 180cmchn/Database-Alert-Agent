@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 import pytest
 from sqlalchemy import select
@@ -887,8 +887,17 @@ async def test_shared_harness_preserves_schema_and_sends_remote_character_limit(
 
 
 @pytest.mark.asyncio
-async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
+async def test_auxiliary_raw_payload_is_replayed_to_internal_model() -> None:
     auxiliary_secret = "authentication-and-metadata-raw-response"
+    raw_member_result = {
+        "structuredContent": {
+            "status": "success",
+            "full_sql": MEMBER_SQL,
+            "rows": [{"f_instance_id": 53}],
+            "authentication_token": auxiliary_secret,
+            "raw_metadata": {"secret": auxiliary_secret},
+        }
+    }
     model = _ScriptedModel(
         [
             _call("member", MEMBER_SQL),
@@ -906,15 +915,7 @@ async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
-                        result={
-                            "structuredContent": {
-                                "status": "success",
-                                "full_sql": MEMBER_SQL,
-                                "rows": [{"f_instance_id": 53}],
-                                "authentication_token": auxiliary_secret,
-                                "raw_metadata": {"secret": auxiliary_secret},
-                            }
-                        },
+                        result=raw_member_result,
                     ),
                     _success(
                         FINAL_SQL,
@@ -937,22 +938,176 @@ async def test_auxiliary_raw_payload_stays_out_of_model_messages() -> None:
     )
 
     assert result.query_completed is True
-    final_request_messages = json.dumps(
-        model.requests[1]["messages"], ensure_ascii=False, default=str
+    feedback_messages = model.requests[1]["messages"]
+    assistant_message = feedback_messages[-2]
+    tool_message = feedback_messages[-1]
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["tool_calls"] == [
+        {
+            "id": "member",
+            "type": "function",
+            "function": {
+                "name": ARCHERY_MCP_QUERY_TOOL_NAME,
+                "arguments": json.dumps(
+                    {**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+    ]
+    assert tool_message["role"] == "tool"
+    assert tool_message["tool_call_id"] == "member"
+    raw_feedback = tool_message["content"]
+    assert isinstance(raw_feedback, str)
+    assert json.loads(raw_feedback) == raw_member_result
+    assert auxiliary_secret in raw_feedback
+
+
+@pytest.mark.asyncio
+async def test_persisted_trace_exposes_only_final_history_projection(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'archery-trace-boundary.db'}"
     )
-    assert auxiliary_secret not in final_request_messages
-    assert "f_instance_id" in final_request_messages
-    assert "internal_audit_artifact_only" in final_request_messages
-    assert "authentication_token" not in final_request_messages
-    assert "raw_metadata" not in final_request_messages
+    await repository.initialize()
+    _, run = await _create_durable_run(
+        repository,
+        external_id="archery-trace-boundary",
+    )
+    auxiliary_secret = "archery-auxiliary-response-secret"
+    auxiliary_column = "internal_member_lookup_column"
+    final_sample = "SELECT final_trace_projection"
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-trace-boundary",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": MEMBER_SQL,
+                                "columns": ["f_instance_id", auxiliary_column],
+                                "rows": [
+                                    {
+                                        "f_instance_id": 53,
+                                        auxiliary_column: auxiliary_secret,
+                                    }
+                                ],
+                                "secret_key": auxiliary_secret,
+                            }
+                        },
+                    ),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sample": final_sample,
+                                "query_time_max": 4.25,
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+    assert run.lease_owner is not None
+
+    result = await _client(
+        _ScriptedModel(_lineage_actions()),
+        connector,
+        repository=repository,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
+        outer_dispatch_id=uuid4(),
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+
+    assert result.query_completed is True
+    events = await repository.list_agent_events(str(run.id))
+    observation_events = [
+        event for event in events if event.kind == AgentEventKind.TRACE_OBSERVATION
+    ]
+    assert len(observation_events) == 1
+    trace_content = observation_events[0].payload["content"]
+    assert isinstance(trace_content, str)
+    projection = json.loads(trace_content)
+    assert projection["projection_kind"] == "mysql_slow_query_review_history"
+    assert projection["rows"][0]["sample_snippet"] == final_sample
+    assert projection["rows"][0]["query_time_max"] == 4.25
+    persisted_trace = json.dumps(
+        [event.payload for event in observation_events],
+        ensure_ascii=False,
+    )
+    assert auxiliary_secret not in persisted_trace
+    assert auxiliary_column not in persisted_trace
+    assert "f_instance_id" not in persisted_trace
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_business_error_raw_payload_is_replayed_to_internal_model() -> None:
+    error_secret = "archery-error-secret-key"
+    raw_error = {
+        "isError": True,
+        "content": [
+            {
+                "type": "text",
+                "text": "Archery rejected the query",
+                "secret_key": error_secret,
+            }
+        ],
+    }
+    model = _ScriptedModel([_call("member-error", MEMBER_SQL), _finish()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-raw-business-error",
+                tools=_tools(),
+                calls=[
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                        result=raw_error,
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is False
+    raw_feedback = model.requests[1]["messages"][-1]["content"]
+    assert isinstance(raw_feedback, str)
+    assert json.loads(raw_feedback) == raw_error
+    assert error_secret in raw_feedback
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row_key", ["results", "data"])
-async def test_instance_discovery_row_lists_are_projected_to_model_messages(
+async def test_instance_discovery_raw_response_drives_followup_queries(
     row_key: str,
 ) -> None:
-    class ProjectionDrivenModel:
+    class RawResponseDrivenModel:
         def __init__(self) -> None:
             self.requests: list[dict[str, Any]] = []
             self.discovered_instance_id: int | None = None
@@ -961,10 +1116,10 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
             self.discovery_feedback = ""
 
         @staticmethod
-        def projection(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        def raw_response(messages: list[dict[str, Any]]) -> dict[str, Any]:
             content = messages[-1].get("content")
             assert isinstance(content, str)
-            return json.loads(content.rsplit("\n", 1)[-1])
+            return json.loads(content)
 
         async def request_mcp_tool_call(
             self,
@@ -987,10 +1142,11 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
                     request_id="request-discover-instance",
                 )
 
-            projection = self.projection(messages)
+            raw_response = self.raw_response(messages)
+            structured = raw_response["structuredContent"]
             if turn == 2:
                 self.discovery_feedback = str(messages[-1]["content"])
-                self.discovered_instance_id = int(projection["rows"][0]["id"])
+                self.discovered_instance_id = int(structured[row_key][0]["id"])
                 return MCPModelToolCall(
                     call_id="query-member",
                     name=ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -1002,7 +1158,7 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
                     request_id="request-query-member",
                 )
             if turn == 3:
-                self.discovered_member_id = int(projection["rows"][0]["f_instance_id"])
+                self.discovered_member_id = int(structured["rows"][0]["f_instance_id"])
                 return MCPModelToolCall(
                     call_id="query-instance",
                     name=ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -1017,7 +1173,7 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
                     request_id="request-query-instance",
                 )
             if turn == 4:
-                endpoint_row = projection["rows"][0]
+                endpoint_row = structured["rows"][0]
                 self.discovered_endpoint = f"{endpoint_row['host']}:{endpoint_row['port']}"
                 return MCPModelToolCall(
                     call_id="query-history",
@@ -1032,7 +1188,7 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
                     },
                     request_id="request-query-history",
                 )
-            return _finish(reason="Projection-driven Archery investigation completed")
+            return _finish(reason="Raw-response-driven Archery investigation completed")
 
     discovery_arguments = {
         "resource_group_id": 9,
@@ -1041,7 +1197,7 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
         "size": 200,
     }
     discovery_secret = "v-7Qx9P3mN-opaque"
-    model = ProjectionDrivenModel()
+    model = RawResponseDrivenModel()
     tools = [
         *_tools(),
         DiscoveredMCPTool(
@@ -1113,12 +1269,12 @@ async def test_instance_discovery_row_lists_are_projected_to_model_messages(
     assert model.discovered_member_id == 53
     assert model.discovered_endpoint == "db-1.example:3306"
     assert result.instance_id == 17
-    assert '"row_count":1' in model.discovery_feedback
+    assert '"structuredContent"' in model.discovery_feedback
     assert '"id":17' in model.discovery_feedback
     assert '"name":"archery-production"' in model.discovery_feedback
-    assert discovery_secret not in model.discovery_feedback
-    assert "***REDACTED***" in model.discovery_feedback
-    assert "internal_audit_artifact_only" in model.discovery_feedback
+    assert discovery_secret in model.discovery_feedback
+    assert "***REDACTED***" not in model.discovery_feedback
+    assert "internal_audit_artifact_only" not in model.discovery_feedback
 
 
 @pytest.mark.asyncio
@@ -1170,7 +1326,13 @@ async def test_shared_archery_harness_replays_responses_items_for_next_tool_call
     assert second_input[-2]["call_id"] == base_call.call_id
     assert second_input[-1]["type"] == "function_call_output"
     assert second_input[-1]["call_id"] == base_call.call_id
-    assert "internal_audit_artifact_only" in second_input[-1]["output"]
+    assert json.loads(second_input[-1]["output"]) == {
+        "structuredContent": {
+            "status": "success",
+            "full_sql": MEMBER_SQL,
+            "rows": [{"f_instance_id": 53}],
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -1964,17 +2126,79 @@ async def test_new_scoped_dispatch_without_checkpoint_starts_archery_session(
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_restart(
+async def test_archery_raw_response_store_ignores_legacy_sanitized_artifact() -> None:
+    invocation_id = uuid4()
+    run_id = uuid4()
+    arguments = {"query": "legacy"}
+    legacy_id = uuid5(invocation_id, "archery-mcp-remote-response/v1")
+    legacy_artifact = SimpleNamespace(
+        artifact_id=legacy_id,
+        kind="archery_mcp_remote_response",
+        media_type="application/json",
+        uri=f"agent-artifact://{legacy_id}",
+        metadata={
+            "contract": "archery-mcp-remote-response/v1",
+            "provider": ARCHERY_HARNESS_PROVIDER,
+            "run_id": str(run_id),
+            "tool_name": "legacy_tool",
+            "invocation_id": str(invocation_id),
+            "outer_dispatch_id": None,
+            "internal_only": True,
+        },
+    )
+
+    class LegacyOnlyRepository:
+        def __init__(self) -> None:
+            self.requested_ids: list[str] = []
+
+        async def get_agent_artifact(self, artifact_id: str) -> Any:
+            self.requested_ids.append(artifact_id)
+            if artifact_id == str(legacy_id):
+                return legacy_artifact, {
+                    "contract": "archery-mcp-remote-response/v1",
+                    "provider": ARCHERY_HARNESS_PROVIDER,
+                    "run_id": str(run_id),
+                    "tool_name": "legacy_tool",
+                    "arguments": arguments,
+                    "response": {"secret_key": "[REDACTED]"},
+                }
+            return None
+
+    repository = LegacyOnlyRepository()
+    store = archery_harness_module.RepositoryArcheryRemoteResponseStore(repository)
+
+    recovered = await store.load(
+        run_id=run_id,
+        invocation_id=invocation_id,
+        tool_name="legacy_tool",
+        arguments=arguments,
+    )
+
+    assert recovered is None
+    assert repository.requested_ids == [str(store.artifact_id(invocation_id))]
+
+
+@pytest.mark.asyncio
+async def test_shared_harness_recovers_raw_response_from_checkpoint_after_process_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'artifact-recovery.db'}"
     repository = SQLAlchemyAlertRepository(database_url)
     await repository.initialize()
-    _, run = await _create_durable_run(
+    manifest, run = await _create_durable_run(
         repository,
         external_id="archery-artifact-recovery",
     )
+    raw_secret = "archery-checkpoint-secret-key"
+    raw_member_result = {
+        "structuredContent": {
+            "status": "success",
+            "full_sql": MEMBER_SQL,
+            "rows": [{"f_instance_id": 53}],
+            "secret_key": raw_secret,
+        }
+    }
     rows = [
         {
             "hostname_max": "db-1.example:3306",
@@ -1988,26 +2212,30 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
                 session_id="archery-artifact-first-process",
                 tools=_tools(),
                 calls=[
-                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+                        result=raw_member_result,
+                    ),
                 ],
             )
         ],
     )
 
-    original_save = archery_harness_module.RepositoryArcheryRemoteResponseStore.save
+    original_checkpoint = archery_harness_module.RepositoryMCPCheckpointStore.__call__
     interrupted = False
 
-    async def interrupt_after_response_save(store: Any, **kwargs: Any) -> None:
+    async def interrupt_after_raw_response_checkpoint(store: Any, snapshot: Any) -> None:
         nonlocal interrupted
-        await original_save(store, **kwargs)
-        if not interrupted:
+        await original_checkpoint(store, snapshot)
+        if not interrupted and snapshot.remote_responses and snapshot.finish is None:
             interrupted = True
             raise asyncio.CancelledError
 
     monkeypatch.setattr(
-        archery_harness_module.RepositoryArcheryRemoteResponseStore,
-        "save",
-        interrupt_after_response_save,
+        archery_harness_module.RepositoryMCPCheckpointStore,
+        "__call__",
+        interrupt_after_raw_response_checkpoint,
     )
     assert run.lease_owner is not None
     with pytest.raises(asyncio.CancelledError):
@@ -2037,26 +2265,41 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
     assert len(invocations) == 1
     assert invocations[0].status == ToolInvocationStatus.STARTED.value
     assert len(artifacts) == 1
-    stored_before_restart = await repository.get_agent_artifact(artifacts[0].id)
-    assert stored_before_restart is not None
-    first_artifact, first_content = stored_before_restart
-    assert first_artifact.kind == "archery_mcp_remote_response"
-    assert first_artifact.metadata["internal_only"] is True
-    assert first_artifact.metadata["invocation_id"] == invocations[0].id
-    assert isinstance(first_content, dict)
-    assert first_content["response"] == {
-        "structuredContent": {
-            "status": "success",
-            "full_sql": MEMBER_SQL,
-            "rows": [{"f_instance_id": 53}],
-        }
-    }
+    interrupted_artifact = await repository.get_agent_artifact(artifacts[0].id)
+    assert interrupted_artifact is not None
+    artifact, artifact_content = interrupted_artifact
+    assert artifact.metadata["internal_only"] is True
+    assert artifact.metadata["sanitized"] is False
+    assert artifact.metadata["raw_response_unmodified"] is True
+    assert isinstance(artifact_content, bytes)
+    decoded_interrupted_artifact = json.loads(artifact_content.decode("utf-8"))
+    assert decoded_interrupted_artifact["response"] == raw_member_result
+    assert decoded_interrupted_artifact["invocation_id"] == artifact.metadata["invocation_id"]
+    assert (
+        decoded_interrupted_artifact["outer_dispatch_id"]
+        == artifact.metadata["outer_dispatch_id"]
+    )
+    checkpoint_store = archery_harness_module.RepositoryMCPCheckpointStore(
+        repository,
+        provider=ARCHERY_HARNESS_PROVIDER,
+        manifest_hash=manifest.digest(),
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+    staged_checkpoint = await checkpoint_store.load(run.id)
+    assert staged_checkpoint is not None
+    assert len(staged_checkpoint.remote_responses) == 1
+    assert staged_checkpoint.remote_responses[0].response == raw_member_result
+    assert raw_secret in json.dumps(
+        staged_checkpoint.remote_responses[0].response,
+        ensure_ascii=False,
+    )
     await repository.close()
 
     monkeypatch.setattr(
-        archery_harness_module.RepositoryArcheryRemoteResponseStore,
-        "save",
-        original_save,
+        archery_harness_module.RepositoryMCPCheckpointStore,
+        "__call__",
+        original_checkpoint,
     )
     restarted_repository = SQLAlchemyAlertRepository(database_url)
     await restarted_repository.initialize()
@@ -2104,23 +2347,35 @@ async def test_shared_harness_recovers_artifact_from_checkpoint_after_process_re
         for item in recovered_invocations
     )
     assert len(recovered_artifacts) == 3
-    artifact_id = recovered_artifacts[-1].id
-    persisted_artifact = await restarted_repository.get_agent_artifact(artifact_id)
-    assert persisted_artifact is not None
-    assert isinstance(persisted_artifact[1], dict)
-    assert persisted_artifact[1]["response"] == {
-        "structuredContent": {
-            "status": "success",
-            "full_sql": FINAL_SQL,
-            "rows": rows,
+    persisted_contents: list[dict[str, Any]] = []
+    for artifact_row in recovered_artifacts:
+        persisted_artifact = await restarted_repository.get_agent_artifact(artifact_row.id)
+        assert persisted_artifact is not None
+        artifact, content = persisted_artifact
+        assert artifact.metadata["internal_only"] is True
+        assert artifact.metadata["sanitized"] is False
+        assert artifact.metadata["raw_response_unmodified"] is True
+        assert isinstance(content, bytes)
+        persisted_contents.append(json.loads(content.decode("utf-8")))
+    assert any(item["response"] == raw_member_result for item in persisted_contents)
+    assert any(
+        item["response"]
+        == {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": FINAL_SQL,
+                "rows": rows,
+            }
         }
-    }
+        for item in persisted_contents
+    )
+    assert raw_secret in json.dumps(persisted_contents, ensure_ascii=False)
     assert not hasattr(resumed, "raw_mcp_call_results")
     await restarted_repository.close()
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_persists_tool_error_response_before_processing(
+async def test_shared_harness_persists_raw_tool_error_after_investigation(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(
@@ -2131,9 +2386,16 @@ async def test_shared_harness_persists_tool_error_response_before_processing(
         repository,
         external_id="archery-tool-error-audit",
     )
+    raw_secret = "archery-tool-error-secret-key"
     raw_error = {
         "isError": True,
-        "content": [{"type": "text", "text": "Archery rejected the query"}],
+        "content": [
+            {
+                "type": "text",
+                "text": "Archery rejected the query",
+                "secret_key": raw_secret,
+            }
+        ],
     }
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
@@ -2177,8 +2439,12 @@ async def test_shared_harness_persists_tool_error_response_before_processing(
     assert stored is not None
     artifact, content = stored
     assert artifact.metadata["internal_only"] is True
-    assert isinstance(content, dict)
-    assert content["response"] == raw_error
+    assert artifact.metadata["sanitized"] is False
+    assert artifact.metadata["raw_response_unmodified"] is True
+    assert isinstance(content, bytes)
+    decoded = json.loads(content.decode("utf-8"))
+    assert decoded["response"] == raw_error
+    assert raw_secret in content.decode("utf-8")
     await repository.close()
 
 

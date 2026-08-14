@@ -312,6 +312,15 @@ class DeterministicToolResultProcessor:
         data = self._structured_data(raw_result)
         results = data.get("monitoring_results")
         results = results if isinstance(results, list) else []
+        if any(
+            isinstance(item, Mapping) and "projection_kind" in item
+            for item in results
+        ):
+            return self._process_prometheus_range_projections(
+                data,
+                results,
+                artifact,
+            )
         required_target = data.get("required_target")
         required_target = required_target if isinstance(required_target, Mapping) else {}
         required_window, window_error = self._prometheus_required_window(data)
@@ -505,6 +514,208 @@ class DeterministicToolResultProcessor:
             analysis_usable=(
                 series_count > 0 and required_window is not None and has_required_target
             ),
+        )
+
+    def _process_prometheus_range_projections(
+        self,
+        data: Mapping[str, Any],
+        results: list[Any],
+        artifact: ArtifactRef,
+    ) -> ToolResultAnalysis:
+        """Validate and expose only the bounded alert-window projection contract."""
+
+        required_window, window_error = self._prometheus_required_window(data)
+        required_target = data.get("required_target")
+        required_target = required_target if isinstance(required_target, Mapping) else {}
+        has_required_target = self._prometheus_has_required_target(required_target)
+        required_host = self._normalized_identity(required_target.get("host"))
+        excluded: Counter[str] = Counter()
+        selected: list[tuple[int, int, Mapping[str, Any], Mapping[str, Any]]] = []
+        total_projected_samples = 0
+
+        for result_index, item in enumerate(results):
+            if not isinstance(item, Mapping):
+                excluded["invalid_result"] += 1
+                continue
+            if item.get("projection_kind") != "alert_window_range":
+                excluded["non_range_projection"] += 1
+                continue
+            projection = item.get("projection")
+            if not isinstance(projection, Mapping):
+                excluded["invalid_projection"] += 1
+                continue
+            if projection.get("projection_kind") != "alert_window_range":
+                excluded["projection_kind_mismatch"] += 1
+                continue
+            projected_window = projection.get("window")
+            if not isinstance(projected_window, Mapping):
+                excluded["window_missing"] += 1
+                continue
+            projected_start = self._prometheus_timestamp(projected_window.get("start"))
+            projected_end = self._prometheus_timestamp(projected_window.get("end"))
+            if (
+                required_window is None
+                or projected_start != required_window.start
+                or projected_end != required_window.end
+            ):
+                excluded["window_mismatch"] += 1
+                continue
+            target_match = projection.get("target_match")
+            matched_fields = (
+                target_match.get("authoritative_fields")
+                if isinstance(target_match, Mapping)
+                and target_match.get("matched") is True
+                else None
+            )
+            if (
+                not has_required_target
+                or not isinstance(matched_fields, list)
+                or not matched_fields
+                or (required_host is not None and "database.host" not in matched_fields)
+                or not all(
+                    isinstance(field, str)
+                    and field
+                    in {
+                        "cluster",
+                        "database.database",
+                        "database.endpoint",
+                        "database.host",
+                        "database.instance",
+                    }
+                    for field in matched_fields
+                )
+            ):
+                excluded["target_match_invalid"] += 1
+                continue
+            timeseries = projection.get("timeseries")
+            series = timeseries.get("series") if isinstance(timeseries, Mapping) else None
+            if not isinstance(series, list):
+                excluded["series_missing"] += 1
+                continue
+            accepted_for_result = 0
+            accepted_samples = 0
+            for series_index, summary in enumerate(series):
+                if not isinstance(summary, Mapping):
+                    excluded["invalid_series_summary"] += 1
+                    continue
+                sample_count = summary.get("sample_count")
+                values = {
+                    key: _number(summary.get(key))
+                    for key in ("min", "max", "avg", "latest", "delta")
+                }
+                if (
+                    not isinstance(sample_count, int)
+                    or isinstance(sample_count, bool)
+                    or sample_count <= 0
+                    or any(value is None for value in values.values())
+                    or values["min"] > values["max"]
+                    or not values["min"] <= values["avg"] <= values["max"]
+                ):
+                    excluded["invalid_series_summary"] += 1
+                    continue
+                selected.append((result_index, series_index, item, summary))
+                accepted_for_result += 1
+                accepted_samples += sample_count
+            declared_series_count = timeseries.get("series_count")
+            declared_sample_count = timeseries.get("sample_count")
+            omitted_series_count = timeseries.get("omitted_series_count", 0)
+            if (
+                not isinstance(declared_series_count, int)
+                or isinstance(declared_series_count, bool)
+                or declared_series_count < accepted_for_result
+                or not isinstance(declared_sample_count, int)
+                or isinstance(declared_sample_count, bool)
+                or declared_sample_count < accepted_samples
+                or not isinstance(omitted_series_count, int)
+                or isinstance(omitted_series_count, bool)
+                or omitted_series_count < 0
+                or declared_series_count != accepted_for_result + omitted_series_count
+            ):
+                if accepted_for_result:
+                    del selected[-accepted_for_result:]
+                excluded["inconsistent_projection_counts"] += 1
+                continue
+            total_projected_samples += accepted_samples
+
+        observations: list[ToolResultObservation] = []
+        if results:
+            observations.append(
+                ToolResultObservation(
+                    statement=(
+                        f"Prometheus 公开投影共 {len(results)} 项；通过协议校验的时序 "
+                        f"{len(selected)} 条、数值样本 {total_projected_samples} 个；"
+                        f"排除统计 {_bounded_json(dict(sorted(excluded.items())))}。"
+                        "目标发现、服务发现、指标目录、元数据和 MCP 原始响应未进入主 Agent。"
+                    ),
+                    source_paths=self._prometheus_context_paths(data),
+                )
+            )
+        omitted = max(len(selected) - _MAX_SELECTED_ITEMS, 0)
+        exposed_samples = 0
+        for result_index, series_index, item, summary in selected[:_MAX_SELECTED_ITEMS]:
+            sample_count = int(summary["sample_count"])
+            exposed_samples += sample_count
+            metric = summary.get("metric")
+            metric = metric if isinstance(metric, Mapping) else {}
+            statement = {
+                "tool_name": item.get("tool_name"),
+                "metric": self._prometheus_metric_identity(metric),
+                "sample_count": sample_count,
+                "min": summary.get("min"),
+                "max": summary.get("max"),
+                "avg": summary.get("avg"),
+                "latest": summary.get("latest"),
+                "delta": summary.get("delta"),
+            }
+            base = (
+                f"/structured_data/monitoring_results/{result_index}/projection"
+            )
+            observations.append(
+                ToolResultObservation(
+                    statement=(
+                        "Prometheus 告警目标五分钟窗口内时序聚合："
+                        f"{_bounded_json(statement)}"
+                    ),
+                    source_paths=[
+                        f"{base}/timeseries/series/{series_index}",
+                        f"{base}/window",
+                        f"{base}/target_match",
+                    ],
+                )
+            )
+
+        limitations: list[str] = []
+        if window_error is not None:
+            limitations.append(window_error)
+        if not has_required_target:
+            limitations.append(
+                "告警详情没有可用于 Prometheus 结果归属的数据库目标；公开投影未进入主 Agent 事实。"
+            )
+        if excluded:
+            limitations.append(
+                "已排除未通过公开投影协议校验的 Prometheus 项："
+                f"{_bounded_json(dict(sorted(excluded.items())))}。"
+            )
+        if omitted:
+            limitations.append(
+                f"主 Agent 仅展示稳定顺序中的前 {_MAX_SELECTED_ITEMS} 条时序；"
+                f"另有 {omitted} 条合格投影保留在源工件。"
+            )
+        if not results:
+            limitations.append("Prometheus MCP 没有返回合格的告警窗口范围投影。")
+        elif not selected:
+            limitations.append("Prometheus 公开返回中没有通过协议校验的范围时序投影。")
+        return _analysis(
+            artifact=artifact,
+            summary=(
+                "Prometheus 告警目标五分钟窗口程序事实投影："
+                f"通过校验 {len(selected)} 条时序；向主 Agent 展示 "
+                f"{min(len(selected), _MAX_SELECTED_ITEMS)} 条时序、"
+                f"{exposed_samples} 个数值样本。"
+            ),
+            observations=observations,
+            limitations=limitations,
+            analysis_usable=bool(selected) and required_window is not None and has_required_target,
         )
 
     @staticmethod

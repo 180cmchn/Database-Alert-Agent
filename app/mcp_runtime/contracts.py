@@ -120,6 +120,16 @@ class HarnessObservation[ObservationT]:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteResponseRecord:
+    """A complete MCP transport response retained until the investigation ends."""
+
+    invocation_id: UUID
+    tool_name: str
+    arguments: dict[str, Any]
+    response: Any
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioTransition[StateT, ObservationT]:
     state: StateT
     observation: ObservationT | None = None
@@ -204,6 +214,7 @@ class MCPHarnessSnapshot[StateT, ObservationT]:
     pending_retry: PreparedCall | None = None
     retry_not_before: datetime | None = None
     active_call: PreparedCall | None = None
+    remote_responses: tuple[RemoteResponseRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +250,7 @@ class ArtifactStore(Protocol):
 
 
 class RemoteResponseStore(Protocol):
-    """Durably retain a transport response before scenario-side processing."""
+    """Persist complete transport responses after an MCP investigation ends."""
 
     async def save(
         self,

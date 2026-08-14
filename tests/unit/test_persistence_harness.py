@@ -917,7 +917,6 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
         assert row is not None
         assert row.request_hash != row.effective_hash
     await repository.close()
-
     reopened = SQLAlchemyAlertRepository(sqlite_url(database))
     await reopened.initialize()
     assert await reopened.get_tool_invocation(str(invocation.invocation_id)) == invocation
@@ -999,6 +998,39 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
         )
         assert [row.status for row in invocation_rows] == [ToolInvocationStatus.FAILED.value]
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_checkpoint_rejects_legacy_sanitized_message_codec() -> None:
+    run_id = uuid4()
+    manifest_hash = "a" * 64
+    budget = BudgetLedger({}).snapshot()
+    checkpoint = RunCheckpoint(
+        run_id=run_id,
+        namespace="mcp:prometheus",
+        version=1,
+        sequence=0,
+        state={
+            "codec": "jsonplus-msgpack-v1",
+            "type": "msgpack",
+            "payload_base64": "",
+        },
+        budget_snapshot=budget.model_dump(mode="json"),
+        manifest_hash=manifest_hash,
+    )
+
+    class LegacyCheckpointRepository:
+        async def load_checkpoint(self, *_args: object, **_kwargs: object) -> RunCheckpoint:
+            return checkpoint
+
+    store = RepositoryMCPCheckpointStore[dict[str, object], object](
+        LegacyCheckpointRepository(),  # type: ignore[arg-type]
+        provider="prometheus",
+        manifest_hash=manifest_hash,
+    )
+
+    with pytest.raises(MCPCheckpointDecodeError, match="unsupported codec"):
+        await store.load(run_id)
 
 
 @pytest.mark.asyncio

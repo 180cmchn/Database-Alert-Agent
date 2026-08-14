@@ -51,6 +51,7 @@ from app.mcp_runtime.contracts import (
     MCPPlanner,
     MCPToolSession,
     PreparedCall,
+    RemoteResponseRecord,
     RemoteResponseStore,
     RetryDirective,
     ScenarioTransition,
@@ -113,6 +114,7 @@ class _RunContext[StateT, ObservationT]:
     retry_not_before: datetime | None = None
     active_call: PreparedCall | None = None
     remote_debited_invocations: set[UUID] = field(default_factory=set)
+    remote_responses: dict[UUID, RemoteResponseRecord] = field(default_factory=dict)
 
 
 class _BudgetedBootstrapSession:
@@ -291,45 +293,121 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 if snapshot.active_call is not None
                 else None
             ),
+            remote_responses={
+                item.invocation_id: RemoteResponseRecord(
+                    invocation_id=item.invocation_id,
+                    tool_name=item.tool_name,
+                    arguments=deepcopy(item.arguments),
+                    response=deepcopy(item.response),
+                )
+                for item in snapshot.remote_responses
+            },
         )
-        persisted_events = await self.event_sink.read(snapshot.run_id)
-        self._reconcile_budget_tail(
-            ctx,
-            persisted_events,
-            after_sequence=snapshot.event_version,
-        )
-        await self._reconcile_durable_invocations(ctx, persisted_events)
-        await self._ensure_observation_trace_events(ctx)
-        if ctx.finish is not None:
-            await self._ensure_run_completed_event(ctx, persisted_events)
+        try:
+            self._validate_recovered_remote_response_lineage(ctx)
+            persisted_events = await self.event_sink.read(snapshot.run_id)
+            self._reconcile_budget_tail(
+                ctx,
+                persisted_events,
+                after_sequence=snapshot.event_version,
+            )
+            await self._reconcile_durable_invocations(ctx, persisted_events)
+            self._validate_recovered_remote_response_lineage(ctx)
+            await self._ensure_observation_trace_events(ctx)
+            if ctx.finish is not None:
+                await self._persist_deferred_remote_responses(ctx)
+                await self._ensure_run_completed_event(ctx, persisted_events)
+                await self._checkpoint(ctx)
+                return await self._result(ctx)
+            await self._reconcile_inflight(ctx)
             await self._checkpoint(ctx)
-            return await self._result(ctx)
-        await self._reconcile_inflight(ctx)
-        await self._checkpoint(ctx)
+        except BaseException as resume_error:
+            await self._cleanup_interrupted_resume(ctx, resume_error)
+            raise
         return await self._drive(ctx)
+
+    async def _cleanup_interrupted_resume(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        resume_error: BaseException,
+    ) -> None:
+        """Close recovery resources and flush staged responses before re-raising."""
+
+        try:
+            await self._close_session(ctx)
+        except BaseException as close_error:
+            resume_error.add_note(
+                "MCP resume session cleanup also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        try:
+            await self._persist_deferred_remote_responses(ctx)
+        except BaseException as persist_error:
+            resume_error.add_note(
+                "MCP raw-response artifact persistence also failed: "
+                f"{type(persist_error).__name__}: {persist_error}"
+            )
 
     async def _drive(
         self,
         ctx: _RunContext[StateT, ObservationT],
     ) -> MCPHarnessResult[StateT, ObservationT]:
 
+        run_loop_completed = False
+        termination_error: BaseException | None = None
         try:
             finish = await self._run_loop(ctx)
         except BudgetExceededError as exc:
             finish = self._budget_finish(exc)
+            run_loop_completed = True
         except Exception as exc:
             await self._emit(
                 ctx,
                 AgentEventKind.RUN_FAILED,
                 {"error_code": type(exc).__name__, "message": str(exc)},
             )
+            termination_error = exc
             raise
+        except BaseException as exc:
+            termination_error = exc
+            raise
+        else:
+            run_loop_completed = True
         finally:
-            await self._close_session(ctx)
+            session_closed = False
+            try:
+                await self._close_session(ctx)
+                session_closed = True
+            finally:
+                if not run_loop_completed or not session_closed:
+                    # A caller-side timeout or cancellation terminates the MCP
+                    # investigation without producing a Finish. Flush every
+                    # staged response before propagating that termination.
+                    try:
+                        await self._persist_deferred_remote_responses(ctx)
+                    except BaseException as persist_error:
+                        if termination_error is None:
+                            raise
+                        termination_error.add_note(
+                            "MCP raw-response artifact persistence also failed: "
+                            f"{type(persist_error).__name__}: {persist_error}"
+                        )
 
         ctx.finish = finish
-        await self._checkpoint(ctx)
+        try:
+            await self._checkpoint(ctx)
+        except BaseException as checkpoint_error:
+            ctx.account_wall_time = False
+            try:
+                await self._persist_deferred_remote_responses(ctx)
+            except BaseException as persist_error:
+                checkpoint_error.add_note(
+                    "MCP raw-response artifact persistence also failed: "
+                    f"{type(persist_error).__name__}: {persist_error}"
+                )
+            raise
         ctx.account_wall_time = False
+        await self._persist_deferred_remote_responses(ctx)
         await self._emit(
             ctx,
             AgentEventKind.RUN_COMPLETED,
@@ -760,7 +838,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         except Exception as exc:
             return await self._complete_failure(ctx, prepared, started, fingerprint, exc)
 
-        await self._persist_remote_response(
+        await self._stage_remote_response(
             ctx,
             invocation=started,
             prepared=prepared,
@@ -785,6 +863,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         raw_result: Any,
     ) -> tuple[Finish | None, RetryDirective | None]:
         """Apply one durable response without crossing the transport again."""
+
+        prepared.metadata["mcp_raw_response"] = self._portable_remote_response(raw_result)
 
         try:
             transition = self.scenario.on_result(ctx.state, prepared, raw_result)
@@ -1958,7 +2038,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 f"failed to persist artifact {invocation.artifact_ref.artifact_id}"
             ) from exc
 
-    async def _persist_remote_response(
+    async def _stage_remote_response(
         self,
         ctx: _RunContext[StateT, ObservationT],
         *,
@@ -1966,20 +2046,44 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         prepared: PreparedCall,
         response: Any,
     ) -> None:
+        record = RemoteResponseRecord(
+            invocation_id=invocation.invocation_id,
+            tool_name=prepared.tool_name,
+            arguments=deepcopy(prepared.effective_arguments),
+            response=self._portable_remote_response(response),
+        )
+        existing = ctx.remote_responses.get(invocation.invocation_id)
+        if existing is not None and existing != record:
+            raise HarnessInfrastructureError(
+                "checkpoint remote MCP response conflicts with the completed invocation"
+            )
+        ctx.remote_responses[invocation.invocation_id] = record
+        # The raw response is checkpointed before scenario processing so a
+        # process restart can finish this read-only call without repeating it.
+        await self._checkpoint(ctx)
+
+    async def _persist_deferred_remote_responses(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+    ) -> None:
         if self.remote_response_store is None:
             return
-        try:
-            await self.remote_response_store.save(
-                run_id=ctx.run_id,
-                invocation_id=invocation.invocation_id,
-                tool_name=prepared.tool_name,
-                arguments=deepcopy(prepared.effective_arguments),
-                response=response,
-            )
-        except Exception as exc:
-            raise HarnessInfrastructureError(
-                "failed to persist the remote MCP response before processing"
-            ) from exc
+        for invocation in ctx.invocations:
+            record = ctx.remote_responses.get(invocation.invocation_id)
+            if record is None:
+                continue
+            try:
+                await self.remote_response_store.save(
+                    run_id=ctx.run_id,
+                    invocation_id=record.invocation_id,
+                    tool_name=record.tool_name,
+                    arguments=deepcopy(record.arguments),
+                    response=deepcopy(record.response),
+                )
+            except Exception as exc:
+                raise HarnessInfrastructureError(
+                    "failed to persist remote MCP responses after investigation completion"
+                ) from exc
 
     async def _load_remote_response(
         self,
@@ -1988,22 +2092,45 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         invocation: ToolInvocation,
         prepared: PreparedCall,
     ) -> Any | None:
+        staged = ctx.remote_responses.get(invocation.invocation_id)
+        if staged is not None:
+            if (
+                staged.tool_name != prepared.tool_name
+                or staged.arguments != prepared.effective_arguments
+            ):
+                raise HarnessInfrastructureError(
+                    "checkpoint remote MCP response does not match its invocation"
+                )
+            return deepcopy(staged.response)
+        # Audit stores have no response-format discriminator and may contain
+        # legacy sanitized artifacts. Only a response carried by the same
+        # checkpoint can safely complete an interrupted invocation.
+        return None
+
+    def _validate_recovered_remote_response_lineage(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+    ) -> None:
         if self.remote_response_store is None:
-            return None
-        loader = getattr(self.remote_response_store, "load", None)
-        if loader is None:
-            return None
-        try:
-            return await loader(
-                run_id=ctx.run_id,
-                invocation_id=invocation.invocation_id,
-                tool_name=prepared.tool_name,
-                arguments=deepcopy(prepared.effective_arguments),
-            )
-        except Exception as exc:
-            raise HarnessInfrastructureError(
-                "failed to load a durable remote MCP response during recovery"
-            ) from exc
+            return
+        for invocation in ctx.invocations:
+            if invocation.status not in {
+                ToolInvocationStatus.SUCCEEDED,
+                ToolInvocationStatus.NO_DATA,
+            }:
+                continue
+            record = ctx.remote_responses.get(invocation.invocation_id)
+            if record is None:
+                raise HarnessInfrastructureError(
+                    "successful MCP invocation is missing its checkpointed raw response"
+                )
+            if (
+                record.tool_name != invocation.tool_name
+                or record.arguments != invocation.effective_arguments
+            ):
+                raise HarnessInfrastructureError(
+                    "checkpoint raw response does not match its successful invocation"
+                )
 
     @staticmethod
     def _accepts_keyword_argument(callable_object: Any, keyword: str) -> bool:
@@ -2051,6 +2178,18 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             active_call=(
                 ctx.active_call.model_copy(deep=True) if ctx.active_call is not None else None
             ),
+            remote_responses=tuple(
+                RemoteResponseRecord(
+                    invocation_id=record.invocation_id,
+                    tool_name=record.tool_name,
+                    arguments=deepcopy(record.arguments),
+                    response=deepcopy(record.response),
+                )
+                for record in (
+                    ctx.remote_responses[invocation_id]
+                    for invocation_id in sorted(ctx.remote_responses, key=str)
+                )
+            ),
         )
 
     async def _result(
@@ -2075,7 +2214,14 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             pending_retry=snapshot.pending_retry,
             retry_not_before=snapshot.retry_not_before,
             active_call=snapshot.active_call,
+            remote_responses=snapshot.remote_responses,
         )
+
+    @staticmethod
+    def _portable_remote_response(response: Any) -> Any:
+        if hasattr(response, "model_dump"):
+            return response.model_dump(mode="json", by_alias=True)
+        return deepcopy(response)
 
     async def _await_bounded(
         self,

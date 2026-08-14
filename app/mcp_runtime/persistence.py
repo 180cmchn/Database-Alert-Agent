@@ -15,7 +15,7 @@ from app.domain.ports import AlertRepository
 from app.mcp_runtime.contracts import MCPHarnessSnapshot
 
 _PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_CODEC = "jsonplus-msgpack-v1"
+_CODEC = "jsonplus-msgpack-v2"
 
 
 class MCPCheckpointDecodeError(RuntimeError):
@@ -157,4 +157,5 @@ class RepositoryMCPCheckpointStore[StateT, ObservationT]:
             pending_retry=getattr(value, "pending_retry", None),
             retry_not_before=getattr(value, "retry_not_before", None),
             active_call=getattr(value, "active_call", None),
+            remote_responses=tuple(getattr(value, "remote_responses", ())),
         )

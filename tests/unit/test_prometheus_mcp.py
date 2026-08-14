@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -38,6 +38,7 @@ from app.domain.tool_calling import MCPModelToolCall
 from app.mcp_catalog import MCPPromptBundle
 
 ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+ALERT_WINDOW_START = ALERT_TIME - timedelta(minutes=5)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROMETHEUS_PROMPTS = MCPPromptBundle(
     role="Prometheus metrics investigator",
@@ -497,6 +498,7 @@ def test_prometheus_mcp_decodes_json_observation_from_text_content() -> None:
 
 
 def test_prometheus_call_result_keeps_complete_envelope_with_structured_payload() -> None:
+    opaque = "x" * 50_000
     raw_result = type(
         "ToolResult",
         (),
@@ -504,7 +506,8 @@ def test_prometheus_call_result_keeps_complete_envelope_with_structured_payload(
             "model_dump": lambda _self, **kwargs: {
                 "_meta": {
                     "trace_id": "trace-1",
-                    "api_key": "must-not-survive",
+                    "api_key": "mcp-owned-secret",
+                    "opaque": opaque,
                     "by_alias": kwargs.get("by_alias"),
                 },
                 "content": [
@@ -522,7 +525,8 @@ def test_prometheus_call_result_keeps_complete_envelope_with_structured_payload(
     assert result.raw_call_result == {
         "_meta": {
             "trace_id": "trace-1",
-            "api_key": "***REDACTED***",
+            "api_key": "mcp-owned-secret",
+            "opaque": opaque,
             "by_alias": True,
         },
         "content": [
@@ -804,6 +808,7 @@ def test_prometheus_finish_tool_records_monitoring_scope_contract() -> None:
 def test_prometheus_model_observation_is_bounded_deterministic_projection() -> None:
     payload = {
         "data": {
+            "api_key": "mcp-owned-secret",
             "activeTargets": [
                 {
                     "labels": {
@@ -816,7 +821,7 @@ def test_prometheus_model_observation_is_bounded_deterministic_projection() -> N
             "result": [
                 {
                     "metric": {"__name__": "ob_cpu_usage", "job": "oceanbase"},
-                    "values": [[1, "80"], [2, "90"]],
+                    "values": [[2, "90"], [1, "80"]],
                 }
             ],
             "opaque_log": "x" * 1_000,
@@ -831,12 +836,306 @@ def test_prometheus_model_observation_is_bounded_deterministic_projection() -> N
     assert projection["series_count"] == 1
     assert projection["sample_count"] == 2
     assert projection["series"][0]["avg"] == 85
-    assert any(
-        fact["value"] == "oceanbase" for fact in projection["scalar_facts"]
-    )
+    assert projection["series"][0]["latest"] == 90
+    assert projection["series"][0]["delta"] == 10
+    assert projection["series"][0]["metric"] == {"__name__": "ob_cpu_usage"}
     serialized = json.dumps(projection, ensure_ascii=False)
+    assert "activeTargets" not in serialized
+    assert "mcp-owned-secret" not in serialized
+    assert "ob-prod-1" not in serialized
     assert "x" * 1_000 not in serialized
     assert len(serialized) < 10_000
+
+
+def test_prometheus_query_target_text_does_not_attribute_unlabelled_series() -> None:
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {"__name__": "mysql_threads_running"},
+                        "values": [[1786067700, "8"], [1786068000, "15"]],
+                    }
+                ]
+            }
+        },
+        arguments={
+            "query": 'mysql_threads_running{instance="mysql-17:3306"}',
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=_mysql_context().alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
+
+
+def test_prometheus_range_projection_keeps_only_series_matching_alert_labels() -> None:
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_threads_running",
+                            "instance": "mysql-17:3306",
+                        },
+                        "values": [[1786067700, "8"], [1786068000, "15"]],
+                    },
+                    {
+                        "metric": {
+                            "__name__": "mysql_threads_running",
+                            "instance": "other-db:3306",
+                            "api_key": "other-series-secret",
+                        },
+                        "values": [[1786067700, "800"], [1786068000, "1500"]],
+                    },
+                ]
+            }
+        },
+        arguments={
+            "query": "mysql_threads_running",
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=_mysql_context().alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is not None
+    assert projection["excluded_series_count"] == 1
+    assert projection["timeseries"]["series_count"] == 1
+    assert projection["timeseries"]["sample_count"] == 2
+    assert projection["timeseries"]["series"][0]["max"] == 15
+    assert "other-series-secret" not in json.dumps(projection, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        {
+            "__name__": "mysql_threads_running",
+            "instance": "mysql-17:3307",
+        },
+        {
+            "__name__": "mysql_threads_running",
+            "instance": "mysql-17:3306",
+            "database": "billing",
+        },
+    ],
+    ids=["wrong_port", "same_host_wrong_database"],
+)
+def test_prometheus_range_projection_rejects_conflicting_target_labels(
+    metric: dict[str, str],
+) -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(
+                update={"database": "orders", "port": 3306}
+            )
+        }
+    )
+
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": metric,
+                        "values": [[1786067700, "8"], [1786068000, "15"]],
+                    }
+                ]
+            }
+        },
+        arguments={
+            "query": "mysql_threads_running",
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        {
+            "__name__": "mysql_threads_running",
+            "cluster": "mysql-prod",
+        },
+        {
+            "__name__": "mysql_threads_running",
+            "database": "orders",
+        },
+    ],
+    ids=["cluster_only", "database_only"],
+)
+def test_prometheus_range_projection_requires_host_label_when_alert_has_host(
+    metric: dict[str, str],
+) -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "cluster": "mysql-prod",
+            "database": context.alert.database.model_copy(
+                update={"database": "orders", "port": 3306}
+            ),
+        }
+    )
+
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": metric,
+                        "values": [[1786067700, "8"], [1786068000, "15"]],
+                    }
+                ]
+            }
+        },
+        arguments={
+            "query": "mysql_threads_running",
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
+
+
+def test_prometheus_range_projection_uses_other_identity_when_alert_has_no_host() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "cluster": "mysql-prod",
+            "database": context.alert.database.model_copy(
+                update={
+                    "host": None,
+                    "port": None,
+                    "instance": None,
+                    "database": "orders",
+                }
+            ),
+        }
+    )
+
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_threads_running",
+                            "cluster": "mysql-prod",
+                            "database": "orders",
+                        },
+                        "values": [[1786067700, "8"], [1786068000, "15"]],
+                    }
+                ]
+            }
+        },
+        arguments={
+            "query": "mysql_threads_running",
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is not None
+    assert projection["target_match"]["authoritative_fields"] == [
+        "cluster",
+        "database.database",
+    ]
+
+
+def test_prometheus_instant_value_is_not_a_range_projection() -> None:
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_threads_running",
+                            "instance": "mysql-17:3306",
+                        },
+                        "value": [1786068000, "15"],
+                    }
+                ]
+            }
+        },
+        arguments={
+            "query": 'mysql_threads_running{instance="mysql-17:3306"}',
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=_mysql_context().alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
+
+
+@pytest.mark.parametrize(
+    ("arguments", "values"),
+    [
+        (
+            {
+                "start": "2026-08-07T01:54:59+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            [[1786067700, "8"], [1786068000, "15"]],
+        ),
+        (
+            {
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            [[1786067699, "8"], [1786068000, "15"]],
+        ),
+    ],
+    ids=["non_exact_argument_window", "sample_outside_window"],
+)
+def test_prometheus_range_projection_requires_exact_window_and_in_window_samples(
+    arguments: dict[str, Any],
+    values: list[list[Any]],
+) -> None:
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_threads_running",
+                            "instance": "mysql-17:3306",
+                        },
+                        "values": values,
+                    }
+                ]
+            }
+        },
+        arguments=arguments,
+        alert=_mysql_context().alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
 
 
 @pytest.mark.asyncio
@@ -930,6 +1229,7 @@ async def test_prometheus_model_can_choose_discovery_and_range_tools_in_any_orde
                                 "__name__": "ob_data_disk_usage_percent",
                                 "job": "ocp-agent:62889/metrics/ob/basic",
                                 "cluster": "sc_store_prod",
+                                "svr_ip": "10.126.106.14",
                             },
                             "values": [[1786067700, "91"]],
                         }
@@ -1095,7 +1395,8 @@ async def test_prometheus_host_forwards_model_tool_name_without_local_gate(
     result = await client.collect_alert_window(_context())
 
     assert _FakeSession.calls == [("delete_prometheus_data", {"confirm": True})]
-    assert result.has_monitoring_data is True
+    assert result.has_monitoring_data is False
+    assert result.responses[0]["projection_kind"] == "auxiliary"
     assert result.termination_reason == "finished_by_model"
     assert [item["outcome"] for item in result.tool_attempts] == ["result"]
     assert result.tool_attempts[0]["tool_name"] == "delete_prometheus_data"
@@ -1148,7 +1449,10 @@ async def test_prometheus_client_keeps_calling_until_model_finishes(
     )
     assert len(result.responses) == 2
     assert result.finished_by_model is True
-    assert result.has_monitoring_data is True
+    assert result.has_monitoring_data is False
+    assert all(
+        item["projection_kind"] == "auxiliary" for item in result.responses
+    )
     assert result.window_end == ALERT_TIME
     assert result.window_start.isoformat() == "2026-08-07T01:55:00+00:00"
     first_request = json.loads(model.messages[0][1]["content"])
@@ -1156,7 +1460,7 @@ async def test_prometheus_client_keeps_calling_until_model_finishes(
 
 
 @pytest.mark.asyncio
-async def test_prometheus_preserves_cross_engine_series_without_target_gate(
+async def test_prometheus_only_qualifies_target_matched_cross_engine_series(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _SequencedSession.calls = []
@@ -1203,8 +1507,16 @@ async def test_prometheus_preserves_cross_engine_series_without_target_gate(
             "finish_prometheus_investigation",
         ],
         arguments=[
-            {"query": "ob_sysstat_cpu_usage"},
-            {"query": 'mysql_cpu_usage{instance="mysql-17:3306"}'},
+            {
+                "query": "ob_sysstat_cpu_usage",
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            {
+                "query": 'mysql_cpu_usage{instance="mysql-17:3306"}',
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
             {},
         ],
     )
@@ -1217,7 +1529,11 @@ async def test_prometheus_preserves_cross_engine_series_without_target_gate(
 
     assert result.has_monitoring_data is True
     assert all("target_verification" not in item for item in result.responses)
-    assert [item["root_cause_eligible"] for item in result.responses] == [True, True]
+    assert [item["root_cause_eligible"] for item in result.responses] == [False, True]
+    assert [item["projection_kind"] for item in result.responses] == [
+        "auxiliary",
+        "alert_window_range",
+    ]
     assert [item["outcome"] for item in result.tool_attempts] == [
         "result",
         "result",
@@ -1356,10 +1672,12 @@ async def test_prometheus_client_returns_standard_mcp_error_text_to_model(
         if isinstance(message.get("content"), str)
         and message["content"].lstrip().startswith("{")
         for payload in [json.loads(message["content"])]
-        if "monitoring_result" in payload
+        if payload.get("isError") is True
     )
-    assert error_feedback["monitoring_result"]["tool_error"] == "PrometheusMCPToolError"
-    assert "invalid range selector" in error_feedback["monitoring_result"]["detail"]
+    assert error_feedback == {
+        "isError": True,
+        "content": [{"type": "text", "text": "invalid range selector"}],
+    }
 
 
 @pytest.mark.asyncio
@@ -1369,7 +1687,19 @@ async def test_prometheus_evidence_reconnects_after_first_session_call_fails(
     _SequencedSession.calls = []
     _SequencedSession.results = [
         ConnectionError("stream closed"),
-        {"structuredContent": {"series": [{"value": 7}]}},
+        {
+            "structuredContent": {
+                "series": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_up",
+                            "instance": "mysql-17:3306",
+                        },
+                        "values": [[1786067700, "7"]],
+                    }
+                ]
+            }
+        },
     ]
     monkeypatch.setattr(
         prometheus_harness_module,
@@ -1381,7 +1711,15 @@ async def test_prometheus_evidence_reconnects_after_first_session_call_fails(
         [
             "arbitrary_monitoring_tool",
             "finish_prometheus_investigation",
-        ]
+        ],
+        arguments=[
+            {
+                "query": 'mysql_up{instance="mysql-17:3306"}',
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            {},
+        ],
     )
     client = PrometheusMCPClient(
         _server_settings(),
@@ -1390,7 +1728,7 @@ async def test_prometheus_evidence_reconnects_after_first_session_call_fails(
 
     evidence = await PrometheusMCPEvidenceTool(client).execute(
         ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
-        _context(),
+        _mysql_context(),
     )
 
     assert len(_SequencedSession.calls) == 2
@@ -1410,7 +1748,19 @@ async def test_prometheus_reconnects_when_only_catalog_precedes_disconnect(
     _SequencedSession.results = [
         {"structuredContent": {"metrics": ["mysql_up"]}},
         ConnectionError("stream closed"),
-        {"structuredContent": {"series": [{"value": 7}]}},
+        {
+            "structuredContent": {
+                "series": [
+                    {
+                        "metric": {
+                            "__name__": "mysql_up",
+                            "instance": "mysql-17:3306",
+                        },
+                        "values": [[1786067700, "7"]],
+                    }
+                ]
+            }
+        },
     ]
     monkeypatch.setattr(
         prometheus_harness_module,
@@ -1426,7 +1776,12 @@ async def test_prometheus_reconnects_when_only_catalog_precedes_disconnect(
         ],
         arguments=[
             {"operation": "list"},
-            {"query": "up", "attempt": 1},
+            {
+                "query": 'mysql_up{instance="mysql-17:3306"}',
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+                "attempt": 1,
+            },
             {},
         ],
     )
@@ -1437,7 +1792,7 @@ async def test_prometheus_reconnects_when_only_catalog_precedes_disconnect(
 
     evidence = await PrometheusMCPEvidenceTool(client).execute(
         ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
-        _context(),
+        _mysql_context(),
     )
 
     assert len(_SequencedSession.calls) == 3
@@ -1445,10 +1800,8 @@ async def test_prometheus_reconnects_when_only_catalog_precedes_disconnect(
     assert evidence.status == ToolStatus.SUCCESS
     assert evidence.structured_data["mcp_session_attempts"] == 2
     monitoring_results = evidence.structured_data["monitoring_results"]
-    assert len(monitoring_results) == 2
-    assert sum(
-        item["has_monitoring_observation"] is True for item in monitoring_results
-    ) == 1
+    assert len(monitoring_results) == 1
+    assert monitoring_results[0]["projection_kind"] == "alert_window_range"
 
 
 @pytest.mark.asyncio
@@ -1482,7 +1835,19 @@ async def test_prometheus_client_preserves_response_while_repairing_model_failur
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeSession.calls = []
-    _FakeSession.result = {"structuredContent": {"series": [{"value": 42}]}}
+    _FakeSession.result = {
+        "structuredContent": {
+            "series": [
+                {
+                    "metric": {
+                        "__name__": "mysql_up",
+                        "instance": "mysql-17:3306",
+                    },
+                    "values": [[1786067700, "42"]],
+                }
+            ]
+        }
+    }
     monkeypatch.setattr(
         prometheus_harness_module,
         "sse_client",
@@ -1502,7 +1867,11 @@ async def test_prometheus_client_preserves_response_while_repairing_model_failur
                 return MCPModelToolCall(
                     call_id="monitoring-result",
                     name="arbitrary_monitoring_tool",
-                    arguments={"query": "up"},
+                    arguments={
+                        "query": 'mysql_up{instance="mysql-17:3306"}',
+                        "start": "2026-08-07T01:55:00+00:00",
+                        "end": "2026-08-07T02:00:00+00:00",
+                    },
                 )
             if self.attempts == 2:
                 raise RuntimeError("temporary model selection failure")
@@ -1515,10 +1884,13 @@ async def test_prometheus_client_preserves_response_while_repairing_model_failur
     model = ModelFailureThenFinish()
     client = PrometheusMCPClient(_server_settings(), model)
 
-    result = await client.collect_alert_window(_context())
+    result = await client.collect_alert_window(_mysql_context())
     evidence = await PrometheusMCPEvidenceTool(
         _RecordingPrometheusClient(result)
-    ).execute(ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME), _context())
+    ).execute(
+        ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
+        _mysql_context(),
+    )
 
     assert len(result.responses) == 1
     assert model.attempts == 3
@@ -1574,6 +1946,10 @@ async def test_prometheus_large_observation_is_preserved_and_remains_finishable(
         "structuredContent": {
             "series": [
                 {
+                    "metric": {
+                        "__name__": "mysql_up",
+                        "instance": "mysql-17:3306",
+                    },
                     "values": [
                         [1786067700, "1"],
                         [1786068000, "x" * 30_000],
@@ -1591,14 +1967,23 @@ async def test_prometheus_large_observation_is_preserved_and_remains_finishable(
     client = PrometheusMCPClient(
         _server_settings(),
         _SequenceModel(
-            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"]
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"],
+            arguments=[
+                {
+                    "query": 'mysql_up{instance="mysql-17:3306"}',
+                    "start": "2026-08-07T01:55:00+00:00",
+                    "end": "2026-08-07T02:00:00+00:00",
+                },
+                {},
+            ],
         ),
     )
 
-    result = await client.collect_alert_window(_context())
+    result = await client.collect_alert_window(_mysql_context())
 
     assert result.finished_by_model is True
-    assert result.has_monitoring_data is True
+    assert result.has_monitoring_data is False
+    assert result.responses[0]["projection_kind"] == "auxiliary"
     assert "window_verification" not in result.responses[0]
     assert "target_verification" not in result.responses[0]
     values = result.responses[0]["result"]["series"][0]["values"]
@@ -1616,7 +2001,11 @@ async def test_prometheus_evidence_record_does_not_expose_raw_call_result(
         "structuredContent": {
             "series": [
                 {
-                    "metric": {"job": "mysql"},
+                    "metric": {
+                        "__name__": "mysql_up",
+                        "job": "mysql",
+                        "instance": "mysql-17:3306",
+                    },
                     "values": [[1786067700, "1"], [1786068000, "2"]],
                 }
             ]
@@ -1634,7 +2023,15 @@ async def test_prometheus_evidence_record_does_not_expose_raw_call_result(
     client = PrometheusMCPClient(
         _server_settings(),
         _SequenceModel(
-            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"]
+            ["arbitrary_monitoring_tool", "finish_prometheus_investigation"],
+            arguments=[
+                {
+                    "query": 'mysql_up{instance="mysql-17:3306"}',
+                    "start": "2026-08-07T01:55:00+00:00",
+                    "end": "2026-08-07T02:00:00+00:00",
+                },
+                {},
+            ],
         ),
     )
     executor = ToolExecutor(
@@ -1643,7 +2040,7 @@ async def test_prometheus_evidence_record_does_not_expose_raw_call_result(
 
     record = await executor.execute(
         ToolExecutionRequest(tool_name=PROMETHEUS_METRICS_TOOL_NAME),
-        _context(),
+        _mysql_context(),
     )
 
     assert record.status == ToolStatus.SUCCESS
@@ -1662,11 +2059,51 @@ class _RecordingPrometheusClient:
         return self.result
 
 
+def _qualified_projection_response(
+    *,
+    tool_name: str = "query_range",
+) -> dict[str, Any]:
+    return {
+        "tool_name": tool_name,
+        "projection_kind": "alert_window_range",
+        "has_monitoring_observation": True,
+        "root_cause_eligible": True,
+        "projection": {
+            "projection_kind": "alert_window_range",
+            "window": {
+                "start": "2026-08-07T01:55:00+00:00",
+                "end": "2026-08-07T02:00:00+00:00",
+            },
+            "target_match": {
+                "matched": True,
+                "authoritative_fields": ["database.instance"],
+            },
+            "timeseries": {
+                "has_numeric_samples": True,
+                "series_count": 1,
+                "sample_count": 1,
+                "series": [
+                    {
+                        "metric": {"__name__": "mysql_up"},
+                        "sample_count": 1,
+                        "min": 1,
+                        "max": 1,
+                        "avg": 1,
+                        "latest": 1,
+                        "delta": 0,
+                    }
+                ],
+                "omitted_series_count": 0,
+            },
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_prometheus_outer_tool_does_not_reject_caller_parameters() -> None:
     result = PrometheusMCPQueryResult(
         responses=(),
-        window_start=ALERT_TIME.replace(minute=55),
+        window_start=ALERT_WINDOW_START,
         window_end=ALERT_TIME,
         model_tool_calls=(),
         model_request_ids=(),
@@ -1699,7 +2136,7 @@ async def test_prometheus_evidence_marks_unmonitored_database_as_skipped() -> No
                 "result": {"data": {"activeTargets": []}},
             },
         ),
-        window_start=ALERT_TIME.replace(minute=55),
+        window_start=ALERT_WINDOW_START,
         window_end=ALERT_TIME,
         model_tool_calls=("get_targets",),
         model_request_ids=(),
@@ -1733,7 +2170,7 @@ async def test_prometheus_evidence_marks_unmonitored_database_as_skipped() -> No
 @pytest.mark.asyncio
 async def test_prometheus_evidence_is_success_only_when_monitoring_result_exists() -> None:
     base = {
-        "window_start": ALERT_TIME.replace(minute=55),
+        "window_start": ALERT_WINDOW_START,
         "window_end": ALERT_TIME,
         "model_tool_calls": ("query", "query"),
         "model_request_ids": (),
@@ -1745,14 +2182,7 @@ async def test_prometheus_evidence_is_success_only_when_monitoring_result_exists
     usable_tool = PrometheusMCPEvidenceTool(
         _RecordingPrometheusClient(
                 PrometheusMCPQueryResult(
-                    responses=(
-                        {
-                            "tool_name": "query",
-                            "has_monitoring_observation": True,
-                            "window_verification": "exact",
-                            "result": {"value": 1},
-                        },
-                    ),
+                    responses=(_qualified_projection_response(tool_name="query"),),
                 **base,
             )
         )  # type: ignore[arg-type]
@@ -1774,7 +2204,7 @@ async def test_prometheus_evidence_is_success_only_when_monitoring_result_exists
 
 
 @pytest.mark.asyncio
-async def test_prometheus_no_data_trace_preserves_complete_results() -> None:
+async def test_prometheus_no_data_output_excludes_auxiliary_response_values() -> None:
     tool_attempts: list[dict[str, Any]] = []
     responses: list[dict[str, Any]] = []
     for index in range(8):
@@ -1862,18 +2292,21 @@ async def test_prometheus_no_data_trace_preserves_complete_results() -> None:
     serialized = json.dumps(record.structured_data, ensure_ascii=False, default=str)
     assert record.status == ToolStatus.NO_DATA
     assert record.truncated is False
-    assert len(serialized) > 12_000
+    assert len(serialized) < 5_000
     assert record.structured_data["schema_version"] == "prometheus-evidence-v2"
     assert record.structured_data["root_cause_eligible"] is False
     assert record.structured_data["root_cause_ineligible_reason"] != ("evidence_payload_truncated")
-    assert record.structured_data["catalog_inventory"]["metric_count"] == 3
-    assert len(record.structured_data["tool_attempts"]) == 8
-    assert len(record.structured_data["monitoring_results"]) == 8
-    assert "prometheus.invalid" in serialized
+    assert record.structured_data["model_tool_call_count"] == 8
+    assert record.structured_data["tool_attempt_count"] == 8
+    assert record.structured_data["monitoring_results"] == []
+    assert "catalog_inventory" not in record.structured_data
+    assert "tool_attempts" not in record.structured_data
+    assert "prometheus.invalid" not in serialized
+    assert "mysql_output_write_sql_count" not in serialized
 
 
 @pytest.mark.asyncio
-async def test_prometheus_target_metadata_does_not_gate_preserved_observation() -> None:
+async def test_prometheus_target_mismatch_response_does_not_enter_main_agent() -> None:
     result = PrometheusMCPQueryResult(
         responses=(
             {
@@ -1885,7 +2318,7 @@ async def test_prometheus_target_metadata_does_not_gate_preserved_observation() 
                 "result": {"series": [{"metric": {"job": "oceanbase"}, "value": 95}]},
             },
         ),
-        window_start=ALERT_TIME.replace(minute=55),
+        window_start=ALERT_WINDOW_START,
         window_end=ALERT_TIME,
         model_tool_calls=("query_range",),
         model_request_ids=(),
@@ -1900,8 +2333,9 @@ async def test_prometheus_target_metadata_does_not_gate_preserved_observation() 
         _mysql_context(),
     )
 
-    assert result.has_monitoring_data is True
-    assert evidence.status == ToolStatus.SUCCESS
+    assert result.has_monitoring_data is False
+    assert evidence.status == ToolStatus.NO_DATA
+    assert evidence.structured_data["monitoring_results"] == []
     assert "target_mismatch_count" not in evidence.structured_data
     assert evidence.structured_data["required_target"]["database_engine"] == "mysql"
 
@@ -1909,15 +2343,8 @@ async def test_prometheus_target_metadata_does_not_gate_preserved_observation() 
 @pytest.mark.asyncio
 async def test_prometheus_partial_result_is_not_root_cause_eligible() -> None:
     result = PrometheusMCPQueryResult(
-        responses=(
-            {
-                "tool_name": "query",
-                "has_monitoring_observation": True,
-                "window_verification": "exact",
-                "result": {"value": 1},
-            },
-        ),
-        window_start=ALERT_TIME.replace(minute=55),
+        responses=(_qualified_projection_response(tool_name="query"),),
+        window_start=ALERT_WINDOW_START,
         window_end=ALERT_TIME,
         model_tool_calls=("query",),
         model_request_ids=(),
@@ -1952,7 +2379,7 @@ async def test_prometheus_out_of_scope_finish_wins_over_incidental_numeric_paylo
                 "result": {"active_target_count": 1},
             },
         ),
-        window_start=ALERT_TIME.replace(minute=55),
+        window_start=ALERT_WINDOW_START,
         window_end=ALERT_TIME,
         model_tool_calls=("get_targets",),
         model_request_ids=(),
@@ -1980,7 +2407,7 @@ async def test_prometheus_out_of_scope_finish_wins_over_incidental_numeric_paylo
 @pytest.mark.asyncio
 async def test_prometheus_catalog_and_empty_series_are_not_root_cause_evidence() -> None:
     base = {
-        "window_start": ALERT_TIME.replace(minute=55),
+        "window_start": ALERT_WINDOW_START,
         "window_end": ALERT_TIME,
         "model_tool_calls": ("list_metrics", "query_range"),
         "model_request_ids": (),

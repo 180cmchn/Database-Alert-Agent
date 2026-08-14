@@ -45,7 +45,11 @@ from app.agent_runtime import (
 )
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.ports import AlertRepository
-from app.domain.tool_calling import MCPModelToolCall, ReasoningDeltaCallback
+from app.domain.tool_calling import (
+    MCPModelToolCall,
+    ReasoningDeltaCallback,
+    mcp_tool_result_messages,
+)
 from app.mcp_runtime import (
     DiscoveredMCPTool,
     Finish,
@@ -147,11 +151,11 @@ class ArcheryHarnessRuntimeDependencies:
     repository: AlertRepository
 
 
-_ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT = "archery-mcp-remote-response/v1"
+_ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT = "archery-mcp-remote-response/v2"
 
 
 class RepositoryArcheryRemoteResponseStore:
-    """Persist every complete MCP response before Archery result processing."""
+    """Persist complete MCP responses after the Archery investigation ends."""
 
     def __init__(
         self,
@@ -169,8 +173,11 @@ class RepositoryArcheryRemoteResponseStore:
         self.fencing_token = fencing_token
 
     @staticmethod
-    def artifact_id(invocation_id: UUID) -> UUID:
-        return uuid5(invocation_id, _ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT)
+    def artifact_id(
+        invocation_id: UUID,
+        contract: str = _ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
+    ) -> UUID:
+        return uuid5(invocation_id, contract)
 
     async def save(
         self,
@@ -182,7 +189,7 @@ class RepositoryArcheryRemoteResponseStore:
         response: Any,
     ) -> None:
         raw = (
-            response.model_dump(mode="json", by_alias=True)
+            response.model_dump(mode="json", by_alias=True, exclude_none=False)
             if hasattr(response, "model_dump")
             else response
         )
@@ -190,10 +197,21 @@ class RepositoryArcheryRemoteResponseStore:
             "contract": _ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT,
             "provider": ARCHERY_HARNESS_PROVIDER,
             "run_id": str(run_id),
+            "invocation_id": str(invocation_id),
+            "outer_dispatch_id": (
+                str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
+            ),
             "tool_name": tool_name,
             "arguments": sanitize(arguments),
-            "response": sanitize(raw),
+            "response": raw,
         }
+        content_bytes = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
         artifact_id = self.artifact_id(invocation_id)
         artifact = ArtifactRef(
             artifact_id=artifact_id,
@@ -211,14 +229,15 @@ class RepositoryArcheryRemoteResponseStore:
                     if self.outer_dispatch_id is not None
                     else None
                 ),
-                "sanitized": True,
+                "sanitized": False,
+                "raw_response_unmodified": True,
                 "internal_only": True,
             },
         )
         await self.repository.save_agent_artifact(
             str(run_id),
             artifact,
-            content,
+            content_bytes,
             invocation_id=str(invocation_id),
             lease_owner=self.lease_owner,
             fencing_token=self.fencing_token,
@@ -236,7 +255,8 @@ class RepositoryArcheryRemoteResponseStore:
         stored = await self.repository.get_agent_artifact(str(artifact_id))
         if stored is None:
             return None
-        artifact, content = stored
+        artifact, stored_content = stored
+        content = self._decode_artifact_content(stored_content, artifact_id)
         expected_outer_dispatch_id = (
             str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
         )
@@ -252,16 +272,19 @@ class RepositoryArcheryRemoteResponseStore:
             or metadata.get("tool_name") != tool_name
             or metadata.get("invocation_id") != str(invocation_id)
             or metadata.get("outer_dispatch_id") != expected_outer_dispatch_id
+            or metadata.get("sanitized") is not False
+            or metadata.get("raw_response_unmodified") is not True
             or metadata.get("internal_only") is not True
         ):
             raise RuntimeError(
                 f"Archery remote-response artifact metadata is invalid: {artifact_id}"
             )
         if (
-            not isinstance(content, dict)
-            or content.get("contract") != _ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            content.get("contract") != _ARCHERY_REMOTE_RESPONSE_ARTIFACT_CONTRACT
             or content.get("provider") != ARCHERY_HARNESS_PROVIDER
             or content.get("run_id") != str(run_id)
+            or content.get("invocation_id") != str(invocation_id)
+            or content.get("outer_dispatch_id") != expected_outer_dispatch_id
             or content.get("tool_name") != tool_name
             or content.get("arguments") != sanitize(arguments)
             or "response" not in content
@@ -270,6 +293,31 @@ class RepositoryArcheryRemoteResponseStore:
                 f"Archery remote-response artifact content is invalid: {artifact_id}"
             )
         return deepcopy(content["response"])
+
+    @staticmethod
+    def _decode_artifact_content(
+        content: bytes | str | dict[str, Any],
+        artifact_id: UUID,
+    ) -> dict[str, Any]:
+        if isinstance(content, bytes):
+            try:
+                content = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Archery remote-response artifact content is invalid: {artifact_id}"
+                ) from exc
+        elif isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Archery remote-response artifact content is invalid: {artifact_id}"
+                ) from exc
+        if not isinstance(content, dict):
+            raise RuntimeError(
+                f"Archery remote-response artifact content is invalid: {artifact_id}"
+            )
+        return content
 
 
 class ArcheryHarnessPlanner:
@@ -699,10 +747,10 @@ class ArcheryHarnessScenario:
         )
         result_sql = executed_sql or requested_sql
         if not result_sql:
-            return self._successful_transition(
+            return self._internal_only_transition(
                 state,
                 call,
-                self.client.auxiliary_model_projection(call.tool_name, normalized_payload),
+                raw_result=result,
             )
         if self._trace(state, call) is None:
             state.query_trace.append(
@@ -732,10 +780,10 @@ class ArcheryHarnessScenario:
                     alert_endpoint=state.alert_endpoint,
                     table_columns=state.table_columns,
                 )
-            return self._successful_transition(
+            return self._internal_only_transition(
                 state,
                 call,
-                self.client.auxiliary_model_projection(call.tool_name, normalized_payload),
+                raw_result=result,
             )
 
         target = self.client.target_key(call.effective_arguments)
@@ -766,17 +814,10 @@ class ArcheryHarnessScenario:
             observation=self.client.trace_projection(
                 call.tool_name,
                 normalized_payload,
-                final_history=True,
             ),
             message=self._tool_result_messages(
                 call,
-                self.client.model_tool_result(
-                    self.client.trace_projection(
-                        call.tool_name,
-                        normalized_payload,
-                        final_history=True,
-                    )
-                ),
+                self._raw_model_tool_result(result),
             ),
             status=(
                 ToolInvocationStatus.NO_DATA
@@ -814,7 +855,10 @@ class ArcheryHarnessScenario:
             state.last_query_error = error.message
 
         original = self._last_failure
-        if isinstance(original, ArcheryMCPToolError):
+        raw_result = call.metadata.get("mcp_raw_response")
+        if raw_result is not None:
+            canonical = self._raw_model_tool_result(raw_result)
+        elif isinstance(original, ArcheryMCPToolError):
             canonical = self.client.model_tool_error_result(original)
         else:
             canonical = (
@@ -825,11 +869,6 @@ class ArcheryHarnessScenario:
             )
         return ScenarioTransition(
             state=state,
-            observation={
-                "error_code": error.code,
-                "evidence_disposition": "MISSING",
-                "is_contradiction": False,
-            },
             message=self._tool_result_messages(call, canonical),
         )
 
@@ -881,41 +920,83 @@ class ArcheryHarnessScenario:
             )
         return None
 
-    def _successful_transition(
+    def _internal_only_transition(
         self,
         state: ArcheryHarnessState,
         call: PreparedCall,
-        projection: Mapping[str, Any],
+        *,
+        raw_result: Any,
     ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        """Return raw feedback to the internal model without creating a UI observation."""
+
         return ScenarioTransition(
             state=state,
-            observation=dict(projection),
             message=self._tool_result_messages(
                 call,
-                self.client.model_tool_result(projection),
+                self._raw_model_tool_result(raw_result),
             ),
+        )
+
+    @staticmethod
+    def _raw_model_tool_result(result: Any) -> str:
+        """Serialize the complete remote envelope for the provider-internal model."""
+
+        raw = (
+            result.model_dump(mode="json", by_alias=True, exclude_none=False)
+            if hasattr(result, "model_dump")
+            else result
+        )
+        return json.dumps(
+            raw,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
         )
 
     @staticmethod
     def _tool_result_messages(
         call: PreparedCall,
         content: str,
-    ) -> list[dict[str, Any]] | dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         provider_output_items = call.metadata.get("provider_output_items")
-        if not isinstance(provider_output_items, list) or not provider_output_items:
-            return {"role": "user", "content": content}
-        return [
-            *(
+        call_id = str(call.metadata.get("call_id") or "harness-call")
+        model_call = MCPModelToolCall(
+            call_id=call_id,
+            name=call.tool_name,
+            arguments=deepcopy(call.effective_arguments),
+            provider_output_items=tuple(
                 deepcopy(item)
                 for item in provider_output_items
                 if isinstance(item, dict)
-            ),
-            {
-                "type": "function_call_output",
-                "call_id": str(call.metadata.get("call_id") or ""),
-                "output": content,
-            },
-        ]
+            )
+            if isinstance(provider_output_items, list)
+            else (),
+        )
+        return mcp_tool_result_messages(
+            model_call,
+            output=content,
+            fallback_messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.tool_name,
+                                "arguments": json.dumps(
+                                    call.effective_arguments,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": content},
+            ],
+        )
 
     def _record_remote_call(
         self,

@@ -564,8 +564,11 @@ async def test_archery_mcp_returns_login_failure_as_observation_for_agent_decisi
     assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
     assert result.query_completed is False
     assert len(model.calls) == 2
-    assert "登录已过期" in str(model.calls[1]["messages"])
-    assert "observation" in str(model.calls[1]["messages"])
+    raw_feedback = model.calls[1]["messages"][-1]["content"]
+    assert isinstance(raw_feedback, str)
+    decoded_feedback = json.loads(raw_feedback)
+    assert decoded_feedback["isError"] is True
+    assert decoded_feedback["content"][0]["text"] == "登录已过期，请重新登录后再试"
 
 
 
@@ -1335,36 +1338,6 @@ def test_archery_tabular_row_shapes_use_consistent_precedence(
 ) -> None:
     assert ArcheryMCPClient._tabular_rows(payload) == expected_rows
     assert ArcheryMCPClient.payload_row_count(payload) == expected_count
-
-
-def test_archery_auxiliary_projection_is_bounded_and_key_sanitized() -> None:
-    opaque_credential = "v-7Qx9P3mN-opaque"
-    rows = [
-        {
-            "id": index,
-            "access_token": opaque_credential,
-            "description": "x" * 600,
-            **{f"field_{field}": field for field in range(25)},
-        }
-        for index in range(25)
-    ]
-
-    projection = ArcheryMCPClient.auxiliary_model_projection(
-        ARCHERY_MCP_INSTANCES_TOOL_NAME,
-        {"status": "ok", "results": rows},
-    )
-
-    assert projection["row_count"] == 25
-    assert projection["projected_row_count"] == 20
-    assert projection["rows_truncated"] is True
-    assert projection["omitted_field_count"] == 160
-    assert projection["truncated_scalar_count"] == 20
-    assert len(projection["rows"]) == 20
-    assert all(len(row) == 20 for row in projection["rows"])
-    assert [row["id"] for row in projection["rows"]] == list(range(20))
-    assert all(row["access_token"] == "***REDACTED***" for row in projection["rows"])
-    assert all(len(row["description"]) == 500 for row in projection["rows"])
-    assert opaque_credential not in json.dumps(projection, ensure_ascii=False)
 
 
 @pytest.mark.asyncio

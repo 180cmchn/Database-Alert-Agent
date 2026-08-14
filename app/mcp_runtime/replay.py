@@ -151,7 +151,7 @@ class ScriptedPlannerExhaustedError(RuntimeError):
 
 
 class ScriptedPlanner:
-    """Returns one sanitized response per planner request and records its inputs."""
+    """Returns one scripted response per planner request and records its inputs."""
 
     def __init__(self, responses: list[AgentAction | dict[str, Any] | Exception | None]) -> None:
         self._responses = list(responses)

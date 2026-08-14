@@ -11,6 +11,7 @@ from collections import Counter
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, timedelta
 from typing import Any
 from uuid import UUID, uuid5
@@ -21,7 +22,7 @@ from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
-from app.agent_runtime.contracts import ArtifactRef
+from app.agent_runtime.contracts import ArtifactRef, RunCheckpoint
 from app.agent_runtime.events import AgentEventKind, EventSink, InMemoryEventSink
 from app.agent_runtime.persistence import RepositoryEventSink
 from app.agent_runtime.trace import AgentTraceEmitter, AgentTraceScope
@@ -34,11 +35,16 @@ from app.domain.models import (
     ToolStatus,
 )
 from app.domain.ports import AlertRepository
-from app.domain.tool_calling import MCPToolCallingModel, mcp_tool_result_messages
+from app.domain.tool_calling import (
+    MCPModelToolCall,
+    MCPToolCallingModel,
+    mcp_tool_result_messages,
+)
 from app.mcp_catalog import MCPServerDescriptor, ResolvedMCPConnection
 
 _FINISH_TOOL_PREFIX = "finish_investigation"
-_REMOTE_RESPONSE_ARTIFACT_CONTRACT = "declarative-mcp-remote-response/v1"
+_REMOTE_RESPONSE_ARTIFACT_CONTRACT = "declarative-mcp-remote-response/v2"
+_CHECKPOINT_CONTRACT = "declarative-mcp-investigation-checkpoint/v1"
 _MAX_MODEL_NUMERIC_GROUPS = 20
 _MAX_MODEL_SCALAR_GROUPS = 40
 _MAX_MODEL_SAMPLES_PER_GROUP = 3
@@ -87,8 +93,41 @@ _INFRASTRUCTURE_PROJECTION_KEY_FORMS = {
 _INTERNAL_ARTIFACT_URI_PREFIX = "agent-artifact://"
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredRemoteResponse:
+    """One complete response retained in memory until the MCP session closes."""
+
+    tool_name: str
+    arguments: dict[str, Any]
+    envelope: dict[str, Any]
+    model_call: MCPModelToolCall
+    response_index: int
+    decision_round: int
+
+
+@dataclass(slots=True)
+class _GenericMCPExecutionState:
+    """Durable state required to continue one declarative MCP investigation."""
+
+    messages: list[dict[str, Any]]
+    observations: list[dict[str, Any]]
+    remote_responses: list[_DeferredRemoteResponse]
+    decision_round: int = 0
+    pending_response_index: int | None = None
+    finished_by_model: bool = False
+    completed: bool = False
+
+
+@dataclass(slots=True)
+class _CheckpointCursor:
+    namespace: str
+    manifest_hash: str
+    invocation_id: UUID
+    version: int = 0
+
+
 def _sanitize_complete(value: Any, key: str | None = None) -> Any:
-    """Sanitize MCP data without applying costly regexes to ordinary large logs."""
+    """Build a safe projection copy without touching the raw model envelope."""
 
     if value is None:
         return None
@@ -382,7 +421,7 @@ class GenericMCPEvidenceTool:
         window_start = window_end - timedelta(minutes=5)
         trace = self._trace_emitter(context)
         trace_scope = str(context.outer_dispatch_id or context.run_id)
-        messages: list[dict[str, Any]] = [
+        initial_messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": self.descriptor.prompts.execution_instructions,
@@ -410,174 +449,322 @@ class GenericMCPEvidenceTool:
                 ),
             },
         ]
+        state, checkpoint = await self._restore_execution_state(
+            request=request,
+            context=context,
+            initial_messages=initial_messages,
+        )
+        if state.completed:
+            await self._persist_remote_response_artifacts(
+                request=request,
+                context=context,
+                responses=state.remote_responses,
+            )
+            return self._execution_result(state)
 
-        async with AsyncExitStack() as stack:
-            session = await self._open_session(stack)
-            remote_tools = await self._list_tools(session)
-            tools = [self._tool_definition(item) for item in remote_tools]
-            if not tools:
-                return ToolExecutionResult(
-                    status=ToolStatus.NO_DATA,
-                    summary=f"MCP {self.descriptor.name} 未声明可调用工具。",
-                    structured_data={"reason_code": "no_discovered_tools"},
+        no_tools_result: ToolExecutionResult | None = None
+        try:
+            if state.pending_response_index is not None:
+                await self._apply_remote_response(
+                    state,
+                    state.remote_responses[state.pending_response_index],
+                    trace=trace,
+                    trace_scope=trace_scope,
                 )
-            remote_tool_names = {
-                item["function"]["name"]
-                for item in tools
-                if isinstance(item.get("function"), dict)
-                and isinstance(item["function"].get("name"), str)
-            }
-            finish_tool_name = self._local_finish_tool_name(remote_tool_names)
-            finish_tool = {
-                "type": "function",
-                "function": {
-                    "name": finish_tool_name,
-                    "description": "Finish this MCP investigation without another remote call.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"reason": {"type": "string"}},
-                        "required": ["reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-            observations: list[dict[str, Any]] = []
-            finished_by_model = False
-            decision_round = 0
-            while True:
-                decision_round += 1
-                trace_prefix = (
-                    f"declarative-mcp:{self.descriptor.name}:{trace_scope}:{decision_round}"
+                state.pending_response_index = None
+                await self._save_execution_checkpoint(
+                    state,
+                    context=context,
+                    cursor=checkpoint,
                 )
-                request_attempt = await self._next_reasoning_request_attempt(
-                    trace,
-                    context.run_id,
-                    prefix=f"{trace_prefix}:reasoning:request:",
-                )
-                stream_id = f"{trace_prefix}:reasoning:request:{request_attempt}"
-                reasoning_callback_invoked = False
 
-                async def emit_reasoning_delta(
-                    content: str,
-                    delta_index: int,
-                    durable_stream_id: str = stream_id,
-                ) -> None:
-                    nonlocal reasoning_callback_invoked
-                    emitted = await trace.emit_reasoning_delta(
-                        content,
-                        stream_id=durable_stream_id,
-                        delta_index=delta_index,
-                        trace_key=f"{durable_stream_id}:delta:{delta_index}",
-                    )
-                    reasoning_callback_invoked = reasoning_callback_invoked or emitted is not None
-
-                model_kwargs = {
-                    "messages": deepcopy(messages),
-                    "tools": [*tools, finish_tool],
-                }
-                if _accepts_keyword_argument(
-                    self.model.request_mcp_tool_call,
-                    "reasoning_callback",
-                ):
-                    call = await self.model.request_mcp_tool_call(
-                        **model_kwargs,
-                        reasoning_callback=emit_reasoning_delta,
+            async with AsyncExitStack() as stack:
+                session = await self._open_session(stack)
+                remote_tools = await self._list_tools(session)
+                tools = [self._tool_definition(item) for item in remote_tools]
+                if not tools:
+                    no_tools_result = ToolExecutionResult(
+                        status=ToolStatus.NO_DATA,
+                        summary=f"MCP {self.descriptor.name} 未声明可调用工具。",
+                        structured_data={"reason_code": "no_discovered_tools"},
                     )
                 else:
-                    call = await self.model.request_mcp_tool_call(**model_kwargs)
-                if not reasoning_callback_invoked:
-                    await trace.emit_reasoning(
-                        call.reasoning_content,
-                        trace_key=f"{stream_id}:complete",
-                    )
-                await trace.emit_action(
-                    json.dumps(
-                        {
-                            "action": "finish" if call.name == finish_tool_name else "call_tool",
-                            "tool_name": call.name,
-                            "arguments": sanitize(call.arguments),
+                    remote_tool_names = {
+                        item["function"]["name"]
+                        for item in tools
+                        if isinstance(item.get("function"), dict)
+                        and isinstance(item["function"].get("name"), str)
+                    }
+                    finish_tool_name = self._local_finish_tool_name(remote_tool_names)
+                    finish_tool = {
+                        "type": "function",
+                        "function": {
+                            "name": finish_tool_name,
+                            "description": (
+                                "Finish this MCP investigation without another remote call."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"reason": {"type": "string"}},
+                                "required": ["reason"],
+                                "additionalProperties": False,
+                            },
                         },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        default=str,
-                    ),
-                    trace_key=f"{trace_prefix}:action",
-                )
-                if call.name == finish_tool_name:
-                    finished_by_model = True
-                    break
-                async with asyncio.timeout(self.timeout_seconds):
-                    raw_result = await session.call_tool(call.name, call.arguments)
-                raw_payload = raw_result.model_dump(mode="json", by_alias=True, exclude_none=False)
-                if not isinstance(raw_payload, dict):
-                    raise GenericMCPConfigurationError("MCP returned a non-object tool result")
-                result = _sanitize_complete(raw_payload)
-                assert isinstance(result, dict)
-                observation_index = len(observations)
-                await self._persist_remote_response_artifact(
+                    }
+
+                while no_tools_result is None:
+                    state.decision_round += 1
+                    trace_prefix = (
+                        f"declarative-mcp:{self.descriptor.name}:"
+                        f"{trace_scope}:{state.decision_round}"
+                    )
+                    request_attempt = await self._next_reasoning_request_attempt(
+                        trace,
+                        context.run_id,
+                        prefix=f"{trace_prefix}:reasoning:request:",
+                    )
+                    stream_id = f"{trace_prefix}:reasoning:request:{request_attempt}"
+                    reasoning_callback_invoked = False
+
+                    async def emit_reasoning_delta(
+                        content: str,
+                        delta_index: int,
+                        durable_stream_id: str = stream_id,
+                    ) -> None:
+                        nonlocal reasoning_callback_invoked
+                        emitted = await trace.emit_reasoning_delta(
+                            content,
+                            stream_id=durable_stream_id,
+                            delta_index=delta_index,
+                            trace_key=f"{durable_stream_id}:delta:{delta_index}",
+                        )
+                        reasoning_callback_invoked = (
+                            reasoning_callback_invoked or emitted is not None
+                        )
+
+                    model_kwargs = {
+                        "messages": deepcopy(state.messages),
+                        "tools": [*tools, finish_tool],
+                    }
+                    if _accepts_keyword_argument(
+                        self.model.request_mcp_tool_call,
+                        "reasoning_callback",
+                    ):
+                        call = await self.model.request_mcp_tool_call(
+                            **model_kwargs,
+                            reasoning_callback=emit_reasoning_delta,
+                        )
+                    else:
+                        call = await self.model.request_mcp_tool_call(**model_kwargs)
+                    if not reasoning_callback_invoked:
+                        await trace.emit_reasoning(
+                            call.reasoning_content,
+                            trace_key=f"{stream_id}:complete",
+                        )
+                    await trace.emit_action(
+                        json.dumps(
+                            {
+                                "action": (
+                                    "finish" if call.name == finish_tool_name else "call_tool"
+                                ),
+                                "tool_name": call.name,
+                                "arguments": sanitize(call.arguments),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        trace_key=f"{trace_prefix}:action",
+                    )
+                    if call.name == finish_tool_name:
+                        state.finished_by_model = True
+                        state.completed = True
+                        await self._save_execution_checkpoint(
+                            state,
+                            context=context,
+                            cursor=checkpoint,
+                        )
+                        break
+
+                    async with asyncio.timeout(self.timeout_seconds):
+                        raw_result = await session.call_tool(call.name, call.arguments)
+                    raw_payload = raw_result.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=False,
+                    )
+                    if not isinstance(raw_payload, dict):
+                        raise GenericMCPConfigurationError(
+                            "MCP returned a non-object tool result"
+                        )
+                    response_index = len(state.remote_responses)
+                    response = _DeferredRemoteResponse(
+                        tool_name=call.name,
+                        arguments=deepcopy(call.arguments),
+                        envelope=deepcopy(raw_payload),
+                        model_call=deepcopy(call),
+                        response_index=response_index,
+                        decision_round=state.decision_round,
+                    )
+                    state.remote_responses.append(response)
+                    state.pending_response_index = response_index
+                    await self._save_execution_checkpoint(
+                        state,
+                        context=context,
+                        cursor=checkpoint,
+                    )
+                    await self._apply_remote_response(
+                        state,
+                        response,
+                        trace=trace,
+                        trace_scope=trace_scope,
+                    )
+                    state.pending_response_index = None
+                    await self._save_execution_checkpoint(
+                        state,
+                        context=context,
+                        cursor=checkpoint,
+                    )
+        except asyncio.CancelledError as exc:
+            try:
+                await self._persist_remote_response_artifacts(
                     request=request,
                     context=context,
-                    tool_name=call.name,
-                    arguments=call.arguments,
-                    result=result,
-                    response_index=observation_index,
-                    decision_round=decision_round,
+                    responses=state.remote_responses,
                 )
-                is_error = result.get("isError") is True or result.get("is_error") is True
-                projection = _project_result_for_model(
-                    result,
-                    source_path="/result",
-                    is_error=is_error,
+            except BaseException as persist_error:
+                exc.add_note(
+                    "Generic MCP raw-response artifact persistence also failed: "
+                    f"{type(persist_error).__name__}: {persist_error}"
                 )
-                has_data = projection["has_data"] is True
-                observation = {
-                    "tool_name": call.name,
-                    "arguments": sanitize(call.arguments),
-                    "response_ordinal": observation_index + 1,
-                    "decision_round": decision_round,
-                    "projection": projection,
-                    "is_error": is_error,
-                    "has_data": has_data,
-                }
-                observations.append(observation)
-                await trace.emit_observation(
-                    json.dumps(
-                        {
-                            "observation_type": "program_fact_projection",
-                            "tool_name": call.name,
-                            "projection": projection,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        default=str,
-                    ),
-                    actor=call.name,
-                    provider=self.source_system,
-                    trace_key=f"{trace_prefix}:observation",
+            raise
+        except Exception as exc:
+            try:
+                await self._persist_remote_response_artifacts(
+                    request=request,
+                    context=context,
+                    responses=state.remote_responses,
                 )
-                model_observation = json.dumps(
-                    {
-                        "observation_type": "program_fact_projection",
-                        "tool_name": call.name,
-                        "arguments": sanitize(call.arguments),
-                        "projection": projection,
-                        "instruction": (
-                            "Use only these program-projected facts when choosing the "
-                            "next action. The complete response is retained only in the "
-                            "internal audit artifact."
-                        ),
-                    },
-                    ensure_ascii=False,
-                    default=str,
+            except BaseException as persist_error:
+                exc.add_note(
+                    "Generic MCP raw-response artifact persistence also failed: "
+                    f"{type(persist_error).__name__}: {persist_error}"
                 )
-                messages.extend(
-                    mcp_tool_result_messages(
-                        call,
-                        output=model_observation,
-                        fallback_messages=[{"role": "user", "content": model_observation}],
-                    )
-                )
+            raise
 
+        await self._persist_remote_response_artifacts(
+            request=request,
+            context=context,
+            responses=state.remote_responses,
+        )
+        if no_tools_result is not None:
+            return no_tools_result
+        return self._execution_result(state)
+
+    async def _apply_remote_response(
+        self,
+        state: _GenericMCPExecutionState,
+        response: _DeferredRemoteResponse,
+        *,
+        trace: AgentTraceEmitter,
+        trace_scope: str,
+    ) -> None:
+        """Project one staged response and append its unmodified model feedback."""
+
+        if response.response_index != len(state.observations):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint response order is inconsistent"
+            )
+        projected_result = _sanitize_complete(response.envelope)
+        assert isinstance(projected_result, dict)
+        is_error = (
+            projected_result.get("isError") is True
+            or projected_result.get("is_error") is True
+        )
+        projection = _project_result_for_model(
+            projected_result,
+            source_path="/result",
+            is_error=is_error,
+        )
+        observation = {
+            "tool_name": response.tool_name,
+            "arguments": sanitize(response.arguments),
+            "response_ordinal": response.response_index + 1,
+            "decision_round": response.decision_round,
+            "projection": projection,
+            "is_error": is_error,
+            "has_data": projection["has_data"] is True,
+        }
+        trace_prefix = (
+            f"declarative-mcp:{self.descriptor.name}:"
+            f"{trace_scope}:{response.decision_round}"
+        )
+        await trace.emit_observation(
+            json.dumps(
+                {
+                    "observation_type": "program_fact_projection",
+                    "tool_name": response.tool_name,
+                    "projection": projection,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            actor=response.tool_name,
+            provider=self.source_system,
+            trace_key=f"{trace_prefix}:observation",
+        )
+        model_observation = json.dumps(
+            response.envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        state.messages.extend(
+            mcp_tool_result_messages(
+                response.model_call,
+                output=model_observation,
+                fallback_messages=self._chat_tool_result_messages(
+                    response.model_call,
+                    model_observation,
+                ),
+            )
+        )
+        state.observations.append(observation)
+
+    @staticmethod
+    def _chat_tool_result_messages(
+        call: MCPModelToolCall,
+        output: str,
+    ) -> list[dict[str, Any]]:
+        """Build a valid Chat Completions tool-call/result message pair."""
+
+        return [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(
+                                call.arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call.call_id,
+                "content": output,
+            },
+        ]
+
+    def _execution_result(self, state: _GenericMCPExecutionState) -> ToolExecutionResult:
+        observations = state.observations
         if not observations:
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
@@ -589,6 +776,7 @@ class GenericMCPEvidenceTool:
         ]
         if not successful_observations:
             errors_only = all(item["is_error"] for item in observations)
+            reason_code = "remote_tool_errors" if errors_only else "empty_remote_results"
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
                 summary=(
@@ -600,14 +788,10 @@ class GenericMCPEvidenceTool:
                     "server": self.descriptor.name,
                     "observations": observations,
                     "successful_observation_count": 0,
-                    "finished_by_model": finished_by_model,
+                    "finished_by_model": state.finished_by_model,
                     "partial": False,
-                    "termination_reason": (
-                        "remote_tool_errors" if errors_only else "empty_remote_results"
-                    ),
-                    "reason_code": (
-                        "remote_tool_errors" if errors_only else "empty_remote_results"
-                    ),
+                    "termination_reason": reason_code,
+                    "reason_code": reason_code,
                     "root_cause_eligible": False,
                 },
             )
@@ -618,12 +802,477 @@ class GenericMCPEvidenceTool:
                 "server": self.descriptor.name,
                 "observations": observations,
                 "successful_observation_count": len(successful_observations),
-                "finished_by_model": finished_by_model,
+                "finished_by_model": state.finished_by_model,
                 "partial": False,
                 "termination_reason": "model_finished",
                 "root_cause_eligible": True,
             },
         )
+
+    async def _restore_execution_state(
+        self,
+        *,
+        request: ToolExecutionRequest,
+        context: InvestigationContext,
+        initial_messages: list[dict[str, Any]],
+    ) -> tuple[_GenericMCPExecutionState, _CheckpointCursor | None]:
+        initial = _GenericMCPExecutionState(
+            messages=deepcopy(initial_messages),
+            observations=[],
+            remote_responses=[],
+        )
+        if self.repository is None:
+            return initial, None
+        manifest = await self.repository.get_run_manifest(str(context.run_id))
+        if manifest is None:
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint requires a durable run manifest"
+            )
+        invocation_id = self._audit_invocation_id(request=request, context=context)
+        scope_id = context.outer_dispatch_id or invocation_id
+        cursor = _CheckpointCursor(
+            namespace=f"mcp:{self.source_system}:{scope_id}",
+            manifest_hash=manifest.digest(),
+            invocation_id=invocation_id,
+        )
+        checkpoint = await self.repository.load_checkpoint(
+            str(context.run_id),
+            namespace=cursor.namespace,
+        )
+        if checkpoint is None:
+            state = initial
+        else:
+            if checkpoint.manifest_hash != cursor.manifest_hash:
+                raise GenericMCPConfigurationError(
+                    "Generic MCP checkpoint manifest does not match the current run"
+                )
+            cursor.version = checkpoint.version
+            state = self._decode_execution_state(
+                checkpoint.state,
+                initial_messages=initial_messages,
+                invocation_id=invocation_id,
+            )
+        await self._restore_orphan_remote_response(
+            state,
+            context=context,
+            invocation_id=invocation_id,
+        )
+        return state, cursor
+
+    async def _restore_orphan_remote_response(
+        self,
+        state: _GenericMCPExecutionState,
+        *,
+        context: InvestigationContext,
+        invocation_id: UUID,
+    ) -> None:
+        """Recover a response artifact left by a failed pending checkpoint write."""
+
+        if (
+            self.repository is None
+            or state.completed
+            or state.pending_response_index is not None
+        ):
+            return
+        response_index = len(state.remote_responses)
+        artifact_id = self._remote_response_artifact_id(
+            invocation_id,
+            response_index=response_index,
+        )
+        stored = await self.repository.get_agent_artifact(str(artifact_id))
+        if stored is None:
+            return
+        artifact, content = stored
+        response = self._decode_remote_response_artifact(
+            artifact,
+            content,
+            expected_artifact_id=artifact_id,
+            expected_index=response_index,
+            expected_context=context,
+            expected_invocation_id=invocation_id,
+        )
+        if response.decision_round != state.decision_round + 1:
+            raise GenericMCPConfigurationError(
+                "Generic MCP orphan artifact decision round is inconsistent"
+            )
+        state.remote_responses.append(response)
+        state.pending_response_index = response_index
+        state.decision_round = response.decision_round
+
+    async def _save_execution_checkpoint(
+        self,
+        state: _GenericMCPExecutionState,
+        *,
+        context: InvestigationContext,
+        cursor: _CheckpointCursor | None,
+    ) -> None:
+        if self.repository is None or cursor is None:
+            return
+        next_version = cursor.version + 1
+        checkpoint = RunCheckpoint(
+            run_id=context.run_id,
+            namespace=cursor.namespace,
+            version=next_version,
+            sequence=next_version,
+            state=self._encode_execution_state(
+                state,
+                invocation_id=cursor.invocation_id,
+            ),
+            budget_snapshot={},
+            manifest_hash=cursor.manifest_hash,
+        )
+        await self.repository.save_checkpoint(
+            checkpoint,
+            expected_version=cursor.version,
+            lease_owner=context.lease_owner,
+            fencing_token=context.fencing_token,
+        )
+        cursor.version = next_version
+
+    def _encode_execution_state(
+        self,
+        state: _GenericMCPExecutionState,
+        *,
+        invocation_id: UUID,
+    ) -> dict[str, Any]:
+        return {
+            "contract": _CHECKPOINT_CONTRACT,
+            "server": self.descriptor.name,
+            "source_system": self.source_system,
+            "invocation_id": str(invocation_id),
+            "messages": deepcopy(state.messages),
+            "observations": deepcopy(state.observations),
+            "remote_responses": [
+                self._encode_remote_response(response)
+                for response in state.remote_responses
+            ],
+            "decision_round": state.decision_round,
+            "pending_response_index": state.pending_response_index,
+            "finished_by_model": state.finished_by_model,
+            "completed": state.completed,
+        }
+
+    def _decode_execution_state(
+        self,
+        payload: dict[str, Any],
+        *,
+        initial_messages: list[dict[str, Any]],
+        invocation_id: UUID,
+    ) -> _GenericMCPExecutionState:
+        if (
+            payload.get("contract") != _CHECKPOINT_CONTRACT
+            or payload.get("server") != self.descriptor.name
+            or payload.get("source_system") != self.source_system
+            or payload.get("invocation_id") != str(invocation_id)
+        ):
+            raise GenericMCPConfigurationError("Generic MCP checkpoint identity is invalid")
+        messages = payload.get("messages")
+        observations = payload.get("observations")
+        raw_responses = payload.get("remote_responses")
+        decision_round = payload.get("decision_round")
+        pending_response_index = payload.get("pending_response_index")
+        finished_by_model = payload.get("finished_by_model")
+        completed = payload.get("completed")
+        if (
+            not isinstance(messages, list)
+            or not all(isinstance(item, dict) for item in messages)
+            or messages[: len(initial_messages)] != initial_messages
+            or not isinstance(observations, list)
+            or not all(isinstance(item, dict) for item in observations)
+            or not isinstance(raw_responses, list)
+            or not isinstance(decision_round, int)
+            or isinstance(decision_round, bool)
+            or decision_round < 0
+            or not isinstance(finished_by_model, bool)
+            or not isinstance(completed, bool)
+        ):
+            raise GenericMCPConfigurationError("Generic MCP checkpoint state is invalid")
+        responses = [
+            self._decode_remote_response(item, expected_index=index)
+            for index, item in enumerate(raw_responses)
+        ]
+        if pending_response_index is not None and (
+            not isinstance(pending_response_index, int)
+            or isinstance(pending_response_index, bool)
+            or pending_response_index != len(observations)
+            or pending_response_index != len(responses) - 1
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint pending response is invalid"
+            )
+        if pending_response_index is None and len(responses) != len(observations):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint response count is invalid"
+            )
+        if pending_response_index is not None and len(responses) != len(observations) + 1:
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint pending response count is invalid"
+            )
+        if completed != finished_by_model or (completed and pending_response_index is not None):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint completion state is invalid"
+            )
+        expected_decision_round = len(responses) + (1 if completed else 0)
+        if decision_round != expected_decision_round:
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint decision round is invalid"
+            )
+        return _GenericMCPExecutionState(
+            messages=deepcopy(messages),
+            observations=deepcopy(observations),
+            remote_responses=responses,
+            decision_round=decision_round,
+            pending_response_index=pending_response_index,
+            finished_by_model=finished_by_model,
+            completed=completed,
+        )
+
+    @staticmethod
+    def _encode_model_call(call: MCPModelToolCall) -> dict[str, Any]:
+        return {
+            "protocol": "responses" if call.provider_output_items else "chat",
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": deepcopy(call.arguments),
+            "request_id": call.request_id,
+            "reasoning_content": call.reasoning_content,
+            "usage": deepcopy(call.usage),
+            "provider_output_items": [
+                deepcopy(item) for item in call.provider_output_items
+            ],
+        }
+
+    def _encode_remote_response(
+        self,
+        response: _DeferredRemoteResponse,
+    ) -> dict[str, Any]:
+        return {
+            "tool_name": response.tool_name,
+            "arguments": deepcopy(response.arguments),
+            "envelope": deepcopy(response.envelope),
+            "model_call": self._encode_model_call(response.model_call),
+            "response_index": response.response_index,
+            "decision_round": response.decision_round,
+        }
+
+    @classmethod
+    def _decode_remote_response(
+        cls,
+        payload: Any,
+        *,
+        expected_index: int,
+    ) -> _DeferredRemoteResponse:
+        if not isinstance(payload, dict):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint remote response is invalid"
+            )
+        tool_name = payload.get("tool_name")
+        arguments = payload.get("arguments")
+        envelope = payload.get("envelope")
+        model_call_payload = payload.get("model_call")
+        response_index = payload.get("response_index")
+        decision_round = payload.get("decision_round")
+        if (
+            not isinstance(tool_name, str)
+            or not tool_name
+            or not isinstance(arguments, dict)
+            or not isinstance(envelope, dict)
+            or not isinstance(model_call_payload, dict)
+            or type(response_index) is not int
+            or response_index != expected_index
+            or type(decision_round) is not int
+            or decision_round != expected_index + 1
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint remote response is invalid"
+            )
+        model_call = cls._decode_model_call(
+            model_call_payload,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        return _DeferredRemoteResponse(
+            tool_name=tool_name,
+            arguments=deepcopy(arguments),
+            envelope=deepcopy(envelope),
+            model_call=model_call,
+            response_index=response_index,
+            decision_round=decision_round,
+        )
+
+    @staticmethod
+    def _decode_model_call(
+        payload: dict[str, Any],
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> MCPModelToolCall:
+        call_id = payload.get("call_id")
+        call_name = payload.get("name")
+        call_arguments = payload.get("arguments")
+        request_id = payload.get("request_id")
+        reasoning_content = payload.get("reasoning_content")
+        usage = payload.get("usage")
+        output_items = payload.get("provider_output_items")
+        protocol = payload.get("protocol")
+        if (
+            protocol not in ("chat", "responses")
+            or (protocol == "chat" and output_items != [])
+            or not isinstance(call_id, str)
+            or not call_id
+            or call_name != tool_name
+            or not isinstance(call_arguments, dict)
+            or _canonical_json(call_arguments) != _canonical_json(arguments)
+            or (request_id is not None and not isinstance(request_id, str))
+            or (reasoning_content is not None and not isinstance(reasoning_content, str))
+            or (usage is not None and not isinstance(usage, dict))
+            or not isinstance(output_items, list)
+            or not all(isinstance(item, dict) for item in output_items)
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP checkpoint model call is invalid"
+            )
+        if protocol == "responses":
+            if (
+                not output_items
+                or output_items[-1].get("type") != "function_call"
+                or any(item.get("type") != "reasoning" for item in output_items[:-1])
+            ):
+                raise GenericMCPConfigurationError(
+                    "Generic MCP Responses model call lineage is invalid"
+                )
+            function_call = output_items[-1]
+            function_arguments = function_call.get("arguments")
+            if (
+                function_call.get("call_id") != call_id
+                or function_call.get("name") != call_name
+                or not isinstance(function_arguments, str)
+            ):
+                raise GenericMCPConfigurationError(
+                    "Generic MCP Responses function call is inconsistent"
+                )
+            try:
+                decoded_function_arguments = json.loads(function_arguments)
+            except json.JSONDecodeError as exc:
+                raise GenericMCPConfigurationError(
+                    "Generic MCP Responses function arguments are invalid"
+                ) from exc
+            if (
+                not isinstance(decoded_function_arguments, dict)
+                or _canonical_json(decoded_function_arguments)
+                != _canonical_json(call_arguments)
+            ):
+                raise GenericMCPConfigurationError(
+                    "Generic MCP Responses function arguments are inconsistent"
+                )
+        return MCPModelToolCall(
+            call_id=call_id,
+            name=call_name,
+            arguments=deepcopy(call_arguments),
+            request_id=request_id,
+            reasoning_content=reasoning_content,
+            usage=deepcopy(usage),
+            provider_output_items=tuple(deepcopy(output_items)),
+        )
+
+    def _decode_remote_response_artifact(
+        self,
+        artifact: ArtifactRef,
+        content: bytes | str | dict[str, Any],
+        *,
+        expected_artifact_id: UUID,
+        expected_index: int,
+        expected_context: InvestigationContext,
+        expected_invocation_id: UUID,
+    ) -> _DeferredRemoteResponse:
+        metadata = artifact.metadata
+        expected_run_id = str(expected_context.run_id)
+        expected_outer_dispatch_id = (
+            str(expected_context.outer_dispatch_id)
+            if expected_context.outer_dispatch_id is not None
+            else None
+        )
+        if (
+            artifact.artifact_id != expected_artifact_id
+            or artifact.kind != "declarative_mcp_remote_response"
+            or artifact.media_type != "application/json"
+            or artifact.uri != f"agent-artifact://{expected_artifact_id}"
+            or metadata.get("contract") != _REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            or metadata.get("server") != self.descriptor.name
+            or metadata.get("source_system") != self.source_system
+            or metadata.get("run_id") != expected_run_id
+            or metadata.get("invocation_id") != str(expected_invocation_id)
+            or metadata.get("outer_dispatch_id") != expected_outer_dispatch_id
+            or type(metadata.get("response_ordinal")) is not int
+            or metadata.get("response_ordinal") != expected_index + 1
+            or type(metadata.get("decision_round")) is not int
+            or metadata.get("decision_round") != expected_index + 1
+            or metadata.get("sanitized") is not False
+            or metadata.get("raw_response_unmodified") is not True
+            or metadata.get("internal_only") is not True
+            or not isinstance(content, bytes)
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP orphan response artifact identity is invalid"
+            )
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GenericMCPConfigurationError(
+                "Generic MCP orphan response artifact content is invalid"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("contract") != _REMOTE_RESPONSE_ARTIFACT_CONTRACT
+            or payload.get("server") != self.descriptor.name
+            or payload.get("source_system") != self.source_system
+            or payload.get("run_id") != expected_run_id
+            or payload.get("invocation_id") != str(expected_invocation_id)
+            or payload.get("outer_dispatch_id") != expected_outer_dispatch_id
+            or type(payload.get("response_ordinal")) is not int
+            or payload.get("response_ordinal") != expected_index + 1
+            or type(payload.get("response_index")) is not int
+            or payload.get("response_index") != expected_index
+            or type(payload.get("decision_round")) is not int
+            or payload.get("decision_round") != expected_index + 1
+            or payload.get("tool_name") != metadata.get("tool_name")
+            or payload.get("decision_round") != metadata.get("decision_round")
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP orphan response artifact content is invalid"
+            )
+        return self._decode_remote_response(
+            {
+                "tool_name": payload.get("tool_name"),
+                "arguments": payload.get("arguments"),
+                "envelope": payload.get("result"),
+                "model_call": payload.get("model_call"),
+                "response_index": payload.get("response_index"),
+                "decision_round": payload.get("decision_round"),
+            },
+            expected_index=expected_index,
+        )
+
+    async def _persist_remote_response_artifacts(
+        self,
+        *,
+        request: ToolExecutionRequest,
+        context: InvestigationContext,
+        responses: list[_DeferredRemoteResponse],
+    ) -> None:
+        """Persist all completed responses after the MCP investigation terminates."""
+
+        for response in responses:
+            await self._persist_remote_response_artifact(
+                request=request,
+                context=context,
+                tool_name=response.tool_name,
+                arguments=response.arguments,
+                result=response.envelope,
+                model_call=response.model_call,
+                response_index=response.response_index,
+                decision_round=response.decision_round,
+            )
 
     async def _persist_remote_response_artifact(
         self,
@@ -633,18 +1282,25 @@ class GenericMCPEvidenceTool:
         tool_name: str,
         arguments: dict[str, Any],
         result: dict[str, Any],
+        model_call: MCPModelToolCall,
         response_index: int,
         decision_round: int,
     ) -> ArtifactRef | None:
-        """Durably retain one complete response before any later fallible work."""
+        """Idempotently persist one complete, unmodified response envelope."""
 
         if self.repository is None:
             return None
         invocation_id = self._audit_invocation_id(request=request, context=context)
-        artifact_id = uuid5(
+        if (
+            model_call.name != tool_name
+            or _canonical_json(model_call.arguments) != _canonical_json(arguments)
+        ):
+            raise GenericMCPConfigurationError(
+                "Generic MCP artifact model call is inconsistent"
+            )
+        artifact_id = self._remote_response_artifact_id(
             invocation_id,
-            f"{_REMOTE_RESPONSE_ARTIFACT_CONTRACT}:{self.descriptor.name}:"
-            f"response:{response_index + 1}",
+            response_index=response_index,
         )
         artifact = ArtifactRef(
             artifact_id=artifact_id,
@@ -655,10 +1311,18 @@ class GenericMCPEvidenceTool:
                 "contract": _REMOTE_RESPONSE_ARTIFACT_CONTRACT,
                 "server": self.descriptor.name,
                 "source_system": self.source_system,
+                "run_id": str(context.run_id),
+                "invocation_id": str(invocation_id),
+                "outer_dispatch_id": (
+                    str(context.outer_dispatch_id)
+                    if context.outer_dispatch_id is not None
+                    else None
+                ),
                 "tool_name": tool_name,
                 "response_ordinal": response_index + 1,
                 "decision_round": decision_round,
-                "sanitized": True,
+                "sanitized": False,
+                "raw_response_unmodified": True,
                 "internal_only": True,
             },
         )
@@ -666,19 +1330,46 @@ class GenericMCPEvidenceTool:
             "contract": _REMOTE_RESPONSE_ARTIFACT_CONTRACT,
             "server": self.descriptor.name,
             "source_system": self.source_system,
+            "run_id": str(context.run_id),
+            "invocation_id": str(invocation_id),
+            "outer_dispatch_id": (
+                str(context.outer_dispatch_id)
+                if context.outer_dispatch_id is not None
+                else None
+            ),
             "tool_name": tool_name,
-            "arguments": sanitize(arguments),
+            "arguments": deepcopy(arguments),
+            "model_call": self._encode_model_call(model_call),
             "response_ordinal": response_index + 1,
+            "response_index": response_index,
             "decision_round": decision_round,
             "result": result,
         }
+        content_bytes = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         return await self.repository.save_agent_artifact(
             str(context.run_id),
             artifact,
-            content,
+            content_bytes,
             invocation_id=(str(invocation_id) if context.outer_dispatch_id is not None else None),
             lease_owner=context.lease_owner,
             fencing_token=context.fencing_token,
+        )
+
+    def _remote_response_artifact_id(
+        self,
+        invocation_id: UUID,
+        *,
+        response_index: int,
+    ) -> UUID:
+        return uuid5(
+            invocation_id,
+            f"{_REMOTE_RESPONSE_ARTIFACT_CONTRACT}:{self.descriptor.name}:"
+            f"response:{response_index + 1}",
         )
 
     def _audit_invocation_id(

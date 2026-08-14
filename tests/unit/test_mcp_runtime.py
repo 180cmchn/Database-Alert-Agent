@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 
@@ -332,6 +332,20 @@ class _RecordingArtifactStore:
         self.artifacts.append(artifact)
 
 
+class _RecordingRemoteResponseStore:
+    def __init__(self) -> None:
+        self.responses: list[dict[str, Any]] = []
+
+    async def save(self, **record: Any) -> None:
+        self.responses.append(deepcopy(record))
+
+    async def load(self, **identity: Any) -> Any | None:
+        for record in self.responses:
+            if all(record.get(key) == value for key, value in identity.items()):
+                return deepcopy(record["response"])
+        return None
+
+
 class _InterruptBeforeArtifactStore(_RecordingArtifactStore):
     def __init__(self) -> None:
         super().__init__()
@@ -451,6 +465,21 @@ class _BlockingOpenConnector:
 class _BlockingPlanner:
     async def plan(self, **kwargs: Any) -> Any:
         del kwargs
+        await asyncio.Event().wait()
+
+
+class _CallThenBlockingPlanner:
+    def __init__(self, query: str) -> None:
+        self.query = query
+        self.requests = 0
+        self.blocked = asyncio.Event()
+
+    async def plan(self, **kwargs: Any) -> Any:
+        del kwargs
+        self.requests += 1
+        if self.requests == 1:
+            return _call(self.query)
+        self.blocked.set()
         await asyncio.Event().wait()
 
 
@@ -2311,3 +2340,642 @@ async def test_invocation_and_artifact_hooks_receive_lifecycle_transitions() -> 
         ToolInvocationStatus.SUCCEEDED,
     ]
     assert artifact_store.artifacts == [result.invocations[0].artifact_ref]
+
+
+async def _capture_staged_remote_response_snapshot() -> tuple[Any, InMemoryEventSink]:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    captured: list[Any] = []
+
+    async def interrupt_after_raw_checkpoint(snapshot: Any) -> None:
+        if snapshot.remote_responses:
+            captured.append(snapshot)
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=ReplayMCPConnector(
+                "fixture-mcp",
+                [
+                    _session(
+                        "staged-response",
+                        ReplayCallFixture(
+                            tool_name="fixture.query",
+                            expected_arguments={"query": "resume-staged-raw"},
+                            result={
+                                "_meta": {"api_key": "mcp-owned-secret"},
+                                "rows": [{"instance_id": 17}],
+                            },
+                        ),
+                    )
+                ],
+            ),
+            planner=ScriptedPlanner([_call("resume-staged-raw")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_after_raw_checkpoint,
+        ).run(run_id=run_id)
+
+    assert len(captured) == 1
+    assert len(captured[0].remote_responses) == 1
+    return captured[0], sink
+
+
+async def _capture_successful_remote_response_snapshot() -> tuple[Any, InMemoryEventSink]:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    captured: list[Any] = []
+
+    async def interrupt_after_success_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.SUCCEEDED
+            and snapshot.finish is None
+        ):
+            captured.append(snapshot)
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=ReplayMCPConnector(
+                "fixture-mcp",
+                [
+                    _session(
+                        "successful-response",
+                        ReplayCallFixture(
+                            tool_name="fixture.query",
+                            expected_arguments={"query": "successful-before-resume"},
+                            result={"rows": [{"instance_id": 17}]},
+                        ),
+                    )
+                ],
+            ),
+            planner=ScriptedPlanner([_call("successful-before-resume")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_after_success_checkpoint,
+        ).run(run_id=run_id)
+
+    assert len(captured) == 1
+    assert len(captured[0].remote_responses) == 1
+    return captured[0], sink
+
+
+@pytest.mark.asyncio
+async def test_remote_response_is_checkpointed_raw_and_persisted_only_after_finish() -> None:
+    response_store = _RecordingRemoteResponseStore()
+    staged_before_finish = False
+
+    async def checkpoint(snapshot: Any) -> None:
+        nonlocal staged_before_finish
+        if snapshot.remote_responses and snapshot.finish is None:
+            staged_before_finish = True
+            assert response_store.responses == []
+
+    raw_response = {
+        "_meta": {"api_key": "mcp-owned-secret"},
+        "content": [{"type": "text", "text": "x" * 50_000}],
+        "structuredContent": {"rows": [{"instance_id": 17}]},
+        "isError": False,
+    }
+    run_id = uuid4()
+    result = await MCPAgentHarnessRuntime(
+        connector=ReplayMCPConnector(
+            "fixture-mcp",
+            [
+                _session(
+                    "session-1",
+                    ReplayCallFixture(
+                        tool_name="fixture.query",
+                        expected_arguments={"query": "raw"},
+                        result=raw_response,
+                    ),
+                )
+            ],
+        ),
+        planner=ScriptedPlanner([_call("raw"), _finish()]),
+        scenario=_Scenario(),
+        event_sink=InMemoryEventSink(),
+        budget=_budget(),
+        checkpoint_hook=checkpoint,
+        remote_response_store=response_store,
+    ).run(run_id=run_id)
+
+    assert staged_before_finish is True
+    assert len(result.remote_responses) == 1
+    assert result.remote_responses[0].response == raw_response
+    assert response_store.responses == [
+        {
+            "run_id": run_id,
+            "invocation_id": result.invocations[0].invocation_id,
+            "tool_name": "fixture.query",
+            "arguments": {"query": "raw"},
+            "response": raw_response,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["cancel", "outer_timeout"])
+async def test_staged_remote_response_is_persisted_after_external_termination(
+    termination: str,
+) -> None:
+    session = _TrackingSession()
+    planner = _CallThenBlockingPlanner("raw-before-termination")
+
+    class CloseAwareResponseStore(_RecordingRemoteResponseStore):
+        async def save(self, **record: Any) -> None:
+            assert session.close_calls == 1
+            await super().save(**record)
+
+    response_store = CloseAwareResponseStore()
+    run_id = uuid4()
+    task = asyncio.create_task(
+        MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(session),
+            planner=planner,
+            scenario=_Scenario(),
+            event_sink=InMemoryEventSink(),
+            budget=_budget(),
+            remote_response_store=response_store,
+        ).run(run_id=run_id)
+    )
+    await asyncio.wait_for(planner.blocked.wait(), timeout=1)
+
+    if termination == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await task
+
+    assert session.close_calls == 1
+    assert len(response_store.responses) == 1
+    assert response_store.responses[0]["run_id"] == run_id
+    assert response_store.responses[0]["tool_name"] == "fixture.query"
+    assert response_store.responses[0]["arguments"] == {"query": "raw-before-termination"}
+    assert response_store.responses[0]["response"] == {"rows": [1]}
+
+
+@pytest.mark.asyncio
+async def test_staged_remote_response_is_persisted_before_infrastructure_error_propagates() -> (
+    None
+):
+    session = _TrackingSession()
+    response_store = _RecordingRemoteResponseStore()
+
+    async def fail_staged_checkpoint(snapshot: Any) -> None:
+        if snapshot.remote_responses:
+            raise RuntimeError("staged checkpoint failed")
+
+    runtime = MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("raw-before-error")]),
+        scenario=_Scenario(),
+        event_sink=InMemoryEventSink(),
+        budget=_budget(),
+        checkpoint_hook=fail_staged_checkpoint,
+        remote_response_store=response_store,
+    )
+
+    with pytest.raises(RuntimeError, match="staged checkpoint failed"):
+        await runtime.run(run_id=uuid4())
+
+    assert session.close_calls == 1
+    assert len(response_store.responses) == 1
+    assert response_store.responses[0]["response"] == {"rows": [1]}
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_failure_still_persists_response_after_session_close() -> None:
+    session = _TrackingSession()
+
+    class CloseAwareResponseStore(_RecordingRemoteResponseStore):
+        async def save(self, **record: Any) -> None:
+            assert session.close_calls == 1
+            await super().save(**record)
+
+    response_store = CloseAwareResponseStore()
+
+    async def fail_terminal_checkpoint(snapshot: Any) -> None:
+        if snapshot.finish is not None:
+            assert session.close_calls == 1
+            raise RuntimeError("terminal checkpoint failed")
+
+    runtime = MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("raw-before-terminal-checkpoint"), _finish()]),
+        scenario=_Scenario(),
+        event_sink=InMemoryEventSink(),
+        budget=_budget(),
+        checkpoint_hook=fail_terminal_checkpoint,
+        remote_response_store=response_store,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal checkpoint failed"):
+        await runtime.run(run_id=uuid4())
+
+    assert session.close_calls == 1
+    assert len(response_store.responses) == 1
+    assert response_store.responses[0]["response"] == {"rows": [1]}
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_error_remains_primary_when_response_persistence_fails() -> (
+    None
+):
+    session = _TrackingSession()
+
+    class FailingResponseStore(_RecordingRemoteResponseStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.save_calls = 0
+
+        async def save(self, **record: Any) -> None:
+            del record
+            self.save_calls += 1
+            assert session.close_calls == 1
+            raise RuntimeError("response artifact failed")
+
+    response_store = FailingResponseStore()
+
+    async def fail_terminal_checkpoint(snapshot: Any) -> None:
+        if snapshot.finish is not None:
+            raise RuntimeError("terminal checkpoint failed")
+
+    runtime = MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("raw-before-double-failure"), _finish()]),
+        scenario=_Scenario(),
+        event_sink=InMemoryEventSink(),
+        budget=_budget(),
+        checkpoint_hook=fail_terminal_checkpoint,
+        remote_response_store=response_store,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal checkpoint failed") as exc_info:
+        await runtime.run(run_id=uuid4())
+
+    assert session.close_calls == 1
+    assert response_store.save_calls == 1
+    assert any(
+        "MCP raw-response artifact persistence also failed" in note
+        and "HarnessInfrastructureError" in note
+        and "failed to persist remote MCP responses" in note
+        for note in (exc_info.value.__notes__ or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_remote_response_artifact_flush_is_idempotently_completed_on_resume() -> (
+    None
+):
+    class PartiallyFailingResponseStore:
+        def __init__(self) -> None:
+            self.records: dict[Any, dict[str, Any]] = {}
+            self.failed_once = False
+
+        async def save(self, **record: Any) -> None:
+            invocation_id = record["invocation_id"]
+            if (
+                len(self.records) == 1
+                and invocation_id not in self.records
+                and not self.failed_once
+            ):
+                self.failed_once = True
+                raise RuntimeError("second response artifact write failed")
+            existing = self.records.get(invocation_id)
+            if existing is not None and existing != record:
+                raise AssertionError("idempotent response artifact changed")
+            self.records[invocation_id] = deepcopy(record)
+
+        async def load(self, **identity: Any) -> Any | None:
+            record = self.records.get(identity["invocation_id"])
+            return deepcopy(record["response"]) if record is not None else None
+
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    checkpoints: list[Any] = []
+    response_store = PartiallyFailingResponseStore()
+    first_connector = ReplayMCPConnector(
+        "fixture-mcp",
+        [
+            _session(
+                "partial-flush",
+                ReplayCallFixture(
+                    tool_name="fixture.query",
+                    expected_arguments={"query": "first-raw"},
+                    result={"rows": [1]},
+                ),
+                ReplayCallFixture(
+                    tool_name="fixture.query",
+                    expected_arguments={"query": "second-raw"},
+                    result={"rows": [2]},
+                ),
+            )
+        ],
+    )
+
+    async def capture(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    with pytest.raises(RuntimeError, match="failed to persist remote MCP responses"):
+        await MCPAgentHarnessRuntime(
+            connector=first_connector,
+            planner=ScriptedPlanner(
+                [_call("first-raw"), _call("second-raw"), _finish()]
+            ),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=capture,
+            remote_response_store=response_store,
+        ).run(run_id=run_id)
+
+    terminal_snapshot = checkpoints[-1]
+    assert terminal_snapshot.finish is not None
+    assert len(terminal_snapshot.remote_responses) == 2
+    assert len(response_store.records) == 1
+
+    second_connector = ReplayMCPConnector("fixture-mcp", [])
+    resumed = await MCPAgentHarnessRuntime(
+        connector=second_connector,
+        planner=ScriptedPlanner([]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        checkpoint_hook=capture,
+        remote_response_store=response_store,
+    ).resume(
+        terminal_snapshot,
+        restored_budget=BudgetLedger.from_snapshot(terminal_snapshot.budget),
+    )
+
+    assert resumed.finish == terminal_snapshot.finish
+    assert second_connector.opened_session_ids == []
+    assert len(response_store.records) == 2
+    assert sorted(
+        record["response"]["rows"][0] for record in response_store.records.values()
+    ) == [1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "method_name"),
+    [
+        ("reconcile", "_reconcile_durable_invocations"),
+        ("trace", "_ensure_observation_trace_events"),
+        ("inflight", "_reconcile_inflight"),
+        ("checkpoint", "_checkpoint"),
+    ],
+)
+async def test_resume_pre_drive_failure_closes_session_then_flushes_staged_response(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    method_name: str,
+) -> None:
+    snapshot, sink = await _capture_staged_remote_response_snapshot()
+    session = _TrackingSession()
+
+    class CloseAwareResponseStore(_RecordingRemoteResponseStore):
+        async def save(self, **record: Any) -> None:
+            assert session.close_calls == 1
+            await super().save(**record)
+
+    response_store = CloseAwareResponseStore()
+    connector = ReplayMCPConnector("fixture-mcp", [])
+    runtime = MCPAgentHarnessRuntime(
+        connector=connector,
+        planner=ScriptedPlanner([]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    )
+
+    async def fail_pre_drive(ctx: Any, *args: Any) -> None:
+        del args
+        ctx.session = session
+        raise RuntimeError(f"{stage} failed")
+
+    monkeypatch.setattr(runtime, method_name, fail_pre_drive)
+
+    with pytest.raises(RuntimeError, match=f"{stage} failed"):
+        await runtime.resume(
+            snapshot,
+            restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+        )
+
+    assert session.close_calls == 1
+    assert connector.opened_session_ids == []
+    assert len(response_store.responses) == 1
+    assert response_store.responses[0]["response"] == snapshot.remote_responses[0].response
+
+
+@pytest.mark.asyncio
+async def test_resume_pre_drive_error_remains_primary_when_response_flush_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, sink = await _capture_staged_remote_response_snapshot()
+    session = _TrackingSession()
+
+    class FailingResponseStore(_RecordingRemoteResponseStore):
+        async def save(self, **record: Any) -> None:
+            del record
+            assert session.close_calls == 1
+            raise RuntimeError("resume artifact failed")
+
+    runtime = MCPAgentHarnessRuntime(
+        connector=ReplayMCPConnector("fixture-mcp", []),
+        planner=ScriptedPlanner([]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=FailingResponseStore(),
+    )
+
+    async def fail_reconcile(ctx: Any, *args: Any) -> None:
+        del args
+        ctx.session = session
+        raise RuntimeError("resume reconcile failed")
+
+    monkeypatch.setattr(runtime, "_reconcile_durable_invocations", fail_reconcile)
+
+    with pytest.raises(RuntimeError, match="resume reconcile failed") as exc_info:
+        await runtime.resume(
+            snapshot,
+            restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+        )
+
+    assert session.close_calls == 1
+    assert any(
+        "MCP raw-response artifact persistence also failed" in note
+        and "failed to persist remote MCP responses" in note
+        for note in (exc_info.value.__notes__ or [])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["cancel", "outer_timeout"])
+async def test_resume_pre_drive_external_termination_flushes_staged_response(
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+) -> None:
+    snapshot, sink = await _capture_staged_remote_response_snapshot()
+    session = _TrackingSession()
+    entered = asyncio.Event()
+
+    class CloseAwareResponseStore(_RecordingRemoteResponseStore):
+        async def save(self, **record: Any) -> None:
+            assert session.close_calls == 1
+            await super().save(**record)
+
+    response_store = CloseAwareResponseStore()
+    runtime = MCPAgentHarnessRuntime(
+        connector=ReplayMCPConnector("fixture-mcp", []),
+        planner=ScriptedPlanner([]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    )
+
+    async def block_trace_recovery(ctx: Any) -> None:
+        ctx.session = session
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runtime, "_ensure_observation_trace_events", block_trace_recovery)
+    task = asyncio.create_task(
+        runtime.resume(
+            snapshot,
+            restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    if termination == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await task
+
+    assert task.done()
+    assert session.close_calls == 1
+    assert len(response_store.responses) == 1
+    assert response_store.responses[0]["response"] == snapshot.remote_responses[0].response
+
+
+@pytest.mark.asyncio
+async def test_normal_resume_consumes_staged_response_without_repeating_remote_call() -> None:
+    snapshot, sink = await _capture_staged_remote_response_snapshot()
+    session = _TrackingSession()
+    connector = _SingleSessionConnector(session)
+    response_store = _RecordingRemoteResponseStore()
+
+    result = await MCPAgentHarnessRuntime(
+        connector=connector,
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert connector.open_calls == 1
+    assert session.call_calls == 0
+    assert result.state.successful_queries == ["resume-staged-raw"]
+    assert result.budget.consumed.remote_tool_calls == 1
+    assert len(response_store.responses) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_successful_legacy_checkpoint_without_raw_response() -> None:
+    snapshot, sink = await _capture_successful_remote_response_snapshot()
+    legacy_snapshot = replace(snapshot, remote_responses=())
+    event_version_before_resume = await sink.current_version(snapshot.run_id)
+    planner = ScriptedPlanner([_finish()])
+    connector = ReplayMCPConnector("fixture-mcp", [])
+
+    class LegacyResponseStore(_RecordingRemoteResponseStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.load_calls = 0
+
+        async def load(self, **identity: Any) -> Any | None:
+            del identity
+            self.load_calls += 1
+            return {"rows": "legacy-sanitized"}
+
+    response_store = LegacyResponseStore()
+
+    with pytest.raises(
+        RuntimeError,
+        match="successful MCP invocation is missing its checkpointed raw response",
+    ):
+        await MCPAgentHarnessRuntime(
+            connector=connector,
+            planner=planner,
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            remote_response_store=response_store,
+        ).resume(
+            legacy_snapshot,
+            restored_budget=BudgetLedger.from_snapshot(legacy_snapshot.budget),
+        )
+
+    assert connector.opened_session_ids == []
+    assert planner.requests == []
+    assert response_store.load_calls == 0
+    assert await sink.current_version(snapshot.run_id) == event_version_before_resume
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_recover_started_invocation_from_legacy_response_store() -> None:
+    snapshot, sink = await _capture_staged_remote_response_snapshot()
+    legacy_snapshot = replace(snapshot, remote_responses=())
+    session = _TrackingSession()
+    planner = ScriptedPlanner([_finish()])
+
+    class LegacyResponseStore(_RecordingRemoteResponseStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.load_calls = 0
+
+        async def load(self, **identity: Any) -> Any | None:
+            del identity
+            self.load_calls += 1
+            return {"rows": "legacy-sanitized"}
+
+    response_store = LegacyResponseStore()
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=planner,
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        legacy_snapshot,
+        restored_budget=BudgetLedger.from_snapshot(legacy_snapshot.budget),
+    )
+
+    assert response_store.load_calls == 0
+    assert result.invocations[0].status == ToolInvocationStatus.UNKNOWN_OUTCOME
+    assert result.state.successful_queries == []
+    assert session.call_calls == 0
+    assert "legacy-sanitized" not in json.dumps(
+        planner.requests[0].messages,
+        sort_keys=True,
+    )

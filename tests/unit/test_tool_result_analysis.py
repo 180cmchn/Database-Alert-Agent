@@ -237,6 +237,156 @@ async def test_prometheus_aggregates_numeric_series_without_host_sentinel_gates(
 
 
 @pytest.mark.asyncio
+async def test_prometheus_consumes_only_valid_bounded_range_projection() -> None:
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    window_start = window_end - timedelta(minutes=5)
+    auxiliary_secret = "must-not-enter-main-agent"
+    raw_result = {
+        "status": "SUCCESS",
+        "structured_data": {
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "required_target": {
+                "database_engine": "mysql",
+                "host": "mysql-17",
+                "port": 3306,
+            },
+            "monitoring_results": [
+                {
+                    "tool_name": "get_targets",
+                    "projection_kind": "auxiliary",
+                    "response": {
+                        "activeTargets": [auxiliary_secret],
+                        "api_key": auxiliary_secret,
+                    },
+                },
+                {
+                    "tool_name": "query_range",
+                    "projection_kind": "alert_window_range",
+                    "projection": {
+                        "projection_kind": "alert_window_range",
+                        "window": {
+                            "start": window_start.isoformat(),
+                            "end": window_end.isoformat(),
+                        },
+                        "target_match": {
+                            "matched": True,
+                            "authoritative_fields": [
+                                "database.host",
+                                "database.endpoint",
+                            ],
+                        },
+                        "timeseries": {
+                            "has_numeric_samples": True,
+                            "series_count": 1,
+                            "sample_count": 3,
+                            "series": [
+                                {
+                                    "metric": {"__name__": "mysql_threads_running"},
+                                    "sample_count": 3,
+                                    "min": 1,
+                                    "max": 5,
+                                    "avg": 3,
+                                    "latest": 5,
+                                    "delta": 4,
+                                }
+                            ],
+                            "omitted_series_count": 0,
+                        },
+                    },
+                },
+            ],
+        },
+    }
+
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result=raw_result,
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [*(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is True
+    assert "通过协议校验的时序 1 条" in projected
+    assert '"sample_count":3' in projected
+    assert '"latest":5' in projected
+    assert '"delta":4' in projected
+    assert auxiliary_secret not in projected
+    assert any(
+        item.source_paths
+        == [
+            "/structured_data/monitoring_results/1/projection/timeseries/series/0",
+            "/structured_data/monitoring_results/1/projection/window",
+            "/structured_data/monitoring_results/1/projection/target_match",
+        ]
+        for item in result.observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_range_projection_requires_alarm_host_match() -> None:
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    window_start = window_end - timedelta(minutes=5)
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result={
+            "status": "SUCCESS",
+            "structured_data": {
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "required_target": {"host": "mysql-17"},
+                "monitoring_results": [
+                    {
+                        "tool_name": "query_range",
+                        "projection_kind": "alert_window_range",
+                        "projection": {
+                            "projection_kind": "alert_window_range",
+                            "window": {
+                                "start": window_start.isoformat(),
+                                "end": window_end.isoformat(),
+                            },
+                            "target_match": {
+                                "matched": True,
+                                "authoritative_fields": ["cluster"],
+                            },
+                            "timeseries": {
+                                "series_count": 1,
+                                "sample_count": 1,
+                                "omitted_series_count": 0,
+                                "series": [
+                                    {
+                                        "sample_count": 1,
+                                        "min": 1,
+                                        "max": 1,
+                                        "avg": 1,
+                                        "latest": 1,
+                                        "delta": 0,
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [*(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is False
+    assert '"target_match_invalid":1' in projected
+    assert not any("时序聚合" in item.statement for item in result.observations[1:])
+
+
+@pytest.mark.asyncio
 async def test_prometheus_empty_series_is_recorded_as_no_sample_without_causality() -> None:
     window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
     result = await DeterministicToolResultProcessor().analyze(

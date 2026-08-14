@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
@@ -61,6 +61,51 @@ _ALERT_THRESHOLD_SUFFIX: Final = re.compile(
     r"(?i)_(?:more|less|greater|higher|lower)_than_\d+(?:\.\d+)?%?$"
 )
 _UNKNOWN_METRIC_IDENTIFIERS: Final = {"n/a", "none", "null", "unknown"}
+_TARGET_HOST_LABEL_KEYS: Final = {
+    "addr",
+    "address",
+    "alarmhost",
+    "endpoint",
+    "host",
+    "hostname",
+    "instance",
+    "ip",
+    "observerip",
+    "server",
+    "serverip",
+    "svrip",
+    "target",
+}
+_TARGET_INSTANCE_LABEL_KEYS: Final = {
+    "databaseinstance",
+    "dbinstance",
+    "instance",
+}
+_TARGET_PORT_LABEL_KEYS: Final = {
+    "alarmport",
+    "databaseport",
+    "dbport",
+    "observerport",
+    "port",
+    "serverport",
+    "svrport",
+}
+_TARGET_CLUSTER_LABEL_KEYS: Final = {
+    "cluster",
+    "clusterid",
+    "clustername",
+    "obcluster",
+    "obclusterid",
+    "obclustername",
+}
+_TARGET_DATABASE_LABEL_KEYS: Final = {
+    "database",
+    "databasename",
+    "datname",
+    "db",
+    "dbname",
+    "schema",
+}
 _CATALOG_METRIC_CONTAINER_KEYS: Final = {
     "metriclist",
     "metricnames",
@@ -363,16 +408,27 @@ class PrometheusMCPClient:
         *,
         alert: NormalizedAlert,
     ) -> dict[str, Any]:
-        """Build a bounded deterministic fact projection for the next model turn."""
+        """Build a bounded time-series projection without auxiliary response values."""
 
         del alert
-        series = cls._numeric_series(payload)
+        series = [
+            (metric, samples)
+            for metric, samples, samples_valid in cls._range_series(payload)
+            if samples_valid and samples
+        ]
+        return cls._project_numeric_series(series)
+
+    @classmethod
+    def _project_numeric_series(
+        cls,
+        series: list[tuple[Mapping[str, Any], list[tuple[Any, float]]]],
+    ) -> dict[str, Any]:
         summaries: list[dict[str, Any]] = []
         for metric, samples in series:
             values = [value for _, value in samples]
             summaries.append(
                 {
-                    "metric": metric,
+                    "metric": cls._project_metric_labels(metric),
                     "sample_count": len(values),
                     "min": cls._display_number(min(values)),
                     "max": cls._display_number(max(values)),
@@ -387,49 +443,307 @@ class PrometheusMCPClient:
                 json.dumps(item["metric"], ensure_ascii=True, sort_keys=True),
             )
         )
-        kind_counts = cls._value_kind_counts(payload)
-        facts = cls._scalar_fact_fragments(payload)
         return {
             "has_numeric_samples": bool(series),
             "series_count": len(series),
             "sample_count": sum(len(samples) for _, samples in series),
             "series": summaries[:20],
             "omitted_series_count": max(len(summaries) - 20, 0),
-            "scalar_facts": facts[:40],
-            "omitted_scalar_fact_count": max(len(facts) - 40, 0),
-            "payload_shape": dict(sorted(kind_counts.items())),
         }
 
     @classmethod
-    def _numeric_series(
+    def project_alert_window_range(
+        cls,
+        payload: Any,
+        *,
+        arguments: Mapping[str, Any],
+        alert: NormalizedAlert,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> dict[str, Any] | None:
+        """Project only a target-scoped range response for the authoritative window."""
+
+        argument_window = cls._argument_window(arguments)
+        if argument_window != (
+            window_start.astimezone(UTC),
+            window_end.astimezone(UTC),
+        ):
+            return None
+        del arguments
+        all_series = cls._range_series(payload)
+        selected: list[tuple[Mapping[str, Any], list[tuple[Any, float]]]] = []
+        matched_fields: list[str] = []
+        for metric, samples, samples_valid in all_series:
+            series_match = cls._metric_alert_target_fields(metric, alert=alert)
+            if (
+                not series_match
+                or not samples_valid
+                or not samples
+                or not cls._samples_within_window(
+                    samples,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+            ):
+                continue
+            selected.append((metric, samples))
+            matched_fields.extend(series_match)
+        if not selected:
+            return None
+        projection = cls._project_numeric_series(selected)
+        if projection["has_numeric_samples"] is not True:
+            return None
+        return {
+            "projection_kind": "alert_window_range",
+            "window": {
+                "start": window_start.astimezone(UTC).isoformat(),
+                "end": window_end.astimezone(UTC).isoformat(),
+            },
+            "target_match": {
+                "matched": True,
+                "authoritative_fields": list(dict.fromkeys(matched_fields)),
+            },
+            "timeseries": projection,
+            "excluded_series_count": max(len(all_series) - len(selected), 0),
+        }
+
+    @classmethod
+    def _range_series(
         cls,
         value: Any,
-    ) -> list[tuple[dict[str, Any], list[tuple[Any, float]]]]:
-        found: list[tuple[dict[str, Any], list[tuple[Any, float]]]] = []
+    ) -> list[tuple[Mapping[str, Any], list[tuple[Any, float]], bool]]:
+        found: list[tuple[Mapping[str, Any], list[tuple[Any, float]], bool]] = []
         if isinstance(value, Mapping):
-            metric = value.get("metric")
-            metric = cls._project_metric_labels(metric)
-            samples = cls._numeric_samples(value)
-            if samples:
-                found.append((metric, samples))
-            for nested in value.values():
+            if "values" in value:
+                metric = value.get("metric")
+                metric = metric if isinstance(metric, Mapping) else {}
+                samples, samples_valid = cls._range_numeric_samples(value.get("values"))
+                found.append((metric, samples, samples_valid))
+            for key, nested in value.items():
+                if key in {"metric", "value", "values"}:
+                    continue
                 if isinstance(nested, (Mapping, list)):
-                    found.extend(cls._numeric_series(nested))
+                    found.extend(cls._range_series(nested))
         elif isinstance(value, list):
             for nested in value:
                 if isinstance(nested, (Mapping, list)):
-                    found.extend(cls._numeric_series(nested))
+                    found.extend(cls._range_series(nested))
         return found
 
     @classmethod
     def _project_metric_labels(cls, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             return {}
-        labels: dict[str, Any] = {}
-        for raw_key, raw_value in sorted(value.items(), key=lambda item: str(item[0])):
-            if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
-                labels[str(raw_key)] = cls._bounded_scalar(raw_value)
-        return labels
+        metric_name = value.get("__name__")
+        if (
+            isinstance(metric_name, str)
+            and _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(metric_name)
+        ):
+            return {"__name__": metric_name}
+        return {}
+
+    @classmethod
+    def _argument_window(
+        cls,
+        arguments: Mapping[str, Any],
+    ) -> tuple[datetime, datetime] | None:
+        start = cls._timestamp(arguments.get("start"))
+        end = cls._timestamp(arguments.get("end"))
+        if start is None or end is None:
+            return None
+        return start, end
+
+    @classmethod
+    def _samples_within_window(
+        cls,
+        samples: list[tuple[Any, float]],
+        *,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> bool:
+        lower = window_start.astimezone(UTC)
+        upper = window_end.astimezone(UTC)
+        timestamps = [
+            cls._timestamp(timestamp)
+            for timestamp, _ in samples
+        ]
+        return bool(timestamps) and all(
+            timestamp is not None and lower <= timestamp <= upper
+            for timestamp in timestamps
+        )
+
+    @staticmethod
+    def _timestamp(value: Any) -> datetime | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+        elif isinstance(value, str):
+            candidate = value.strip()
+            try:
+                seconds = float(candidate)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    return None
+                return parsed.astimezone(UTC)
+        else:
+            return None
+        if not math.isfinite(seconds):
+            return None
+        if abs(seconds) >= 100_000_000_000:
+            seconds /= 1000
+        try:
+            return datetime.fromtimestamp(seconds, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _metric_alert_target_fields(
+        cls,
+        metric: Mapping[str, Any],
+        *,
+        alert: NormalizedAlert,
+    ) -> list[str]:
+        labels = {
+            re.sub(r"[^a-z0-9]", "", str(key).casefold()): value
+            for key, value in metric.items()
+        }
+        database = alert.database
+        matched: list[str] = []
+        host_values = cls._label_values(labels, _TARGET_HOST_LABEL_KEYS)
+
+        if database is not None and database.host:
+            for value in host_values:
+                endpoint = cls._label_endpoint(value)
+                if endpoint is not None and endpoint[0].casefold() != (
+                    database.host.strip().casefold()
+                ):
+                    return []
+                if cls._label_matches_host(value, database.host):
+                    matched.append("database.host")
+            if "database.host" not in matched:
+                return []
+
+        if database is not None and database.port is not None:
+            for value in host_values:
+                endpoint = cls._label_endpoint(value)
+                if endpoint is not None and endpoint[1] is not None:
+                    if endpoint[1] != database.port:
+                        return []
+                    matched.append("database.endpoint")
+            for value in cls._label_values(labels, _TARGET_PORT_LABEL_KEYS):
+                port = cls._label_port(value)
+                if port is not None and port != database.port:
+                    return []
+
+        if database is not None and database.instance:
+            for key in _TARGET_INSTANCE_LABEL_KEYS:
+                value = labels.get(key)
+                if not cls._has_label_value(value):
+                    continue
+                if not cls._label_matches_instance(value, database.instance):
+                    return []
+                matched.append("database.instance")
+            if any(
+                cls._label_equals(value, database.instance) for value in host_values
+            ):
+                matched.append("database.instance")
+
+        cluster_values = cls._label_values(labels, _TARGET_CLUSTER_LABEL_KEYS)
+        if alert.cluster and cluster_values:
+            if any(
+                not cls._label_equals(value, alert.cluster)
+                for value in cluster_values
+            ):
+                return []
+            matched.append("cluster")
+
+        if database is not None and database.database:
+            database_values = cls._label_values(labels, _TARGET_DATABASE_LABEL_KEYS)
+            if database_values:
+                if any(
+                    not cls._label_equals(value, database.database)
+                    for value in database_values
+                ):
+                    return []
+                matched.append("database.database")
+
+        return list(dict.fromkeys(matched))
+
+    @classmethod
+    def _label_values(
+        cls,
+        labels: Mapping[str, Any],
+        keys: set[str],
+    ) -> list[Any]:
+        return [
+            value
+            for key in keys
+            if cls._has_label_value(value := labels.get(key))
+        ]
+
+    @staticmethod
+    def _has_label_value(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _label_equals(value: Any, expected: str) -> bool:
+        return (
+            isinstance(value, str)
+            and value.strip().casefold() == expected.strip().casefold()
+        )
+
+    @classmethod
+    def _label_matches_host(cls, value: Any, expected_host: str) -> bool:
+        endpoint = cls._label_endpoint(value)
+        if endpoint is None:
+            return False
+        return endpoint[0].casefold() == expected_host.strip().casefold()
+
+    @classmethod
+    def _label_matches_instance(cls, value: Any, expected: str) -> bool:
+        if cls._label_equals(value, expected):
+            return True
+        candidate_endpoint = cls._label_endpoint(value)
+        expected_endpoint = cls._label_endpoint(expected)
+        if candidate_endpoint is None or expected_endpoint is None:
+            return False
+        if candidate_endpoint[0].casefold() != expected_endpoint[0].casefold():
+            return False
+        return expected_endpoint[1] is None or (
+            candidate_endpoint[1] == expected_endpoint[1]
+        )
+
+    @staticmethod
+    def _label_endpoint(value: Any) -> tuple[str, int | None] | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(
+                candidate if "://" in candidate else f"//{candidate}"
+            )
+            parsed_host = parsed.hostname
+            parsed_port = parsed.port
+        except ValueError:
+            return None
+        if not isinstance(parsed_host, str) or not parsed_host:
+            return None
+        return parsed_host, parsed_port
+
+    @staticmethod
+    def _label_port(value: Any) -> int | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            port = int(value.strip())
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65_535 else None
 
     @classmethod
     def _scalar_fact_fragments(
@@ -510,19 +824,30 @@ class PrometheusMCPClient:
         return f"{value[:300]}...[sha256:{digest},total_chars:{len(value)}]"
 
     @classmethod
-    def _numeric_samples(cls, value: Mapping[str, Any]) -> list[tuple[Any, float]]:
-        raw_samples = value.get("values")
+    def _range_numeric_samples(
+        cls,
+        raw_samples: Any,
+    ) -> tuple[list[tuple[Any, float]], bool]:
         if not isinstance(raw_samples, list):
-            raw_sample = value.get("value")
-            raw_samples = [raw_sample] if isinstance(raw_sample, list) else []
+            return [], False
         samples: list[tuple[Any, float]] = []
+        valid = True
         for item in raw_samples:
             if not isinstance(item, list) or len(item) < 2:
+                valid = False
                 continue
             number = cls._finite_number(item[1])
-            if number is not None:
-                samples.append((item[0], number))
-        return samples
+            if number is None or cls._timestamp(item[0]) is None:
+                valid = False
+                continue
+            samples.append((item[0], number))
+        samples.sort(
+            key=lambda item: (
+                cls._timestamp(item[0]) or datetime.max.replace(tzinfo=UTC),
+                str(item[0]),
+            )
+        )
+        return samples, valid
 
     @staticmethod
     def _finite_number(value: Any) -> float | None:
@@ -562,7 +887,9 @@ class PrometheusMCPClient:
     @staticmethod
     def responses_have_monitoring_data(responses: list[dict[str, Any]]) -> bool:
         return any(
-            response.get("has_monitoring_observation") is True
+            response.get("projection_kind") == "alert_window_range"
+            and response.get("has_monitoring_observation") is True
+            and isinstance(response.get("projection"), dict)
             for response in responses
         )
 
@@ -923,7 +1250,7 @@ class PrometheusMCPClient:
 
     @staticmethod
     def call_result(raw_result: Any) -> PrometheusMCPCallResult:
-        """Decode one result while retaining its complete sanitized MCP envelope."""
+        """Decode one result while retaining its complete unmodified MCP envelope."""
 
         raw = PrometheusMCPClient.raw_call_result(raw_result)
         payload = PrometheusMCPClient._result_payload_from_raw(raw)
@@ -934,7 +1261,7 @@ class PrometheusMCPClient:
 
     @staticmethod
     def raw_call_result(raw_result: Any) -> dict[str, Any]:
-        """Return the complete sanitized ``CallToolResult.model_dump`` payload."""
+        """Return the complete MCP envelope without filtering or rewriting it."""
 
         raw = (
             raw_result.model_dump(mode="json", by_alias=True)
@@ -945,12 +1272,7 @@ class PrometheusMCPClient:
             raise PrometheusMCPProtocolError(
                 "Prometheus MCP tool result is not an object"
             )
-        complete = sanitize(raw)
-        if not isinstance(complete, dict):
-            raise PrometheusMCPProtocolError(
-                "Prometheus MCP tool result could not be sanitized as an object"
-            )
-        return complete
+        return deepcopy(raw)
 
     @staticmethod
     def _result_payload_from_raw(raw: dict[str, Any]) -> Any | None:
@@ -1027,17 +1349,13 @@ class PrometheusMCPClient:
         *,
         host_control: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        result_content: dict[str, Any] = {
-            "monitoring_result": payload if payload is not None else "no usable data"
-        }
-        if host_control is not None:
-            result_content["host_control"] = sanitize(dict(host_control))
         content = json.dumps(
-            result_content,
+            payload,
             ensure_ascii=False,
+            separators=(",", ":"),
             default=str,
         )
-        return mcp_tool_result_messages(
+        messages = mcp_tool_result_messages(
             call,
             output=content,
             fallback_messages=[
@@ -1057,6 +1375,19 @@ class PrometheusMCPClient:
                 {"role": "tool", "tool_call_id": call.call_id, "content": content},
             ],
         )
+        if host_control is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"host_control": sanitize(dict(host_control))},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                }
+            )
+        return messages
 
     def agent_messages(
         self,
@@ -1129,6 +1460,8 @@ class PrometheusMCPEvidenceTool:
         del request
         result = await self.client.collect_alert_window(context)
         required_target = PrometheusMCPClient.monitoring_target_context(context.alert)
+        monitoring_results = self._public_monitoring_results(result)
+        has_monitoring_data = bool(monitoring_results)
         structured_data = {
             "schema_version": PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION,
             "window_start": result.window_start.isoformat(),
@@ -1136,26 +1469,21 @@ class PrometheusMCPEvidenceTool:
             "window_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
             "mcp_invocation": "shared_agent_harness",
             "allow_followup_dispatch": False,
-            "model_tool_calls": list(result.model_tool_calls),
-            "model_request_ids": list(result.model_request_ids),
-            "tool_attempts": list(result.tool_attempts),
+            "model_tool_call_count": len(result.model_tool_calls),
+            "tool_attempt_count": len(result.tool_attempts),
             "finished_by_model": result.finished_by_model,
             "termination_reason": result.termination_reason,
             "partial": result.partial,
             "termination_error_type": result.termination_error_type,
-            "termination_error_detail": result.termination_error_detail,
             "mcp_session_attempts": result.mcp_session_attempts,
             "reconnect_error_type": result.reconnect_error_type,
-            "inconclusive_reason": result.inconclusive_reason,
             "required_target": required_target,
             "monitoring_scope_status": result.monitoring_scope_status,
-            "monitoring_scope_reason": result.monitoring_scope_reason,
-            "monitored_database_engines": list(result.monitored_database_engines),
-            "monitoring_target_identifiers": list(result.monitoring_target_identifiers),
-            "monitoring_result_count": len(result.responses),
-            "monitoring_results": list(result.responses),
-            "query_completed": result.has_monitoring_data,
-            "root_cause_eligible": result.has_monitoring_data and not result.partial,
+            "monitoring_scope_reason": self._public_scope_reason(result),
+            "monitoring_result_count": len(monitoring_results),
+            "monitoring_results": monitoring_results,
+            "query_completed": has_monitoring_data,
+            "root_cause_eligible": has_monitoring_data and not result.partial,
         }
         if result.partial:
             structured_data["root_cause_ineligible_reason"] = "partial_evidence"
@@ -1169,13 +1497,12 @@ class PrometheusMCPEvidenceTool:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
                 summary=(
-                    "Prometheus MCP 已完成监控范围发现："
-                    f"{result.monitoring_scope_reason or '告警数据库不在当前监控范围内'}"
+                    "Prometheus MCP 中没有配置告警数据库对应的监控信息，"
                     "已跳过后续指标查询。"
                 ),
                 structured_data=structured_data,
             )
-        if result.has_monitoring_data:
+        if has_monitoring_data:
             if result.partial:
                 suffix = "；后续调查未完整结束，已保留此前取得的可用监控返回"
             else:
@@ -1189,20 +1516,19 @@ class PrometheusMCPEvidenceTool:
                 status=ToolStatus.SUCCESS,
                 summary=(
                     f"{coverage_prefix}已取得告警发生前五分钟的实时监控证据"
-                    f"（{len(result.responses)} 条工具返回）{suffix}。"
+                    f"（{len(monitoring_results)} 条合格范围投影）{suffix}。"
                 ),
                 structured_data=structured_data,
             )
         if result.monitoring_scope_status == "unknown":
             reason = (
                 "Prometheus MCP 无法确认告警数据库是否在当前监控范围内，"
-                "未继续执行指标查询："
-                f"{result.monitoring_scope_reason or '目标发现结果不足'}"
+                "未取得合格的告警窗口范围投影。"
             )
         elif result.termination_reason == "no_discriminating_evidence":
             reason = (
                 "Prometheus MCP 已停止无效探测，未取得完整的告警信号事实："
-                f"{result.inconclusive_reason or '没有可归属的告警窗口监控样本'}"
+                "没有可归属的告警窗口监控样本"
             )
         else:
             reason = "Prometheus MCP 未返回可用监控结果，实时证据不足。"
@@ -1228,20 +1554,40 @@ class PrometheusMCPEvidenceTool:
         structured_data: dict[str, Any],
         result: PrometheusMCPQueryResult,
     ) -> dict[str, Any]:
-        """Add derived inventory without dropping any MCP result or trace field."""
+        """Return public limitations without exposing discovery or catalog values."""
 
-        inventory_seen, metric_names = PrometheusMCPClient.catalog_metric_inventory(
-            list(result.responses)
-        )
+        del result
         complete = deepcopy(structured_data)
-        complete.update(
-            {
-                "model_tool_call_count": len(result.model_tool_calls),
-                "catalog_inventory": {
-                    "observed": inventory_seen,
-                    "metric_count": len(metric_names),
-                    "metrics": metric_names,
-                },
-            }
-        )
         return sanitize(complete)
+
+    @staticmethod
+    def _public_monitoring_results(
+        result: PrometheusMCPQueryResult,
+    ) -> list[dict[str, Any]]:
+        public: list[dict[str, Any]] = []
+        for response in result.responses:
+            projection = response.get("projection")
+            if (
+                response.get("projection_kind") != "alert_window_range"
+                or response.get("root_cause_eligible") is not True
+                or not isinstance(projection, dict)
+            ):
+                continue
+            public.append(
+                {
+                    "tool_name": str(response.get("tool_name") or "prometheus_range"),
+                    "projection_kind": "alert_window_range",
+                    "projection": deepcopy(projection),
+                }
+            )
+        return public
+
+    @staticmethod
+    def _public_scope_reason(result: PrometheusMCPQueryResult) -> str | None:
+        if result.monitoring_scope_status == "out_of_scope":
+            return "Prometheus MCP 中没有配置告警数据库对应的监控信息"
+        if result.monitoring_scope_status == "unknown":
+            return "Prometheus MCP 无法确认告警数据库是否在当前监控范围内"
+        if result.monitoring_scope_status == "in_scope":
+            return "Prometheus MCP 已确认告警数据库在监控范围内"
+        return None
