@@ -1926,7 +1926,12 @@ async def test_archery_evidence_preserves_complete_sanitized_result() -> None:
     assert first["InnoDB_IO_r_wait_max"] == 0.75
     assert "raw_result" not in parsed
     assert "raw_mcp_call_results" not in parsed
-    assert "opaque_diagnostics" not in serialized
+    # The final result is passed through with format conversion only, so every
+    # field of the embedded payload (including provider diagnostics) survives
+    # verbatim inside final_result_payload instead of being filtered away.
+    assert parsed["final_result_payload"]["opaque_diagnostics"] == "z" * 50_000
+    assert parsed["final_result_payload"]["rowCount"] == 18
+    assert parsed["final_result_payload"]["rows"][0]["sample"] == rows[0]["sample"]
 
 
 @pytest.mark.asyncio
@@ -2148,10 +2153,7 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     assert analysis["analysis_usable"] is False
     assert analysis["source_coverage_complete"] is True
     assert analysis["observations"][0]["source_paths"] == [
-        "/structured_data/reported_row_count",
-        "/structured_data/parsed_row_count",
-        "/structured_data/included_row_count",
-        "/structured_data/omitted_row_count",
+        "/structured_data/final_result_payload",
     ]
     assert evidence.structured_data["root_cause_eligible"] is False
     assert result.recommendation is not None
@@ -2159,3 +2161,69 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
     assert result.recommendation.root_causes == []
     assert result.recommendation.likely_causes == []
     await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_slow_log_evidence_keys_positional_rows_by_column_list() -> None:
+    client = RecordingArcheryClient(
+        payload={
+            "full_sql": (
+                "SELECT id, checksum, sample FROM mysql_slow_query_review_history;"
+            ),
+            "is_execute": False,
+            "rows": [
+                [24311020, "2DBE950C61C1BBB4617E83D777A3A810", "select * from orders"],
+                [24311019, "FFFCA4D67EA0A788813031B8BBC3B329", "commit"],
+            ],
+            "column_list": ["id", "checksum", "sample"],
+            "column_type": ["LONG", "STRING", "BLOB"],
+            "status": None,
+            "affected_rows": 2,
+        }
+    )
+    tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+    structured = tool._build_slow_query_evidence(
+        result,
+        session_attempts=1,
+        root_cause_ineligible_reason="",
+    )
+
+    payload = structured["final_result_payload"]
+    assert payload["rows"] == [
+        {
+            "id": 24311020,
+            "checksum": "2DBE950C61C1BBB4617E83D777A3A810",
+            "sample": "select * from orders",
+        },
+        {
+            "id": 24311019,
+            "checksum": "FFFCA4D67EA0A788813031B8BBC3B329",
+            "sample": "commit",
+        },
+    ]
+    assert payload["column_list"] == ["id", "checksum", "sample"]
+    assert payload["full_sql"] == (
+        "SELECT id, checksum, sample FROM mysql_slow_query_review_history;"
+    )
+    assert "final_result_parse_failed" not in structured
+
+
+@pytest.mark.asyncio
+async def test_slow_log_evidence_keeps_raw_text_when_json_unparseable() -> None:
+    raw_text = (
+        "SQL 查询已执行。\n执行的SQL：SELECT id FROM mysql_slow_query_review_history\n\n"
+        '返回 5 行。\n结果：\n{"full_sql": "SELECT id", "rows": [ bro'
+    )
+    client = RecordingArcheryClient(payload={"content": [raw_text]})
+    tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
+    result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
+    structured = tool._build_slow_query_evidence(
+        result,
+        session_attempts=1,
+        root_cause_ineligible_reason="",
+    )
+
+    assert structured["final_result_parse_failed"] is True
+    assert structured["final_result_text"] == raw_text
+    assert "final_result_payload" not in structured

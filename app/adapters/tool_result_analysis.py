@@ -14,10 +14,9 @@ from app.application.sanitization import sanitize
 from app.domain.errors import AdvisorError
 from app.domain.models import ToolResultAnalysis, ToolResultObservation
 
-TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v3"
+TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v4"
 _MAX_SNIPPET_CHARS = 800
 _MAX_SELECTED_ITEMS = 20
-_ARCHERY_FINAL_TABLE = "mysql_slow_query_review_history"
 _PROMETHEUS_WINDOW_SECONDS = 300
 _HOST_LABEL_KEYS = frozenset(
     {"address", "addr", "endpoint", "host", "hostname", "instance", "ip", "server", "target"}
@@ -129,6 +128,8 @@ def _analysis(
     observations: list[ToolResultObservation],
     limitations: list[str],
     analysis_usable: bool | None = None,
+    passthrough_payload: dict[str, Any] | None = None,
+    passthrough_parse_failed: bool = False,
 ) -> ToolResultAnalysis:
     if artifact.sha256 is None:
         raise AdvisorError("tool-result artifact must have a SHA-256 before processing")
@@ -146,6 +147,8 @@ def _analysis(
         request_id=None,
         prompt_version=TOOL_RESULT_ANALYSIS_PROMPT_VERSION,
         usage={},
+        passthrough_payload=passthrough_payload,
+        passthrough_parse_failed=passthrough_parse_failed,
     )
 
 
@@ -186,122 +189,87 @@ class DeterministicToolResultProcessor:
         raw_result: dict[str, Any],
         artifact: ArtifactRef,
     ) -> ToolResultAnalysis:
+        """Pass the Archery final query result through with format conversion only.
+
+        The program converts the JSON embedded in the Archery ``result`` text into
+        a JSON object (positional rows are labeled with ``column_list`` upstream)
+        and forwards it unchanged: no filtering, aggregation, sorting, truncation,
+        or size limit is applied. The projection never judges causality.
+        """
+
         data = self._structured_data(raw_result)
-        rows = data.get("rows")
-        rows = rows if isinstance(rows, list) else []
         base = "/structured_data"
-        observations: list[ToolResultObservation] = []
-        limitations: list[str] = []
 
-        count_fields = (
-            "reported_row_count",
-            "parsed_row_count",
-            "included_row_count",
-            "omitted_row_count",
-        )
-        counts = {key: data.get(key) for key in count_fields if key in data}
-        count_paths = [f"{base}/{key}" for key in counts]
-        if count_paths:
-            observations.append(
-                ToolResultObservation(
-                    statement=(
-                        "Archery 最终慢查询结果计数："
-                        f"{_bounded_json(counts)}；选择规则：仅使用 rows 中由最终 "
-                        f"{_ARCHERY_FINAL_TABLE} 查询形成的语义行，登录、实例解析和"
-                        "目录调用仅保留在原始审计工件。"
-                    ),
-                    source_paths=count_paths,
-                )
-            )
-
-        fingerprints: Counter[tuple[str, str]] = Counter()
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            identity = row.get("checksum")
-            if isinstance(identity, str) and identity.strip():
-                fingerprints[("checksum", identity.strip())] += 1
-                continue
-            sample = row.get("sample")
-            if isinstance(sample, str) and sample.strip():
-                # The full sample is used only as an in-process equality key. It
-                # is never copied into the grouping summary or replaced by a
-                # program-generated digest.
-                fingerprints[("sample", sample)] += 1
-        if fingerprints:
-            groups = []
-            for index, ((kind, identity), count) in enumerate(
-                sorted(fingerprints.items(), key=lambda item: item[0]),
-                start=1,
-            ):
-                group: dict[str, Any] = {
-                    "group": f"sql_group_{index}",
-                    "record_count": count,
-                    "identity_source": kind,
-                }
-                if kind == "checksum":
-                    group["checksum"] = identity
-                groups.append(group)
-            observations.append(
-                ToolResultObservation(
-                    statement=(
-                        f"慢查询语义行共 {len(rows)} 行、{len(fingerprints)} 个 SQL 分组；"
-                        "分组规则为优先使用业务 checksum，否则只在程序内按完整 sample 等值分组："
-                        f"{_bounded_json(groups)}"
-                    ),
-                    source_paths=[f"{base}/rows"],
-                )
+        if data.get("final_result_parse_failed") is True:
+            raw_text = data.get("final_result_text")
+            text = raw_text if isinstance(raw_text, str) and raw_text else None
+            return _analysis(
+                artifact=artifact,
+                summary=(
+                    "Archery 最终查询结果的内嵌 JSON 无法解析；原始文本已原样放入 "
+                    "passthrough_payload.final_result_text，未做删改，"
+                    "该结果不能用于根因判断。"
+                ),
+                observations=[
+                    ToolResultObservation(
+                        statement=(
+                            "Archery MCP 最终查询结果的内嵌 JSON 解析失败；原始文本已原样"
+                            "放入 passthrough_payload.final_result_text（未删改）。"
+                            "该文本未经程序结构化校验，不能用于根因判断。"
+                        ),
+                        source_paths=[f"{base}/final_result_text"],
+                    )
+                ],
+                limitations=[
+                    "Archery 最终查询结果文本未能转换为 JSON；已原样保留原始文本，"
+                    "该结果不能用于根因判断。"
+                ],
+                analysis_usable=False,
+                passthrough_payload=({"final_result_text": text} if text else None),
+                passthrough_parse_failed=True,
             )
 
-        ranked: list[tuple[float, int, Mapping[str, Any], str]] = []
-        for index, row in enumerate(rows):
-            if not isinstance(row, Mapping):
-                continue
-            numeric = [
-                (str(key), number)
-                for key, value in row.items()
-                if str(key).casefold().startswith("query_time_")
-                and (number := _number(value)) is not None
-            ]
-            if numeric:
-                field, score = max(numeric, key=lambda item: (item[1], item[0]))
-            else:
-                field, score = "row_order", 0.0
-            ranked.append((score, index, row, field))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        for rank, (score, index, row, field) in enumerate(ranked[:_MAX_SELECTED_ITEMS], start=1):
-            safe_fields = {
-                key: value for key, value in row.items() if str(key).casefold() != "sample"
-            }
-            sample = row.get("sample")
-            if isinstance(sample, str):
-                safe_fields["sample_snippet"] = _bounded_json(sample, limit=400)
-            observations.append(
-                ToolResultObservation(
-                    statement=(
-                        f"慢查询样本排名 {rank}；稳定选择规则：query_time_* 最大值降序、"
-                        f"原始行号升序；排序字段={field}，值={_display_number(score)}，"
-                        f"事实={_bounded_json(safe_fields)}"
-                    ),
-                    source_paths=[f"{base}/rows/{index}"],
-                )
+        payload = data.get("final_result_payload")
+        if isinstance(payload, Mapping):
+            rows = payload.get("rows")
+            row_text = (
+                f"rows 共 {len(rows)} 行"
+                if isinstance(rows, list)
+                else "rows 行数未知"
             )
-        if len(ranked) > _MAX_SELECTED_ITEMS:
-            limitations.append(
-                f"主 Agent 投影仅展示排序前 {_MAX_SELECTED_ITEMS} 行；"
-                f"完整 {len(ranked)} 行保存在源工件。"
+            limitations: list[str] = []
+            if not (isinstance(rows, list) and rows):
+                limitations.append("Archery 最终查询结果没有数据行。")
+            return _analysis(
+                artifact=artifact,
+                summary=(
+                    "Archery 最终查询结果（若因内容过长被 MCP 截断，则为按 id 分次查询后"
+                    f"合并的结果）已仅做格式转换为 JSON 并完整透传：{row_text}；"
+                    "程序只更改事实格式为 JSON，不判断因果。"
+                ),
+                observations=[
+                    ToolResultObservation(
+                        statement=(
+                            "Archery MCP 最终查询结果的完整内容位于 "
+                            "passthrough_payload.final_result_payload：程序仅将 result 文本"
+                            "中的内嵌 JSON 按 column_list 转换为 JSON 格式，不过滤、"
+                            f"不聚合、不排序、不截断、不设大小限制；{row_text}。"
+                            "程序只更改事实格式为 JSON，不判断因果。"
+                        ),
+                        source_paths=[f"{base}/final_result_payload"],
+                    )
+                ],
+                limitations=limitations,
+                analysis_usable=isinstance(rows, list) and bool(rows),
+                passthrough_payload=dict(payload),
             )
-        if not rows:
-            limitations.append("Archery 最终慢查询结果没有可投影的语义行。")
+
         return _analysis(
             artifact=artifact,
-            summary=(
-                f"已确定性处理 Archery 最终慢查询结果：{len(rows)} 行；"
-                "辅助认证、实例解析和目录返回未进入主 Agent 上下文。"
-            ),
-            observations=observations,
-            limitations=limitations,
-            analysis_usable=bool(rows),
+            summary="Archery 本次调查没有产生可透传的最终查询结果。",
+            observations=[],
+            limitations=["Archery 本次调查没有产生最终查询结果，没有可透传的内容。"],
+            analysis_usable=False,
         )
 
     def _process_prometheus(

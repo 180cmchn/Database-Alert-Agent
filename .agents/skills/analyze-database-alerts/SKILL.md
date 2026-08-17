@@ -112,24 +112,31 @@ another database, or an unscoped cross-cluster aggregate.
 These examples describe the checked-in provider prompts. A future provider follows its own external
 workflow and must not inherit Archery or Prometheus assumptions.
 
-## 6. Project MCP results deterministically
+## 6. Convert or project MCP results deterministically
 
 Save every complete sanitized raw MCP response as an internal, hash-bound audit artifact. Do not
 send auxiliary raw responses or the complete raw artifact to the main Agent. Result screening,
 simplification, aggregation, and sorting must be deterministic and must not invoke an LLM.
 
-Program-side processing may deterministically filter, aggregate, sort, calculate statistics, and
-select traceable snippets. Every projected fact or anomaly must reference a real source JSON Pointer.
-Artifact URIs, IDs, hashes, and complete raw content stay internal and must not enter the main-Agent
-context. A projection may describe values and deviations but must not claim that a fact supports or
-disproves a root cause. For Archery, project only the final
-`mysql_slow_query_review_history` result; keep login and lookup responses internal. For Prometheus,
+For Archery, the program passes the final `mysql_slow_query_review_history` query result (the
+merged result when content-length truncation forced per-id follow-up queries) through to the main
+Agent with a format conversion only: the JSON embedded in the `result` text becomes a JSON object
+and positional rows are labeled with `column_list`. It performs no filtering, aggregation,
+sorting, truncation, or size capping, and it never judges causality. When the embedded JSON
+cannot be parsed, the original text is passed through as-is and the record is marked
+`processing_status=unavailable`. Login and lookup responses stay internal.
+
+For every other provider, program-side processing may deterministically filter, aggregate, sort,
+calculate statistics, and select traceable snippets. Every projected fact or anomaly must
+reference a real source JSON Pointer. Artifact URIs, IDs, hashes, and complete raw content stay
+internal and must not enter the main-Agent context. A projection may describe values and
+deviations but must not claim that a fact supports or disproves a root cause. For Prometheus,
 project target-matched, exact-window time-series statistics and anomalies; keep discovery and
 catalog responses internal.
 
-The projection is intentionally bounded so logs do not exhaust the main context. This does not
-truncate or discard the audit artifact. If deterministic processing cannot produce a reliable
-projection, mark that observation unusable and retain the raw artifact for audit.
+The bounded projection path exists so logs do not exhaust the main context; it never truncates
+or discards the audit artifact. If deterministic processing cannot produce a reliable projection,
+mark that observation unusable and retain the raw artifact for audit.
 
 ## 7. Decide causality only in the main Agent
 

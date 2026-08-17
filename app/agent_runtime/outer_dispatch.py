@@ -776,9 +776,17 @@ class DurableOuterToolDispatcher:
                 and analysis.analysis_usable
                 and analysis.source_coverage_complete
             )
+            # A passthrough provider whose final-result JSON could not be parsed
+            # still reaches the main Agent verbatim, but stays mechanically
+            # unavailable so it can never support a root cause.
+            passthrough_parse_failed = bool(
+                getattr(analysis, "passthrough_parse_failed", False)
+            )
             projected_data: dict[str, Any] = {
                 **self._status_metadata(evidence),
-                "processing_status": "completed",
+                "processing_status": (
+                    "unavailable" if passthrough_parse_failed else "completed"
+                ),
                 "tool_result_analysis": analysis.model_dump(
                     mode="json",
                     exclude={"source_artifact_id", "source_sha256"},
@@ -787,7 +795,11 @@ class DurableOuterToolDispatcher:
                 # whether these facts, combined with other evidence, imply a cause.
                 "root_cause_eligible": result_usable_by_main_agent,
             }
-            if not analysis.analysis_usable:
+            if passthrough_parse_failed:
+                projected_data["root_cause_ineligible_reason"] = (
+                    "final_result_json_unparseable"
+                )
+            elif not analysis.analysis_usable:
                 projected_data["root_cause_ineligible_reason"] = (
                     "program_fact_projection_unusable"
                 )

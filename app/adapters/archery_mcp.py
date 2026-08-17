@@ -1776,6 +1776,38 @@ class ArcherySlowLogEvidenceTool:
             )
         return summary, structured_data
 
+    def _final_result_passthrough(
+        self,
+        payload: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Return the format-converted final result, or its raw text when unparseable.
+
+        The program only converts the JSON embedded in the Archery ``result`` text
+        into a JSON object: positional rows are labeled with ``column_list`` and
+        every other field is kept unchanged. No row is filtered, reordered,
+        aggregated, or truncated, and no size limit is applied. When the embedded
+        JSON cannot be parsed, the original text is returned verbatim so the main
+        Agent still sees it while the record stays ineligible for root causes.
+        """
+
+        rows = payload.get("rows")
+        if isinstance(rows, list):
+            passthrough = {
+                str(key): value for key, value in payload.items() if str(key) != "rows"
+            }
+            tabular = ArcheryMCPClient._tabular_rows(payload)
+            if tabular:
+                passthrough["rows"] = tabular
+            else:
+                # No column mapping is available; keep positional rows unchanged
+                # so no fact is dropped or invented by the program.
+                passthrough["rows"] = rows
+            return passthrough, None
+        raw_text = "\n".join(ArcheryMCPClient._metadata_text(payload))
+        if raw_text.strip():
+            return None, raw_text
+        return None, None
+
     def _build_slow_query_evidence(
         self,
         result: ArcherySlowLogQueryResult,
@@ -1792,6 +1824,9 @@ class ArcherySlowLogEvidenceTool:
         reported_row_count = self._reported_row_count(result.payload)
         total_row_count = max(reported_row_count or 0, len(source_rows))
         partial = result.payload.get("rows_recovered_from_truncated_json") is True
+        final_result_payload, final_result_text = self._final_result_passthrough(
+            result.payload
+        )
         structured_data: dict[str, Any] = {
             "schema_version": ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
             "query_completed": result.query_completed,
@@ -1818,6 +1853,11 @@ class ArcherySlowLogEvidenceTool:
             "root_cause_eligible": bool(semantic_rows) and not partial,
             "root_cause_ineligible_reason": root_cause_ineligible_reason,
         }
+        if final_result_payload is not None:
+            structured_data["final_result_payload"] = final_result_payload
+        if final_result_text is not None:
+            structured_data["final_result_parse_failed"] = True
+            structured_data["final_result_text"] = final_result_text
         return sanitize(structured_data)
 
     @classmethod

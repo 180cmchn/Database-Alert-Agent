@@ -56,8 +56,12 @@ During collection, record temporal order without interpreting it. After all sele
 terminal, the analysis phase may establish a causal mechanism only when the complete evidence
 supports it. Otherwise return no root cause.
 
-MCP results are projected by deterministic program logic. The projection may filter, aggregate,
-sort, and identify anomalies, but it performs no causal reasoning and cannot label
-a fact as supporting or contradicting a cause. Only the main Agent combines evidence across sources
-and decides causality. The complete raw response and its artifact URI, ID, and hash remain internal
-audit data and are never injected into the main Agent context merely because a tool returned them.
+MCP results reach the main Agent through deterministic program logic that never judges causality.
+Archery final query results are passed through with a format conversion only: the JSON embedded in
+the `result` text becomes a JSON object with positional rows labeled by `column_list`, without
+filtering, aggregation, sorting, or size limits. Other providers' results are projected by bounded
+deterministic filtering, aggregation, sorting, and anomaly identification. Neither path performs
+causal reasoning and neither can label a fact as supporting or contradicting a cause. Only the
+main Agent combines evidence across sources and decides causality. The complete raw response and
+its artifact URI, ID, and hash remain internal audit data and are never injected into the main
+Agent context merely because a tool returned them.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -20,8 +21,112 @@ def _artifact() -> ArtifactRef:
     )
 
 
+ARCHERY_COLUMN_LIST: tuple[str, ...] = (
+    "id",
+    "ts_min",
+    "ts_max",
+    "hostname_max",
+    "client_max",
+    "user_max",
+    "db_max",
+    "checksum",
+    "sample",
+    "ts_cnt",
+    "Query_time_sum",
+    "Query_time_min",
+    "Query_time_max",
+    "Query_time_pct_95",
+    "Rows_examined_sum",
+    "Rows_sent_sum",
+)
+
+
+def _archery_keyed_row(
+    *,
+    row_id: int,
+    checksum: str,
+    sample: str,
+    query_time_sum: float,
+) -> dict[str, object]:
+    return {
+        "id": row_id,
+        "ts_min": "2026-08-14T10:12:02",
+        "ts_max": "2026-08-14T10:12:02",
+        "hostname_max": "100.84.97.11:4000",
+        "client_max": "10.126.146.67",
+        "user_max": "data_etl",
+        "db_max": "prod_oms_order",
+        "checksum": checksum,
+        "sample": sample,
+        "ts_cnt": 1.0,
+        "Query_time_sum": query_time_sum,
+        "Query_time_min": query_time_sum,
+        "Query_time_max": query_time_sum,
+        "Query_time_pct_95": query_time_sum,
+        "Rows_examined_sum": None,
+        "Rows_sent_sum": None,
+    }
+
+
+def _archery_final_result_payload(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Mirror the JSON embedded in the Archery ``result`` text after keying."""
+
+    return {
+        "full_sql": (
+            "SELECT id, ts_min, ts_max, hostname_max, client_max, user_max, db_max, "
+            "checksum, sample, ts_cnt, Query_time_sum, Query_time_min, Query_time_max, "
+            "Query_time_pct_95, Rows_examined_sum, Rows_sent_sum "
+            "FROM mysql_slow_query_review_history ORDER BY id DESC LIMIT 5;"
+        ),
+        "is_execute": False,
+        "checked": None,
+        "is_masked": False,
+        "query_time": 0.000844,
+        "mask_rule_hit": False,
+        "mask_time": "",
+        "warning": None,
+        "error": None,
+        "is_critical": False,
+        "rows": rows,
+        "column_list": list(ARCHERY_COLUMN_LIST),
+        "column_type": [
+            "LONG",
+            "DATETIME",
+            "DATETIME",
+            "VAR_STRING",
+            "VAR_STRING",
+            "VAR_STRING",
+            "VAR_STRING",
+            "STRING",
+            "BLOB",
+            "FLOAT",
+            "FLOAT",
+            "FLOAT",
+            "FLOAT",
+            "FLOAT",
+            "FLOAT",
+            "FLOAT",
+        ],
+        "status": None,
+        "affected_rows": len(rows),
+    }
+
+
 @pytest.mark.asyncio
-async def test_archery_projects_only_final_slow_query_rows() -> None:
+async def test_archery_passes_final_result_json_through_without_modification() -> None:
+    slower_first = _archery_keyed_row(
+        row_id=24311020,
+        checksum="sql-a",
+        sample="select * from orders where id = 1",
+        query_time_sum=9.5,
+    )
+    faster_second = _archery_keyed_row(
+        row_id=24311019,
+        checksum="sql-b",
+        sample="select sleep(1)",
+        query_time_sum=3.0,
+    )
+    payload = _archery_final_result_payload([slower_first, faster_second])
     raw_result = {
         "status": "SUCCESS",
         "structured_data": {
@@ -30,20 +135,7 @@ async def test_archery_projects_only_final_slow_query_rows() -> None:
             "parsed_row_count": 2,
             "included_row_count": 2,
             "omitted_row_count": 0,
-            "rows": [
-                {
-                    "checksum": "sql-a",
-                    "sample": "select * from orders where id = 1",
-                    "query_time_sum": 9.5,
-                    "ts_cnt": 2,
-                },
-                {
-                    "checksum": "sql-b",
-                    "sample": "select sleep(1)",
-                    "query_time_sum": 3,
-                    "ts_cnt": 1,
-                },
-            ],
+            "final_result_payload": payload,
             "raw_result": {"sql": "select * from mysql_slow_query_review_history"},
             "raw_mcp_call_results": [
                 {"tool_name": "login", "result": {"token": "TOP-SECRET"}},
@@ -71,44 +163,79 @@ async def test_archery_projects_only_final_slow_query_rows() -> None:
         artifact=_artifact(),
     )
 
-    projected = "\n".join(item.statement for item in result.observations)
     assert result.provider == "deterministic_host"
     assert result.model == "none"
+    assert result.passthrough_parse_failed is False
     assert result.analysis_usable is True
-    assert "2 个 SQL 分组" in projected
-    assert projected.index("sql-a") < projected.index("sql-b")
-    assert "TOP-SECRET" not in projected
-    assert "INSTANCE-SECRET" not in projected
-    assert "CATALOG-SECRET" not in projected
-    assert all(
-        not any("raw_mcp_call_results" in path for path in item.source_paths)
-        for item in result.observations
+    assert result.passthrough_payload is not None
+    # Every embedded field survives unchanged and rows keep their original order:
+    # the slower row stays first because the program never filters or re-sorts.
+    assert result.passthrough_payload == payload
+    assert result.passthrough_payload["rows"][0]["checksum"] == "sql-a"
+    assert result.passthrough_payload["rows"][0]["sample"] == (
+        "select * from orders where id = 1"
     )
-    assert any(item.source_paths == ["/structured_data/rows/0"] for item in result.observations)
+    assert result.passthrough_payload["affected_rows"] == 2
+    assert result.passthrough_payload["column_list"] == list(ARCHERY_COLUMN_LIST)
+    serialized = json.dumps(result.passthrough_payload, ensure_ascii=False)
+    assert "TOP-SECRET" not in serialized
+    assert "INSTANCE-SECRET" not in serialized
+    assert "CATALOG-SECRET" not in serialized
+    assert len(result.observations) == 1
+    assert result.observations[0].source_paths == [
+        "/structured_data/final_result_payload"
+    ]
+    assert "不判断因果" in result.observations[0].statement
+    assert result.limitations == []
 
 
 @pytest.mark.asyncio
-async def test_archery_does_not_generate_digest_when_checksum_is_missing() -> None:
+async def test_archery_unparseable_final_result_passes_raw_text_verbatim() -> None:
+    raw_text = (
+        "SQL 查询已执行。\n执行的SQL：SELECT id FROM mysql_slow_query_review_history "
+        "ORDER BY id DESC LIMIT 5\n\n返回 5 行。\n结果：\n"
+        '{"full_sql": "SELECT id FROM mysql_slow_query_review_history", "rows": [ bro'
+    )
     result = await DeterministicToolResultProcessor().analyze(
         tool_name="query_mcp_archery",
         source_system="archery_mcp",
         request={},
         raw_result={
-            "status": "SUCCESS",
+            "status": "NO_DATA",
             "structured_data": {
-                "rows": [
-                    {"sample": "select sleep(1)", "query_time_sum": 2},
-                    {"sample": "select sleep(1)", "query_time_sum": 1},
-                ]
+                "final_result_parse_failed": True,
+                "final_result_text": raw_text,
             },
         },
         artifact=_artifact(),
     )
 
-    statements = "\n".join(item.statement for item in result.observations)
-    assert "1 个 SQL 分组" in statements
-    assert '"identity_source":"sample"' in statements
-    assert "sha256" not in statements.casefold()
+    assert result.analysis_usable is False
+    assert result.passthrough_parse_failed is True
+    assert result.passthrough_payload == {"final_result_text": raw_text}
+    assert result.observations[0].source_paths == ["/structured_data/final_result_text"]
+    assert "未删改" in result.observations[0].statement
+    assert "不能用于根因判断" in result.limitations[0]
+
+
+@pytest.mark.asyncio
+async def test_archery_without_final_result_is_unusable() -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        request={},
+        raw_result={
+            "status": "NO_DATA",
+            "structured_data": {"query_completed": False},
+        },
+        artifact=_artifact(),
+    )
+
+    assert result.analysis_usable is False
+    assert result.passthrough_payload is None
+    assert result.passthrough_parse_failed is False
+    assert result.observations == []
+    assert result.limitations
 
 
 @pytest.mark.asyncio

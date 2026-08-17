@@ -122,6 +122,11 @@ class ToolResultAnalysis(BaseModel):
     request_id: str | None = Field(default=None, max_length=512)
     prompt_version: str = Field(min_length=1, max_length=128)
     usage: dict[str, Any] = Field(default_factory=dict)
+    # Format-conversion passthrough for providers (currently Archery) whose final
+    # result must reach the main Agent unchanged. The program only converts the
+    # text JSON into a JSON object and never judges causality.
+    passthrough_payload: dict[str, Any] | None = Field(default=None)
+    passthrough_parse_failed: bool = False
 
     @model_validator(mode="after")
     def validate_usability(self) -> ToolResultAnalysis:

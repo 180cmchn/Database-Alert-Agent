@@ -37,7 +37,9 @@ def make_alert():
 
 
 def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> None:
-    assert "程序根据" in ai_module.SYSTEM_PROMPT
+    assert "程序只把 result 文本内嵌 JSON 按" in ai_module.SYSTEM_PROMPT
+    assert "column_list 更改格式为 JSON" in ai_module.SYSTEM_PROMPT
+    assert "不删改内容、不过滤、不聚合、不排序、不设大小限制" in ai_module.SYSTEM_PROMPT
     assert "过滤、聚合和排序" in ai_module.SYSTEM_PROMPT
     assert "不得比较告警标题端点与 hostname_max" in ai_module.SYSTEM_PROMPT
     assert "不得输出 instance_id 归属核验" in ai_module.SYSTEM_PROMPT
@@ -63,14 +65,17 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
 
 
 def test_prompts_treat_program_projection_as_non_causal_evidence() -> None:
-    assert "NO_DATA 或没有可用事实的程序投影只是证据缺失" in ai_module.SYSTEM_PROMPT
-    assert "只陈述事实、异常、限制和来源" in (ai_module.SYSTEM_PROMPT)
-    assert "不提出、选择或判断根因" in ai_module.SYSTEM_PROMPT
-    assert "只有你这个主 Agent" in ai_module.SYSTEM_PROMPT
-    assert "MCP 原始响应只保存在内部审计 artifact" in ai_module.SYSTEM_PROMPT
-    assert "子 Agent" not in ai_module.SYSTEM_PROMPT
-    assert "宿主完整性门禁" not in ai_module.SYSTEM_PROMPT
-    assert "call_limit_reached" not in ai_module.SYSTEM_PROMPT
+    prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
+    assert (
+        "NO_DATA、JSON 无法解析或没有可用事实的程序输出只是证据缺失" in prompt
+    )
+    assert "只陈述事实、异常、限制和来源" in prompt
+    assert "不提出、选择或判断根因" in prompt
+    assert "只有你这个主 Agent" in prompt
+    assert "MCP 原始响应只保存在内部审计 artifact" in prompt
+    assert "子 Agent" not in prompt
+    assert "宿主完整性门禁" not in prompt
+    assert "call_limit_reached" not in prompt
 
 
 def test_ai_adapter_exposes_no_model_based_conclusion_validator() -> None:
