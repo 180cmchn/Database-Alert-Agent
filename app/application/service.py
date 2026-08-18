@@ -685,6 +685,17 @@ class AlertAnalysisService:
             ai_fallback_enabled=self.ai_fallback_enabled,
             ai_model=getattr(self.advisor, "model", ""),
             ai_provider=getattr(self.advisor, "provider", ""),
+            ai_react_model=getattr(self.advisor, "react_model", "")
+            or getattr(self.advisor, "model", ""),
+            ai_mcp_model=getattr(self.advisor, "mcp_model", "")
+            or getattr(self.advisor, "model", ""),
+            ai_react_reasoning_effort=getattr(
+                self.advisor, "react_reasoning_effort", ""
+            ),
+            ai_reasoning_effort=getattr(self.advisor, "reasoning_effort", ""),
+            ai_mcp_reasoning_effort=getattr(
+                self.advisor, "mcp_reasoning_effort", ""
+            ),
             ai_timeout_seconds=float(
                 self.runtime_manifest_config.get("ai_timeout_seconds", 300)
             ),

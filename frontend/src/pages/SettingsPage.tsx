@@ -22,7 +22,13 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import type { AdminSettings, AdminSettingsPatch, AIProvider } from "../types/api";
+import type {
+  AdminSettings,
+  AdminSettingsPatch,
+  AIProvider,
+  ReasoningEffort,
+} from "../types/api";
+import { REASONING_EFFORT_OPTIONS } from "../types/api";
 
 const AI_PROVIDERS = new Set<AIProvider>(["openai_compatible", "openai_responses", "fake"]);
 
@@ -41,6 +47,14 @@ function numberField(form: FormData, name: string, fallback?: number): number {
     throw new Error("数值配置项格式不正确。");
   }
   return value;
+}
+
+function effortField(form: FormData, name: string): ReasoningEffort {
+  const rawValue = form.get(name);
+  if (typeof rawValue !== "string") return "";
+  return REASONING_EFFORT_OPTIONS.some((option) => option.value === rawValue)
+    ? (rawValue as ReasoningEffort)
+    : "";
 }
 
 export function SettingsPage() {
@@ -111,6 +125,11 @@ export function SettingsPage() {
         ai_provider: selectedProvider,
         ai_base_url: String(form.get("ai_base_url")).trim(),
         ai_model: String(form.get("ai_model")).trim(),
+        ai_react_model: String(form.get("ai_react_model") || "").trim(),
+        ai_mcp_model: String(form.get("ai_mcp_model") || "").trim(),
+        ai_react_reasoning_effort: effortField(form, "ai_react_reasoning_effort"),
+        ai_reasoning_effort: effortField(form, "ai_reasoning_effort"),
+        ai_mcp_reasoning_effort: effortField(form, "ai_mcp_reasoning_effort"),
         ai_timeout_seconds: numberField(form, "ai_timeout_seconds"),
         ai_json_mode: form.get("ai_json_mode") === "on",
         ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
@@ -195,6 +214,13 @@ export function SettingsPage() {
             <label className="field span-2"><span>Base URL <b>*</b></span><input name="ai_base_url" type="url" defaultValue={settings.ai_base_url} required placeholder="https://api.openai.com/v1" /></label>
             <label className="field span-2"><span>API Key（只写） {realProviderSelected && !settings.ai_api_key_configured && <b>*</b>}</span><div className="secret-field"><input name="ai_api_key" type={showApiKey ? "text" : "password"} autoComplete="new-password" required={realProviderSelected && !settings.ai_api_key_configured} placeholder={settings.ai_api_key_configured ? "已配置 · 留空保持不变" : "输入新的 API Key"} /><button type="button" onClick={() => setShowApiKey((value) => !value)} aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
             <label className="field"><span>请求超时（秒）</span><input name="ai_timeout_seconds" type="number" min="1" max="600" step="1" required defaultValue={settings.ai_timeout_seconds} /></label>
+          </div>
+          <div className="form-grid two-cols">
+            <label className="field"><span>ReAct 决策模型（可选）</span><input name="ai_react_model" defaultValue={settings.ai_react_model} placeholder="留空使用上方主模型" /><small>主 Agent 每轮选择工具或结束调查所用的模型，可配置为更轻量的模型以降低时延</small></label>
+            <label className="field"><span>ReAct 决策 Reasoning Effort</span><select name="ai_react_reasoning_effort" defaultValue={settings.ai_react_reasoning_effort}>{REASONING_EFFORT_OPTIONS.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}</select><small>决策轮思考强度；建议 low，缩短每轮等待</small></label>
+            <label className="field"><span>MCP 内循环模型（可选）</span><input name="ai_mcp_model" defaultValue={settings.ai_mcp_model} placeholder="留空使用上方主模型" /><small>MCP 工具（慢日志、指标等）参数生成内循环使用的模型</small></label>
+            <label className="field"><span>MCP 内循环 Reasoning Effort</span><select name="ai_mcp_reasoning_effort" defaultValue={settings.ai_mcp_reasoning_effort}>{REASONING_EFFORT_OPTIONS.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}</select><small>工具调用参数生成的思考强度；建议 low～medium</small></label>
+            <label className="field span-2"><span>终局分析 Reasoning Effort</span><select name="ai_reasoning_effort" defaultValue={settings.ai_reasoning_effort}>{REASONING_EFFORT_OPTIONS.map((option) => <option key={option.value || "default"} value={option.value}>{option.label}</option>)}</select><small>最终根因与恢复建议生成（主模型）的思考强度；建议 high 以上保证结论质量</small></label>
           </div>
           <label className="switch-row"><span><Bot size={17} /><span><strong>强制 JSON 输出模式</strong><small>要求模型返回可由 Pydantic 校验的结构化结果</small></span></span><input name="ai_json_mode" type="checkbox" defaultChecked={settings.ai_json_mode} /><i /></label>
         </SectionCard>

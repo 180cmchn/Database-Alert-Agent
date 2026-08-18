@@ -368,6 +368,17 @@ export interface RunbookRecord {
   updated_at: string;
 }
 
+export type ReasoningEffort = "" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export const REASONING_EFFORT_OPTIONS: ReadonlyArray<{ value: ReasoningEffort; label: string }> = [
+  { value: "", label: "默认（不发送，跟随 Provider）" },
+  { value: "low", label: "low · 快速决策" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "xhigh", label: "xhigh · 深度推理" },
+  { value: "max", label: "max · 最大推理" },
+];
+
 export interface AdminSettings {
   app_env: string;
   fake_provider_allowed: boolean;
@@ -379,6 +390,11 @@ export interface AdminSettings {
   ai_timeout_seconds: number;
   ai_json_mode: boolean;
   ai_fallback_enabled: boolean;
+  ai_react_model: string;
+  ai_mcp_model: string;
+  ai_react_reasoning_effort: ReasoningEffort;
+  ai_reasoning_effort: ReasoningEffort;
+  ai_mcp_reasoning_effort: ReasoningEffort;
   runbook_limit: number;
   scheduler_workers: number;
   react_max_rounds: number;
@@ -412,6 +428,11 @@ export interface AdminSettingsPatch {
   ai_provider?: AIProvider;
   ai_base_url?: string;
   ai_model?: string;
+  ai_react_model?: string;
+  ai_mcp_model?: string;
+  ai_react_reasoning_effort?: ReasoningEffort;
+  ai_reasoning_effort?: ReasoningEffort;
+  ai_mcp_reasoning_effort?: ReasoningEffort;
   ai_timeout_seconds?: number;
   ai_json_mode?: boolean;
   ai_fallback_enabled?: boolean;

@@ -19,6 +19,12 @@ DEFAULT_ENVIRONMENT_ALIASES = {
 REAL_AI_PROVIDERS = frozenset({"openai_compatible", "openai_responses"})
 SUPPORTED_AI_PROVIDERS = REAL_AI_PROVIDERS | {"fake"}
 
+# Reasoning-effort levels accepted by the model backends (OpenAI
+# Chat Completions `reasoning_effort` / Responses `reasoning.effort` and
+# compatible gateways). An empty string means "do not send the parameter" so
+# the provider default applies.
+SUPPORTED_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
 # Only these settings may be changed through the administrative API. Bootstrap
 # controls such as the database URL, scheduler backend and admin credential
 # intentionally remain environment/file-deployment concerns.
@@ -31,6 +37,11 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_timeout_seconds",
         "ai_json_mode",
         "ai_fallback_enabled",
+        "ai_react_model",
+        "ai_react_reasoning_effort",
+        "ai_reasoning_effort",
+        "ai_mcp_model",
+        "ai_mcp_reasoning_effort",
         "runbook_limit",
         "wecom_webhook_url",
         "wecom_page_base_url",
@@ -85,6 +96,39 @@ class Settings(BaseSettings):
     # temporarily unavailable or returns an invalid structure.  The fallback is
     # deliberately conservative and always produces an INCONCLUSIVE result.
     ai_fallback_enabled: bool = True
+    # Role-specific model overrides. The three model usage points (main-Agent
+    # ReAct round decisions, final root-cause analysis, and the MCP tool inner
+    # loop) may each use a different model. An empty value falls back to
+    # ``ai_model`` so a single-model deployment keeps working unchanged.
+    ai_react_model: str = ""
+    ai_mcp_model: str = ""
+    # Reasoning effort per usage point. Empty means "do not send the parameter"
+    # and lets the provider default apply. Configure a low effort for cheap
+    # tool-selection decisions and keep a high effort for final analysis.
+    ai_react_reasoning_effort: str = ""
+    ai_reasoning_effort: str = ""
+    ai_mcp_reasoning_effort: str = ""
+
+    @field_validator(
+        "ai_react_reasoning_effort",
+        "ai_reasoning_effort",
+        "ai_mcp_reasoning_effort",
+    )
+    @classmethod
+    def validate_reasoning_effort(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized and normalized not in SUPPORTED_REASONING_EFFORTS:
+            allowed = ", ".join(sorted(SUPPORTED_REASONING_EFFORTS))
+            raise ValueError(
+                f"reasoning effort must be one of: {allowed} (empty disables the "
+                "parameter and keeps the provider default)"
+            )
+        return normalized
+
+    @field_validator("ai_react_model", "ai_mcp_model")
+    @classmethod
+    def strip_role_model(cls, value: str) -> str:
+        return value.strip()
 
     runbook_pdf_dir: Path = Path("./runbooks/pdfs-typed")
     runbook_limit: int = Field(default=5, ge=1, le=20)

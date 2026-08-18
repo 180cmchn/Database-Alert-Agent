@@ -118,6 +118,9 @@ class FlashDutyPollResponse(BaseModel):
     )
 
 
+ReasoningEffort = Literal["", "low", "medium", "high", "xhigh", "max"]
+
+
 class RuntimeSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,6 +129,11 @@ class RuntimeSettingsPatch(BaseModel):
     ai_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
     ai_api_key: str | None = Field(default=None, max_length=8192, repr=False)
     ai_model: str | None = Field(default=None, max_length=300)
+    ai_react_model: str | None = Field(default=None, max_length=300)
+    ai_mcp_model: str | None = Field(default=None, max_length=300)
+    ai_react_reasoning_effort: ReasoningEffort | None = None
+    ai_reasoning_effort: ReasoningEffort | None = None
+    ai_mcp_reasoning_effort: ReasoningEffort | None = None
     ai_timeout_seconds: float | None = Field(default=None, gt=0, le=600)
     ai_json_mode: bool | None = None
     ai_fallback_enabled: bool | None = None
@@ -158,6 +166,11 @@ class RuntimeSettingsResponse(BaseModel):
     ai_timeout_seconds: float
     ai_json_mode: bool
     ai_fallback_enabled: bool
+    ai_react_model: str
+    ai_mcp_model: str
+    ai_react_reasoning_effort: str
+    ai_reasoning_effort: str
+    ai_mcp_reasoning_effort: str
     react_max_rounds: int
     analysis_timeout_seconds: int
     runbook_limit: int
@@ -205,6 +218,11 @@ class RuntimeSettingsResponse(BaseModel):
             ai_timeout_seconds=settings.ai_timeout_seconds,
             ai_json_mode=settings.ai_json_mode,
             ai_fallback_enabled=settings.ai_fallback_enabled,
+            ai_react_model=settings.ai_react_model,
+            ai_mcp_model=settings.ai_mcp_model,
+            ai_react_reasoning_effort=settings.ai_react_reasoning_effort,
+            ai_reasoning_effort=settings.ai_reasoning_effort,
+            ai_mcp_reasoning_effort=settings.ai_mcp_reasoning_effort,
             react_max_rounds=settings.react_max_rounds,
             analysis_timeout_seconds=settings.analysis_timeout_seconds,
             runbook_limit=settings.runbook_limit,

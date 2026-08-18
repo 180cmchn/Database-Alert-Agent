@@ -699,9 +699,9 @@ REACT_PROMPT = """你是数据库告警分析的唯一主 Agent。你需要按 R
 只返回一个符合 output_schema 的 JSON action。不要把思维链、分析草稿或根因结论写进 JSON。
 
 action=tool 时，每轮只能选择 available_tools 中一个真实存在的外层工具。根据每个工具给出的 role、
-capability、workflow 和 safety 自主判断是否相关；不是每一个告警都需要调用所有 MCP，也不是每个 MCP 都覆盖
-当前数据库。parameters 必须符合工具公开 Schema，objective 要说明本轮希望取得的事实。工具返回的
-observation 会在下一轮作为 evidence 提供。不得虚构工具、告警详情、知识来源或工具返回内容。
+capability、workflow 和 safety 自主判断是否相关；不是每一个告警都需要调用所有 MCP，也不是每个 MCP
+都配置有当前数据库。parameters 必须符合工具公开 Schema，objective 要说明本轮希望取得的事实。
+工具返回的observation 会在下一轮作为 evidence 提供。不得虚构工具、告警详情、知识来源或工具返回内容。
 
 action=finish 表示现有证据已足够进入最终根因汇总，或继续调用任何工具都没有分析价值。达到
 react_max_rounds 后 Host 也会正常结束调查。FlashDuty 告警详情已经先于本流程获取，alert.database
@@ -874,9 +874,24 @@ class OpenAICompatibleAdvisor:
         max_tokens: int,
         timeout_seconds: float,
         json_mode: bool,
+        react_model: str | None = None,
+        react_reasoning_effort: str | None = None,
+        mcp_model: str | None = None,
+        mcp_reasoning_effort: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
+        # Role-specific overrides. The final root-cause analysis (``advise``)
+        # always uses ``model``; the ReAct round decisions (``decide_investigation``)
+        # and the embedded MCP tool loop (``request_mcp_tool_call``) may use a
+        # cheaper/faster model. Empty effort values mean "do not send" so the
+        # provider default applies.
+        self._react_model = (react_model or "").strip() or model
+        self._mcp_model = (mcp_model or "").strip() or model
+        self._reasoning_effort = (reasoning_effort or "").strip().lower()
+        self._react_reasoning_effort = (react_reasoning_effort or "").strip().lower()
+        self._mcp_reasoning_effort = (mcp_reasoning_effort or "").strip().lower()
         self._max_tokens = max_tokens
         self._json_mode = json_mode
         self._client = AsyncOpenAI(
@@ -896,6 +911,26 @@ class OpenAICompatibleAdvisor:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def react_model(self) -> str:
+        return self._react_model
+
+    @property
+    def mcp_model(self) -> str:
+        return self._mcp_model
+
+    @property
+    def reasoning_effort(self) -> str:
+        return self._reasoning_effort
+
+    @property
+    def react_reasoning_effort(self) -> str:
+        return self._react_reasoning_effort
+
+    @property
+    def mcp_reasoning_effort(self) -> str:
+        return self._mcp_reasoning_effort
 
     @property
     def prompt_version(self) -> str:
@@ -1083,6 +1118,10 @@ class OpenAICompatibleAdvisor:
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
         messages = base_messages
+        analysis_effort = getattr(self, "_reasoning_effort", "")
+        complete_kwargs: dict[str, Any] = {}
+        if analysis_effort:
+            complete_kwargs["reasoning_effort"] = analysis_effort
 
         attempt = 0
         while True:
@@ -1101,9 +1140,10 @@ class OpenAICompatibleAdvisor:
                 content, metadata = await self._complete(
                     messages,
                     reasoning_callback=emit_delta,
+                    **complete_kwargs,
                 )
             else:
-                content, metadata = await self._complete(messages)
+                content, metadata = await self._complete(messages, **complete_kwargs)
                 if reasoning_callback is not None and metadata.reasoning_content:
                     await reasoning_callback(metadata.reasoning_content, f"final:{attempt}", 0)
             try:
@@ -1169,6 +1209,16 @@ class OpenAICompatibleAdvisor:
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
         messages = base_messages
+        # Role overrides are resolved defensively so test doubles that bypass
+        # __init__ keep the legacy single-model behaviour. Overrides are only
+        # forwarded when they actually change the request.
+        react_model = getattr(self, "_react_model", "") or self._model
+        react_effort = getattr(self, "_react_reasoning_effort", "")
+        complete_kwargs: dict[str, Any] = {}
+        if react_model != self._model:
+            complete_kwargs["model"] = react_model
+        if react_effort:
+            complete_kwargs["reasoning_effort"] = react_effort
         repair_attempt = 0
         while True:
 
@@ -1190,9 +1240,10 @@ class OpenAICompatibleAdvisor:
                 content, metadata = await self._complete(
                     messages,
                     reasoning_callback=emit_delta,
+                    **complete_kwargs,
                 )
             else:
-                content, metadata = await self._complete(messages)
+                content, metadata = await self._complete(messages, **complete_kwargs)
                 if reasoning_callback is not None and metadata.reasoning_content:
                     await reasoning_callback(
                         metadata.reasoning_content,
@@ -1235,17 +1286,22 @@ class OpenAICompatibleAdvisor:
             raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
         if not tools:
             raise AdvisorError("MCP model tool definitions cannot be empty")
+        mcp_model = getattr(self, "_mcp_model", "") or self._model
+        mcp_effort = getattr(self, "_mcp_reasoning_effort", "")
+        mcp_request_kwargs: dict[str, Any] = {
+            "model": mcp_model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+            "temperature": 0,
+            "max_tokens": self._max_tokens,
+        }
+        if mcp_effort:
+            mcp_request_kwargs["reasoning_effort"] = mcp_effort
         try:
             response = await self._stream_chat_completion(
-                {
-                    "model": self._model,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "required",
-                    "parallel_tool_calls": False,
-                    "temperature": 0,
-                    "max_tokens": self._max_tokens,
-                },
+                mcp_request_kwargs,
                 operation="mcp_tool_call",
                 reasoning_callback=reasoning_callback,
             )
@@ -1316,18 +1372,23 @@ class OpenAICompatibleAdvisor:
         messages: list[dict[str, str]],
         *,
         reasoning_callback: ReasoningDeltaCallback | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, AdvisorMetadata]:
         input_chars = sum(
             len(message.get("content", ""))
             for message in messages
             if isinstance(message.get("content"), str)
         )
+        effective_model = model or self._model
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": effective_model,
             "messages": messages,
             "temperature": 0,
             "max_tokens": self._max_tokens,
         }
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         if self._json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         try:
@@ -1363,7 +1424,7 @@ class OpenAICompatibleAdvisor:
             )
         return content, AdvisorMetadata(
             provider=self.provider,
-            model=self._model,
+            model=effective_model,
             prompt_version=PROMPT_VERSION,
             request_id=request_id,
             usage=usage,
@@ -1389,6 +1450,11 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
             "include": ["reasoning.encrypted_content"],
             "stream": True,
         }
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            # Chat-Completions-style effort maps onto the Responses protocol's
+            # structured reasoning configuration.
+            request["reasoning"] = {"effort": reasoning_effort}
         tools = kwargs.get("tools")
         if isinstance(tools, list):
             request["tools"] = _responses_tools(tools)

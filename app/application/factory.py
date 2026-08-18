@@ -115,6 +115,11 @@ def _build_advisor(settings: Settings) -> AIAdvisor:
         max_tokens=settings.ai_max_tokens,
         timeout_seconds=settings.ai_timeout_seconds,
         json_mode=settings.ai_json_mode,
+        react_model=settings.ai_react_model or None,
+        react_reasoning_effort=settings.ai_react_reasoning_effort or None,
+        mcp_model=settings.ai_mcp_model or None,
+        mcp_reasoning_effort=settings.ai_mcp_reasoning_effort or None,
+        reasoning_effort=settings.ai_reasoning_effort or None,
     )
 
 

@@ -495,6 +495,13 @@ class AnalysisConfigSnapshot(BaseModel):
     ai_fallback_enabled: bool = True
     ai_model: str = ""
     ai_provider: str = "openai_compatible"
+    # Role-specific model usage recorded per run for audit and re-analysis
+    # comparison. Empty effort values mean "provider default" (parameter not sent).
+    ai_react_model: str = ""
+    ai_mcp_model: str = ""
+    ai_react_reasoning_effort: str = ""
+    ai_reasoning_effort: str = ""
+    ai_mcp_reasoning_effort: str = ""
     ai_timeout_seconds: float = 300
     # Historical compatibility only. New analyses always store zero because
     # provider retries are bounded by analysis timeout/cancellation, not a count.
