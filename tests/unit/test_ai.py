@@ -41,8 +41,11 @@ def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> No
     assert "column_list 更改格式为 JSON" in ai_module.SYSTEM_PROMPT
     assert "不删改内容、不过滤、不聚合、不排序、不设大小限制" in ai_module.SYSTEM_PROMPT
     assert "过滤、聚合和排序" in ai_module.SYSTEM_PROMPT
-    assert "不得比较告警标题端点与 hostname_max" in ai_module.SYSTEM_PROMPT
     assert "不得输出 instance_id 归属核验" in ai_module.SYSTEM_PROMPT
+    prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
+    assert "证据与告警实例的归属已由程序保障" in prompt
+    assert "与 hostname_max 不同属于预期现象" in prompt
+    assert "不得把一致与否作为采纳、降级或拒绝任何证据的条件" in prompt
     assert "instance_identity_verification.status=MATCHED" not in (ai_module.SYSTEM_PROMPT)
     assert "target_verification" not in ai_module.SYSTEM_PROMPT
 

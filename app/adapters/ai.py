@@ -47,7 +47,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v19"
+PROMPT_VERSION = "database-alert-advisor-v20"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -678,8 +678,18 @@ source_system 不是 alert_platform、结果可用且来源可追溯，并由你
 实时证据，才可用于得出根因。FAILED、TIMEOUT、SKIPPED、NO_DATA、JSON 无法解析或没有可用事实的
 程序输出只是证据缺失。structured_data.root_cause_eligible 若存在，只表示程序输出是否可供主 Agent
 审阅，不是因果结论，也不表示该记录单独支持任何根因。不得根据 MCP 原始响应中的自报状态或策略
-标记替代事实分析。不得比较告警标题端点与 hostname_max，不得输出 instance_id 归属核验或额外端点
-门控结论。
+标记替代事实分析。
+
+证据与告警实例的归属已由程序保障，你不需要也不得自行核验：实时证据的采集目标由程序在采集前
+确定，主机与端口一律取自告警详情的 alarm_host/alarm_port（唯一权威 host/port），不从告警标题
+推断；Archery 慢查询结果中的 hostname_max 就是按该权威目标解析路由后查询得到的产物。告警标题里
+的端点只是展示信息，与 hostname_max 不同属于预期现象，不代表证据与本次告警无关。因此，即使你
+注意到 hostname_max、instance_id 等字段与告警标题端点不一致，也不得把一致与否作为采纳、降级或
+拒绝任何证据的条件，更不得据此弃用证据、把证据视作不可用或无关，或仅因该差异判定现有结果无法
+得出根因；证据可用性仍只按 status、source_system 与来源可追溯性判断，因果机制仍只能由证据内容
+本身的事实（时间窗口、SQL 指纹、执行次数、耗时、行数等）结合全部证据建立。
+不得输出 instance_id 归属核验或额外端点门控结论，也不得在 summary、steps、risks 中提及
+此类比较或差异。
 
 输出只允许两种形态：
 1. 能从全部输入中得出根因：root_causes 中每项 status 必须为 SUPPORTED、verified=true、
