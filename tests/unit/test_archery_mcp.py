@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -287,6 +287,34 @@ def _client(
         model or PromptFollowingMCPModel(),
         transport=transport,
     )
+
+
+def test_agent_messages_projects_beijing_window_literals_for_ts_columns() -> None:
+    client = _client(httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    occurred_at = datetime(2026, 8, 17, 1, 46, 12, tzinfo=UTC)
+    window_start = occurred_at - timedelta(seconds=300)
+
+    messages = client.agent_messages(
+        occurred_at=occurred_at,
+        window_start=window_start,
+        window_end=occurred_at,
+        alert_context={"alarm_host": "100.84.97.135", "alarm_port": 3306},
+    )
+
+    assert messages[0]["role"] == "system"
+    task = json.loads(messages[1]["content"])
+    window = task["required_window"]
+    # The window itself stays UTC-authoritative for the outer audit trail.
+    assert window["start"] == "2026-08-17T01:41:12+00:00"
+    assert window["end"] == "2026-08-17T01:46:12+00:00"
+    assert window["start_unix_seconds"] == int(window_start.timestamp())
+    assert window["end_unix_seconds"] == int(occurred_at.timestamp())
+    # ts_min/ts_max are stored as Beijing time (UTC+8): the model must receive
+    # ready-made literals instead of deriving (and mis-translating) them.
+    assert window["ts_column_timezone"] == "UTC+8"
+    assert window["start_beijing"] == "2026-08-17 09:41:12"
+    assert window["end_beijing"] == "2026-08-17 09:46:12"
+    assert window["ts_min_lower_bound_beijing"] == "2026-08-17 08:41:12"
 
 
 def test_project_mcp_settings_resolve_environment_without_persisting_token(

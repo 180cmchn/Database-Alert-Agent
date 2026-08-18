@@ -96,6 +96,7 @@ class AgentState(BaseModel):
 
     # Configuration
     ai_fallback_enabled: bool = True
+    stream_main_agent_reasoning: bool = True
     knowledge_sources: list[str] = Field(default_factory=lambda: ["local_pdf"])
 
 
@@ -107,6 +108,7 @@ def create_initial_state(
     *,
     react_max_rounds: int = 8,
     ai_fallback_enabled: bool = True,
+    stream_main_agent_reasoning: bool = True,
     knowledge_sources: list[str] | None = None,
 ) -> AgentState:
     """Create the initial state for a new investigation.
@@ -118,6 +120,9 @@ def create_initial_state(
         run: The investigation run
         react_max_rounds: Maximum main-Agent ReAct rounds
         ai_fallback_enabled: Whether AI fallback is enabled
+        stream_main_agent_reasoning: Whether to persist one durable event per
+            main-Agent reasoning delta (complete reasoning is recorded once
+            per decision otherwise)
         knowledge_sources: Which knowledge sources to use for matching
 
     Returns:
@@ -133,6 +138,7 @@ def create_initial_state(
         run_status=RunStatus.RUNNING,
         react_max_rounds=react_max_rounds,
         ai_fallback_enabled=ai_fallback_enabled,
+        stream_main_agent_reasoning=stream_main_agent_reasoning,
         knowledge_sources=(
             knowledge_sources if knowledge_sources is not None else ["local_pdf"]
         ),

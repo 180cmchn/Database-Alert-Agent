@@ -1110,6 +1110,113 @@ async def test_react_node_supports_advisor_without_reasoning_callback(
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
+class _CallbackProbingAdvisor(ScriptedReActAdvisor):
+    """Record whether the nodes forward a durable reasoning-delta callback."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            [
+                InvestigationDecision(
+                    action="tool",
+                    tool_name="mcp_style_probe",
+                    parameters={"phase": "probe"},
+                    objective="collect probe evidence",
+                ),
+                InvestigationDecision(action="finish", reason="probe evidence ready"),
+            ],
+            reasoning=["round-one reasoning", "round-two reasoning"],
+            final_reasoning="final complete reasoning",
+        )
+        self.decision_callbacks: list[object] = []
+        self.advise_callbacks: list[object] = []
+
+    async def decide_investigation(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.decision_callbacks.append(kwargs.get("reasoning_callback", "absent"))
+        return await super().decide_investigation(**kwargs)
+
+    async def advise(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        self.advise_callbacks.append(kwargs.get("reasoning_callback", "absent"))
+        return await super().advise(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_stream_main_agent_reasoning_disabled_records_reasoning_once(
+    tmp_path: Path,
+) -> None:
+    advisor = _CallbackProbingAdvisor()
+    runtime = build_runtime(
+        settings_for(tmp_path).model_copy(
+            update={"stream_main_agent_reasoning": False}
+        ),
+        advisor=advisor,
+        tool_registry=InvestigationToolRegistry([RecordingMCPStyleTool()]),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "main-agent-reasoning-once",
+            "severity": "INFO",
+            "title": "Reasoning once",
+            "reason": "reasoning_once",
+        },
+    )
+
+    # Durable delta persistence is disabled, so neither node forwards a
+    # reasoning callback and each decision records one complete event.
+    assert advisor.decision_callbacks == ["absent", "absent"]
+    assert advisor.advise_callbacks == ["absent"]
+
+    assert result.latest_run is not None
+    events = await runtime.repository.list_agent_events(str(result.latest_run.id))
+    reasoning_events = [
+        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
+    ]
+    assert [item.payload["content"] for item in reasoning_events] == [
+        "round-one reasoning",
+        "round-two reasoning",
+        "final complete reasoning",
+    ]
+    assert all("stream_id" not in item.payload for item in reasoning_events)
+    assert all("delta_index" not in item.payload for item in reasoning_events)
+    actions = [
+        json.loads(item.payload["content"])
+        for item in events
+        if item.kind == AgentEventKind.TRACE_ACTION
+    ]
+    assert [item["action"] for item in actions] == ["tool", "finish"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_main_agent_reasoning_enabled_passes_delta_callback(
+    tmp_path: Path,
+) -> None:
+    advisor = _CallbackProbingAdvisor()
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        advisor=advisor,
+        tool_registry=InvestigationToolRegistry([RecordingMCPStyleTool()]),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "main-agent-reasoning-stream",
+            "severity": "INFO",
+            "title": "Reasoning stream",
+            "reason": "reasoning_stream",
+        },
+    )
+
+    assert result.latest_run is not None
+    assert all(callable(item) for item in advisor.decision_callbacks)
+    assert callable(advisor.advise_callbacks[0])
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 async def test_react_max_rounds_stops_normally_after_existing_observation(
     tmp_path: Path,

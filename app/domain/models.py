@@ -502,6 +502,10 @@ class AnalysisConfigSnapshot(BaseModel):
     ai_react_reasoning_effort: str = ""
     ai_reasoning_effort: str = ""
     ai_mcp_reasoning_effort: str = ""
+    # Whether the main Agent persisted one durable event per reasoning
+    # delta at run time. Recorded per run so historical behavior stays
+    # interpretable after the flag changes.
+    stream_main_agent_reasoning: bool = True
     ai_timeout_seconds: float = 300
     # Historical compatibility only. New analyses always store zero because
     # provider retries are bounded by analysis timeout/cancellation, not a count.

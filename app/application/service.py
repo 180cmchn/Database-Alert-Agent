@@ -84,6 +84,7 @@ class AlertAnalysisService:
         investigation_lease_seconds: int = 300,
         lease_heartbeat_interval_seconds: float | None = None,
         ai_fallback_enabled: bool = True,
+        stream_main_agent_reasoning: bool = True,
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
         react_max_rounds: int = 8,
         analysis_timeout_seconds: int = 1800,
@@ -110,6 +111,7 @@ class AlertAnalysisService:
         self.investigation_lease_seconds = investigation_lease_seconds
         self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
         self.ai_fallback_enabled = ai_fallback_enabled
+        self.stream_main_agent_reasoning = stream_main_agent_reasoning
         self.alert_sanitizer = alert_sanitizer
         self.react_max_rounds = react_max_rounds
         self.analysis_timeout_seconds = analysis_timeout_seconds
@@ -276,6 +278,7 @@ class AlertAnalysisService:
             run=run,
             react_max_rounds=run_snapshot.react_max_rounds,
             ai_fallback_enabled=run_snapshot.ai_fallback_enabled,
+            stream_main_agent_reasoning=run_snapshot.stream_main_agent_reasoning,
             knowledge_sources=run_snapshot.knowledge_sources,
         )
 
@@ -683,6 +686,7 @@ class AlertAnalysisService:
             analysis_timeout_seconds=self.analysis_timeout_seconds,
             validation_enabled=True,
             ai_fallback_enabled=self.ai_fallback_enabled,
+            stream_main_agent_reasoning=self.stream_main_agent_reasoning,
             ai_model=getattr(self.advisor, "model", ""),
             ai_provider=getattr(self.advisor, "provider", ""),
             ai_react_model=getattr(self.advisor, "react_model", "")

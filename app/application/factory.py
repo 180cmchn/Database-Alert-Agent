@@ -440,6 +440,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.react_max_rounds = settings.react_max_rounds
     service.analysis_timeout_seconds = settings.analysis_timeout_seconds
     service.ai_fallback_enabled = settings.ai_fallback_enabled
+    service.stream_main_agent_reasoning = settings.stream_main_agent_reasoning
     service.external_knowledge_client = external_knowledge_client
     service.external_knowledge_limit = settings.external_knowledge_limit
     service.external_knowledge_min_relevance = settings.external_knowledge_min_relevance
@@ -522,6 +523,7 @@ def build_runtime(
         runbook_limit=settings.runbook_limit,
         investigation_lease_seconds=settings.investigation_lease_seconds,
         ai_fallback_enabled=settings.ai_fallback_enabled,
+        stream_main_agent_reasoning=settings.stream_main_agent_reasoning,
         react_max_rounds=settings.react_max_rounds,
         analysis_timeout_seconds=settings.analysis_timeout_seconds,
         external_knowledge_client=external_knowledge_client,

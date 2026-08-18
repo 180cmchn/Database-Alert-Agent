@@ -576,7 +576,14 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
                         reasoning_callback_invoked or emitted is not None
                     )
 
-                if _accepts_keyword_argument(decide, "reasoning_callback"):
+                # Persisting one durable event per main-Agent reasoning
+                # delta (insert plus a full-history idempotency read)
+                # dominates decision wall time, so durable delta streaming
+                # is opt-in; the complete reasoning is recorded once per
+                # decision through the fallback below otherwise.
+                if _accepts_keyword_argument(decide, "reasoning_callback") and (
+                    state.stream_main_agent_reasoning
+                ):
                     result = await decide(
                         **decision_kwargs,
                         reasoning_callback=emit_response_reasoning,
@@ -854,7 +861,12 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             "external_knowledge": external_knowledge,
             "knowledge_match_summary": knowledge_match_summary,
         }
-        if _accepts_keyword_argument(ctx.advisor.advise, "reasoning_callback"):
+        # Same rationale as the ReAct node: durable delta persistence
+        # dominates the final-analysis wall time, so it stays opt-in and
+        # the complete reasoning is recorded once after advise returns.
+        if _accepts_keyword_argument(
+            ctx.advisor.advise, "reasoning_callback"
+        ) and state.stream_main_agent_reasoning:
             recommendation, advisor_metadata = await ctx.advisor.advise(
                 alert,
                 runbooks,

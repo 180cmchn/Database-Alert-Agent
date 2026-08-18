@@ -524,6 +524,27 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
 
 
 @pytest.mark.asyncio
+async def test_stream_main_agent_reasoning_is_runtime_editable(
+    tmp_path: Path,
+) -> None:
+    settings = runtime_test_settings(tmp_path)
+    manager = RuntimeSettingsManager(settings.runtime_settings_path)
+
+    assert settings.stream_main_agent_reasoning is True
+    assert "stream_main_agent_reasoning" in RUNTIME_SETTINGS_KEYS
+
+    disabled, _, changed = await manager.patch(
+        settings,
+        {"stream_main_agent_reasoning": False},
+        expected_revision=manager.revision,
+    )
+    assert disabled.stream_main_agent_reasoning is False
+    assert changed == ["stream_main_agent_reasoning"]
+    persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
+    assert persisted["stream_main_agent_reasoning"] is False
+
+
+@pytest.mark.asyncio
 async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_values(
     tmp_path: Path,
 ) -> None:

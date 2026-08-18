@@ -42,6 +42,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_reasoning_effort",
         "ai_mcp_model",
         "ai_mcp_reasoning_effort",
+        "stream_main_agent_reasoning",
         "runbook_limit",
         "wecom_webhook_url",
         "wecom_page_base_url",
@@ -108,6 +109,11 @@ class Settings(BaseSettings):
     ai_react_reasoning_effort: str = ""
     ai_reasoning_effort: str = ""
     ai_mcp_reasoning_effort: str = ""
+    # Persisting one durable event per main-Agent reasoning delta (insert
+    # plus a full-history idempotency read) dominates decision wall time, so
+    # durable delta streaming is opt-in; when disabled, each decision or
+    # final conclusion records its complete reasoning once instead.
+    stream_main_agent_reasoning: bool = True
 
     @field_validator(
         "ai_react_reasoning_effort",

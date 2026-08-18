@@ -10,7 +10,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -48,8 +48,11 @@ ARCHERY_MCP_COLUMNS_TOOL_NAME: Final = "list_table_columns_gymJPA"
 # Compatibility hint only; dynamic probes use the discovered table's real columns.
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
+# mysql_slow_query_review_history 的 ts_min/ts_max 列以北京时间（UTC+8）字符串
+# 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
+ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v25"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v26"
 ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v1"
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -371,6 +374,12 @@ class ArcheryMCPClient:
     ) -> list[dict[str, Any]]:
         window_start_epoch = int(window_start.timestamp())
         window_end_epoch = int(window_end.timestamp())
+
+        def beijing(value: datetime) -> str:
+            return value.astimezone(ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
         task = {
             "prompt_version": ARCHERY_SLOW_LOG_PROMPT_VERSION,
             "alert": sanitize(dict(alert_context)),
@@ -381,6 +390,12 @@ class ArcheryMCPClient:
                 "start_unix_seconds": window_start_epoch,
                 "end_unix_seconds": window_end_epoch,
                 "duration_seconds": self.window_seconds,
+                "ts_column_timezone": "UTC+8",
+                "start_beijing": beijing(window_start),
+                "end_beijing": beijing(window_end),
+                "ts_min_lower_bound_beijing": beijing(
+                    window_start - timedelta(hours=1)
+                ),
             },
             "investigation_context": {
                 "read_only": True,
