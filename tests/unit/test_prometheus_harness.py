@@ -1353,10 +1353,14 @@ async def test_transport_failure_without_response_creates_no_response_artifact(
 
 
 @pytest.mark.asyncio
-async def test_prometheus_planner_streams_provider_reasoning_in_delta_order(
+async def test_prometheus_planner_records_reasoning_once_without_delta_streams(
     tmp_path: Path,
 ) -> None:
-    class StreamingReasoningModel(_SequenceModel):
+    class ReasoningModel(_SequenceModel):
+        def __init__(self, responses: list[MCPModelToolCall | Exception]) -> None:
+            super().__init__(responses)
+            self.received_callbacks: list[Any | None] = []
+
         async def request_mcp_tool_call(
             self,
             *,
@@ -1366,11 +1370,9 @@ async def test_prometheus_planner_streams_provider_reasoning_in_delta_order(
         ) -> MCPModelToolCall:
             self.messages.append(messages)
             self.tools.append(tools)
-            assert reasoning_callback is not None
-            await reasoning_callback("先确认监控范围，", 0)
-            await reasoning_callback("再决定是否查询指标。", 1)
+            self.received_callbacks.append(reasoning_callback)
             return MCPModelToolCall(
-                call_id="finish-with-streamed-reasoning",
+                call_id="finish-with-reasoning",
                 name="finish_prometheus_investigation",
                 arguments={
                     "monitoring_scope_status": "unknown",
@@ -1380,17 +1382,22 @@ async def test_prometheus_planner_streams_provider_reasoning_in_delta_order(
             )
 
     repository = SQLAlchemyAlertRepository(
-        f"sqlite+aiosqlite:///{tmp_path / 'prometheus-reasoning-stream.db'}"
+        f"sqlite+aiosqlite:///{tmp_path / 'prometheus-reasoning-once.db'}"
     )
     await repository.initialize()
     context, _, run = await _durable_context(
         repository,
-        external_id="prometheus-reasoning-stream",
+        external_id="prometheus-reasoning-once",
     )
+    model = ReasoningModel([])
     await _client(
-        StreamingReasoningModel([]),
+        model,
         repository=repository,
     ).collect_alert_window(context)
+
+    # Durable reasoning deltas dominated the bounded planner wall time, so the
+    # Prometheus harness no longer forwards a reasoning callback at all.
+    assert model.received_callbacks == [None]
 
     events = await repository.list_agent_events(str(run.id))
     reasoning = [
@@ -1400,14 +1407,20 @@ async def test_prometheus_planner_streams_provider_reasoning_in_delta_order(
         and event.payload.get("provider") == PROMETHEUS_MCP_SERVER_NAME
     ]
     assert [event.payload["content"] for event in reasoning] == [
-        "先确认监控范围，",
-        "再决定是否查询指标。",
+        "先确认监控范围，再决定是否查询指标。",
     ]
-    assert [event.payload["delta_index"] for event in reasoning] == [0, 1]
-    assert len({event.payload["stream_id"] for event in reasoning}) == 1
-    assert all(
-        event.payload["stream_id"].startswith("prometheus-agent:decision:")
-        for event in reasoning
+    assert all("delta_index" not in event.payload for event in reasoning)
+    assert all("stream_id" not in event.payload for event in reasoning)
+    finish_decisions = [
+        event
+        for event in events
+        if event.kind == AgentEventKind.MODEL_DECISION
+        and event.payload.get("action") == "finish"
+    ]
+    assert len(finish_decisions) == 1
+    assert (
+        finish_decisions[0].payload["reasoning"]
+        == "先确认监控范围，再决定是否查询指标。"
     )
     await repository.close()
 

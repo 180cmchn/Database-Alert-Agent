@@ -158,6 +158,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         remote_response_store: RemoteResponseStore | None = None,
         planner_timeout_seconds: float = 60,
         session_timeout_seconds: float = 30,
+        stream_planner_reasoning: bool = True,
         dispatch_scope_id: UUID | None = None,
     ) -> None:
         if connector.provider != scenario.provider:
@@ -177,6 +178,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         self.remote_response_store = remote_response_store
         self.planner_timeout_seconds = planner_timeout_seconds
         self.session_timeout_seconds = session_timeout_seconds
+        self.stream_planner_reasoning = stream_planner_reasoning
         self.dispatch_scope_id = dispatch_scope_id
 
     async def run(
@@ -633,9 +635,19 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                             for name in sorted(ctx.catalog)
                         ],
                     }
-                    if self._accepts_keyword_argument(
-                        self.planner.plan,
-                        "reasoning_callback",
+                    # Streaming every reasoning delta durably (one event
+                    # insert plus a version read per delta) dominates planner
+                    # wall time for long reasoning outputs and can exhaust
+                    # planner_timeout_seconds before the decision returns.
+                    # Providers that disable streaming still record the
+                    # complete reasoning once per decision through
+                    # MODEL_DECISION and TRACE_REASONING.
+                    if (
+                        self.stream_planner_reasoning
+                        and self._accepts_keyword_argument(
+                            self.planner.plan,
+                            "reasoning_callback",
+                        )
                     ):
                         planner_kwargs["reasoning_callback"] = emit_reasoning_delta
                     raw = await self._await_bounded(

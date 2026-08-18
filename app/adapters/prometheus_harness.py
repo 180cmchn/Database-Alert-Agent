@@ -1090,6 +1090,10 @@ async def collect_prometheus_with_harness(
         remote_response_store=remote_response_store,
         planner_timeout_seconds=client.timeout_seconds,
         session_timeout_seconds=client.timeout_seconds,
+        # Same rationale as Archery: durable reasoning deltas dominate
+        # planner wall time inside the bounded client timeout, and the
+            # MODEL_DECISION / TRACE_REASONING.
+        stream_planner_reasoning=False,
     )
     checkpoint = (
         await checkpoint_store.load(context.run_id)

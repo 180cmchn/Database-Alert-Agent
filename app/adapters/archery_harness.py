@@ -1164,6 +1164,13 @@ async def execute_archery_harness(
         remote_response_store=remote_response_store,
         planner_timeout_seconds=client.timeout_seconds,
         session_timeout_seconds=client.timeout_seconds,
+        # Persisting every reasoning delta as one durable event dominated the
+        # planner wall time, so long slow-log summaries repeatedly exhausted
+        # planner_timeout_seconds before the finish decision could return and
+        # forced identical planner repairs. The complete reasoning is still
+        # recorded once per decision through MODEL_DECISION / TRACE_REASONING,
+        # so no audit evidence is lost.
+        stream_planner_reasoning=False,
     )
     checkpoint = (
         await checkpoint_store.load(effective_run_id)

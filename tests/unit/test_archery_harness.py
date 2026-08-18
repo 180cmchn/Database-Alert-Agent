@@ -1153,6 +1153,107 @@ async def test_persisted_trace_exposes_only_final_history_projection(
 
 
 @pytest.mark.asyncio
+async def test_shared_harness_records_reasoning_once_without_delta_streams(
+    tmp_path: Path,
+) -> None:
+    class StreamingCapableModel(_ScriptedModel):
+        def __init__(self, responses: list[MCPModelToolCall | Exception]) -> None:
+            super().__init__(responses)
+            self.received_callbacks: list[Any | None] = []
+
+        async def request_mcp_tool_call(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            reasoning_callback: Any | None = None,
+        ) -> MCPModelToolCall:
+            self.received_callbacks.append(reasoning_callback)
+            return await super().request_mcp_tool_call(
+                messages=messages,
+                tools=tools,
+            )
+
+    finish_with_reasoning = MCPModelToolCall(
+        call_id="finish-with-reasoning",
+        name=FINISH_TOOL_NAME,
+        arguments={"reason": "Archery evidence collection is complete"},
+        request_id="request-finish-with-reasoning",
+        reasoning_content="Inspect the returned slow-log facts before finishing.",
+    )
+    model = StreamingCapableModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("final", FINAL_SQL),
+            finish_with_reasoning,
+        ]
+    )
+    repository = SQLAlchemyAlertRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'archery-reasoning-once.db'}"
+    )
+    await repository.initialize()
+    _, run = await _create_durable_run(
+        repository,
+        external_id="archery-reasoning-once",
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reasoning-once",
+                tools=_tools(),
+                calls=_lineage_replay_calls(),
+            )
+        ],
+    )
+    assert run.lease_owner is not None
+
+    result = await _client(
+        model,
+        connector,
+        repository=repository,
+    ).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+        run_id=run.id,
+        outer_dispatch_id=uuid4(),
+        lease_owner=run.lease_owner,
+        fencing_token=run.fencing_token,
+    )
+
+    assert result.query_completed is True
+    # Durable reasoning deltas dominated the bounded planner wall time, so the
+    # Archery harness no longer forwards a reasoning callback at all.
+    assert model.received_callbacks == [None, None, None, None]
+
+    events = await repository.list_agent_events(str(run.id))
+    reasoning_events = [
+        event
+        for event in events
+        if event.kind == AgentEventKind.TRACE_REASONING
+        and event.payload.get("provider") == ARCHERY_HARNESS_PROVIDER
+    ]
+    assert [event.payload["content"] for event in reasoning_events] == [
+        "Inspect the returned slow-log facts before finishing.",
+    ]
+    assert all("delta_index" not in event.payload for event in reasoning_events)
+    assert all("stream_id" not in event.payload for event in reasoning_events)
+    finish_decisions = [
+        event
+        for event in events
+        if event.kind == AgentEventKind.MODEL_DECISION
+        and event.payload.get("action") == "finish"
+    ]
+    assert len(finish_decisions) == 1
+    assert (
+        finish_decisions[0].payload["reasoning"]
+        == "Inspect the returned slow-log facts before finishing."
+    )
+    await repository.close()
+
+
+@pytest.mark.asyncio
 async def test_business_error_raw_payload_is_replayed_to_internal_model() -> None:
     error_secret = "archery-error-secret-key"
     raw_error = {
