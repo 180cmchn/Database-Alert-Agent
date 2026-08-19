@@ -3,7 +3,10 @@ import test from "node:test";
 import type { AgentTraceEntry, AgentTraceKind } from "../src/types/api.ts";
 import {
   advanceTraceSequence,
+  countMcpTraceItems,
+  filterAgentTraceItems,
   mergeAgentTraceItems,
+  resolveTraceVisibility,
   shouldShowReasoningFallback,
 } from "../src/components/agentTraceModel.ts";
 import {
@@ -149,6 +152,68 @@ test("reasoning streams with the same id remain isolated by scope", () => {
 
   assert.deepEqual(merged.map((item) => item.content), ["主 Agent", "MCP Agent"]);
   assert.deepEqual(merged.map((item) => item.scope), ["main_agent", "mcp_internal"]);
+});
+
+test("default trace visibility keeps every entry untouched", () => {
+  const items = [
+    traceEntry("main-1", 1, "REASONING", "main_agent"),
+    traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
+  ];
+
+  assert.deepEqual(
+    filterAgentTraceItems(items, { hideMainAgent: false, hideMcp: false }),
+    items,
+  );
+});
+
+test("hiding only the MCP chain keeps main agent entries", () => {
+  const items = [
+    traceEntry("main-1", 1, "REASONING", "main_agent"),
+    traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
+    traceEntry("main-2", 3, "OBSERVATION", "main_agent"),
+    traceEntry("mcp-2", 4, "REASONING", "mcp_internal"),
+  ];
+
+  const filtered = filterAgentTraceItems(items, { hideMainAgent: false, hideMcp: true });
+
+  assert.deepEqual(filtered.map((item) => item.event_id), ["main-1", "main-2"]);
+});
+
+test("hiding the main agent chain forces the MCP chain to hide too", () => {
+  const items = [
+    traceEntry("main-1", 1, "REASONING", "main_agent"),
+    traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
+  ];
+  const forced = { hideMainAgent: true, hideMcp: false };
+
+  assert.deepEqual(resolveTraceVisibility(forced), { hideMainAgent: true, hideMcp: true });
+  assert.deepEqual(filterAgentTraceItems(items, forced), []);
+  assert.deepEqual(
+    filterAgentTraceItems(items, { hideMainAgent: true, hideMcp: true }),
+    [],
+  );
+});
+
+test("resolving visibility preserves the independent MCP intent", () => {
+  assert.deepEqual(
+    resolveTraceVisibility({ hideMainAgent: false, hideMcp: true }),
+    { hideMainAgent: false, hideMcp: true },
+  );
+  assert.deepEqual(
+    resolveTraceVisibility({ hideMainAgent: false, hideMcp: false }),
+    { hideMainAgent: false, hideMcp: false },
+  );
+});
+
+test("hidden MCP entries are counted for the inline notice", () => {
+  const items = [
+    traceEntry("main-1", 1, "REASONING", "main_agent"),
+    traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
+    traceEntry("mcp-2", 3, "OBSERVATION", "mcp_internal"),
+  ];
+
+  assert.equal(countMcpTraceItems(items), 2);
+  assert.equal(countMcpTraceItems([]), 0);
 });
 
 test("a submitted cancellation cannot be requested twice", () => {

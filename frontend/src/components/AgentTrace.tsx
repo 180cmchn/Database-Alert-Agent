@@ -1,12 +1,16 @@
-import { BrainCircuit, Eye, LoaderCircle, TerminalSquare } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { BrainCircuit, Eye, EyeOff, LoaderCircle, TerminalSquare } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { formatDateTime } from "../lib/format";
 import type { AgentTraceEntry, AgentTraceKind } from "../types/api";
 import {
   advanceTraceSequence,
+  countMcpTraceItems,
+  filterAgentTraceItems,
   mergeAgentTraceItems,
+  resolveTraceVisibility,
   shouldShowReasoningFallback,
+  type TraceVisibilityFlags,
 } from "./agentTraceModel";
 
 const kindLabel: Record<AgentTraceKind, string> = {
@@ -35,6 +39,10 @@ interface AgentTraceProps {
 export function AgentTrace({ alertId, runId, active }: AgentTraceProps) {
   const [items, setItems] = useState<AgentTraceEntry[]>([]);
   const [error, setError] = useState("");
+  const [visibility, setVisibility] = useState<TraceVisibilityFlags>({
+    hideMainAgent: false,
+    hideMcp: false,
+  });
   const nextSequence = useRef(0);
 
   useEffect(() => {
@@ -76,41 +84,91 @@ export function AgentTrace({ alertId, runId, active }: AgentTraceProps) {
     };
   }, [active, alertId, runId]);
 
-  const showReasoningFallback = shouldShowReasoningFallback(items, active);
+  const resolvedVisibility = resolveTraceVisibility(visibility);
+  const visibleItems = useMemo(
+    () => filterAgentTraceItems(items, visibility),
+    [items, visibility],
+  );
+  const mcpItemCount = useMemo(() => countMcpTraceItems(items), [items]);
+  const showReasoningFallback = !resolvedVisibility.hideMainAgent
+    && shouldShowReasoningFallback(visibleItems, active);
 
   return (
     <div className="agent-trace" aria-live="polite">
+      <div className="trace-visibility-toolbar" role="group" aria-label="思考链显示设置">
+        <label
+          className={`trace-visibility-toggle${resolvedVisibility.hideMcp ? " on" : ""}${resolvedVisibility.hideMainAgent ? " locked" : ""}`}
+          title={resolvedVisibility.hideMainAgent
+            ? "主 Agent 思考链隐藏期间，MCP 思考链被强制隐藏"
+            : undefined}
+        >
+          <input
+            type="checkbox"
+            checked={resolvedVisibility.hideMcp}
+            disabled={resolvedVisibility.hideMainAgent}
+            onChange={() => setVisibility((current) => ({ ...current, hideMcp: !current.hideMcp }))}
+          />
+          {resolvedVisibility.hideMcp ? <EyeOff size={13} /> : <Eye size={13} />}
+          <span>隐藏 MCP 思考链</span>
+        </label>
+        <label className={`trace-visibility-toggle${resolvedVisibility.hideMainAgent ? " on" : ""}`}>
+          <input
+            type="checkbox"
+            checked={visibility.hideMainAgent}
+            onChange={() => setVisibility((current) => ({
+              ...current,
+              hideMainAgent: !current.hideMainAgent,
+            }))}
+          />
+          {resolvedVisibility.hideMainAgent ? <EyeOff size={13} /> : <Eye size={13} />}
+          <span>隐藏主 Agent 思考链</span>
+        </label>
+      </div>
       {showReasoningFallback && (
         <div className="trace-reasoning-fallback">
           <LoaderCircle size={16} className="spin" />
           <span>当前暂时无法显示思维链，但仍在分析中</span>
         </div>
       )}
-      {items.length ? (
-        <ol className="agent-trace-list">
-          {items.map((item) => (
-            <li
-              key={item.event_id}
-              className={`trace-${item.kind.toLowerCase()} trace-scope-${item.scope}`}
-            >
-              <span className="trace-icon"><TraceIcon kind={item.kind} /></span>
-              <div>
-                <header>
-                  <strong>{kindLabel[item.kind]}</strong>
-                  <span className={`trace-scope-label scope-${item.scope}`}>
-                    {scopeLabel[item.scope]}
-                  </span>
-                  <span>{item.actor} · {item.provider}</span>
-                  <time>{formatDateTime(item.occurred_at)}</time>
-                </header>
-                <pre>{item.content}</pre>
-              </div>
-            </li>
-          ))}
-        </ol>
-      ) : !active ? (
-        <p className="muted-copy">本次运行没有可展示的 Agent 实时事件。</p>
-      ) : null}
+      {resolvedVisibility.hideMainAgent ? (
+        <div className="trace-hidden-notice">
+          <EyeOff size={16} />
+          <span>主 Agent 与 MCP 思考链均已隐藏，后台仍在持续收集完整轨迹用于审计。</span>
+        </div>
+      ) : (
+        <>
+          {resolvedVisibility.hideMcp && mcpItemCount > 0 && (
+            <p className="trace-hidden-notice-inline">
+              已隐藏 {mcpItemCount} 条 MCP 内部思考轨迹，主 Agent 轨迹仍正常展示。
+            </p>
+          )}
+          {visibleItems.length ? (
+            <ol className="agent-trace-list">
+              {visibleItems.map((item) => (
+                <li
+                  key={item.event_id}
+                  className={`trace-${item.kind.toLowerCase()} trace-scope-${item.scope}`}
+                >
+                  <span className="trace-icon"><TraceIcon kind={item.kind} /></span>
+                  <div>
+                    <header>
+                      <strong>{kindLabel[item.kind]}</strong>
+                      <span className={`trace-scope-label scope-${item.scope}`}>
+                        {scopeLabel[item.scope]}
+                      </span>
+                      <span>{item.actor} · {item.provider}</span>
+                      <time>{formatDateTime(item.occurred_at)}</time>
+                    </header>
+                    <pre>{item.content}</pre>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          ) : !active ? (
+            <p className="muted-copy">本次运行没有可展示的 Agent 实时事件。</p>
+          ) : null}
+        </>
+      )}
       {error && <p className="trace-load-error">轨迹更新失败：{error}</p>}
     </div>
   );

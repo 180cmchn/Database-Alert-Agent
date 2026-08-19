@@ -63,3 +63,37 @@ export function shouldShowReasoningFallback(
       && item.sequence > latestObservationSequence,
   );
 }
+
+export interface TraceVisibilityFlags {
+  hideMainAgent: boolean;
+  hideMcp: boolean;
+}
+
+export function resolveTraceVisibility(
+  flags: TraceVisibilityFlags,
+): TraceVisibilityFlags {
+  // Hiding the main Agent chain always forces the MCP chain to hide as well,
+  // while the MCP chain may be hidden on its own.
+  return flags.hideMainAgent
+    ? { hideMainAgent: true, hideMcp: true }
+    : { hideMainAgent: false, hideMcp: flags.hideMcp };
+}
+
+export function filterAgentTraceItems(
+  items: AgentTraceEntry[],
+  flags: TraceVisibilityFlags,
+): AgentTraceEntry[] {
+  const resolved = resolveTraceVisibility(flags);
+  if (resolved.hideMainAgent) return [];
+  if (resolved.hideMcp) {
+    return items.filter((item) => item.scope !== "mcp_internal");
+  }
+  return items;
+}
+
+export function countMcpTraceItems(items: AgentTraceEntry[]): number {
+  return items.reduce(
+    (count, item) => (item.scope === "mcp_internal" ? count + 1 : count),
+    0,
+  );
+}
