@@ -791,6 +791,147 @@ def test_archery_mcp_classifies_history_without_host_window_sort_or_limit_checks
     )
 
 
+def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> None:
+    history_table = ARCHERY_SLOW_QUERY_REVIEW_TABLE
+    assert ArcheryMCPClient.is_history_id_only_projection(
+        f"SELECT id FROM {history_table} WHERE hostname_max = 'h:3306' ORDER BY id DESC"
+    )
+    assert not ArcheryMCPClient.is_history_id_only_projection(
+        f"SELECT id, hostname_max FROM {history_table} WHERE id = 24413454"
+    )
+    assert not ArcheryMCPClient.is_history_id_only_projection(
+        f"SELECT * FROM {history_table} WHERE hostname_max = 'h:3306'"
+    )
+    assert ArcheryMCPClient.is_history_id_retrieval_query(
+        f"SELECT * FROM {history_table} WHERE id = 24413454"
+    )
+    assert ArcheryMCPClient.is_history_id_retrieval_query(
+        f"SELECT id, hostname_max FROM {history_table} "
+        "WHERE hostname_max = 'h:3306' AND id IN (24413454, 24413460)"
+    )
+    window_sql = (
+        f"SELECT * FROM {history_table} "
+        "WHERE hostname_max = 'h:3306' AND ts_min >= '2026-08-17 08:41:12' "
+        "AND ts_min < '2026-08-17 09:46:12' AND ts_max >= '2026-08-17 09:41:12' "
+        "ORDER BY id DESC"
+    )
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(window_sql)
+    assert not ArcheryMCPClient.is_history_id_only_projection(window_sql)
+    # In-word identifiers such as f_instance_id must never look like id retrieval.
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(
+        f"SELECT * FROM {history_table} WHERE f_instance_id = 53"
+    )
+    # Projection queries that clip oversized columns (LEFT/LENGTH aliases) are
+    # still per-id retrievals and must keep merging into the final payload.
+    assert ArcheryMCPClient.is_history_id_retrieval_query(
+        "SELECT id, hostname_max, ts_cnt, LEFT(sample, '4000') AS sample, "
+        f"LENGTH(sample) AS sample_full_length FROM {history_table} "
+        "WHERE id = 24413640"
+    )
+
+
+def test_accumulate_history_rows_merges_by_id_with_field_union() -> None:
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    sources: list[dict[str, Any]] = []
+
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {"rows": [{"id": 24413458, "sample": "UPDATE t", "ts_cnt": 6}]},
+        sql="SELECT * FROM mysql_slow_query_review_history WHERE id = 24413458",
+        include_source=True,
+    )
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {
+            "rows": [
+                {"id": "24413458", "ts_cnt": 12},
+                {"id": 24413460, "sample": "SELECT 1", "ts_cnt": 40},
+                {"sample": "row without id cannot join the merge"},
+            ]
+        },
+        sql=(
+            "SELECT * FROM mysql_slow_query_review_history "
+            "WHERE id IN (24413458, 24413460)"
+        ),
+        include_source=True,
+    )
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {"rows": [{"id": 24413460}]},
+        sql="SELECT * FROM mysql_slow_query_review_history WHERE id = 24413460",
+        include_source=False,
+    )
+
+    payload = ArcheryMCPClient.merged_history_payload(rows_by_id, sources)
+    assert payload["rows_merged_from_per_id_queries"] is True
+    assert payload["merged_query_count"] == 2
+    assert [row["id"] for row in payload["rows"]] == ["24413458", 24413460]
+    assert payload["rows"][0] == {
+        "id": "24413458",
+        "sample": "UPDATE t",
+        "ts_cnt": 12,
+    }
+    assert payload["rows"][1] == {"id": 24413460, "sample": "SELECT 1", "ts_cnt": 40}
+    assert "rows_recovered_from_truncated_json" not in payload
+    assert payload["merged_full_sqls"] == [
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413458",
+        "SELECT * FROM mysql_slow_query_review_history "
+        "WHERE id IN (24413458, 24413460)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_merged_history_payload_reaches_evidence_as_eligible_success() -> None:
+    rows_by_id = {
+        row["id"]: dict(row)
+        for row in (
+            _large_slow_query_row(0),
+            _large_slow_query_row(1),
+            _large_slow_query_row(2),
+        )
+    }
+    merged = ArcheryMCPClient.merged_history_payload(
+        rows_by_id,
+        [
+            {
+                "full_sql": (
+                    "SELECT * FROM mysql_slow_query_review_history WHERE id = 1000"
+                ),
+                "row_count": 1,
+            },
+            {
+                "full_sql": (
+                    "SELECT * FROM mysql_slow_query_review_history "
+                    "WHERE id IN (1001, 1002)"
+                ),
+                "row_count": 2,
+            },
+        ],
+    )
+
+    outcome = await ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload=merged)
+    ).execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context(
+            "database_latency",
+            title="MySQL/mysql_slow_query_400/db-1:3306",
+        ),
+    )
+
+    assert not isinstance(outcome, ToolExecutionResult)
+    summary, structured_data = outcome
+    assert "字符截断" not in summary
+    assert structured_data["query_completed"] is True
+    assert structured_data["root_cause_eligible"] is True
+    passthrough = structured_data["final_result_payload"]
+    assert passthrough["rows_merged_from_per_id_queries"] is True
+    assert len(passthrough["rows"]) == 3
+
+
 
 
 @pytest.mark.asyncio

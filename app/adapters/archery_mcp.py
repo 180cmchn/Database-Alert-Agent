@@ -498,6 +498,166 @@ class ArcheryMCPClient:
 
         return cls._is_slow_query_review_history_select(sql)
 
+    @classmethod
+    def is_history_id_only_projection(cls, sql: str) -> bool:
+        """Classify id-only listing queries issued after result truncation.
+
+        This is a post-result classifier in the same spirit as
+        ``is_history_result_query``: it never accepts, rejects, or rewrites a
+        call. An id listing navigates the follow-up per-id retrieval and is
+        never itself the final slow-log result.
+        """
+
+        return cls._simple_select_columns(sql) == ("id",)
+
+    @classmethod
+    def is_history_id_retrieval_query(cls, sql: str) -> bool:
+        """Classify per-id history retrieval queries (id equality or id IN)."""
+
+        uncommented = cls._sql_without_comments(sql)
+        if not uncommented:
+            return False
+        identifier = r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?`?id`?"
+        # The identifier must start after whitespace, "(", ",", or a qualified
+        # prefix so column names such as ``f_instance_id`` never match.
+        boundary = r"(?:^|[\s(,])"
+        return bool(
+            re.search(rf"(?is){boundary}{identifier}\s*=\s*\d", uncommented)
+            or re.search(rf"(?is){boundary}{identifier}\s+in\s*\(", uncommented)
+        )
+
+    @classmethod
+    def truncation_row_shortfall(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, int] | None:
+        """Return ``(declared, recovered)`` when MCP truncation lost rows.
+
+        Two payload shapes signal truncation: a recovered JSON prefix whose
+        ``mcp_reported_row_count`` exceeds the recovered ``rows`` length, and a
+        payload that only carries Archery's textual row-count claim without
+        any parsable rows (``row_count_source == "archery_text"``).
+        """
+
+        rows = payload.get("rows")
+        recovered = len(rows) if isinstance(rows, list) else None
+        declared: int | None = None
+        if isinstance(payload.get("mcp_reported_row_count"), int):
+            declared = payload["mcp_reported_row_count"]
+        elif (
+            payload.get("row_count_source") == "archery_text"
+            and isinstance(payload.get("rowCount"), int)
+            and payload["rowCount"] > 0
+        ):
+            declared = payload["rowCount"]
+        if declared is None:
+            return None
+        if recovered is None:
+            return declared, 0
+        if declared > recovered:
+            return declared, recovered
+        return None
+
+    @classmethod
+    def accumulate_history_rows(
+        cls,
+        rows_by_id: dict[int, dict[str, Any]],
+        merge_sources: list[Mapping[str, Any]],
+        payload: Mapping[str, Any],
+        *,
+        sql: str,
+        include_source: bool,
+    ) -> None:
+        """Accumulate history rows keyed by id; later fields overwrite earlier.
+
+        Mechanical union only: rows without a usable id stay in their own
+        query result but cannot join the merge, no row is invented, reordered,
+        or filtered, and per-query source metadata is recorded for tracing.
+        """
+
+        rows = cls._tabular_rows(payload)
+        for row in rows:
+            row_id = cls._coerce_positive_integer(row.get("id"))
+            if row_id is None:
+                continue
+            merged = dict(rows_by_id.get(row_id) or {})
+            merged.update(row)
+            rows_by_id[row_id] = merged
+        if include_source:
+            merge_sources.append({"full_sql": sql, "row_count": len(rows)})
+
+    @classmethod
+    def history_row_ids(cls, payload: Mapping[str, Any]) -> set[int]:
+        """Collect the ids an id-listing or history result claims to contain."""
+
+        ids: set[int] = set()
+        for row in cls._tabular_rows(payload):
+            if isinstance(row, Mapping):
+                row_id = cls._coerce_positive_integer(row.get("id"))
+                if row_id is not None:
+                    ids.add(row_id)
+        if not ids:
+            rows = payload.get("rows")
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, (list, tuple)) and row:
+                        row_id = cls._coerce_positive_integer(row[0])
+                        if row_id is not None:
+                            ids.add(row_id)
+        return ids
+
+    @classmethod
+    def merge_positional_rows_with_reference(
+        cls,
+        rows_by_id: dict[int, dict[str, Any]],
+        positional_rows: list[list[Any]],
+        reference_row: Mapping[str, Any],
+    ) -> int:
+        """Decode deferred positional rows using a structured row's column order.
+
+        Deferred rows come from a truncated window query whose column list sat
+        behind the truncation point. Fields already present on the structured
+        rows win the union, so a later per-id row still takes precedence.
+        """
+        columns = [str(column) for column in reference_row.keys()]
+        decoded_count = 0
+        for row in positional_rows:
+            if not isinstance(row, (list, tuple)) or not row:
+                continue
+            row_id = cls._coerce_positive_integer(row[0])
+            if row_id is None:
+                continue
+            decoded = {
+                column: value for column, value in zip(columns, row, strict=False)
+            }
+            merged = dict(rows_by_id.get(row_id) or {})
+            rows_by_id[row_id] = {**decoded, **merged}
+            decoded_count += 1
+        return decoded_count
+
+    @classmethod
+    def merged_history_payload(
+        cls,
+        rows_by_id: Mapping[int, Mapping[str, Any]],
+        merge_sources: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the merged final payload from per-id retrieval accumulation.
+
+        Rows keep first-seen order and every field of every contributing query
+        survives the id-keyed union. The payload deliberately does not carry
+        ``rows_recovered_from_truncated_json``: the per-id rows themselves were
+        received complete, so the merged result is not character-truncated.
+        """
+
+        return {
+            "rows": [dict(row) for row in rows_by_id.values()],
+            "rows_merged_from_per_id_queries": True,
+            "merged_query_count": len(merge_sources),
+            "merged_full_sqls": [
+                str(source.get("full_sql") or "") for source in merge_sources
+            ],
+        }
+
     @staticmethod
     def clean_table_name(value: str) -> str:
         part = re.split(r"\s*\.\s*", value.strip())[-1]

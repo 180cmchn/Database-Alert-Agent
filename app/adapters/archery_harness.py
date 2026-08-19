@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
@@ -131,6 +132,16 @@ class ArcheryHarnessState:
     fatal_error_kind: str | None = None
     fatal_error_message: str | None = None
     fatal_error_diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Per-id row accumulation for the truncation-recovery path: every per-id
+    # retrieval query merges its rows here (id-keyed field union, later wins),
+    # so the final result carries the complete window row set instead of only
+    # the last query. New fields must keep defaults so old checkpoints load.
+    history_id_rows: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history_merge_sources: list[dict[str, Any]] = field(default_factory=list)
+    truncation_retry_hinted_sqls: set[str] = field(default_factory=set)
+    truncation_projection_hinted_sqls: set[str] = field(default_factory=set)
+    history_positional_rows: list[list[Any]] = field(default_factory=list)
+    window_positional_hint_given: bool = False
 
 
 @dataclass(slots=True)
@@ -787,6 +798,83 @@ class ArcheryHarnessScenario:
             )
 
         target = self.client.target_key(call.effective_arguments)
+        # Truncation-recovery navigation: an id listing or a per-id retrieval
+        # query must never become the final slow-log result (run 2970f801 lost
+        # 5 of 6 window rows because each history SELECT overwrote it).
+        if self.client.is_history_id_only_projection(result_sql):
+            return self._history_observation_transition(
+                state,
+                call,
+                result,
+                normalized_payload,
+                result_sql=result_sql,
+            )
+        if self.client.is_history_id_retrieval_query(result_sql):
+            self.client.accumulate_history_rows(
+                state.history_id_rows,
+                state.history_merge_sources,
+                normalized_payload,
+                sql=result_sql,
+                include_source=True,
+            )
+            self._resolve_deferred_positional_rows(state)
+            return self._history_observation_transition(
+                state,
+                call,
+                result,
+                normalized_payload,
+                result_sql=result_sql,
+            )
+        window_note: str | None = None
+        if normalized_payload.get("rows_recovered_from_truncated_json") is True:
+            # Truncated window query: recovered rows join the accumulation
+            # while final_result keeps recording this query as the window
+            # baseline; the merge itself happens in _query_result.
+            self.client.accumulate_history_rows(
+                state.history_id_rows,
+                state.history_merge_sources,
+                normalized_payload,
+                sql=result_sql,
+                include_source=False,
+            )
+            recovered_rows = normalized_payload.get("rows")
+            has_columns = isinstance(
+                normalized_payload.get("column_list")
+                or normalized_payload.get("columns"),
+                list,
+            )
+            if (
+                isinstance(recovered_rows, list)
+                and recovered_rows
+                and not has_columns
+            ):
+                # Archery places column_list after "rows", so a mid-rows
+                # truncation leaves recovered rows positional. Defer them until
+                # a structured row reveals the table column order.
+                state.history_positional_rows = [
+                    list(row)
+                    for row in recovered_rows
+                    if isinstance(row, (list, tuple))
+                ]
+                self._resolve_deferred_positional_rows(state)
+                if not state.window_positional_hint_given:
+                    state.window_positional_hint_given = True
+                    window_note = (
+                        "\n\n【程序截断检测-列名缺失】window 查询被 MCP 截断：程序恢复了 "
+                        + str(len(recovered_rows))
+                        + " 行原始数据，但列名清单（column_list）位于截断点之后而丢失，这些行"
+                        "暂时无法结构化进入最终合并结果（截断点所在行未被恢复）。请执行 id 清单"
+                        "查询（SELECT id FROM "
+                        + ARCHERY_SLOW_QUERY_REVIEW_TABLE
+                        + " ...），并以下一条消息的程序合并检测提示为准，对缺失 id 逐一执行"
+                        "per-id 查询。"
+                    )
+        else:
+            # A fresh complete window query starts a new baseline: discard any
+            # earlier accumulation so stale rows cannot leak into the result.
+            state.history_id_rows.clear()
+            state.history_merge_sources.clear()
+            state.history_positional_rows = []
         state.final_result = ArcherySlowLogQueryResult(
             payload=normalized_payload,
             requested_sql=requested_sql or result_sql,
@@ -817,13 +905,144 @@ class ArcheryHarnessScenario:
             ),
             message=self._tool_result_messages(
                 call,
-                self._raw_model_tool_result(result),
+                self._raw_model_tool_result(result) + (window_note or ""),
             ),
             status=(
                 ToolInvocationStatus.NO_DATA
                 if self.client.payload_row_count(normalized_payload) == 0
                 else ToolInvocationStatus.SUCCEEDED
             ),
+        )
+
+    def _history_observation_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        result: Any,
+        normalized_payload: Mapping[str, Any],
+        *,
+        result_sql: str,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        """Return an id-listing / per-id retrieval result to the model only.
+
+        The result still reaches the model unchanged and stays in the query
+        trace; it simply never becomes the final slow-log result. When the MCP
+        truncated the payload and complete rows were lost, a one-time program
+        hint appended to the tool message asks the model to retry the same SQL
+        once with an explicit ``max_result_chars`` so the truncated id is not
+        silently dropped (run 92c9a017 lost id=24413640 this way: the model
+        acknowledged the truncation but moved on without retrying).
+        """
+
+        content = self._raw_model_tool_result(result)
+        if self.client.is_history_id_only_projection(result_sql):
+            content = self._append_missing_id_hint(state, content, normalized_payload)
+        shortfall = self.client.truncation_row_shortfall(normalized_payload)
+        if shortfall is not None:
+            hint_key = re.sub(r"\s+", " ", result_sql).strip().casefold()
+            declared, recovered = shortfall
+            limit_argument = call.effective_arguments.get("max_result_chars")
+            carries_high_limit = isinstance(limit_argument, int) and limit_argument >= 24000
+            if (
+                not carries_high_limit
+                and hint_key not in state.truncation_retry_hinted_sqls
+            ):
+                state.truncation_retry_hinted_sqls.add(hint_key)
+                content = (
+                    content
+                    + "\n\n【程序截断检测】本次查询结果被 MCP 因内容过长截断：MCP 声明返回 "
+                    + str(declared)
+                    + " 行，程序仅恢复出 "
+                    + str(recovered)
+                    + " 行完整数据。请立即用相同的 SQL 重试一次本次查询，并在调用参数中"
+                    "显式传 max_result_chars=24000；若重试后仍被截断，请继续其余调查"
+                    "步骤，不要再次重试该 SQL。"
+                )
+            elif hint_key not in state.truncation_projection_hinted_sqls:
+                state.truncation_retry_hinted_sqls.add(hint_key)
+                state.truncation_projection_hinted_sqls.add(hint_key)
+                content = (
+                    content
+                    + "\n\n【程序截断检测-字段级】提高 max_result_chars 后仍被截断：MCP 声明返回 "
+                    + str(declared)
+                    + " 行，程序仅恢复出 "
+                    + str(recovered)
+                    + " 行完整数据。该行包含超长字段（通常为 sample，完整长度可达数十万"
+                    "字符），提高 max_result_chars 也无法完整取回。请改用列投影查询取回该行："
+                    "保留常规列，用 LEFT(sample, '4000') AS sample 代替 sample 列（取前缀），并加 "
+                    "LENGTH(sample) AS sample_full_length 记录完整长度，两者会随该行一起进入"
+                    "最终证据供主 Agent 分析。注意：LEFT 的长度参数必须写成带引号的 '4000'，"
+                    "Archery 的 SQL 解析层不接受函数参数中的裸数字，否则会报 1064 语法错误。"
+                    "参考 SQL：\n"
+                    + self._projection_retry_template(result_sql)
+                )
+        return ScenarioTransition(
+            state=state,
+            observation=self.client.trace_projection(
+                call.tool_name,
+                normalized_payload,
+            ),
+            message=self._tool_result_messages(call, content),
+            status=(
+                ToolInvocationStatus.NO_DATA
+                if self.client.payload_row_count(normalized_payload) == 0
+                else ToolInvocationStatus.SUCCEEDED
+            ),
+        )
+
+    @staticmethod
+    def _projection_retry_template(result_sql: str) -> str:
+        """Build the column-projection SQL suggested after a fatal truncation."""
+
+        match = re.search(r"(?i)\bid\s*=\s*(\d+)", result_sql)
+        row_id = match.group(1) if match else "<该行id>"
+        return (
+            "SELECT id, hostname_max, client_max, user_max, db_max, checksum, "
+            "ts_min, ts_max, ts_cnt, Query_time_sum, Query_time_min, "
+            "Query_time_max, Query_time_pct_95, Query_time_median, Lock_time_sum, "
+            "Lock_time_max, Rows_sent_sum, Rows_examined_sum, Full_scan_cnt, "
+            "Tmp_table_cnt, Filesort_cnt, Bytes_sum, LEFT(sample, '4000') AS sample, "
+            "LENGTH(sample) AS sample_full_length FROM "
+            f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
+        )
+
+    def _resolve_deferred_positional_rows(self, state: ArcheryHarnessState) -> None:
+        """Decode deferred window rows once a structured row provides columns."""
+
+        if not state.history_positional_rows or not state.history_id_rows:
+            return
+        reference_row = next(iter(state.history_id_rows.values()))
+        decoded = self.client.merge_positional_rows_with_reference(
+            state.history_id_rows,
+            state.history_positional_rows,
+            reference_row,
+        )
+        if decoded:
+            state.history_positional_rows = []
+
+    def _append_missing_id_hint(
+        self,
+        state: ArcheryHarnessState,
+        content: str,
+        normalized_payload: Mapping[str, Any],
+    ) -> str:
+        """Tell the model which listed ids are still missing from the merge."""
+
+        listed_ids = self.client.history_row_ids(normalized_payload)
+        missing = sorted(listed_ids - set(state.history_id_rows.keys()))
+        if not missing:
+            return content
+        return (
+            content
+            + "\n\n【程序合并检测】id 清单共 "
+            + str(len(listed_ids))
+            + " 个，其中 "
+            + str(len(missing))
+            + " 个尚未进入最终合并结果（window 查询截断恢复的行会因列名缺失暂缓合并）。"
+            "请对下列 id 逐一执行 per-id 查询（SELECT * FROM "
+            + ARCHERY_SLOW_QUERY_REVIEW_TABLE
+            + " WHERE id = X）："
+            + ", ".join(str(row_id) for row_id in missing)
         )
 
     def result_error_directive(
@@ -1206,6 +1425,61 @@ def _query_result(
     harness: MCPHarnessResult[ArcheryHarnessState, dict[str, Any]],
 ) -> ArcherySlowLogQueryResult:
     state = harness.state
+    if (
+        state.final_result is None
+        and state.history_merge_sources
+        and state.history_id_rows
+    ):
+        # Truncation recovery can also run without any successful full-column
+        # window query: the model jumps straight from the id listing to per-id
+        # retrievals (observed 2026-08-17: 14 rows recovered, yet no query ever
+        # set final_result, so the main Agent received "no passthrough result"
+        # and the whole evidence set was lost). Rebuild the final result from
+        # the accumulated rows so the merged row set stays available.
+        raw_target = state.last_query_target
+        fallback_target = (
+            (raw_target[0], raw_target[1])
+            if isinstance(raw_target, (list, tuple))
+            and len(raw_target) == 2
+            and type(raw_target[0]) is int
+            and isinstance(raw_target[1], str)
+            else None
+        )
+        resolution_tables: tuple[str, ...] = ()
+        if fallback_target is not None:
+            resolution_steps = state.metadata_resolution_steps
+            resolved_steps = resolution_steps.get(fallback_target)
+            if resolved_steps is None:
+                resolved_steps = next(
+                    (
+                        value
+                        for key, value in resolution_steps.items()
+                        if list(key) == list(fallback_target)
+                    ),
+                    None,
+                )
+            resolution_tables = tuple(resolved_steps or ())
+        state.final_result = ArcherySlowLogQueryResult(
+            payload=client.merged_history_payload(
+                state.history_id_rows,
+                state.history_merge_sources,
+            ),
+            requested_sql=str(state.history_merge_sources[0].get("full_sql") or ""),
+            window_start=state.window_start,
+            window_end=state.window_end,
+            model_tool_calls=tuple(state.executed_model_calls),
+            model_request_ids=tuple(state.model_request_ids),
+            instance_id=(
+                fallback_target[0] if fallback_target is not None else None
+            ),
+            db_name=(fallback_target[1] if fallback_target is not None else None),
+            table_name=ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+            metadata_resolution_tables=resolution_tables,
+            diagnostics={
+                "final_result_source": "merged_per_id_queries_without_window_query"
+            },
+            query_completed=True,
+        )
     if state.final_result is not None:
         final_result = replace(
             state.final_result,
@@ -1215,6 +1489,17 @@ def _query_result(
                 state.final_result.metadata_resolution_tables
             ),
         )
+        if state.history_merge_sources and state.history_id_rows:
+            # The truncation-recovery path merged per-id retrieval rows; the
+            # final result carries the complete row set instead of only the
+            # last single query (run 2970f801 lost 5 of 6 rows without this).
+            final_result = replace(
+                final_result,
+                payload=client.merged_history_payload(
+                    state.history_id_rows,
+                    state.history_merge_sources,
+                ),
+            )
         diagnostics = dict(final_result.diagnostics or {})
         diagnostics["mcp_session_attempts"] = harness.budget.consumed.session_attempts
         diagnostics["reconnect_error_type"] = (

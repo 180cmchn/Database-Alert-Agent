@@ -765,6 +765,840 @@ async def test_harness_parses_structured_response_result_history_rows() -> None:
     assert len(model.requests) == 2
 
 
+_MERGE_WINDOW_SQL = (
+    "SELECT id, hostname_max, db_max, user_max, checksum, sample, ts_min, ts_max, ts_cnt, "
+    "Query_time_sum, Query_time_max, Query_time_pct_95 "
+    f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+    "WHERE hostname_max = 'db-1.example:3306' "
+    "AND ts_min >= FROM_UNIXTIME(1784793300) "
+    "AND ts_min < FROM_UNIXTIME(1784793600) "
+    "AND ts_max >= FROM_UNIXTIME(1784793300) "
+    "ORDER BY id DESC"
+)
+_MERGE_IDS_SQL = (
+    f"SELECT id FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+    "WHERE hostname_max = 'db-1.example:3306' "
+    "AND ts_min >= FROM_UNIXTIME(1784793300) "
+    "AND ts_min < FROM_UNIXTIME(1784793600) "
+    "AND ts_max >= FROM_UNIXTIME(1784793300) "
+    "ORDER BY id DESC"
+)
+_MERGE_ID_SQL_60 = (
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413460"
+)
+_MERGE_ID_SQL_54 = (
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413454"
+)
+_MERGE_ID_SQL_44 = (
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413644"
+)
+_MERGE_RECOVERED_ROW = {
+    "id": 24413458,
+    "hostname_max": "db-1.example:3306",
+    "db_max": "dpm",
+    "user_max": "dpm_rw",
+    "checksum": "a" * 32,
+    "sample": "UPDATE t_dpm_task_warning SET del_flag = 1",
+    "ts_min": "2026-08-17T09:41:30",
+    "ts_max": "2026-08-17T09:42:49",
+    "ts_cnt": 6,
+    "Query_time_sum": 0.340724,
+    "Query_time_max": 0.058781,
+    "Query_time_pct_95": 0.0585588,
+}
+
+
+def _merge_truncated_window_fixture() -> ReplayCallFixture:
+    truncated_result = (
+        '{"rows":['
+        + json.dumps(_MERGE_RECOVERED_ROW, ensure_ascii=False)
+        + ',{"id":24413460,"hostname_max":"db-1.example:3306'
+    )
+    wrapped_window_result = (
+        f"SQL 查询已执行。\n执行的SQL：{_MERGE_WINDOW_SQL}\n\n返回 6 行。\n结果：\n"
+        + truncated_result
+    )
+    return ReplayCallFixture(
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        expected_arguments={
+            **TARGET_ARGUMENTS,
+            "sql_content": _MERGE_WINDOW_SQL,
+        },
+        result={
+            "structuredContent": {
+                "response": {"result": wrapped_window_result},
+            }
+        },
+    )
+
+
+def _truncated_window_positional_fixture() -> ReplayCallFixture:
+    """Mirror of run 2c18cb74: Archery's JSON puts ``rows`` before
+    ``column_list``, so a mid-rows truncation recovers positional rows whose
+    column names are lost with the tail of the payload.
+    """
+    recovered = json.dumps(
+        [
+            [24413648, "db-1.example:3306", "dpm"],
+            [24413647, "db-1.example:3306", "dpm"],
+            [24413646, "db-1.example:3306", "dpm"],
+            [24413645, "db-1.example:3306", "dpm"],
+        ]
+    )
+    truncated_result = (
+        '{"full_sql": '
+        + json.dumps(_MERGE_WINDOW_SQL, ensure_ascii=False)
+        + ', "rows": '
+        + recovered[:-1]
+        + ',\n      [24413644, "db-1.example:3306", "d'
+    )
+    wrapped_window_result = (
+        f"SQL 查询已执行。\n执行的SQL：{_MERGE_WINDOW_SQL}\n\n返回 6 行。\n结果：\n"
+        + truncated_result
+    )
+    return ReplayCallFixture(
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        expected_arguments={
+            **TARGET_ARGUMENTS,
+            "sql_content": _MERGE_WINDOW_SQL,
+        },
+        result={
+            "structuredContent": {
+                "response": {"result": wrapped_window_result},
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncated_window_merges_per_id_retrieval_rows_into_final_result() -> None:
+    """Replay of run 2970f801: truncation -> id listing -> per-id retrieval.
+
+    Before this fix every history SELECT overwrote state.final_result, so the
+    evidence reaching the main Agent held only the last single-id row (1 of 6).
+    """
+    row_60 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413460,
+        "checksum": "b" * 32,
+        "ts_cnt": 40,
+        "Query_time_sum": 12.5,
+    }
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window", _MERGE_WINDOW_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-60", _MERGE_ID_SQL_60),
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-truncated-merge",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _merge_truncated_window_fixture(),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413460}, {"id": 24413458}, {"id": 24413454}],
+                    ),
+                    _success(_MERGE_ID_SQL_60, rows=[row_60]),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == _MERGE_WINDOW_SQL
+    assert result.executed_sql == _MERGE_WINDOW_SQL
+    payload = result.payload
+    assert payload["rows_merged_from_per_id_queries"] is True
+    assert payload["merged_query_count"] == 2
+    assert payload["merged_full_sqls"] == [_MERGE_ID_SQL_60, _MERGE_ID_SQL_54]
+    assert "rows_recovered_from_truncated_json" not in payload
+    assert [row["id"] for row in payload["rows"]] == [
+        24413458,
+        24413460,
+        24413454,
+    ]
+    assert payload["rows"][0] == _MERGE_RECOVERED_ROW
+    assert payload["rows"][1] == row_60
+    assert payload["rows"][2] == row_54
+
+
+@pytest.mark.asyncio
+async def test_id_listing_after_truncation_never_becomes_final_result() -> None:
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window", _MERGE_WINDOW_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-id-listing-only",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _merge_truncated_window_fixture(),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413460}, {"id": 24413458}, {"id": 24413454}],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == _MERGE_WINDOW_SQL
+    assert result.payload["rows_recovered_from_truncated_json"] is True
+    assert result.payload["rows"] == [_MERGE_RECOVERED_ROW]
+    assert "rows_merged_from_per_id_queries" not in result.payload
+
+
+@pytest.mark.asyncio
+async def test_per_id_retrieval_without_window_query_still_merges() -> None:
+    """Replay of the 2026-08-17 alert run: the model jumped straight from the
+    id listing to per-id retrievals without any full-column window query, so
+    state.final_result stayed empty and the main Agent saw "no passthrough
+    result" although every per-id row had been recovered.
+    """
+    row_60 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413460,
+        "checksum": "b" * 32,
+        "ts_cnt": 40,
+        "Query_time_sum": 12.5,
+    }
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-60", _MERGE_ID_SQL_60),
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-per-id-without-window",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413460}, {"id": 24413454}],
+                    ),
+                    _success(_MERGE_ID_SQL_60, rows=[row_60]),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.requested_sql == _MERGE_ID_SQL_60
+    payload = result.payload
+    assert payload["rows_merged_from_per_id_queries"] is True
+    assert payload["merged_query_count"] == 2
+    assert payload["merged_full_sqls"] == [_MERGE_ID_SQL_60, _MERGE_ID_SQL_54]
+    assert "rows_recovered_from_truncated_json" not in payload
+    assert [row["id"] for row in payload["rows"]] == [24413460, 24413454]
+    assert payload["rows"][0] == row_60
+    assert payload["rows"][1] == row_54
+    assert result.diagnostics["final_result_source"] == (
+        "merged_per_id_queries_without_window_query"
+    )
+
+
+_TRUNCATED_ID_SQL_40 = (
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413640"
+)
+
+
+def _truncated_id_retrieval_fixture(
+    sql: str,
+    *,
+    max_result_chars: int | None = None,
+) -> ReplayCallFixture:
+    truncated_result = (
+        '{"rows":[{"id":24413640,"hostname_max":"db-1.example:3306",'
+        '"sample":"SELECT count(0) FROM t_device WHERE store_code IN ('
+    )
+    wrapped = (
+        f"SQL 查询已执行。\n执行的SQL：{sql}\n\n返回 1 行。\n结果：\n"
+        + truncated_result
+    )
+    expected = {**TARGET_ARGUMENTS, "sql_content": sql}
+    if max_result_chars is not None:
+        expected["max_result_chars"] = max_result_chars
+    return ReplayCallFixture(
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        expected_arguments=expected,
+        result={
+            "structuredContent": {
+                "response": {"result": wrapped},
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncated_id_retrieval_gets_one_time_retry_hint() -> None:
+    """Replay of run 92c9a017 (attempt=15): id=24413640's single-row retrieval
+    was MCP-truncated with zero recoverable rows and the model silently moved
+    on. The program now appends a one-time retry hint to the model-visible
+    tool message, and never repeats the hint for the same SQL after the
+    retry, so a hopeless SQL cannot loop until the budget expires.
+    """
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    retry_call = MCPModelToolCall(
+        call_id="id-40-retry",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={
+            **TARGET_ARGUMENTS,
+            "sql_content": _TRUNCATED_ID_SQL_40,
+            "max_result_chars": 24000,
+        },
+        request_id="request-id-40-retry",
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-40", _TRUNCATED_ID_SQL_40),
+            retry_call,
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-truncated-id-hint",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413640}, {"id": 24413454}],
+                    ),
+                    _truncated_id_retrieval_fixture(_TRUNCATED_ID_SQL_40),
+                    _truncated_id_retrieval_fixture(
+                        _TRUNCATED_ID_SQL_40,
+                        max_result_chars=24000,
+                    ),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    hint_request = model.requests[4]["messages"]
+    hinted = [
+        message
+        for message in hint_request
+        if message.get("role") == "tool"
+        and "程序截断检测" in str(message.get("content"))
+        and "max_result_chars=24000" in str(message.get("content"))
+    ]
+    assert hinted, "retry hint missing from the model-visible tool message"
+
+    # After the retry (still truncated) the first-level hint must not repeat,
+    # and the one-time field-level projection hint appears exactly once.
+    after_retry = model.requests[5]["messages"]
+    first_level_after_retry = [
+        message
+        for message in after_retry
+        if message.get("role") == "tool"
+        and "【程序截断检测】" in str(message.get("content"))
+    ]
+    field_level_after_retry = [
+        message
+        for message in after_retry
+        if message.get("role") == "tool"
+        and "字段级" in str(message.get("content"))
+    ]
+    assert len(first_level_after_retry) == 1
+    assert len(field_level_after_retry) == 1
+
+    assert result.query_completed is True
+    assert [row["id"] for row in result.payload["rows"]] == [24413454]
+    assert result.payload["merged_query_count"] == 3
+
+
+_PROJECTION_SAMPLE_PREFIX = (
+    "SELECT count(0) FROM t_device WHERE store_code IN "
+    "('1000042256', '1000042257')"
+)
+_PROJECTION_ID_SQL_40 = (
+    "SELECT id, hostname_max, client_max, user_max, db_max, checksum, "
+    "ts_min, ts_max, ts_cnt, Query_time_sum, Query_time_max, "
+    "Query_time_pct_95, Query_time_median, Lock_time_sum, Lock_time_max, "
+    "Rows_sent_sum, Rows_examined_sum, Full_scan_cnt, Tmp_table_cnt, "
+    "Filesort_cnt, Bytes_sum, LEFT(sample, '4000') AS sample, "
+    f"LENGTH(sample) AS sample_full_length FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+    "WHERE id = 24413640"
+)
+
+
+@pytest.mark.asyncio
+async def test_truncated_id_retrieval_retry_then_projection_hint_recovers_row() -> None:
+    """Replay of run be8080ac (attempt=16): the retry hint worked (the model
+    retried with max_result_chars=24000) but the row was still truncated
+    because its sample column alone is 321,237 bytes. The second-level hint
+    now directs the model to a column-projection query that clips sample via
+    LEFT(sample, 4000) and records the full length via
+    LENGTH(sample) AS sample_full_length, so the recovered row (prefix +
+    full length) reaches the main Agent as evidence.
+    """
+    row_40 = {
+        "id": 24413640,
+        "hostname_max": "db-1.example:3306",
+        "sample": _PROJECTION_SAMPLE_PREFIX,
+        "sample_full_length": 321237,
+        "ts_cnt": 1,
+        "Query_time_max": 0.806,
+    }
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    retry_call = MCPModelToolCall(
+        call_id="id-40-retry",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={
+            **TARGET_ARGUMENTS,
+            "sql_content": _TRUNCATED_ID_SQL_40,
+            "max_result_chars": 24000,
+        },
+        request_id="request-id-40-retry",
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-40", _TRUNCATED_ID_SQL_40),
+            retry_call,
+            _call("id-40-projection", _PROJECTION_ID_SQL_40),
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-truncated-id-projection",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413640}, {"id": 24413454}],
+                    ),
+                    _truncated_id_retrieval_fixture(_TRUNCATED_ID_SQL_40),
+                    _truncated_id_retrieval_fixture(
+                        _TRUNCATED_ID_SQL_40,
+                        max_result_chars=24000,
+                    ),
+                    _success(_PROJECTION_ID_SQL_40, rows=[row_40]),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    # First truncation still gets the retry hint.
+    first_hint_request = model.requests[4]["messages"]
+    assert any(
+        "max_result_chars=24000" in str(message.get("content"))
+        for message in first_hint_request
+        if message.get("role") == "tool"
+    )
+
+    # The still-truncated retry gets the one-time projection hint with the
+    # LEFT/LENGTH recipe including the concrete row id.
+    projection_hint_request = model.requests[5]["messages"]
+    projection_hinted = [
+        message
+        for message in projection_hint_request
+        if message.get("role") == "tool"
+        and "字段级" in str(message.get("content"))
+        and "LEFT(sample, '4000') AS sample" in str(message.get("content"))
+        and "LENGTH(sample) AS sample_full_length" in str(message.get("content"))
+        and "WHERE id = 24413640" in str(message.get("content"))
+    ]
+    assert projection_hinted, "projection hint missing from the tool message"
+
+    # After the successful projection query the hint is not repeated.
+    after_projection = model.requests[6]["messages"]
+    field_level_hints = [
+        message
+        for message in after_projection
+        if message.get("role") == "tool"
+        and "字段级" in str(message.get("content"))
+    ]
+    assert len(field_level_hints) == 1, "projection hint must not repeat"
+
+    # The recovered row carries both the clipped prefix and the full length.
+    assert result.query_completed is True
+    payload_rows = result.payload["rows"]
+    assert [row["id"] for row in payload_rows] == [24413640, 24413454]
+    assert payload_rows[0]["sample"] == _PROJECTION_SAMPLE_PREFIX
+    assert payload_rows[0]["sample_full_length"] == 321237
+    assert result.payload["merged_query_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_complete_window_query_resets_per_id_accumulation() -> None:
+    row_a = dict(_MERGE_RECOVERED_ROW)
+    row_c = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413462,
+        "checksum": "d" * 32,
+        "ts_cnt": 25,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window-truncated", _MERGE_WINDOW_SQL),
+            _call("id-60", _MERGE_ID_SQL_60),
+            _call("window-requery", _MERGE_WINDOW_SQL),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-window-requery-resets",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _merge_truncated_window_fixture(),
+                    _success(_MERGE_ID_SQL_60, rows=[dict(_MERGE_RECOVERED_ROW)]),
+                    _success(_MERGE_WINDOW_SQL, rows=[row_a, row_c]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert "rows_merged_from_per_id_queries" not in result.payload
+    assert result.payload["rows"] == [row_a, row_c]
+    assert "rows_recovered_from_truncated_json" not in result.payload
+
+
+@pytest.mark.asyncio
+async def test_truncated_id_retrieval_with_high_limit_skips_to_projection_hint() -> None:
+    """Replay of run 2c18cb74 (attempt=18): the model already sent
+    max_result_chars=24000 on the very first per-id query, so the level-1
+    "retry with 24000" hint was a dead end the model correctly skipped --
+    and the projection hint never fired because it required a second
+    truncation of the same SQL. A first truncation under a high
+    max_result_chars now goes straight to the field-level projection hint.
+    """
+    row_40 = {
+        "id": 24413640,
+        "hostname_max": "db-1.example:3306",
+        "sample": _PROJECTION_SAMPLE_PREFIX,
+        "sample_full_length": 321237,
+        "ts_cnt": 1,
+        "Query_time_max": 0.806,
+    }
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    first_call = MCPModelToolCall(
+        call_id="id-40",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={
+            **TARGET_ARGUMENTS,
+            "sql_content": _TRUNCATED_ID_SQL_40,
+            "max_result_chars": 24000,
+        },
+        request_id="request-id-40",
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            first_call,
+            _call("id-40-projection", _PROJECTION_ID_SQL_40),
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-truncated-high-limit-projection",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[{"id": 24413640}, {"id": 24413454}],
+                    ),
+                    _truncated_id_retrieval_fixture(
+                        _TRUNCATED_ID_SQL_40,
+                        max_result_chars=24000,
+                    ),
+                    _success(_PROJECTION_ID_SQL_40, rows=[row_40]),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    # The very first truncation under max_result_chars=24000 goes straight to
+    # the field-level projection hint; the level-1 retry hint never appears.
+    hint_request = model.requests[4]["messages"]
+    tool_contents = [
+        str(message.get("content"))
+        for message in hint_request
+        if message.get("role") == "tool"
+    ]
+    assert any("字段级" in content for content in tool_contents)
+    assert any(
+        "LEFT(sample, '4000') AS sample" in content for content in tool_contents
+    )
+    assert not any(
+        "请立即用相同的 SQL 重试一次" in content for content in tool_contents
+    )
+
+    assert result.query_completed is True
+    payload_rows = result.payload["rows"]
+    assert [row["id"] for row in payload_rows] == [24413640, 24413454]
+    assert payload_rows[0]["sample"] == _PROJECTION_SAMPLE_PREFIX
+    assert payload_rows[0]["sample_full_length"] == 321237
+    assert result.payload["merged_query_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_window_positional_truncation_hint_and_deferred_decode() -> None:
+    """Replay of run 2c18cb74 (attempt=18): the truncated window query
+    recovered positional rows whose column_list sat behind the truncation
+    point, so the rows could not be structured and the merge silently lost
+    them (merged 8 of 14). The window tool message now explains the loss, the
+    id-listing message lists every id still missing from the merge (including
+    the row that straddled the truncation point), and the deferred positional
+    rows are decoded once a structured per-id row reveals the column order.
+    """
+    row_44 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413644,
+        "checksum": "e" * 32,
+        "sample": "SELECT e FROM t5",
+        "ts_cnt": 3,
+    }
+    row_54 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413454,
+        "checksum": "c" * 32,
+        "sample": "SELECT /* full scan */ * FROM orders",
+        "ts_cnt": 610,
+        "Query_time_sum": 96.5,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window", _MERGE_WINDOW_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-44", _MERGE_ID_SQL_44),
+            _call("id-54", _MERGE_ID_SQL_54),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-window-positional-decode",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
+                    ),
+                    _truncated_window_positional_fixture(),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[
+                            {"id": 24413648},
+                            {"id": 24413647},
+                            {"id": 24413646},
+                            {"id": 24413645},
+                            {"id": 24413644},
+                            {"id": 24413454},
+                        ],
+                    ),
+                    _success(_MERGE_ID_SQL_44, rows=[row_44]),
+                    _success(_MERGE_ID_SQL_54, rows=[row_54]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    # The truncated window query message explains the column_list loss.
+    window_request = model.requests[3]["messages"]
+    assert any(
+        "列名缺失" in str(message.get("content"))
+        for message in window_request
+        if message.get("role") == "tool"
+    )
+
+    # The id-listing message lists every id still missing from the merge,
+    # including the row that straddled the truncation point (24413644).
+    ids_request = model.requests[4]["messages"]
+    missing_hint = [
+        str(message.get("content"))
+        for message in ids_request
+        if message.get("role") == "tool"
+        and "【程序合并检测】" in str(message.get("content"))
+    ]
+    assert missing_hint, "missing-id hint absent from the id-listing message"
+    for row_id in (24413648, 24413647, 24413646, 24413645, 24413644, 24413454):
+        assert str(row_id) in missing_hint[0]
+
+    # The model only re-queried two ids; the deferred positional rows are
+    # decoded with the first structured row's column order, so all six ids
+    # reach the final evidence.
+    assert result.query_completed is True
+    payload = result.payload
+    assert payload["rows_merged_from_per_id_queries"] is True
+    assert payload["merged_query_count"] == 2
+    merged_ids = sorted(row["id"] for row in payload["rows"])
+    assert merged_ids == [
+        24413454,
+        24413644,
+        24413645,
+        24413646,
+        24413647,
+        24413648,
+    ]
+    decoded = next(row for row in payload["rows"] if row["id"] == 24413648)
+    assert decoded["hostname_max"] == "db-1.example:3306"
+    assert decoded["db_max"] == "dpm"
+
+
 @pytest.mark.asyncio
 async def test_actual_response_sql_overrides_requested_history_for_classification() -> None:
     actual_sql = "SELECT index_name FROM information_schema.statistics"
