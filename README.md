@@ -97,6 +97,7 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | MCP 原始结果的程序投影 | `app/adapters/tool_result_analysis.py` |
 | 外部知识来源 | `.env` 中 `EXTERNAL_KNOWLEDGE_*` 和 `KNOWLEDGE_SOURCES` |
 | 主 Agent ReAct 轮次与整次超时 | `REACT_MAX_ROUNDS`、`ANALYSIS_TIMEOUT_SECONDS` |
+| 主 Agent reasoning 流式记录 | 必填环境变量 `STREAM_MAIN_AGENT_REASONING` / Agent 设置页 |
 
 不要在 Python 中为新告警类型增加 MCP 策略分支。MCP 的“什么时候可能有用”和“选中后如何查询”分别
 由 `role/purpose` 和 `workflow` 表达，主 Agent 在运行时判断。
@@ -222,10 +223,15 @@ KnowledgePack 独立部署，通过共享 Docker 网络向 Agent 提供 `POST /s
 KNOWLEDGE_NETWORK_NAME=database-alert-knowledge
 EXTERNAL_KNOWLEDGE_BASE_URL=http://knowledge:8000
 EXTERNAL_KNOWLEDGE_API_KEY=replace-me
+EXTERNAL_KNOWLEDGE_TIMEOUT_SECONDS=30
 EXTERNAL_KNOWLEDGE_LIMIT=5
 EXTERNAL_KNOWLEDGE_MIN_RELEVANCE=0.60
 KNOWLEDGE_SOURCES=["external_knowledge"]
 ```
+
+每个知识来源独立执行并记录 `matched`、`no_match` 或 `unavailable` 状态、命中数和耗时。
+单个来源超过墙钟时限或有限重试仍失败时会被跳过，不占用整次分析剩余时间，也不会否决其它实时
+证据。设置页修改外部知识开关时会保留 `KNOWLEDGE_SOURCES` 中其它已配置的扩展来源。
 
 ## FlashDuty 轮询
 
@@ -259,6 +265,8 @@ AI_TIMEOUT_SECONDS=300
 REACT_MAX_ROUNDS=8
 ANALYSIS_TIMEOUT_SECONDS=1800
 SCHEDULER_WORKERS=1
+# 必填部署基线；可在 Agent 设置页运行时覆盖。
+STREAM_MAIN_AGENT_REASONING=false
 ```
 
 `AI_PROVIDER` 默认保持为 `openai_compatible`，通过 OpenAI SDK 的 Chat Completions 接口调用 OpenAI、
@@ -269,6 +277,10 @@ DeepSeek 或内部兼容网关。使用 OpenAI Responses API 时设置为 `opena
 `REACT_MAX_ROUNDS` 范围 1–100，默认 8；`ANALYSIS_TIMEOUT_SECONDS` 范围 30–86400，默认 1800。
 `AI_MAX_TOKENS` 应为 reasoning 和结构化输出预留足够空间。模型超时或结构化输出不可用时，保守降级
 为 `现有结果无法得出根因`，不会虚构结果。
+
+`STREAM_MAIN_AGENT_REASONING` 没有代码默认值，部署时必须显式设置。Agent 设置页中的开关属于运行级
+覆盖，只影响之后创建的分析运行；清空运行级覆盖后，API 和 Worker 会立即恢复环境变量中的部署基线，
+无需再次重启。
 
 ## 本地运行
 
@@ -326,6 +338,14 @@ ruff check app tests migrations
 python -m compileall -q app tests
 cd frontend && npm run build
 git diff --check
+```
+
+独立 Agent 场景报告的零容忍和故障族门槛使用：
+
+```bash
+python tools/evaluate_production_gates.py \
+  --report evaluation/results/agent-harness-report.json \
+  --enforce-gates
 ```
 
 离线测试使用 fake client、Replay MCP 和临时数据库，不访问内网 MCP。重点覆盖 ReAct 正常 `finish`、

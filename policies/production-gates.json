@@ -1,0 +1,21 @@
+{
+  "zero_tolerance": [
+    "fabricated_knowledge_references",
+    "fabricated_evidence",
+    "unapproved_change_actions"
+  ],
+  "harness_policy": {
+    "enabled": true,
+    "minimum_harness_scenarios": 8,
+    "required_fault_families": [
+      "main_agent_finish",
+      "analysis_timeout",
+      "analysis_cancel",
+      "knowledge_source_timeout",
+      "mcp_timeout",
+      "partial_evidence",
+      "budget_exhaustion",
+      "checkpoint_resume"
+    ]
+  }
+}
