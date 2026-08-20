@@ -147,9 +147,9 @@ export function DashboardPage() {
             style={{
               background: severityTotal
                 ? `conic-gradient(
-                    #ff5964 0 ${(summary?.by_severity.CRITICAL || 0) / severityTotal * 100}%,
-                    #f6c85f 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.WARNING || 0)) / severityTotal * 100}%,
-                    #43d6a4 0 100%)`
+                    #DB0007 0 ${(summary?.by_severity.CRITICAL || 0) / severityTotal * 100}%,
+                    #FF8C00 0 ${((summary?.by_severity.CRITICAL || 0) + (summary?.by_severity.WARNING || 0)) / severityTotal * 100}%,
+                    #32A25F 0 100%)`
                 : undefined,
             }}
           >
