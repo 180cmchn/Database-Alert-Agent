@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -33,7 +34,53 @@ async def test_fresh_database_is_created_with_current_revision(tmp_path: Path) -
     await repository.close()
 
 
-def test_0014_to_0015_removes_local_pdf_and_preserves_generic_knowledge(
+def test_fresh_0015_database_can_downgrade_and_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "fresh-round-trip.db"
+    database_url = sqlite_url(database)
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    repository = SQLAlchemyAlertRepository(database_url)
+
+    async def initialize() -> None:
+        await repository.initialize()
+        await repository.close()
+
+    asyncio.run(initialize())
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+
+    try:
+        command.downgrade(config, "0014")
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0014",
+            )
+            for table in ("alerts", "investigation_runs"):
+                columns = {
+                    row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
+                }
+                assert "runbooks_json" in columns
+                assert "legacy_runbooks_json" not in columns
+
+        command.upgrade(config, "0015")
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0015",
+            )
+            for table in ("alerts", "investigation_runs"):
+                columns = {
+                    row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
+                }
+                assert "runbooks_json" not in columns
+                assert "legacy_runbooks_json" in columns
+    finally:
+        get_settings.cache_clear()
+
+
+def test_0014_to_0015_retires_local_pdf_without_erasing_audit_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,6 +292,7 @@ def test_0014_to_0015_removes_local_pdf_and_preserves_generic_knowledge(
             for table in ("alerts", "investigation_runs"):
                 columns = {row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")}
                 assert "runbooks_json" not in columns
+                assert "legacy_runbooks_json" in columns
 
             alert_recommendation = json.loads(
                 connection.execute(
@@ -279,58 +327,148 @@ def test_0014_to_0015_removes_local_pdf_and_preserves_generic_knowledge(
                     "manual_matches",
                     "runbook_excerpts",
                 } & migrated.keys()
+                assert migrated["legacy_knowledge_contract_v1"] == recommendation
 
             assert run_row[0] == "KNOWLEDGE_MATCHING"
             migrated_snapshot = json.loads(run_row[1])
-            assert migrated_snapshot["knowledge_sources"] == ["external_knowledge"]
-            assert "runbook_limit" not in migrated_snapshot
+            assert migrated_snapshot == config_snapshot
             migrated_manifest = json.loads(run_row[2])
-            assert migrated_manifest["configuration"]["knowledge_sources"] == [
-                "external_knowledge"
-            ]
-            assert "runbook_limit" not in migrated_manifest["configuration"]
-            assert run_row[3] != "legacy-manifest-hash"
+            assert migrated_manifest == manifest
+            assert run_row[3] == "legacy-manifest-hash"
+            assert json.loads(
+                connection.execute(
+                    "SELECT legacy_runbooks_json FROM alerts WHERE id = 'alert-1'"
+                ).fetchone()[0]
+            ) == [local_match]
+            assert json.loads(
+                connection.execute(
+                    "SELECT legacy_runbooks_json FROM investigation_runs "
+                    "WHERE id = 'run-1'"
+                ).fetchone()[0]
+            ) == [local_match]
 
             progress_stage, progress_details_json = connection.execute(
                 "SELECT stage, details_json FROM investigation_progress WHERE id = 'progress-1'"
             ).fetchone()
             assert progress_stage == "KNOWLEDGE_MATCHING"
             progress_details = json.loads(progress_details_json)
-            assert progress_details["stage"] == "KNOWLEDGE_MATCHING"
-            assert progress_details["knowledge_matches"][0]["knowledge_id"] == "external-1"
-            assert "runbooks" not in progress_details
+            assert progress_details == {
+                "stage": "RUNBOOK_MATCHING",
+                "runbooks": [local_match],
+                "external_knowledge_matches": [external_match],
+            }
 
             event_payload = json.loads(
                 connection.execute(
                     "SELECT payload_json FROM agent_events WHERE id = 'event-1'"
                 ).fetchone()[0]
             )
-            assert event_payload["stage"] == "KNOWLEDGE_MATCHING"
-            assert event_payload["knowledge_matches"][0]["knowledge_id"] == "external-1"
-            assert "runbook_references" not in event_payload
+            assert event_payload == {
+                "stage": "RUNBOOK_MATCHING",
+                "runbook_references": [local_match],
+                "external_knowledge_matches": [external_match],
+            }
 
-            assert connection.execute(
-                "SELECT COUNT(*) FROM agent_checkpoints WHERE id = 'agent-checkpoint'"
-            ).fetchone() == (0,)
+            agent_checkpoint = connection.execute(
+                "SELECT namespace, payload_json, manifest_hash FROM agent_checkpoints "
+                "WHERE id = 'agent-checkpoint'"
+            ).fetchone()
+            assert agent_checkpoint is not None
+            assert agent_checkpoint[0] == "legacy:0015:agent"
+            assert json.loads(agent_checkpoint[1]) == {
+                "state": {
+                    "stage": "RUNBOOK_MATCHING",
+                    "runbooks": [local_match],
+                    "external_knowledge_matches": [external_match],
+                },
+                "manifest_hash": "legacy-manifest-hash",
+            }
+            assert agent_checkpoint[2] == "legacy-manifest-hash"
             assert connection.execute(
                 "SELECT COUNT(*) FROM agent_checkpoint_writes "
                 "WHERE checkpoint_id = 'agent-checkpoint'"
-            ).fetchone() == (0,)
+            ).fetchone() == (1,)
             mcp_checkpoint = connection.execute(
                 "SELECT payload_json, manifest_hash FROM agent_checkpoints "
                 "WHERE id = 'mcp-checkpoint'"
             ).fetchone()
             assert mcp_checkpoint is not None
             mcp_payload = json.loads(mcp_checkpoint[0])
-            assert mcp_payload["state"]["stage"] == "KNOWLEDGE_MATCHING"
-            assert mcp_payload["state"]["knowledge_matches"][0]["knowledge_id"] == (
-                "external-1"
-            )
-            assert mcp_checkpoint[1] == run_row[3] == mcp_payload["manifest_hash"]
+            assert mcp_payload["state"]["stage"] == "RUNBOOK_MATCHING"
+            assert mcp_payload["state"]["runbooks"] == [local_match]
+            assert mcp_checkpoint[1] == run_row[3] == "legacy-manifest-hash"
+            assert mcp_payload["manifest_hash"] == "legacy-manifest-hash"
             assert connection.execute(
                 "SELECT COUNT(*) FROM agent_checkpoint_writes "
                 "WHERE checkpoint_id = 'mcp-checkpoint'"
             ).fetchone() == (1,)
+
+        command.downgrade(config, "0014")
+
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0014",
+            )
+            for table, expected_not_null in (
+                ("alerts", True),
+                ("investigation_runs", False),
+            ):
+                columns = {
+                    row[1]: bool(row[3])
+                    for row in connection.execute(f"PRAGMA table_info('{table}')")
+                }
+                assert "legacy_runbooks_json" not in columns
+                assert columns["runbooks_json"] is expected_not_null
+
+            restored_alert = connection.execute(
+                "SELECT recommendation_json, runbooks_json FROM alerts WHERE id = 'alert-1'"
+            ).fetchone()
+            assert restored_alert is not None
+            assert json.loads(restored_alert[0]) == recommendation
+            assert json.loads(restored_alert[1]) == [local_match]
+
+            restored_run = connection.execute(
+                "SELECT current_stage, config_snapshot_json, manifest_json, manifest_hash, "
+                "recommendation_json, runbooks_json FROM investigation_runs WHERE id = 'run-1'"
+            ).fetchone()
+            assert restored_run is not None
+            assert restored_run[0] == "RUNBOOK_MATCHING"
+            assert json.loads(restored_run[1]) == config_snapshot
+            assert json.loads(restored_run[2]) == manifest
+            assert restored_run[3] == "legacy-manifest-hash"
+            assert json.loads(restored_run[4]) == recommendation
+            assert json.loads(restored_run[5]) == [local_match]
+            assert connection.execute(
+                "SELECT stage FROM investigation_progress WHERE id = 'progress-1'"
+            ).fetchone() == ("RUNBOOK_MATCHING",)
+            assert connection.execute(
+                "SELECT namespace FROM agent_checkpoints WHERE id = 'agent-checkpoint'"
+            ).fetchone() == ("agent",)
+            assert connection.execute(
+                "SELECT namespace FROM agent_checkpoints WHERE id = 'mcp-checkpoint'"
+            ).fetchone() == ("mcp:external",)
+
+        command.upgrade(config, "0015")
+
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0015",
+            )
+            assert connection.execute(
+                "SELECT current_stage FROM investigation_runs WHERE id = 'run-1'"
+            ).fetchone() == ("KNOWLEDGE_MATCHING",)
+            assert connection.execute(
+                "SELECT stage FROM investigation_progress WHERE id = 'progress-1'"
+            ).fetchone() == ("KNOWLEDGE_MATCHING",)
+            assert connection.execute(
+                "SELECT namespace FROM agent_checkpoints WHERE id = 'agent-checkpoint'"
+            ).fetchone() == ("legacy:0015:agent",)
+            migrated_again = json.loads(
+                connection.execute(
+                    "SELECT recommendation_json FROM alerts WHERE id = 'alert-1'"
+                ).fetchone()[0]
+            )
+            assert migrated_again["legacy_knowledge_contract_v1"] == recommendation
     finally:
         get_settings.cache_clear()
 

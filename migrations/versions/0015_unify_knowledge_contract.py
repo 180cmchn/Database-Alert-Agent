@@ -1,4 +1,4 @@
-"""Remove local runbook persistence and unify historical knowledge results.
+"""Retire active local-PDF persistence without deleting historical audit data.
 
 Revision ID: 0015
 Revises: 0014
@@ -6,8 +6,6 @@ Revises: 0014
 
 from __future__ import annotations
 
-import json
-from hashlib import sha256
 from typing import Any
 
 import sqlalchemy as sa
@@ -18,6 +16,8 @@ down_revision = "0014"
 branch_labels = None
 depends_on = None
 
+_LEGACY_ARCHIVE_KEY = "legacy_knowledge_contract_v1"
+_LEGACY_CHECKPOINT_PREFIX = "legacy:0015:"
 _REMOVED_RESULT_KEYS = {
     "external_knowledge_matches",
     "manual_matched",
@@ -26,30 +26,13 @@ _REMOVED_RESULT_KEYS = {
     "runbook_references",
     "runbooks",
 }
-_REMOVED_CONFIG_KEYS = {
-    "knowledge_local_pdf",
-    "local_pdf_enabled",
-    "runbook_limit",
-    "runbook_match_min_confidence",
-    "runbook_match_min_score",
-    "runbook_pdf_dir",
-    "runbook_pdf_max_file_bytes",
-    "runbook_pdf_max_text_chars",
-}
 
 
-def _canonical_json_hash(value: Any) -> str:
-    canonical = json.dumps(
-        value,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _knowledge_match(value: Any, *, default_source: str | None = None) -> dict[str, Any] | None:
+def _knowledge_match(
+    value: Any,
+    *,
+    default_source: str | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
@@ -88,13 +71,13 @@ def _knowledge_match(value: Any, *, default_source: str | None = None) -> dict[s
 def _knowledge_matches(value: dict[str, Any]) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    sources = (
+    candidates = (
         (value.get("knowledge_matches"), None),
         (value.get("external_knowledge_matches"), "external_knowledge"),
         (value.get("external_knowledge"), "external_knowledge"),
         (value.get("knowledge"), None),
     )
-    for raw_items, default_source in sources:
+    for raw_items, default_source in candidates:
         if not isinstance(raw_items, list):
             continue
         for raw_item in raw_items:
@@ -132,51 +115,38 @@ def _knowledge_reference(
 
 
 def _normalize_recommendation(value: dict[str, Any]) -> dict[str, Any]:
-    recommendation = dict(value)
-    knowledge = _knowledge_matches(recommendation)
-    matches = {(item["source"], item["knowledge_id"]): item for item in knowledge}
+    if isinstance(value.get(_LEGACY_ARCHIVE_KEY), dict):
+        return value
 
-    knowledge_bases: list[dict[str, Any]] = []
-    ai_bases: list[dict[str, Any]] = []
-    for raw_basis in recommendation.get("analysis_bases") or []:
+    recommendation = dict(value)
+    knowledge = _knowledge_matches(value)
+    matches = {(item["source"], item["knowledge_id"]): item for item in knowledge}
+    analysis_bases: list[dict[str, Any]] = []
+    for raw_basis in value.get("analysis_bases") or []:
         if not isinstance(raw_basis, dict):
             continue
         source = raw_basis.get("source")
         statement = str(raw_basis.get("statement") or "").strip()
         if not statement:
             continue
-        if source in {"KNOWLEDGE", "EXTERNAL_KNOWLEDGE"}:
-            reference = _knowledge_reference(raw_basis.get("source_ref"), matches)
-            if reference is not None:
-                knowledge_bases.append(
-                    {"source": "KNOWLEDGE", "statement": statement, "source_ref": reference}
-                )
-        elif source == "AI":
-            ai_bases.append({"source": "AI", "statement": statement, "source_ref": None})
-
-    cited = {
-        (basis["source_ref"]["source"], basis["source_ref"]["knowledge_id"])
-        for basis in knowledge_bases
-    }
-    for item in knowledge:
-        identity = (item["source"], item["knowledge_id"])
-        if identity in cited:
-            continue
-        knowledge_bases.append(
-            {
-                "source": "KNOWLEDGE",
-                "statement": f"命中历史知识《{item['title']}》，需结合本次实时证据核验。",
-                "source_ref": {
-                    "source": item["source"],
-                    "knowledge_id": item["knowledge_id"],
-                    "title": item["title"],
-                    "source_uri": item["source_uri"],
-                },
-            }
-        )
+        if source == "AI":
+            analysis_bases.append(
+                {"source": "AI", "statement": statement, "source_ref": None}
+            )
+        elif source in {"KNOWLEDGE", "EXTERNAL_KNOWLEDGE"}:
+            analysis_bases.append(
+                {
+                    "source": "KNOWLEDGE",
+                    "statement": statement,
+                    "source_ref": _knowledge_reference(
+                        raw_basis.get("source_ref"),
+                        matches,
+                    ),
+                }
+            )
 
     steps: list[Any] = []
-    for raw_step in recommendation.get("steps") or []:
+    for raw_step in value.get("steps") or []:
         if not isinstance(raw_step, dict):
             steps.append(raw_step)
             continue
@@ -187,67 +157,13 @@ def _normalize_recommendation(value: dict[str, Any]) -> dict[str, Any]:
     for key in _REMOVED_RESULT_KEYS:
         recommendation.pop(key, None)
     recommendation["knowledge_matches"] = knowledge
-    recommendation["analysis_bases"] = [*knowledge_bases, *ai_bases]
+    recommendation["analysis_bases"] = analysis_bases
     recommendation["steps"] = steps
+    recommendation[_LEGACY_ARCHIVE_KEY] = dict(value)
     return recommendation
 
 
-def _clean_data(value: Any, *, configuration: bool = False) -> Any:
-    if isinstance(value, str):
-        return "KNOWLEDGE_MATCHING" if value == "RUNBOOK_MATCHING" else value
-    if isinstance(value, list):
-        cleaned_items = [
-            cleaned
-            for item in value
-            if (cleaned := _clean_data(item, configuration=configuration)) is not None
-        ]
-        if configuration:
-            return [item for item in cleaned_items if item != "local_pdf"]
-        return cleaned_items
-    if not isinstance(value, dict):
-        return value
-
-    source = str(value.get("source") or "")
-    metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
-    if (
-        value.get("runbook_id")
-        or source in {"RUNBOOK", "local_pdf"}
-        or metadata.get("source_type") == "local_pdf"
-    ):
-        return None
-
-    converted_knowledge = _knowledge_matches(value)
-    cleaned: dict[str, Any] = {}
-    for key, item in value.items():
-        lowered = key.casefold()
-        if key in _REMOVED_RESULT_KEYS or "runbook" in lowered:
-            continue
-        if configuration and key in _REMOVED_CONFIG_KEYS:
-            continue
-        child_configuration = configuration or key in {
-            "config_snapshot",
-            "config_snapshot_json",
-            "configuration",
-        }
-        if key == "recommendation" and isinstance(item, dict):
-            cleaned[key] = _normalize_recommendation(item)
-            continue
-        child = _clean_data(item, configuration=child_configuration)
-        if child is not None:
-            cleaned[key] = child
-
-    if converted_knowledge:
-        cleaned["knowledge_matches"] = converted_knowledge
-    if cleaned.get("source") == "EXTERNAL_KNOWLEDGE":
-        cleaned["source"] = "KNOWLEDGE"
-    if configuration and isinstance(cleaned.get("knowledge_sources"), list):
-        cleaned["knowledge_sources"] = [
-            item for item in cleaned["knowledge_sources"] if item != "local_pdf"
-        ]
-    return cleaned
-
-
-def _clean_recommendation_table(
+def _normalize_recommendation_table(
     connection: sa.Connection,
     table: sa.TableClause,
 ) -> None:
@@ -265,166 +181,31 @@ def _clean_recommendation_table(
         )
 
 
-def _clean_run_manifests(
-    connection: sa.Connection,
-    runs: sa.TableClause,
-) -> dict[str, str]:
-    hashes: dict[str, str] = {}
-    rows = list(
-        connection.execute(
-            sa.select(runs.c.id, runs.c.manifest_json, runs.c.manifest_hash)
-        ).mappings()
-    )
-    for row in rows:
-        manifest = row["manifest_json"]
-        if not isinstance(manifest, dict):
-            continue
-        cleaned = _clean_data(manifest, configuration=True)
-        new_hash = _canonical_json_hash(cleaned)
-        hashes[str(row["id"])] = new_hash
-        connection.execute(
-            runs.update()
-            .where(runs.c.id == row["id"])
-            .values(manifest_json=cleaned, manifest_hash=new_hash)
-        )
-    return hashes
-
-
 def upgrade() -> None:
     connection = op.get_bind()
     alerts = sa.table(
         "alerts",
         sa.column("id", sa.String(length=36)),
         sa.column("recommendation_json", sa.JSON()),
-        sa.column("runbooks_json", sa.JSON()),
     )
     runs = sa.table(
         "investigation_runs",
         sa.column("id", sa.String(length=36)),
         sa.column("current_stage", sa.String(length=40)),
-        sa.column("config_snapshot_json", sa.JSON()),
-        sa.column("manifest_json", sa.JSON()),
-        sa.column("manifest_hash", sa.String(length=64)),
         sa.column("recommendation_json", sa.JSON()),
-        sa.column("runbooks_json", sa.JSON()),
     )
     progress = sa.table(
         "investigation_progress",
-        sa.column("id", sa.String(length=36)),
         sa.column("stage", sa.String(length=40)),
-        sa.column("details_json", sa.JSON()),
     )
     checkpoints = sa.table(
         "agent_checkpoints",
         sa.column("id", sa.String(length=36)),
-        sa.column("run_id", sa.String(length=36)),
         sa.column("namespace", sa.String(length=256)),
-        sa.column("payload_json", sa.JSON()),
-        sa.column("state_hash", sa.String(length=64)),
-        sa.column("manifest_hash", sa.String(length=64)),
-    )
-    checkpoint_writes = sa.table(
-        "agent_checkpoint_writes",
-        sa.column("checkpoint_id", sa.String(length=36)),
-    )
-    events = sa.table(
-        "agent_events",
-        sa.column("id", sa.String(length=36)),
-        sa.column("payload_json", sa.JSON()),
     )
 
-    _clean_recommendation_table(connection, alerts)
-    _clean_recommendation_table(connection, runs)
-
-    run_rows = list(
-        connection.execute(
-            sa.select(runs.c.id, runs.c.config_snapshot_json)
-        ).mappings()
-    )
-    for row in run_rows:
-        snapshot = row["config_snapshot_json"]
-        if not isinstance(snapshot, dict):
-            continue
-        connection.execute(
-            runs.update()
-            .where(runs.c.id == row["id"])
-            .values(config_snapshot_json=_clean_data(snapshot, configuration=True))
-        )
-
-    progress_rows = list(
-        connection.execute(sa.select(progress.c.id, progress.c.details_json)).mappings()
-    )
-    for row in progress_rows:
-        details = row["details_json"]
-        if not isinstance(details, dict):
-            continue
-        connection.execute(
-            progress.update()
-            .where(progress.c.id == row["id"])
-            .values(details_json=_clean_data(details))
-        )
-
-    event_rows = list(
-        connection.execute(sa.select(events.c.id, events.c.payload_json)).mappings()
-    )
-    for row in event_rows:
-        payload = row["payload_json"]
-        if not isinstance(payload, dict):
-            continue
-        connection.execute(
-            events.update()
-            .where(events.c.id == row["id"])
-            .values(payload_json=_clean_data(payload))
-        )
-
-    manifest_hashes = _clean_run_manifests(connection, runs)
-
-    # Main graph checkpoints serialize the former AgentState class inside a
-    # JsonPlus payload. They are execution internals rather than analysis results,
-    # and cannot be safely resumed after the state contract changes. Delete them
-    # together with pending writes. Provider-specific MCP checkpoints are retained.
-    agent_checkpoint_ids = list(
-        connection.execute(
-            sa.select(checkpoints.c.id).where(checkpoints.c.namespace.like("agent%"))
-        ).scalars()
-    )
-    if agent_checkpoint_ids:
-        connection.execute(
-            checkpoint_writes.delete().where(
-                checkpoint_writes.c.checkpoint_id.in_(agent_checkpoint_ids)
-            )
-        )
-        connection.execute(
-            checkpoints.delete().where(checkpoints.c.id.in_(agent_checkpoint_ids))
-        )
-
-    checkpoint_rows = list(
-        connection.execute(
-            sa.select(
-                checkpoints.c.id,
-                checkpoints.c.run_id,
-                checkpoints.c.payload_json,
-            )
-        ).mappings()
-    )
-    for row in checkpoint_rows:
-        payload = row["payload_json"]
-        if not isinstance(payload, dict):
-            continue
-        cleaned = _clean_data(payload)
-        new_manifest_hash = manifest_hashes.get(str(row["run_id"]))
-        if new_manifest_hash:
-            cleaned["manifest_hash"] = new_manifest_hash
-        state = cleaned.get("state") if isinstance(cleaned.get("state"), dict) else {}
-        connection.execute(
-            checkpoints.update()
-            .where(checkpoints.c.id == row["id"])
-            .values(
-                payload_json=cleaned,
-                state_hash=_canonical_json_hash(state),
-                manifest_hash=cleaned.get("manifest_hash"),
-            )
-        )
+    _normalize_recommendation_table(connection, alerts)
+    _normalize_recommendation_table(connection, runs)
 
     connection.execute(
         runs.update()
@@ -437,24 +218,151 @@ def upgrade() -> None:
         .values(stage="KNOWLEDGE_MATCHING")
     )
 
+    legacy_checkpoints = list(
+        connection.execute(
+            sa.select(checkpoints.c.id, checkpoints.c.namespace).where(
+                checkpoints.c.namespace.like("agent%")
+            )
+        ).mappings()
+    )
+    for checkpoint in legacy_checkpoints:
+        archived_namespace = f"{_LEGACY_CHECKPOINT_PREFIX}{checkpoint['namespace']}"
+        if len(archived_namespace) > 256:
+            raise ValueError("Legacy Agent checkpoint namespace exceeds storage limit")
+        connection.execute(
+            checkpoints.update()
+            .where(checkpoints.c.id == checkpoint["id"])
+            .values(namespace=archived_namespace)
+        )
+
+    # These columns are retained verbatim for historical audit, but renamed so
+    # current application code cannot treat them as an active local-PDF provider.
     with op.batch_alter_table("alerts") as batch_op:
-        batch_op.drop_column("runbooks_json")
+        batch_op.alter_column(
+            "runbooks_json",
+            new_column_name="legacy_runbooks_json",
+            existing_type=sa.JSON(),
+            existing_nullable=False,
+        )
     with op.batch_alter_table("investigation_runs") as batch_op:
-        batch_op.drop_column("runbooks_json")
+        batch_op.alter_column(
+            "runbooks_json",
+            new_column_name="legacy_runbooks_json",
+            existing_type=sa.JSON(),
+            existing_nullable=True,
+        )
+
+
+def _restore_recommendation_table(
+    connection: sa.Connection,
+    table: sa.TableClause,
+) -> None:
+    rows = list(
+        connection.execute(sa.select(table.c.id, table.c.recommendation_json)).mappings()
+    )
+    for row in rows:
+        recommendation = row["recommendation_json"]
+        if not isinstance(recommendation, dict):
+            continue
+        archived = recommendation.get(_LEGACY_ARCHIVE_KEY)
+        if not isinstance(archived, dict):
+            continue
+        connection.execute(
+            table.update()
+            .where(table.c.id == row["id"])
+            .values(recommendation_json=archived)
+        )
 
 
 def downgrade() -> None:
-    json_default: str | sa.TextClause = (
-        sa.text("('[]')") if op.get_bind().dialect.name == "mysql" else "[]"
+    connection = op.get_bind()
+    alert_columns = {
+        str(column["name"])
+        for column in sa.inspect(connection).get_columns("alerts")
+    }
+    if "legacy_runbooks_json" in alert_columns:
+        with op.batch_alter_table("alerts") as batch_op:
+            batch_op.alter_column(
+                "legacy_runbooks_json",
+                new_column_name="runbooks_json",
+                existing_type=sa.JSON(),
+                existing_nullable=False,
+            )
+    elif "runbooks_json" not in alert_columns:
+        json_default: str | sa.TextClause = (
+            sa.text("('[]')") if connection.dialect.name == "mysql" else "[]"
+        )
+        with op.batch_alter_table("alerts") as batch_op:
+            batch_op.add_column(
+                sa.Column(
+                    "runbooks_json",
+                    sa.JSON(),
+                    nullable=False,
+                    server_default=json_default,
+                )
+            )
+
+    run_columns = {
+        str(column["name"])
+        for column in sa.inspect(connection).get_columns("investigation_runs")
+    }
+    if "legacy_runbooks_json" in run_columns:
+        with op.batch_alter_table("investigation_runs") as batch_op:
+            batch_op.alter_column(
+                "legacy_runbooks_json",
+                new_column_name="runbooks_json",
+                existing_type=sa.JSON(),
+                existing_nullable=True,
+            )
+    elif "runbooks_json" not in run_columns:
+        with op.batch_alter_table("investigation_runs") as batch_op:
+            batch_op.add_column(sa.Column("runbooks_json", sa.JSON(), nullable=True))
+
+    alerts = sa.table(
+        "alerts",
+        sa.column("id", sa.String(length=36)),
+        sa.column("recommendation_json", sa.JSON()),
     )
-    with op.batch_alter_table("alerts") as batch_op:
-        batch_op.add_column(
-            sa.Column(
-                "runbooks_json",
-                sa.JSON(),
-                nullable=False,
-                server_default=json_default,
+    runs = sa.table(
+        "investigation_runs",
+        sa.column("id", sa.String(length=36)),
+        sa.column("current_stage", sa.String(length=40)),
+        sa.column("recommendation_json", sa.JSON()),
+    )
+    progress = sa.table(
+        "investigation_progress",
+        sa.column("stage", sa.String(length=40)),
+    )
+    checkpoints = sa.table(
+        "agent_checkpoints",
+        sa.column("id", sa.String(length=36)),
+        sa.column("namespace", sa.String(length=256)),
+    )
+
+    _restore_recommendation_table(connection, alerts)
+    _restore_recommendation_table(connection, runs)
+    connection.execute(
+        runs.update()
+        .where(runs.c.current_stage == "KNOWLEDGE_MATCHING")
+        .values(current_stage="RUNBOOK_MATCHING")
+    )
+    connection.execute(
+        progress.update()
+        .where(progress.c.stage == "KNOWLEDGE_MATCHING")
+        .values(stage="RUNBOOK_MATCHING")
+    )
+    legacy_checkpoints = list(
+        connection.execute(
+            sa.select(checkpoints.c.id, checkpoints.c.namespace).where(
+                checkpoints.c.namespace.like(f"{_LEGACY_CHECKPOINT_PREFIX}%")
+            )
+        ).mappings()
+    )
+    for checkpoint in legacy_checkpoints:
+        connection.execute(
+            checkpoints.update()
+            .where(checkpoints.c.id == checkpoint["id"])
+            .values(
+                namespace=checkpoint["namespace"][len(_LEGACY_CHECKPOINT_PREFIX) :]
             )
         )
-    with op.batch_alter_table("investigation_runs") as batch_op:
-        batch_op.add_column(sa.Column("runbooks_json", sa.JSON(), nullable=True))
