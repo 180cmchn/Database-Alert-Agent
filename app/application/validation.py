@@ -96,6 +96,7 @@ class RuleConclusionValidator:
         evidence: list[EvidenceRecord],
     ) -> ValidationRecord:
         issues: list[str] = []
+        knowledge_warnings: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
         has_supported_cause = bool(recommendation.root_causes)
 
@@ -177,44 +178,50 @@ class RuleConclusionValidator:
             if basis.source == AnalysisBasisSource.KNOWLEDGE
         ]
         if knowledge_matches and not knowledge_bases:
-            issues.append("命中知识时必须提供至少一条知识依据")
+            knowledge_warnings.append("命中知识时未提供知识依据")
         if not knowledge_matches and knowledge_bases:
-            issues.append("未命中知识时不得声称存在知识依据")
+            knowledge_warnings.append("未命中知识时声称存在知识依据")
         for index, basis in enumerate(recommendation.analysis_bases, start=1):
             if basis.source != AnalysisBasisSource.KNOWLEDGE:
                 continue
             if basis.source_ref is None:
-                issues.append(f"知识依据 #{index} 缺少合法 source_ref")
+                knowledge_warnings.append(f"知识依据 #{index} 缺少合法 source_ref")
                 continue
             expected = valid_knowledge_refs.get(
                 (basis.source_ref.source, basis.source_ref.knowledge_id)
             )
             if expected is None:
-                issues.append(
+                knowledge_warnings.append(
                     f"知识依据 #{index} 引用了未知条目："
                     f"{basis.source_ref.source}/{basis.source_ref.knowledge_id}"
                 )
             elif (basis.source_ref.title, basis.source_ref.source_uri) != expected:
-                issues.append(f"知识依据 #{index} 的标题或来源与检索结果不一致")
+                knowledge_warnings.append(
+                    f"知识依据 #{index} 的标题或来源与检索结果不一致"
+                )
 
         knowledge_matched = bool(knowledge_matches)
         for index, step in enumerate(recommendation.steps, start=1):
             source_ref = step.source_ref
             if not knowledge_matched:
                 if source_ref is not None:
-                    issues.append(f"未命中知识时处理步骤 #{index} 不得提供 source_ref")
+                    knowledge_warnings.append(
+                        f"未命中知识时处理步骤 #{index} 提供了 source_ref"
+                    )
                 continue
             if source_ref is not None:
                 expected = valid_knowledge_refs.get(
                     (source_ref.source, source_ref.knowledge_id)
                 )
                 if expected is None:
-                    issues.append(
+                    knowledge_warnings.append(
                         f"处理步骤 #{index} 引用了未知知识："
                         f"{source_ref.source}/{source_ref.knowledge_id}"
                     )
                 elif (source_ref.title, source_ref.source_uri) != expected:
-                    issues.append(f"处理步骤 #{index} 的知识标题或来源不一致")
+                    knowledge_warnings.append(
+                        f"处理步骤 #{index} 的知识标题或来源不一致"
+                    )
 
         source_rank = {
             AnalysisBasisSource.KNOWLEDGE: 0,
@@ -222,7 +229,9 @@ class RuleConclusionValidator:
         }
         ranks = [source_rank[source] for source in sources]
         if ranks != sorted(ranks):
-            issues.append("判断依据顺序错误：所有知识依据必须排在 AI 依据之前")
+            knowledge_warnings.append(
+                "判断依据顺序提示：建议将知识依据排在 AI 依据之前"
+            )
 
         return ValidationRecord(
             run_id=run.id,
@@ -237,5 +246,6 @@ class RuleConclusionValidator:
                 "checked_steps": len(recommendation.steps),
                 "evidence_count": len(evidence),
                 "knowledge_count": len(knowledge_matches),
+                "knowledge_warnings": knowledge_warnings,
             },
         )

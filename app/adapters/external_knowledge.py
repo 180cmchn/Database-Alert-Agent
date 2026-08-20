@@ -127,12 +127,18 @@ class ExternalKnowledgeClient:
         *,
         api_key: str = "",
         timeout_seconds: float = 30,
+        max_retries: int = 2,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+        if max_retries < 0:
+            raise ValueError("max_retries must not be negative")
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
         self._transport = transport
         self._sleep = sleep
 
@@ -158,8 +164,8 @@ class ExternalKnowledgeClient:
     ) -> KnowledgeSearchResponse:
         """Call ``POST /search`` on the KnowledgePack service.
 
-        Recoverable failures retry until the owning analysis times out or is
-        actively cancelled. Permanent HTTP and response errors still fail fast.
+        Recoverable failures use a bounded retry budget and total wall-clock
+        deadline. Permanent HTTP and response errors still fail fast.
         """
 
         if not query.strip():
@@ -189,27 +195,36 @@ class ExternalKnowledgeClient:
         json: Mapping[str, Any] | None = None,
     ) -> Any:
         url = f"{self.base_url}{path}"
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout_seconds),
-            transport=self._transport,
-            follow_redirects=False,
-            headers=self._headers(),
-        ) as client:
-            response: httpx.Response | None = None
-            attempt = 0
-            while True:
-                try:
-                    response = await client.request(method, url, json=json)
-                except httpx.TransportError:
-                    await self._sleep(min(2 ** min(attempt, 4), 10))
-                    attempt += 1
-                    continue
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self.timeout_seconds),
+                    transport=self._transport,
+                    follow_redirects=False,
+                    headers=self._headers(),
+                ) as client:
+                    response: httpx.Response | None = None
+                    for attempt in range(self.max_retries + 1):
+                        try:
+                            response = await client.request(method, url, json=json)
+                        except httpx.TransportError as exc:
+                            if attempt >= self.max_retries:
+                                raise ExternalKnowledgeAPIError(
+                                    "Knowledge service request failed",
+                                    code="NetworkError",
+                                ) from exc
+                            await self._sleep(min(2 ** min(attempt, 4), 10))
+                            continue
 
-                if response.status_code == 429 or response.status_code >= 500:
-                    await self._sleep(self._retry_delay(response, attempt))
-                    attempt += 1
-                    continue
-                break
+                        retryable = response.status_code == 429 or response.status_code >= 500
+                        if not retryable or attempt >= self.max_retries:
+                            break
+                        await self._sleep(self._retry_delay(response, attempt))
+        except TimeoutError as exc:
+            raise ExternalKnowledgeAPIError(
+                "Knowledge service request exceeded its time budget",
+                code="Timeout",
+            ) from exc
 
         if response is None:  # pragma: no cover - loop contract guard
             raise ExternalKnowledgeAPIError("No response received", code="NetworkError")

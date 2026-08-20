@@ -765,7 +765,9 @@ def _validate_knowledge_policy(
             )
             kept_knowledge_bases.append(basis.model_copy(update={"source_ref": exact_ref}))
         elif basis.source == AnalysisBasisSource.AI:
-            kept_ai_bases.append(basis)
+            # Keep model parsing tolerant, but never project a knowledge citation
+            # from an AI-labelled basis into the user-facing recommendation.
+            kept_ai_bases.append(basis.model_copy(update={"source_ref": None}))
     cited_knowledge = {
         (basis.source_ref.source, basis.source_ref.knowledge_id)
         for basis in kept_knowledge_bases

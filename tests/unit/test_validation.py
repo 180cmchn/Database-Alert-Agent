@@ -13,6 +13,8 @@ from app.domain.models import (
     AnalysisBasisSource,
     EvidenceRecord,
     InvestigationRun,
+    KnowledgeExcerpt,
+    KnowledgeReference,
     Recommendation,
     RecommendationStep,
     RootCauseAssessment,
@@ -362,6 +364,78 @@ async def test_rule_validator_accepts_supported_with_live_evidence() -> None:
     assert result.passed is True
     assert result.evidence_sufficient is True
     assert result.issues == []
+
+
+@pytest.mark.asyncio
+async def test_knowledge_reference_warnings_do_not_erase_live_supported_cause() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="长事务持续占用连接槽位，最终触发连接耗尽。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    ).model_copy(
+        update={
+            "knowledge_matches": [
+                KnowledgeExcerpt(
+                    source="incident_library",
+                    knowledge_id="known-entry",
+                    title="连接耗尽案例",
+                    content="检查长事务。",
+                    source_uri="https://knowledge.example.test/known-entry",
+                    score=0.9,
+                    raw_score=0.1,
+                )
+            ],
+            "analysis_bases": [
+                AnalysisBasis(
+                    source=AnalysisBasisSource.AI,
+                    statement="实时证据支持该因果机制。",
+                ),
+                AnalysisBasis(
+                    source=AnalysisBasisSource.KNOWLEDGE,
+                    statement="知识条目仅作为处置参考。",
+                    source_ref=KnowledgeReference(
+                        source="incident_library",
+                        knowledge_id="unknown-entry",
+                        title="未知条目",
+                        source_uri="https://knowledge.example.test/unknown-entry",
+                    ),
+                ),
+            ],
+        }
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [evidence],
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is True
+    assert result.issues == []
+    warnings = result.metadata["knowledge_warnings"]
+    assert any("未知条目" in warning for warning in warnings)
+    assert any("顺序提示" in warning for warning in warnings)
+
+
+def test_analysis_basis_accepts_missing_knowledge_reference_for_non_blocking_audit() -> None:
+    basis = AnalysisBasis(
+        source=AnalysisBasisSource.KNOWLEDGE,
+        statement="模型未返回引用，保留为审计警告。",
+    )
+
+    assert basis.source_ref is None
 
 
 @pytest.mark.asyncio

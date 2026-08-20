@@ -647,7 +647,16 @@ def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
                     source_uri="https://untrusted.invalid",
                 ),
             ),
-            AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis"),
+            AnalysisBasis(
+                source=AnalysisBasisSource.AI,
+                statement="AI basis",
+                source_ref=KnowledgeReference(
+                    source="incident_library",
+                    knowledge_id="fabricated",
+                    title="fabricated title",
+                    source_uri="https://untrusted.invalid/fabricated",
+                ),
+            ),
         ],
         steps=[
             RecommendationStep(
@@ -673,6 +682,7 @@ def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
         source_uri=knowledge.source_uri,
     )
     assert result.analysis_bases[0].source_ref == exact
+    assert result.analysis_bases[1].source_ref is None
     assert result.steps[0].source_ref == exact
     assert result.confidence == 0.8
 

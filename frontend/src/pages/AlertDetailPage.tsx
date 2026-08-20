@@ -288,7 +288,7 @@ export function AlertDetailPage() {
           description="展示本次运行的知识来源配置、匹配进度与结果。"
           className="knowledge-match-card"
           action={knowledgeCard.state === "matched"
-            ? <span className="match-score"><ExternalLink size={14} /> 命中 {knowledgeCard.matches.length} 条</span>
+            ? <span className="match-score"><ExternalLink size={14} /> 命中 {knowledgeCard.matchCount} 条</span>
             : <span className={`knowledge-status knowledge-status-${knowledgeCard.state}`}>{knowledgeCard.state === "matching" && <Radio size={13} className="pulse" />}{knowledgeCard.headline}</span>}
         >
           <div className={`knowledge-card-body knowledge-state-${knowledgeCard.state}`}>
@@ -308,7 +308,24 @@ export function AlertDetailPage() {
             {knowledgeCard.sources.length > 0 && (
               <div className="knowledge-source-list">
                 <span>本次来源</span>
-                <div>{knowledgeCard.sources.map((source) => <code key={source}>{source}</code>)}</div>
+                {knowledgeCard.sourceOutcomes.length > 0 ? (
+                  <div className="knowledge-source-outcomes">
+                    {knowledgeCard.sourceOutcomes.map((outcome) => (
+                      <article key={outcome.source} className={`knowledge-source-outcome source-${outcome.status}`}>
+                        <span>{outcome.status === "matched" ? <CheckCircle2 size={15} /> : <CircleAlert size={15} />}</span>
+                        <div>
+                          <code>{outcome.source}</code>
+                          <small>{outcome.status === "matched"
+                            ? `命中 ${outcome.matchCount} 条可用知识`
+                            : outcome.status === "unavailable"
+                              ? `本次不可用${outcome.error ? ` · ${outcome.error}` : ""}`
+                              : "已查询，未匹配到可用知识"}</small>
+                        </div>
+                        {outcome.durationMs !== null && <b>{outcome.durationMs} ms</b>}
+                      </article>
+                    ))}
+                  </div>
+                ) : <div>{knowledgeCard.sources.map((source) => <code key={source}>{source}</code>)}</div>}
               </div>
             )}
 

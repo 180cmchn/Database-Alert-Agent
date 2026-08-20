@@ -22,6 +22,7 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
+import { knowledgeSourcesForSave } from "../lib/knowledgeSources";
 import type {
   AdminSettings,
   AdminSettingsPatch,
@@ -111,7 +112,10 @@ export function SettingsPage() {
     setError("");
     setNotice("");
     try {
-      const knowledgeSources = externalKnowledgeSelected ? ["external_knowledge"] : [];
+      const knowledgeSources = knowledgeSourcesForSave(
+        settings.knowledge_sources,
+        externalKnowledgeSelected,
+      );
       if (!isAIProvider(selectedProvider)) {
         throw new Error("请选择受支持的 AI Provider。");
       }
@@ -178,6 +182,11 @@ export function SettingsPage() {
   if (!settings) return <ErrorState message={error || "设置数据不可用"} onRetry={() => void load()} />;
   const realProviderSelected = selectedProvider !== "fake";
   const unsupportedProviderSelected = !isAIProvider(selectedProvider);
+  const extensionKnowledgeSources = settings.knowledge_sources.filter(
+    (source) => source !== "external_knowledge",
+  );
+  const selectedKnowledgeSourceCount = extensionKnowledgeSources.length
+    + (externalKnowledgeSelected ? 1 : 0);
 
   return (
     <div className="page-stack settings-page">
@@ -235,7 +244,7 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        <SectionCard eyebrow="KNOWLEDGE SOURCE" title="Agent 参考依据" description="外部知识库是可选的参考来源；不可用、未命中或未选择都不会阻止实时证据分析。" action={<span className={`configured-chip ${externalKnowledgeSelected ? "yes" : "no"}`}><ShieldCheck size={13} />{externalKnowledgeSelected ? "外部知识库已选择" : "未选择知识来源"}</span>}>
+        <SectionCard eyebrow="KNOWLEDGE SOURCE" title="Agent 参考依据" description="外部知识库是可选的参考来源；不可用、未命中或未选择都不会阻止实时证据分析。" action={<span className={`configured-chip ${selectedKnowledgeSourceCount > 0 ? "yes" : "no"}`}><ShieldCheck size={13} />{selectedKnowledgeSourceCount > 0 ? `已选择 ${selectedKnowledgeSourceCount} 个知识来源` : "未选择知识来源"}</span>}>
           <div className="switch-stack">
             <label className="switch-row"><span><Sparkles size={17} /><span><strong>外部知识库</strong><small>选中后连接并检索 KnowledgePack 内容；取消后仅使用告警、实时证据和通用推理</small></span></span><input name="knowledge_external" type="checkbox" checked={externalKnowledgeSelected} onChange={(event) => setExternalKnowledgeSelected(event.target.checked)} /><i /></label>
           </div>
@@ -243,6 +252,7 @@ export function SettingsPage() {
             <label className="field"><span>外部知识最低相关度（部署配置）</span><input value={settings.external_knowledge_min_relevance.toFixed(2)} readOnly /></label>
             <label className="field span-2"><span>外部知识库 Base URL（部署配置，只读）</span><input value={settings.external_knowledge_base_url} readOnly /></label>
             <label className="field span-2"><span>Knowledge API Key（只写，URL 变更后必须重新输入）</span><div className="secret-field"><input name="external_knowledge_api_key" type={showKnowledgeApiKey ? "text" : "password"} autoComplete="new-password" disabled={!externalKnowledgeSelected} placeholder={settings.external_knowledge_api_key_configured ? "已绑定当前 URL · 留空保持不变" : "认证可选；如服务启用认证请重新输入"} /><button type="button" onClick={() => setShowKnowledgeApiKey((value) => !value)} aria-label={showKnowledgeApiKey ? "隐藏 Knowledge API Key" : "显示 Knowledge API Key"}>{showKnowledgeApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
+            {extensionKnowledgeSources.length > 0 && <label className="field span-2"><span>其他已配置知识来源（保留）</span><input value={extensionKnowledgeSources.join(", ")} readOnly /></label>}
           </div>
         </SectionCard>
 

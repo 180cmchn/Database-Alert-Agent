@@ -112,7 +112,7 @@ test("a completed zero-count search reports no qualifying match and keeps its su
   assert.equal(model.summary, summary);
 });
 
-test("a failed provider is a non-blocking no-match result", () => {
+test("a failed provider is explicitly unavailable and non-blocking", () => {
   const summary = "知识匹配结果：incident_library 查询失败（TimeoutError），已忽略。";
   const model = buildKnowledgeCardModel({
     run: run("RUNNING", ["incident_library"]),
@@ -125,7 +125,14 @@ test("a failed provider is a non-blocking no-match result", () => {
     resultAvailable: true,
   });
 
-  assert.equal(model.state, "no_match");
+  assert.equal(model.state, "unavailable");
+  assert.deepEqual(model.sourceOutcomes, [{
+    source: "incident_library",
+    status: "unavailable",
+    matchCount: 0,
+    error: "TimeoutError",
+    durationMs: null,
+  }]);
   assert.equal(model.summary, summary);
   assert.match(model.description, /继续分析实时证据/);
 });

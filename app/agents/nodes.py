@@ -308,8 +308,10 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
     source_details = [
         {
             "source": result.source,
+            "status": result.status,
             "match_count": len(result.matches),
             "error": result.error,
+            "duration_ms": result.duration_ms,
         }
         for result in results
     ]
@@ -319,7 +321,7 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
         source_summaries = [
             (
                 f"{result.source} 查询失败（{result.error}），已忽略"
-                if result.error
+                if result.status == "unavailable"
                 else f"{result.source} 命中 {len(result.matches)} 条"
             )
             for result in results
@@ -330,22 +332,24 @@ async def knowledge_match_node(state: AgentState, ctx: NodeContext) -> dict[str,
                 "所选知识来源均未命中或不可用，Agent 将使用告警、实时证据和通用推理。"
             )
 
+    progress = await _update_progress(
+        ctx.repository,
+        alert_id,
+        run,
+        InvestigationStage.KNOWLEDGE_MATCHING,
+        "知识匹配完成。",
+        {
+            "sources": source_details,
+            "knowledge_match_count": len(knowledge),
+            "knowledge_match_summary": knowledge_match_summary,
+        },
+    )
+
     return {
         "current_stage": InvestigationStage.KNOWLEDGE_MATCHING,
         "knowledge": knowledge,
         "knowledge_match_summary": knowledge_match_summary,
-        "progress": [
-            ProgressRecord(
-                run_id=run.id,
-                stage=InvestigationStage.KNOWLEDGE_MATCHING,
-                message="正在检索已选择的知识来源。",
-                details={
-                    "sources": source_details,
-                    "knowledge_match_count": len(knowledge),
-                    "knowledge_match_summary": knowledge_match_summary,
-                },
-            )
-        ],
+        "progress": [progress],
     }
 
 

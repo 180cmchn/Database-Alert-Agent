@@ -218,16 +218,6 @@ class AnalysisBasis(BaseModel):
     statement: str = Field(min_length=1)
     source_ref: KnowledgeReference | None = None
 
-    @model_validator(mode="after")
-    def validate_source_reference(self) -> AnalysisBasis:
-        if self.source == AnalysisBasisSource.KNOWLEDGE and not isinstance(
-            self.source_ref, KnowledgeReference
-        ):
-            raise ValueError("KNOWLEDGE analysis basis requires a knowledge source_ref")
-        if self.source == AnalysisBasisSource.AI and self.source_ref is not None:
-            raise ValueError("AI analysis basis must not contain source_ref")
-        return self
-
 
 class RecommendationStep(BaseModel):
     order: int = Field(ge=1)
