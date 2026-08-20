@@ -13,7 +13,6 @@ from app.domain.models import (
     AlertStatus,
     AnalysisConfigSnapshot,
     NormalizedAlert,
-    RunbookDocument,
     RunStatus,
 )
 
@@ -24,11 +23,6 @@ class AlertAccepted(BaseModel):
     status: AlertStatus
     detail_url: str
     deduplicated: bool
-
-
-class RunbookListResponse(BaseModel):
-    items: list[RunbookDocument]
-    total: int = Field(ge=0)
 
 
 class ReanalyzeRequest(BaseModel):
@@ -137,9 +131,9 @@ class RuntimeSettingsPatch(BaseModel):
     ai_timeout_seconds: float | None = Field(default=None, gt=0, le=600)
     ai_json_mode: bool | None = None
     ai_fallback_enabled: bool | None = None
+    stream_main_agent_reasoning: bool | None = None
     react_max_rounds: int | None = Field(default=None, ge=1, le=100)
     analysis_timeout_seconds: int | None = Field(default=None, ge=30, le=86_400)
-    runbook_limit: int | None = Field(default=None, ge=1, le=20)
     scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     wecom_page_base_url: str | None = Field(default=None, max_length=2048)
@@ -166,6 +160,7 @@ class RuntimeSettingsResponse(BaseModel):
     ai_timeout_seconds: float
     ai_json_mode: bool
     ai_fallback_enabled: bool
+    stream_main_agent_reasoning: bool
     ai_react_model: str
     ai_mcp_model: str
     ai_react_reasoning_effort: str
@@ -173,9 +168,7 @@ class RuntimeSettingsResponse(BaseModel):
     ai_mcp_reasoning_effort: str
     react_max_rounds: int
     analysis_timeout_seconds: int
-    runbook_limit: int
     scheduler_workers: int
-    runbook_match_min_confidence: float
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
     wecom_page_base_url: str
@@ -218,6 +211,7 @@ class RuntimeSettingsResponse(BaseModel):
             ai_timeout_seconds=settings.ai_timeout_seconds,
             ai_json_mode=settings.ai_json_mode,
             ai_fallback_enabled=settings.ai_fallback_enabled,
+            stream_main_agent_reasoning=settings.stream_main_agent_reasoning,
             ai_react_model=settings.ai_react_model,
             ai_mcp_model=settings.ai_mcp_model,
             ai_react_reasoning_effort=settings.ai_react_reasoning_effort,
@@ -225,9 +219,7 @@ class RuntimeSettingsResponse(BaseModel):
             ai_mcp_reasoning_effort=settings.ai_mcp_reasoning_effort,
             react_max_rounds=settings.react_max_rounds,
             analysis_timeout_seconds=settings.analysis_timeout_seconds,
-            runbook_limit=settings.runbook_limit,
             scheduler_workers=settings.scheduler_workers,
-            runbook_match_min_confidence=settings.runbook_match_min_confidence,
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             wecom_page_base_url=settings.wecom_page_base_url,

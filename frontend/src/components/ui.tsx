@@ -2,7 +2,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   DatabaseZap,
-  FileQuestion,
   LoaderCircle,
   LockKeyhole,
   RefreshCw,
@@ -145,9 +144,9 @@ export function EmptyState({
   title: string;
   description: string;
   action?: ReactNode;
-  kind?: "empty" | "search" | "runbook";
+  kind?: "empty" | "search";
 }) {
-  const Icon = kind === "search" ? SearchX : kind === "runbook" ? FileQuestion : DatabaseZap;
+  const Icon = kind === "search" ? SearchX : DatabaseZap;
   return (
     <div className="state-panel empty-state">
       <span className="empty-icon"><Icon size={26} /></span>

@@ -19,26 +19,6 @@ class AdvisorError(AlertAgentError):
     pass
 
 
-class RunbookError(AlertAgentError):
-    pass
-
-
-class InvalidRunbookIdError(RunbookError, ValueError):
-    pass
-
-
-class RunbookNotFoundError(RunbookError, LookupError):
-    pass
-
-
-class RunbookAlertTypeNotFoundError(RunbookError, LookupError):
-    """The local corpus has no directory for the alert's normalized type."""
-
-    def __init__(self, alert_type: str) -> None:
-        super().__init__("匹配本地pdf失败，pdf中没有该类型告警的处理方法")
-        self.alert_type = alert_type
-
-
 class NotificationError(AlertAgentError):
     pass
 

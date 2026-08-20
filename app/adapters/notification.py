@@ -165,11 +165,11 @@ class LogManagementNotifier:
     async def send(self, event: AnalysisResultEvent) -> str:
         delivery_id = f"log-{uuid4()}"
         logger.warning(
-            "analysis_result delivery_id=%s alert_id=%s status=%s manual_matched=%s",
+            "analysis_result delivery_id=%s alert_id=%s status=%s knowledge_matches=%s",
             delivery_id,
             event.alert.id,
             event.status.value,
-            event.recommendation.manual_matched,
+            len(event.recommendation.knowledge_matches),
         )
         return delivery_id
 

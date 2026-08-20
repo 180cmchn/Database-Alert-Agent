@@ -13,7 +13,7 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
    `FLASHDUTY_POLL_CHANNEL_IDS` 查询协作空间，以 `source + alert_id` 去重，只有新告警自动入队。
 2. 分析首先调用 FlashDuty `/alert/info`。详情中的数据库、`alarm_host`、`alarm_port` 和
    `occurred_at` 同时参与知识匹配、MCP 选择和查询；host、port 不从标题推断或补全。
-3. 系统检索本次选择的本地 PDF 和/或外部 KnowledgePack，保留实际命中的来源、章节和页码。
+3. 系统检索本次选择的知识来源，保留实际命中的来源、知识 ID、标题和 URI。
 4. 主 Agent 进入 ReAct 循环。每轮按 `thought -> action -> observation` 执行一个外层工具，或输出
    `finish`；它根据 MCP 的角色和作用判断是否需要调用，不存在按告警类型硬编码的必调 MCP。
 5. MCP 完整原始响应保存为内部审计 artifact。程序侧确定性过滤、聚合、排序并产生可追溯
@@ -62,7 +62,7 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | 数据 | 用途 | 能否单独证明根因 |
 | --- | --- | --- |
 | FlashDuty `/alert/info` | 确认告警语义、目标和时间 | 否 |
-| 本地 PDF / 外部知识 | 提供可能机制和处置知识 | 否 |
+| 可选知识来源 | 提供可能机制和处置知识 | 否 |
 | MCP 实时 observation | 提供告警目标、告警窗口内的事实 | 需由主 Agent 结合其它证据判断 |
 | MCP 辅助响应 | 认证、资源定位、Schema 和目录发现 | 否，仅内部审计 |
 
@@ -95,7 +95,6 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | MCP 连接与提示词引用 | `config/mcp/settings.json` |
 | MCP 角色、作用、工作流程和行为边界 | `config/mcp/prompts/<provider>/{role,purpose,workflow,safety}.md` |
 | MCP 原始结果的程序投影 | `app/adapters/tool_result_analysis.py` |
-| 本地 PDF 与结构化索引 | `runbooks/pdfs-typed/<alert_type>/` |
 | 外部知识来源 | `.env` 中 `EXTERNAL_KNOWLEDGE_*` 和 `KNOWLEDGE_SOURCES` |
 | 主 Agent ReAct 轮次与整次超时 | `REACT_MAX_ROUNDS`、`ANALYSIS_TIMEOUT_SECONDS` |
 
@@ -214,29 +213,6 @@ PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 
 ## 知识来源
 
-### 本地 PDF
-
-运行时目录为 `runbooks/pdfs-typed/<alert_type>/`。每个目录包含 PDF 与 `index.json`；索引保存真实章节、
-页码、别名、适用范围和结构化诊断内容。PDF 必须未加密并带可提取文字层，扫描件需先 OCR。含图页面
-应在索引中记录 `visual_evidence`。
-
-```bash
-.venv/bin/python tools/process_pdf_runbooks.py \
-  --source-pdf-dir runbooks/pdfs \
-  --output-dir runbooks/pdfs-typed \
-  --auto-index --sync --enforce-gates
-```
-
-```dotenv
-RUNBOOK_PDF_DIR=./runbooks/pdfs-typed
-RUNBOOK_LIMIT=5
-RUNBOOK_MATCH_MIN_SCORE=12
-RUNBOOK_MATCH_MIN_CONFIDENCE=0.35
-```
-
-低于阈值的候选会被拒绝。项目不会虚构 PDF 命中、章节或页码；手册说明的原因不能代替本次告警的
-实时证据。
-
 ### 外部 KnowledgePack
 
 KnowledgePack 独立部署，通过共享 Docker 网络向 Agent 提供 `POST /search`。检索失败或空响应只表示
@@ -248,7 +224,7 @@ EXTERNAL_KNOWLEDGE_BASE_URL=http://knowledge:8000
 EXTERNAL_KNOWLEDGE_API_KEY=replace-me
 EXTERNAL_KNOWLEDGE_LIMIT=5
 EXTERNAL_KNOWLEDGE_MIN_RELEVANCE=0.60
-KNOWLEDGE_SOURCES=["local_pdf","external_knowledge"]
+KNOWLEDGE_SOURCES=["external_knowledge"]
 ```
 
 ## FlashDuty 轮询

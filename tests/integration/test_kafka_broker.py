@@ -20,13 +20,10 @@ async def test_kafka_broker_message_uses_shared_pipeline(tmp_path: Path) -> None
 
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
     topic = f"database-alert-test-{uuid4().hex}"
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'kafka.db'}",
-        runbook_pdf_dir=runbooks,
     )
     runtime = build_runtime(settings)
     await runtime.repository.initialize()

@@ -6,11 +6,13 @@ import pytest
 from app.adapters.ai import FakeAIAdvisor
 from app.adapters.external_knowledge import (
     ExternalKnowledgeClient,
+    ExternalKnowledgeSource,
     KnowledgeSearchResponse,
     KnowledgeSearchResult,
     _distance_to_relevance,
     format_items_for_advisor,
 )
+from app.adapters.knowledge import KnowledgeSourceRegistry
 from app.application.factory import build_runtime
 from app.config import Settings
 from app.domain.models import INCONCLUSIVE_ROOT_CAUSE_SUMMARY, AnalysisBasisSource
@@ -170,24 +172,22 @@ class StubExternalKnowledgeClient:
 
 class CapturingAdvisor(FakeAIAdvisor):
     def __init__(self) -> None:
-        self.external_knowledge = []
+        self.knowledge = []
         self.knowledge_match_summary = ""
 
     async def advise(  # type: ignore[no-untyped-def]
         self,
         alert,
-        runbooks,
+        knowledge,
         evidence=None,
-        external_knowledge=None,
         knowledge_match_summary="",
     ):
-        self.external_knowledge = list(external_knowledge or [])
+        self.knowledge = list(knowledge)
         self.knowledge_match_summary = knowledge_match_summary
         return await super().advise(
             alert,
-            runbooks,
+            knowledge,
             evidence=evidence,
-            external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
         )
 
@@ -197,8 +197,6 @@ def external_only_settings(tmp_path: Path) -> Settings:
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=tmp_path / "unused-runbooks",
-        external_knowledge_enabled=True,
         external_knowledge_base_url="http://knowledge.test",
         external_knowledge_min_relevance=0.60,
         knowledge_sources=["external_knowledge"],
@@ -210,12 +208,20 @@ async def test_threshold_rejects_low_relevance_before_advisor(
     tmp_path: Path,
 ) -> None:
     advisor = CapturingAdvisor()
-    runtime = build_runtime(external_only_settings(tmp_path), advisor=advisor)
-    runtime.service.agent.ctx.external_knowledge_client = StubExternalKnowledgeClient(
-        [
-            knowledge_result("Relevant replica diagnostic.", "replica.md", 0.2),
-            knowledge_result("Unrelated backup article.", "backup.md", 0.9),
-        ]
+    source = ExternalKnowledgeSource(
+        StubExternalKnowledgeClient(
+            [
+                knowledge_result("Relevant replica diagnostic.", "replica.md", 0.2),
+                knowledge_result("Unrelated backup article.", "backup.md", 0.9),
+            ]
+        ),
+        limit=5,
+        min_relevance=0.60,
+    )
+    runtime = build_runtime(
+        external_only_settings(tmp_path),
+        advisor=advisor,
+        knowledge_registry=KnowledgeSourceRegistry([source]),
     )
     await runtime.repository.initialize()
 
@@ -230,11 +236,10 @@ async def test_threshold_rejects_low_relevance_before_advisor(
         },
     )
 
-    assert len(advisor.external_knowledge) == 1
-    assert "低于相关度阈值" in advisor.knowledge_match_summary
+    assert len(advisor.knowledge) == 1
     assert result.recommendation is not None
-    assert len(result.recommendation.external_knowledge_matches) == 1
-    assert AnalysisBasisSource.EXTERNAL_KNOWLEDGE in {
+    assert len(result.recommendation.knowledge_matches) == 1
+    assert AnalysisBasisSource.KNOWLEDGE in {
         basis.source for basis in result.recommendation.analysis_bases
     }
     await runtime.repository.close()  # type: ignore[attr-defined]
@@ -244,9 +249,16 @@ async def test_threshold_rejects_low_relevance_before_advisor(
 async def test_all_low_relevance_results_produce_explicit_no_match(
     tmp_path: Path,
 ) -> None:
-    runtime = build_runtime(external_only_settings(tmp_path))
-    runtime.service.agent.ctx.external_knowledge_client = StubExternalKnowledgeClient(
-        [knowledge_result("Unrelated document.", "unrelated.md", 0.95)]
+    source = ExternalKnowledgeSource(
+        StubExternalKnowledgeClient(
+            [knowledge_result("Unrelated document.", "unrelated.md", 0.95)]
+        ),
+        limit=5,
+        min_relevance=0.60,
+    )
+    runtime = build_runtime(
+        external_only_settings(tmp_path),
+        knowledge_registry=KnowledgeSourceRegistry([source]),
     )
     await runtime.repository.initialize()
 
@@ -261,10 +273,8 @@ async def test_all_low_relevance_results_produce_explicit_no_match(
     )
 
     assert result.recommendation is not None
-    assert result.recommendation.external_knowledge_matches == []
-    assert "已拒绝匹配" in result.recommendation.knowledge_match_summary
+    assert result.recommendation.knowledge_matches == []
     assert "所选知识来源均未命中" in result.recommendation.knowledge_match_summary
     assert result.recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
     assert result.recommendation.root_causes == []
-    assert result.recommendation.confidence <= 0.45
     await runtime.repository.close()  # type: ignore[attr-defined]

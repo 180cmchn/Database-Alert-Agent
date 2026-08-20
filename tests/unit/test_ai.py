@@ -10,7 +10,7 @@ import pytest
 import app.adapters.ai as ai_module
 from app.adapters.ai import (
     FakeAIAdvisor,
-    _validate_manual_policy,
+    _validate_knowledge_policy,
 )
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.domain.errors import AdvisorError
@@ -19,13 +19,10 @@ from app.domain.models import (
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
-    ExternalKnowledgeExcerpt,
-    ExternalKnowledgeReference,
+    KnowledgeExcerpt,
+    KnowledgeReference,
     Recommendation,
     RecommendationStep,
-    RunbookExcerpt,
-    RunbookReference,
-    RunbookVisualEvidence,
     ToolStatus,
 )
 
@@ -115,11 +112,9 @@ async def test_fake_advisor_returns_fixed_no_cause_for_partial_success() -> None
 
 
 @pytest.mark.asyncio
-async def test_no_runbook_forces_low_confidence() -> None:
+async def test_no_knowledge_remains_a_valid_optional_input() -> None:
     recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [])
-    assert recommendation.manual_matched is False
-    assert recommendation.confidence <= 0.45
-    assert recommendation.runbook_references == []
+    assert recommendation.knowledge_matches == []
     assert [item.source for item in recommendation.analysis_bases] == [AnalysisBasisSource.AI]
 
 
@@ -134,14 +129,13 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
         confidence=0.3,
-        manual_matched=False,
     )
 
     async def complete(messages):  # type: ignore[no-untyped-def]
         return model_response.model_dump_json(), object()
 
     advisor._complete = complete
-    expected = "匹配本地pdf失败，pdf中没有该类型告警的处理方法"
+    expected = "所选知识来源均未命中。"
 
     recommendation, _ = await advisor.advise(
         make_alert(),
@@ -182,7 +176,6 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
         confidence=0.3,
-        manual_matched=False,
     )
 
     async def complete(messages):  # type: ignore[no-untyped-def]
@@ -302,7 +295,6 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[],
         confidence=0.3,
-        manual_matched=False,
     )
     calls = 0
 
@@ -324,8 +316,7 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
     await advisor.advise(make_alert(), [], evidence=evidence)
     await advisor.decide_investigation(
         alert=make_alert(),
-        runbooks=[],
-        external_knowledge=[],
+        knowledge=[],
         knowledge_match_summary="",
         evidence=evidence,
         available_tools=[],
@@ -442,7 +433,6 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
         confidence=0.3,
-        manual_matched=False,
     )
     calls = 0
 
@@ -475,7 +465,6 @@ async def test_advisor_does_not_apply_archery_endpoint_output_gate() -> None:
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
         confidence=0.3,
-        manual_matched=False,
     )
     calls = 0
 
@@ -503,7 +492,6 @@ async def test_advisor_accepts_schema_valid_archery_endpoint_statement_once() ->
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
         steps=[RecommendationStep(order=1, action="执行只读核查")],
         confidence=0.3,
-        manual_matched=False,
     )
 
     calls = 0
@@ -555,8 +543,7 @@ async def test_react_decision_keeps_repairing_until_schema_is_valid() -> None:
 
     result = await advisor.decide_investigation(
         alert=make_alert(),
-        runbooks=[],
-        external_knowledge=[],
+        knowledge=[],
         knowledge_match_summary="",
         evidence=[],
         available_tools=[],
@@ -577,7 +564,7 @@ async def test_react_decision_keeps_repairing_until_schema_is_valid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None:
+async def test_advisor_payload_uses_unified_knowledge_contract() -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._api_key = "test-key"
     advisor._model = "test-model"
@@ -587,7 +574,6 @@ async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
         steps=[RecommendationStep(order=1, action="check read-only metrics")],
         confidence=0.3,
-        manual_matched=False,
     )
 
     async def complete(messages):  # type: ignore[no-untyped-def]
@@ -595,136 +581,52 @@ async def test_advisor_payload_omits_runbook_quality_and_review_states() -> None
         return model_response.model_dump_json(), object()
 
     advisor._complete = complete
-    runbook = RunbookExcerpt(
-        runbook_id="rb-1",
+    knowledge = KnowledgeExcerpt(
+        source="incident_library",
+        knowledge_id="knowledge-1",
         title="Replica guide",
-        section="triage",
         content="Check replica apply rate.",
-        visual_evidence=[
-            RunbookVisualEvidence(
-                page=1,
-                kind="screenshot",
-                text="Replica apply rate chart",
-            )
-        ],
+        source_uri="https://knowledge.test/replica",
+        score=0.9,
+        raw_score=0.1,
     )
 
-    await advisor.advise(make_alert(), [runbook])
+    await advisor.advise(make_alert(), [knowledge])
 
-    excerpt = captured_payload["runbook_excerpts"][0]  # type: ignore[index]
-    assert "quality_status" not in excerpt
-    assert "review_status" not in excerpt["visual_evidence"][0]
+    excerpt = captured_payload["knowledge_matches"][0]  # type: ignore[index]
+    assert excerpt["source"] == "incident_library"
+    assert excerpt["knowledge_id"] == "knowledge-1"
 
 
 @pytest.mark.asyncio
-async def test_matched_runbook_bases_are_ordered_before_ai() -> None:
-    runbook = RunbookExcerpt(
-        runbook_id="rb-1",
-        title="RB",
-        section="triage",
+async def test_matched_knowledge_bases_are_ordered_before_ai() -> None:
+    knowledge = KnowledgeExcerpt(
+        source="incident_library",
+        knowledge_id="knowledge-1",
+        title="Replica guide",
         content="diagnostic guidance",
+        source_uri="https://knowledge.test/replica",
+        score=0.9,
+        raw_score=0.1,
     )
 
-    recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [runbook])
+    recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [knowledge])
 
     assert [item.source for item in recommendation.analysis_bases] == [
-        AnalysisBasisSource.RUNBOOK,
+        AnalysisBasisSource.KNOWLEDGE,
         AnalysisBasisSource.AI,
     ]
-    assert recommendation.analysis_bases[0].source_ref == RunbookReference(
-        runbook_id="rb-1", section="triage"
+    assert recommendation.analysis_bases[0].source_ref == KnowledgeReference(
+        source="incident_library",
+        knowledge_id="knowledge-1",
+        title="Replica guide",
+        source_uri="https://knowledge.test/replica",
     )
 
 
-def test_matched_runbook_auto_repairs_invalid_citations() -> None:
-    """manual_matched=True with invalid/missing citations must auto-repair:
-    drop invalid RUNBOOK bases, keep AI bases, drop steps without valid source_ref,
-    clear invalid runbook_references, and lower confidence rather than raising
-    AdvisorError."""
-    recommendation = Recommendation(
-        summary="test",
-        analysis_bases=[
-            AnalysisBasis(
-                source=AnalysisBasisSource.AI,
-                statement="AI basis",
-            )
-        ],
-        steps=[RecommendationStep(order=1, action="check")],
-        confidence=0.9,
-        manual_matched=True,
-        runbook_references=[RunbookReference(runbook_id="unknown-rb", section="PDF")],
-    )
-    runbooks = [
-        RunbookExcerpt(
-            runbook_id="rb-1",
-            title="RB",
-            section="PDF",
-            content="diagnostic guidance",
-        )
-    ]
-    result = _validate_manual_policy(recommendation, runbooks)
-
-    # Invalid runbook reference dropped, valid references kept.
-    assert result.runbook_references == []
-
-    # AI basis preserved; no RUNBOOK basis (none were valid), but one AI basis
-    # ensures the ordering invariant.
-    assert [basis.source for basis in result.analysis_bases] == [AnalysisBasisSource.AI]
-
-    # Step without valid source_ref dropped.
-    assert result.steps == []
-
-    # No AdvisorError raised — that is the new behavior.
-
-
-def test_unmatched_runbook_with_candidates_degrades_instead_of_raising() -> None:
-    """When retrieval returns candidates but the model judges them irrelevant
-    (manual_matched=False), policy should NOT raise; it should clear citations,
-    and cap confidence."""
-    reference = RunbookReference(runbook_id="rb-1", section="triage")
-    recommendation = Recommendation(
-        summary="候选手册与本次告警无关",
-        analysis_bases=[
-            AnalysisBasis(
-                source=AnalysisBasisSource.RUNBOOK,
-                statement="手册候选",
-                source_ref=reference,
-            ),
-            AnalysisBasis(
-                source=AnalysisBasisSource.AI,
-                statement="AI basis",
-            ),
-        ],
-        steps=[
-            RecommendationStep(
-                order=1,
-                action="check",
-                source_ref=reference,
-            )
-        ],
-        confidence=0.9,
-        manual_matched=False,
-        runbook_references=[reference],
-    )
-    runbooks = [
-        RunbookExcerpt(
-            runbook_id="rb-1",
-            title="RB",
-            section="triage",
-            content="diagnostic guidance",
-        )
-    ]
-    result = _validate_manual_policy(recommendation, runbooks)
-    assert result.manual_matched is False
-    assert result.runbook_references == []
-    assert result.confidence <= 0.45
-    assert all(step.source_ref is None for step in result.steps)
-    runbook_bases = [b for b in result.analysis_bases if b.source == AnalysisBasisSource.RUNBOOK]
-    assert all(basis.source_ref is None for basis in runbook_bases)
-
-
-def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
-    external = ExternalKnowledgeExcerpt(
+def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
+    knowledge = KnowledgeExcerpt(
+        source="incident_library",
         knowledge_id="external-1",
         title="Replica guide",
         content="Check replica apply rate.",
@@ -736,9 +638,10 @@ def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> N
         summary="test",
         analysis_bases=[
             AnalysisBasis(
-                source=AnalysisBasisSource.EXTERNAL_KNOWLEDGE,
-                statement="External basis",
-                source_ref=ExternalKnowledgeReference(
+                source=AnalysisBasisSource.KNOWLEDGE,
+                statement="Knowledge basis",
+                source_ref=KnowledgeReference(
+                    source="incident_library",
                     knowledge_id="external-1",
                     title="altered title",
                     source_uri="https://untrusted.invalid",
@@ -750,7 +653,8 @@ def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> N
             RecommendationStep(
                 order=1,
                 action="check",
-                source_ref=ExternalKnowledgeReference(
+                source_ref=KnowledgeReference(
+                    source="incident_library",
                     knowledge_id="external-1",
                     title="altered title",
                     source_uri="https://untrusted.invalid",
@@ -758,15 +662,15 @@ def test_external_knowledge_reference_metadata_is_restored_from_retrieval() -> N
             )
         ],
         confidence=0.8,
-        manual_matched=False,
     )
 
-    result = _validate_manual_policy(recommendation, [], [external])
+    result = _validate_knowledge_policy(recommendation, [knowledge])
 
-    exact = ExternalKnowledgeReference(
-        knowledge_id=external.knowledge_id,
-        title=external.title,
-        source_uri=external.source_uri,
+    exact = KnowledgeReference(
+        source=knowledge.source,
+        knowledge_id=knowledge.knowledge_id,
+        title=knowledge.title,
+        source_uri=knowledge.source_uri,
     )
     assert result.analysis_bases[0].source_ref == exact
     assert result.steps[0].source_ref == exact
@@ -914,21 +818,28 @@ async def test_provider_retries_end_when_outer_analysis_timeout_expires(
 ) -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     attempts = 0
+    block_until_timeout = asyncio.Event()
     request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
 
     async def operation() -> str:
         nonlocal attempts
         attempts += 1
+        if attempts >= 3:
+            await block_until_timeout.wait()
         raise ai_module.APIConnectionError(request=request)
 
-    monkeypatch.setattr(ai_module, "AI_RETRY_INITIAL_DELAY_SECONDS", 0.001)
-    monkeypatch.setattr(ai_module, "AI_RETRY_MAX_DELAY_SECONDS", 0.001)
+    original_sleep = asyncio.sleep
+
+    async def cooperative_retry_wait(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(ai_module.asyncio, "sleep", cooperative_retry_wait)
 
     with pytest.raises(TimeoutError):
-        async with asyncio.timeout(0.01):
+        async with asyncio.timeout(0.05):
             await advisor._request_provider(operation, operation="test")
 
-    assert attempts > 2
+    assert attempts == 3
 
 
 @pytest.mark.asyncio

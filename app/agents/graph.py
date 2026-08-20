@@ -10,8 +10,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
-from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.adapters.knowledge import KnowledgeSourceRegistry
 from app.agent_runtime.langgraph_checkpoint import RepositoryLangGraphCheckpointer
 from app.agents.nodes import (
     NodeContext,
@@ -19,9 +19,9 @@ from app.agents.nodes import (
     enrich_alert_node,
     execute_react_tool_node,
     fingerprint_node,
+    knowledge_match_node,
     react_decide_node,
     report_node,
-    runbook_match_node,
     validate_node,
 )
 from app.agents.state import AgentState
@@ -30,7 +30,6 @@ from app.domain.ports import (
     AlertDetailEnricher,
     AlertRepository,
     ConclusionValidator,
-    RunbookProvider,
     ToolResultAnalyzer,
 )
 
@@ -40,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Node names for the graph
 NODE_ENRICH_ALERT = "enrich_alert"
 NODE_FINGERPRINT = "fingerprint"
-NODE_RUNBOOK = "runbook"
+NODE_KNOWLEDGE = "knowledge"
 NODE_REACT_DECIDE = "react_decide"
 NODE_EXECUTE_REACT_TOOL = "execute_react_tool"
 NODE_ADVISE = "advise"
@@ -57,7 +56,7 @@ def build_investigation_graph(
 
     The graph implements the following flow:
 
-    START -> enrich_alert -> fingerprint -> runbook -> react_decide
+    START -> enrich_alert -> fingerprint -> knowledge -> react_decide
           -> execute_react_tool -> react_decide -> ... -> advise -> validate
           -> report -> END
 
@@ -78,7 +77,7 @@ def build_investigation_graph(
     # partial keeps the async nature intact, unlike lambda which returns a coroutine object
     graph.add_node(NODE_ENRICH_ALERT, partial(enrich_alert_node, ctx=ctx))
     graph.add_node(NODE_FINGERPRINT, partial(fingerprint_node, ctx=ctx))
-    graph.add_node(NODE_RUNBOOK, partial(runbook_match_node, ctx=ctx))
+    graph.add_node(NODE_KNOWLEDGE, partial(knowledge_match_node, ctx=ctx))
     graph.add_node(NODE_REACT_DECIDE, partial(react_decide_node, ctx=ctx))
     graph.add_node(
         NODE_EXECUTE_REACT_TOOL,
@@ -93,8 +92,8 @@ def build_investigation_graph(
 
     # Add linear edges
     graph.add_edge(NODE_ENRICH_ALERT, NODE_FINGERPRINT)
-    graph.add_edge(NODE_FINGERPRINT, NODE_RUNBOOK)
-    graph.add_edge(NODE_RUNBOOK, NODE_REACT_DECIDE)
+    graph.add_edge(NODE_FINGERPRINT, NODE_KNOWLEDGE)
+    graph.add_edge(NODE_KNOWLEDGE, NODE_REACT_DECIDE)
     graph.add_conditional_edges(
         NODE_REACT_DECIDE,
         _route_after_react_decision,
@@ -130,7 +129,7 @@ class InvestigationAgent:
         self,
         *,
         repository: AlertRepository,
-        runbook_provider: RunbookProvider,
+        knowledge_registry: KnowledgeSourceRegistry,
         advisor: AIAdvisor,
         fallback_advisor: AIAdvisor | None = None,
         rule_validator: ConclusionValidator,
@@ -138,32 +137,23 @@ class InvestigationAgent:
         tool_executor: ToolExecutor,
         tool_result_analyzer: ToolResultAnalyzer | None = None,
         alert_detail_enricher: AlertDetailEnricher | None = None,
-        runbook_limit: int = 5,
-        external_knowledge_client: ExternalKnowledgeClient | None = None,
-        external_knowledge_limit: int = 5,
-        external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
     ) -> None:
         """Initialize the investigation agent.
 
         Args:
             repository: Alert repository for persistence
-            runbook_provider: Runbook search provider
+            knowledge_registry: Registry of optional advisory knowledge sources
             advisor: Primary AI advisor
             fallback_advisor: Fallback AI advisor for degraded mode
             rule_validator: Deterministic recommendation-contract validator
             tool_registry: Registry of investigation tools
             tool_executor: Tool execution engine
-            runbook_limit: Maximum runbooks to retrieve per alert
-            external_knowledge_client: Optional external knowledge API client
-            external_knowledge_limit: Maximum external knowledge items to retrieve
-            external_knowledge_min_relevance: Minimum accepted external relevance
-            knowledge_sources: Which knowledge sources to use ("local_pdf",
-                "external_knowledge")
+            knowledge_sources: Registered knowledge sources selected for this run
         """
         self.ctx = NodeContext(
             repository=repository,
-            runbook_provider=runbook_provider,
+            knowledge_registry=knowledge_registry,
             advisor=advisor,
             fallback_advisor=fallback_advisor,
             rule_validator=rule_validator,
@@ -171,10 +161,6 @@ class InvestigationAgent:
             tool_executor=tool_executor,
             tool_result_analyzer=tool_result_analyzer,
             alert_detail_enricher=alert_detail_enricher,
-            runbook_limit=runbook_limit,
-            external_knowledge_client=external_knowledge_client,
-            external_knowledge_limit=external_knowledge_limit,
-            external_knowledge_min_relevance=external_knowledge_min_relevance,
             knowledge_sources=knowledge_sources,
         )
         self.graph = build_investigation_graph(self.ctx)

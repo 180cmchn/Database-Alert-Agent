@@ -5,7 +5,6 @@ import os
 import stat
 import time
 from pathlib import Path
-from shutil import copy2
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -23,13 +22,6 @@ from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
-from tests.pdf_fixtures import (
-    TIKV_ALERT_TYPE_DIRECTORY,
-    TIKV_METRIC_NAME,
-    TIKV_RUNBOOK_ID,
-    TIKV_RUNBOOK_PDF_NAME,
-    create_tikv_runbook_pdf,
-)
 
 ADMIN_TOKEN = "integration-admin-token"
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
@@ -58,17 +50,15 @@ def create_admin_client(
     *,
     admin_token: str = ADMIN_TOKEN,
 ) -> tuple[TestClient, Runtime]:
-    runbooks = tmp_path / "runbooks"
-    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         http_scheduler="manual",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'admin.db'}",
-        runbook_pdf_dir=runbooks,
         admin_api_token=admin_token,
         runtime_settings_path=tmp_path / "runtime-settings.json",
         external_knowledge_base_url="http://127.0.0.1:8001",
+        knowledge_sources=[],
     )
     runtime = build_runtime(settings)
     app = create_app(settings, runtime, ManualAnalysisScheduler())
@@ -125,18 +115,20 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "expected_revision": initial["revision"],
                 "ai_provider": "openai_compatible",
                 "ai_base_url": "https://models.example.test/v1",
-                    "ai_api_key": secret,
-                    "ai_model": "example-model-v2",
-                    "runbook_limit": 7,
-                    "analysis_timeout_seconds": 2400,
+                "ai_api_key": secret,
+                "ai_model": "example-model-v2",
+                "scheduler_workers": 3,
+                "analysis_timeout_seconds": 2400,
+                "stream_main_agent_reasoning": True,
             },
         )
         assert response.status_code == 200
         body = response.json()
         assert body["ai_api_key_configured"] is True
         assert body["ai_model"] == "example-model-v2"
-        assert body["runbook_limit"] == 7
+        assert body["scheduler_workers"] == 3
         assert body["analysis_timeout_seconds"] == 2400
+        assert body["stream_main_agent_reasoning"] is True
         assert "archery_mcp_max_agent_steps" not in body
         assert body["apply_status"] == "applied"
         assert body["worker_refresh_mode"] == "before_each_batch"
@@ -153,7 +145,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
             json={
                 "expected_revision": body["revision"],
                 "ai_model": "example-model-v2",
-                "runbook_limit": 7,
+                "scheduler_workers": 3,
             },
         )
         assert unchanged.status_code == 200
@@ -163,7 +155,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         conflict = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
-            json={"expected_revision": "0" * 16, "runbook_limit": 8},
+            json={"expected_revision": "0" * 16, "scheduler_workers": 4},
         )
         assert conflict.status_code == 409
         assert conflict.json()["detail"]["code"] == ("RUNTIME_SETTINGS_REVISION_CONFLICT")
@@ -182,8 +174,10 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
 
         assert isinstance(runtime.service.advisor, OpenAICompatibleAdvisor)
         assert runtime.service.advisor._model == "example-model-v2"
-        assert runtime.service.runbook_limit == 7
+        assert runtime.settings.scheduler_workers == 3
         assert runtime.settings.analysis_timeout_seconds == 2400
+        assert runtime.settings.stream_main_agent_reasoning is True
+        assert runtime.service.stream_main_agent_reasoning is True
         assert "validation_enabled" not in body
 
         removed_validator_setting = client.patch(
@@ -339,7 +333,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
                 "flashduty_poll_lookback_seconds": 1200,
                 "scheduler_workers": 4,
                 "external_knowledge_api_key": "test-knowledge-key",
-                "knowledge_sources": ["local_pdf", "external_knowledge"],
+                "knowledge_sources": ["external_knowledge"],
             },
         )
 
@@ -352,7 +346,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert body["external_knowledge_enabled"] is True
     assert body["external_knowledge_base_url"] == "http://127.0.0.1:8001"
     assert body["external_knowledge_api_key_configured"] is True
-    assert body["knowledge_sources"] == ["local_pdf", "external_knowledge"]
+    assert body["knowledge_sources"] == ["external_knowledge"]
     assert set(body["changed_fields"]) == {
         "external_knowledge_api_key",
         "external_knowledge_api_key_base_url",
@@ -365,7 +359,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert runtime.settings.flashduty_polling_enabled is True
     assert runtime.settings.scheduler_workers == 4
     assert runtime.settings.external_knowledge_enabled is True
-    assert runtime.service.external_knowledge_client is not None
+    assert runtime.service.knowledge_registry.names() == ["external_knowledge"]
 
     persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
     assert persisted["flashduty_polling_enabled"] is True
@@ -376,7 +370,7 @@ def test_runtime_settings_persist_polling_knowledge_selection_and_bound_key(
     assert "external_knowledge_base_url" not in persisted
     assert persisted["external_knowledge_api_key"] == "test-knowledge-key"
     assert persisted["external_knowledge_api_key_base_url"] == "http://127.0.0.1:8001"
-    assert persisted["knowledge_sources"] == ["local_pdf", "external_knowledge"]
+    assert persisted["knowledge_sources"] == ["external_knowledge"]
 
 
 def test_runtime_knowledge_selection_disables_external_client(tmp_path: Path) -> None:
@@ -388,30 +382,30 @@ def test_runtime_knowledge_selection_disables_external_client(tmp_path: Path) ->
             headers=ADMIN_HEADERS,
             json={
                 "expected_revision": initial["revision"],
-                "knowledge_sources": ["local_pdf", "external_knowledge"],
+                "knowledge_sources": ["external_knowledge"],
             },
         )
         assert enabled.status_code == 200
         assert enabled.json()["external_knowledge_enabled"] is True
-        assert runtime.service.external_knowledge_client is not None
+        assert runtime.service.knowledge_registry.names() == ["external_knowledge"]
 
         disabled = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
             json={
                 "expected_revision": enabled.json()["revision"],
-                "knowledge_sources": ["local_pdf"],
+                "knowledge_sources": [],
             },
         )
 
     assert disabled.status_code == 200
     assert disabled.json()["external_knowledge_enabled"] is False
-    assert disabled.json()["knowledge_sources"] == ["local_pdf"]
+    assert disabled.json()["knowledge_sources"] == []
     assert runtime.settings.external_knowledge_enabled is False
-    assert runtime.service.external_knowledge_client is None
+    assert runtime.service.knowledge_registry.names() == []
 
     persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
-    assert persisted["knowledge_sources"] == ["local_pdf"]
+    assert persisted["knowledge_sources"] == []
     assert "external_knowledge_enabled" not in persisted
 
 
@@ -427,14 +421,15 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
             json={
                 "expected_revision": initial["revision"],
                 "ai_model": "override-model",
-                "runbook_limit": 9,
+                "scheduler_workers": 2,
+                "stream_main_agent_reasoning": True,
             },
         )
         assert patched.status_code == 200
         body = patched.json()
         assert body["ai_model"] == "override-model"
-        assert body["runbook_limit"] == 9
-        assert runtime.service.runbook_limit == 9
+        assert body["scheduler_workers"] == 2
+        assert body["stream_main_agent_reasoning"] is True
 
         reset = client.delete(
             "/api/v1/admin/settings/runtime-overrides",
@@ -445,8 +440,8 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
         reset_body = reset.json()
         # Defaults come from the Settings() built in create_admin_client.
         assert reset_body["ai_model"] == ""
-        assert reset_body["runbook_limit"] == 5
-        assert runtime.service.runbook_limit == 5
+        assert reset_body["scheduler_workers"] == 1
+        assert reset_body["stream_main_agent_reasoning"] is False
 
         persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
         assert persisted == {}
@@ -461,81 +456,6 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
 
         audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
         assert '"action": "reset"' in audit
-
-
-def test_runbook_api_is_a_read_only_local_pdf_inventory(tmp_path: Path) -> None:
-    client, _ = create_admin_client(tmp_path)
-    with client:
-        listed = client.get("/api/v1/admin/runbooks", headers=ADMIN_HEADERS).json()
-        assert listed["total"] == 1
-        item = listed["items"][0]
-        assert item["id"] == TIKV_RUNBOOK_ID
-        assert item["section"] == "PDF"
-        assert item["metadata"]["source_type"] == "local_pdf"
-        assert item["metadata"]["file_name"] == TIKV_RUNBOOK_PDF_NAME
-
-        detail = client.get(f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS)
-        assert detail.status_code == 200
-        assert TIKV_METRIC_NAME in detail.json()["content"]
-        assert client.get(
-            "/api/v1/admin/runbooks/../escape", headers=ADMIN_HEADERS
-        ).status_code in {404, 422}
-        assert (
-            client.post("/api/v1/admin/runbooks", headers=ADMIN_HEADERS, json={}).status_code == 405
-        )
-        assert (
-            client.put(
-                f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
-                headers=ADMIN_HEADERS,
-                json={},
-            ).status_code
-            == 405
-        )
-        assert (
-            client.delete(
-                f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}", headers=ADMIN_HEADERS
-            ).status_code
-            == 405
-        )
-
-
-def test_runbook_api_deduplicates_one_pdf_used_by_multiple_alert_types(
-    tmp_path: Path,
-) -> None:
-    client, _ = create_admin_client(tmp_path)
-    runbooks = tmp_path / "runbooks"
-    source_directory = runbooks / TIKV_ALERT_TYPE_DIRECTORY
-    second_alert_type = "synthetic_replica_lag_alternate"
-    second_directory = runbooks / second_alert_type
-    second_directory.mkdir()
-    copy2(
-        source_directory / TIKV_RUNBOOK_PDF_NAME,
-        second_directory / TIKV_RUNBOOK_PDF_NAME,
-    )
-    payload = json.loads((source_directory / "index.json").read_text(encoding="utf-8"))
-    payload["alert_type"] = second_alert_type
-    payload["runbooks"][0]["alert_type"] = second_alert_type
-    (second_directory / "index.json").write_text(
-        json.dumps(payload),
-        encoding="utf-8",
-    )
-
-    with client:
-        listed = client.get("/api/v1/admin/runbooks", headers=ADMIN_HEADERS)
-        assert listed.status_code == 200
-        assert listed.json()["total"] == 1
-        assert listed.json()["items"][0]["metadata"]["alert_types"] == sorted(
-            [TIKV_ALERT_TYPE_DIRECTORY, second_alert_type]
-        )
-
-        detail = client.get(
-            f"/api/v1/admin/runbooks/{TIKV_RUNBOOK_ID}",
-            headers=ADMIN_HEADERS,
-        )
-        assert detail.status_code == 200
-        assert detail.json()["metadata"]["alert_types"] == sorted(
-            [TIKV_ALERT_TYPE_DIRECTORY, second_alert_type]
-        )
 
 
 def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -> None:
@@ -603,51 +523,6 @@ def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -
         assert dashboard["by_status"]["INCONCLUSIVE"] == 1
 
 
-def test_local_pdf_runbook_is_used_by_the_visible_investigation_flow(
-    tmp_path: Path,
-) -> None:
-    client, runtime = create_admin_client(tmp_path)
-    with client:
-        accepted = client.post(
-            "/api/v1/alerts/canonical/analyze",
-            json={
-                "external_id": "local-pdf-flow-1",
-                "severity": "CRITICAL",
-                "title": "Synthetic replica lag alert",
-                "reason": TIKV_METRIC_NAME,
-                "environment": "test",
-                "service_name": "orders-api",
-                "database": {"engine": "TiDB"},
-            },
-        )
-        assert accepted.status_code == 202
-        alert_id = accepted.json()["alert_id"]
-        assert client.portal is not None
-        client.portal.call(runtime.service.analyze_by_id, alert_id)
-
-        detail = client.get(f"/api/v1/alerts/{alert_id}")
-        assert detail.status_code == 200
-        body = detail.json()
-        assert body["status"] == "INCONCLUSIVE"
-        assert body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
-        assert body["recommendation"]["manual_matched"] is True
-        assert body["recommendation"]["steps"][0]["source_ref"] == {
-            "runbook_id": TIKV_RUNBOOK_ID,
-            "section": "PDF",
-        }
-        assert [item["stage"] for item in body["progress"]] == [
-            "RECEIVED",
-            "FINGERPRINTING",
-            "RUNBOOK_MATCHING",
-            "INVESTIGATING",
-            "ADVISING",
-            "VALIDATING",
-            "REPORTING",
-            "INCONCLUSIVE",
-            "REPORTING",
-        ]
-
-
 def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
     client, runtime = create_admin_client(tmp_path)
     with client:
@@ -657,7 +532,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
                 "external_id": "run-history-results-1",
                 "severity": "CRITICAL",
                 "title": "Synthetic replica lag alert",
-                "reason": TIKV_METRIC_NAME,
+                "reason": "replica_lag",
                 "environment": "test",
                 "service_name": "orders-api",
                 "database": {"engine": "TiDB"},
@@ -672,8 +547,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         first = client.get(endpoint).json()
         first_run_id = first["latest_run"]["id"]
         assert first["selected_run"]["id"] == first_run_id
-        assert first["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
-        assert first["recommendation"]["manual_matched"] is True
+        assert first["recommendation"]["knowledge_matches"] == []
 
         runtime.service.knowledge_sources = []
         reanalyzed = client.post(
@@ -687,8 +561,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         latest = wait_for_run_terminal(client, endpoint, second_run_id)
         assert latest["latest_run"]["id"] == second_run_id
         assert latest["selected_run"]["id"] == second_run_id
-        assert latest["manual_matches"] == []
-        assert latest["recommendation"]["manual_matched"] is False
+        assert latest["recommendation"]["knowledge_matches"] == []
 
         historical = client.get(endpoint, params={"run_id": first_run_id})
         assert historical.status_code == 200
@@ -696,8 +569,7 @@ def test_each_reanalysis_keeps_its_own_detail_result(tmp_path: Path) -> None:
         assert history_body["latest_run"]["id"] == second_run_id
         assert history_body["selected_run"]["id"] == first_run_id
         assert history_body["selected_run_result_available"] is True
-        assert history_body["manual_matches"][0]["runbook_id"] == TIKV_RUNBOOK_ID
-        assert history_body["recommendation"]["manual_matched"] is True
+        assert history_body["recommendation"]["knowledge_matches"] == []
         assert all(item["run_id"] == first_run_id for item in history_body["progress"])
         assert all(item["run_id"] == first_run_id for item in history_body["evidence_records"])
         assert all(item["run_id"] == first_run_id for item in history_body["validations"])

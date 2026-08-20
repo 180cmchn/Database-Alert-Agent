@@ -16,7 +16,7 @@ mindmap
       Kafka 和 Analysis Worker
     Agent 分析
       FlashDuty 权威详情
-      本地与外部知识
+      可选知识来源
       LangGraph 和 ReAct
       唯一主 Agent 判断根因
       确定性契约校验
@@ -70,9 +70,9 @@ mindmap
         只信任权威 host 和 port
       fingerprint
         生成问题指纹
-      runbook
-        并行检索本地 PDF
-        并行检索外部知识
+      knowledge
+        检索已选择的知识来源
+        来源失败时独立降级
     3 ReAct 决策
       thought
         使用模型真实 reasoning
@@ -113,7 +113,7 @@ mindmap
 对应的 LangGraph 主路径是：
 
 ```text
-START -> enrich_alert -> fingerprint -> runbook -> react_decide
+START -> enrich_alert -> fingerprint -> knowledge -> react_decide
                                       react_decide --tool--> execute_react_tool
                                       execute_react_tool -> react_decide
                                       react_decide --finish/max rounds--> advise
@@ -125,7 +125,7 @@ START -> enrich_alert -> fingerprint -> runbook -> react_decide
 每次 `react_decide` 都会收到以下有界输入：
 
 - `/alert/info` 归一化后的权威告警，尤其是 `occurred_at`、`alarm_host`、`alarm_port`；
-- 达到阈值的本地 PDF 片段和外部知识片段；
+- 达到阈值的通用知识匹配结果；
 - 前几轮工具产生的 `EvidenceRecord` 程序投影；
 - 当前运行时可用工具的 `ToolSpec`，包括角色、用途、工作流、安全边界、输入 Schema 和超时；
 - 当前轮次与 `REACT_MAX_ROUNDS`。
@@ -142,7 +142,7 @@ START -> enrich_alert -> fingerprint -> runbook -> react_decide
 | 组件 | 职责 | 是否可以判断根因 |
 | --- | --- | --- |
 | FlashDuty `/alert/info` | 提供告警语义、目标和发生时间 | 否，仅是告警事实 |
-| 本地 PDF / External KnowledgePack | 提供可能机制、排查方法和处置知识 | 否，知识不能证明本次事故 |
+| 可选知识来源 | 提供可能机制、排查方法和处置知识 | 否，知识不能证明本次事故 |
 | MCP 内部调查 Agent | 在单个 provider 内发现并调用远端工具 | 否，不做跨证据因果判断 |
 | 程序事实投影器 | 过滤、聚合、排序、统计和标注来源路径 | 否，不提出、支持或反驳根因 |
 | **唯一主 Agent** | 结合告警、知识和合格实时证据 | **是** |
@@ -402,7 +402,7 @@ app/
 ├── agent_runtime/       事件、轨迹、租约、外层调用、checkpoint、artifact
 ├── mcp_catalog/         声明式 MCP 配置和提示词加载
 ├── mcp_runtime/         共享 MCP Harness、调用契约和持久化
-├── adapters/            AI、FlashDuty、PDF、MCP、数据库、通知等适配器
+├── adapters/            AI、FlashDuty、知识、MCP、数据库、通知等适配器
 └── domain/              领域模型、端口、工具调用契约
 
 config/mcp/
@@ -410,8 +410,6 @@ config/mcp/
 └── prompts/<provider>/  role / purpose / workflow / safety
 
 frontend/                React 运维界面与实时 Agent 轨迹
-runbooks/pdfs-typed/     本地 PDF 与结构化索引
-evaluation/              评估数据和说明
 tests/                   unit / integration / live 测试
 ```
 
@@ -425,8 +423,7 @@ tests/                   unit / integration / live 测试
 | MCP 共享运行时 | `app/mcp_runtime/`、`app/agent_runtime/` | `test_agent_runtime_core.py`、provider harness 测试 |
 | MCP 结果投影 | `app/adapters/tool_result_analysis.py` | `test_tool_result_analysis.py` |
 | FlashDuty 轮询与详情 | `app/application/scheduler.py`、`app/adapters/flashduty.py` | `test_flashduty.py`、`test_workflow.py` |
-| PDF 知识 | `runbooks/pdfs-typed/`、`app/adapters/pdf_runbooks.py` | PDF、runbook indexing 测试 |
-| 外部知识 | `app/adapters/external_knowledge.py` | `test_external_knowledge.py` |
+| 通用知识来源 | `app/adapters/knowledge.py`、`app/adapters/external_knowledge.py` | `test_external_knowledge.py` |
 | 持久化、恢复和租约 | `app/adapters/persistence.py`、`app/agent_runtime/` | persistence、lease、checkpoint 测试 |
 | 前端实时轨迹 | `frontend/src/components/AgentTrace.tsx` | `frontend/tests/agentTraceModel.test.ts` |
 

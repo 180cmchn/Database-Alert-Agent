@@ -2184,8 +2184,6 @@ async def test_archery_reported_count_without_parsed_rows_is_no_data() -> None:
 
 
 def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     mcp_settings_path = tmp_path / "mcp" / "settings.json"
     mcp_settings_path.parent.mkdir()
     prompts = _write_prompt_files(mcp_settings_path.parent, "archery")
@@ -2211,7 +2209,6 @@ def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
         ai_api_key="test-model-key" if real_model else "",
         ai_model="test-tool-model" if real_model else "",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=runbooks,
         mcp_settings_path=mcp_settings_path,
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-archery-token",

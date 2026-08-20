@@ -48,7 +48,6 @@ from app.domain.models import (
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
-    RunbookExcerpt,
     RunStatus,
     StoredAlert,
     ToolStatus,
@@ -291,7 +290,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0014"
+DATABASE_SCHEMA_REVISION = "0015"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -325,7 +324,6 @@ class AlertRow(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     alert_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
-    runbooks_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -361,7 +359,6 @@ class InvestigationRunRow(Base):
     manifest_json: Mapped[dict | None] = mapped_column(JSON)
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
-    runbooks_json: Mapped[list | None] = mapped_column(JSON)
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, default=_utc_now
@@ -771,7 +768,6 @@ class SQLAlchemyAlertRepository:
                 external_id=alert.external_id,
                 status=AlertStatus.QUEUED.value,
                 alert_json=alert.model_dump(mode="json"),
-                runbooks_json=[],
             )
             session.add(row)
             try:
@@ -983,9 +979,6 @@ class SQLAlchemyAlertRepository:
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                     current_stage=(InvestigationStage(run.current_stage) if run else None),
-                    manual_matched=bool(
-                        recommendation.get("manual_matched", bool(row.runbooks_json))
-                    ),
                     confidence=recommendation.get("confidence"),
                 )
             )
@@ -1001,13 +994,11 @@ class SQLAlchemyAlertRepository:
         if run_row is None or any(
             value is not None
             for value in (
-                run_row.runbooks_json,
                 run_row.recommendation_json,
                 run_row.advisor_metadata_json,
             )
         ):
             return
-        run_row.runbooks_json = list(alert_row.runbooks_json or [])
         run_row.recommendation_json = alert_row.recommendation_json
         run_row.advisor_metadata_json = alert_row.advisor_metadata_json
 
@@ -1015,7 +1006,6 @@ class SQLAlchemyAlertRepository:
     def _clear_current_alert_result(alert_row: AlertRow) -> None:
         """Clear the denormalized current view after its result has been archived."""
 
-        alert_row.runbooks_json = []
         alert_row.recommendation_json = None
         alert_row.advisor_metadata_json = None
         alert_row.error = None
@@ -2397,7 +2387,6 @@ class SQLAlchemyAlertRepository:
         final_stage: InvestigationStage,
         alert_status: AlertStatus,
         progress: ProgressRecord,
-        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
@@ -2425,11 +2414,6 @@ class SQLAlchemyAlertRepository:
         if progress.stage != final_stage:
             raise ValueError("terminal progress stage must match the finalized stage")
 
-        serialized_runbooks = (
-            [item.model_dump(mode="json") for item in runbooks]
-            if runbooks is not None
-            else None
-        )
         serialized_recommendation = (
             recommendation.model_dump(mode="json") if recommendation else None
         )
@@ -2474,8 +2458,6 @@ class SQLAlchemyAlertRepository:
             run_row.status = run_status.value
             run_row.current_stage = final_stage.value
             run_row.error = error
-            if serialized_runbooks is not None:
-                run_row.runbooks_json = serialized_runbooks
             run_row.recommendation_json = serialized_recommendation
             run_row.advisor_metadata_json = serialized_advisor_metadata
             run_row.updated_at = now
@@ -2494,8 +2476,6 @@ class SQLAlchemyAlertRepository:
             )
 
             alert_row.status = alert_status.value
-            if serialized_runbooks is not None:
-                alert_row.runbooks_json = serialized_runbooks
             alert_row.recommendation_json = serialized_recommendation
             alert_row.advisor_metadata_json = serialized_advisor_metadata
             alert_row.error = error
@@ -2656,49 +2636,10 @@ class SQLAlchemyAlertRepository:
             row.updated_at = _utc_now()
             await session.commit()
 
-    async def save_runbooks(
-        self,
-        alert_id: str,
-        runbooks: list[RunbookExcerpt],
-        *,
-        run_id: str,
-        lease_owner: str,
-        fencing_token: int,
-    ) -> None:
-        async with self.session_factory() as session:
-            row = await _lock_alert_row(session, alert_id)
-            if row is None:
-                raise RunLeaseConflict(run_id, "alert does not exist")
-            run_row = await _require_active_run_lease(
-                session,
-                run_id,
-                lease_owner=lease_owner,
-                fencing_token=fencing_token,
-            )
-            if run_row.alert_id != alert_id:
-                raise RunLeaseConflict(
-                    run_id, "run does not belong to the requested alert"
-                )
-            serialized = [item.model_dump(mode="json") for item in runbooks]
-            now = _utc_now()
-            run_row.runbooks_json = serialized
-            run_row.updated_at = now
-            latest_run_id = await session.scalar(
-                select(InvestigationRunRow.id)
-                .where(InvestigationRunRow.alert_id == alert_id)
-                .order_by(desc(InvestigationRunRow.attempt))
-                .limit(1)
-            )
-            if latest_run_id == run_id:
-                row.runbooks_json = serialized
-                row.updated_at = now
-            await session.commit()
-
     async def save_analysis(
         self,
         alert_id: str,
         status: AlertStatus,
-        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
@@ -2708,11 +2649,6 @@ class SQLAlchemyAlertRepository:
             row = await session.get(AlertRow, alert_id)
             if not row:
                 return
-            serialized_runbooks = (
-                [item.model_dump(mode="json") for item in runbooks]
-                if runbooks is not None
-                else None
-            )
             serialized_recommendation = (
                 recommendation.model_dump(mode="json") if recommendation else None
             )
@@ -2725,8 +2661,6 @@ class SQLAlchemyAlertRepository:
                 run_row = await session.get(InvestigationRunRow, run_id)
                 if run_row is None or run_row.alert_id != alert_id:
                     return
-                if serialized_runbooks is not None:
-                    run_row.runbooks_json = serialized_runbooks
                 run_row.recommendation_json = serialized_recommendation
                 run_row.advisor_metadata_json = serialized_advisor_metadata
                 run_row.updated_at = now
@@ -2739,8 +2673,6 @@ class SQLAlchemyAlertRepository:
                 update_current = latest_run_id == run_id
             if update_current:
                 row.status = status.value
-                if serialized_runbooks is not None:
-                    row.runbooks_json = serialized_runbooks
                 row.recommendation_json = serialized_recommendation
                 row.advisor_metadata_json = serialized_advisor_metadata
                 row.error = error
@@ -2872,7 +2804,6 @@ class SQLAlchemyAlertRepository:
         selected_status = AlertStatus(row.status)
         selected_error = row.error
         recommendation_json: dict | None = row.recommendation_json
-        runbooks_json: list = list(row.runbooks_json or [])
         advisor_metadata_json: dict | None = row.advisor_metadata_json
         if run_row:
             selected_status = {
@@ -2886,14 +2817,12 @@ class SQLAlchemyAlertRepository:
             selected_result_available = any(
                 value is not None
                 for value in (
-                    run_row.runbooks_json,
                     run_row.recommendation_json,
                     run_row.advisor_metadata_json,
                 )
             )
             if selected_result_available:
                 recommendation_json = run_row.recommendation_json
-                runbooks_json = list(run_row.runbooks_json or [])
                 advisor_metadata_json = run_row.advisor_metadata_json
             elif (
                 latest_run_row is not None
@@ -2906,11 +2835,10 @@ class SQLAlchemyAlertRepository:
                 selected_result_available = True
             else:
                 recommendation_json = None
-                runbooks_json = []
                 advisor_metadata_json = None
         else:
             selected_result_available = bool(
-                recommendation_json or runbooks_json or advisor_metadata_json
+                recommendation_json or advisor_metadata_json
             )
 
         return StoredAlert(
@@ -2921,7 +2849,6 @@ class SQLAlchemyAlertRepository:
                 if recommendation_json
                 else None
             ),
-            manual_matches=[RunbookExcerpt.model_validate(item) for item in runbooks_json],
             advisor_metadata=(
                 AdvisorMetadata.model_validate(advisor_metadata_json)
                 if advisor_metadata_json

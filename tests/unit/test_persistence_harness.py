@@ -36,7 +36,6 @@ from app.domain.models import (
     EvidenceRecord,
     InvestigationStage,
     ProgressRecord,
-    RunbookExcerpt,
     RunStatus,
     ToolStatus,
     ValidationKind,
@@ -363,7 +362,6 @@ async def test_finalize_run_commits_terminal_projection_and_progress_together(
         final_stage=InvestigationStage.INCONCLUSIVE,
         alert_status=AlertStatus.INCONCLUSIVE,
         progress=progress,
-        runbooks=[],
     )
 
     current = await repository.get(str(stored.alert.id))
@@ -1294,19 +1292,6 @@ async def test_domain_run_writes_reject_stale_fencing_token(tmp_path: Path) -> N
     }
 
     with pytest.raises(RunLeaseConflict):
-        await repository.save_runbooks(
-            str(stored.alert.id),
-            [
-                RunbookExcerpt(
-                    runbook_id="stale-runbook",
-                    title="Stale runbook",
-                    content="must not persist",
-                )
-            ],
-            run_id=str(run.id),
-            **stale_fence,
-        )
-    with pytest.raises(RunLeaseConflict):
         await repository.append_progress(
             str(stored.alert.id),
             ProgressRecord(
@@ -1342,7 +1327,6 @@ async def test_domain_run_writes_reject_stale_fencing_token(tmp_path: Path) -> N
 
     current = await repository.get(str(stored.alert.id))
     assert current is not None
-    assert current.manual_matches == []
     assert current.progress == []
     assert current.evidence_records == []
     assert current.validations == []

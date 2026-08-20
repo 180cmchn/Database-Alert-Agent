@@ -18,13 +18,10 @@ from app.domain.models import AlertStatus, InvestigationStage, RunStatus
 
 
 def _settings(tmp_path: Path) -> Settings:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     return Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=runbooks,
     )
 
 

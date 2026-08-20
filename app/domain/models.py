@@ -34,7 +34,6 @@ class InvestigationStage(StrEnum):
     RECEIVED = "RECEIVED"
     FINGERPRINTING = "FINGERPRINTING"
     KNOWLEDGE_MATCHING = "KNOWLEDGE_MATCHING"
-    RUNBOOK_MATCHING = "RUNBOOK_MATCHING"
     INVESTIGATING = "INVESTIGATING"
     ADVISING = "ADVISING"
     VALIDATING = "VALIDATING"
@@ -141,18 +140,6 @@ class ValidationKind(StrEnum):
     AGENT = "AGENT"
 
 
-class RunbookKnowledgeType(StrEnum):
-    RUNBOOK = "runbook"
-    INCIDENT_CASE = "incident_case"
-    REFERENCE = "reference"
-    INCOMPLETE = "incomplete"
-
-
-class ExecutionClass(StrEnum):
-    READ_ONLY = "read_only"
-    CHANGE = "change"
-
-
 class RootCauseStatus(StrEnum):
     # Retained only so recommendations written before the result-contract
     # migration remain deserializable. New analyses emit SUPPORTED.
@@ -201,70 +188,10 @@ class NormalizedAlert(BaseModel):
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class RunbookProbe(BaseModel):
-    tool_name: str
-    objective: str
+class KnowledgeExcerpt(BaseModel):
+    """A bounded match returned by any registered advisory knowledge source."""
 
-
-class RunbookCause(BaseModel):
-    cause_id: str
-    hypothesis: str
-    section_ids: list[str] = Field(default_factory=list)
-    supporting_evidence: list[str] = Field(default_factory=list)
-    contradicting_evidence: list[str] = Field(default_factory=list)
-    probes: list[RunbookProbe] = Field(default_factory=list)
-
-
-class RunbookAction(BaseModel):
-    action: str
-    cause_id: str | None = None
-    section_ids: list[str] = Field(default_factory=list)
-    execution_class: ExecutionClass = ExecutionClass.READ_ONLY
-    expected_result: str | None = None
-    approval_required: bool = False
-
-    @model_validator(mode="after")
-    def require_approval_for_changes(self) -> RunbookAction:
-        if self.execution_class == ExecutionClass.CHANGE and not self.approval_required:
-            raise ValueError("change runbook actions must require approval")
-        return self
-
-
-class RunbookSection(BaseModel):
-    id: str = Field(min_length=1, max_length=200)
-    title: str = Field(min_length=1, max_length=300)
-    pages: list[int] = Field(default_factory=list)
-    match_terms: list[str] = Field(default_factory=list)
-    content: str = ""
-
-
-class RunbookVisualEvidence(BaseModel):
-    page: int = Field(ge=1)
-    kind: str = Field(min_length=1, max_length=100)
-    text: str = Field(min_length=1, max_length=10_000)
-    keywords: list[str] = Field(default_factory=list)
-    section_ids: list[str] = Field(default_factory=list)
-
-
-class RunbookExcerpt(BaseModel):
-    runbook_id: str
-    title: str
-    section: str = "main"
-    content: str
-    score: float = 0
-    match_confidence: float = Field(default=0, ge=0, le=1)
-    match_reasons: list[str] = Field(default_factory=list)
-    page_refs: list[int] = Field(default_factory=list)
-    knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
-    causes: list[RunbookCause] = Field(default_factory=list)
-    actions: list[RunbookAction] = Field(default_factory=list)
-    visual_evidence: list[RunbookVisualEvidence] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ExternalKnowledgeExcerpt(BaseModel):
-    """Excerpt returned by the configured external knowledge service."""
-
+    source: str = Field(min_length=1, max_length=128)
     knowledge_id: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=300)
     content: str = Field(min_length=1, max_length=20_000)
@@ -274,69 +201,29 @@ class ExternalKnowledgeExcerpt(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class RunbookDocument(BaseModel):
-    id: str = Field(min_length=1, max_length=128)
-    title: str = Field(min_length=1, max_length=300)
-    section: str = Field(default="main", min_length=1, max_length=200)
-    reasons: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
-    severities: list[str] = Field(default_factory=list)
-    labels: dict[str, str] = Field(default_factory=dict)
-    knowledge_type: RunbookKnowledgeType = RunbookKnowledgeType.RUNBOOK
-    deprecated: bool = False
-    sections: list[RunbookSection] = Field(default_factory=list)
-    causes: list[RunbookCause] = Field(default_factory=list)
-    actions: list[RunbookAction] = Field(default_factory=list)
-    visual_evidence: list[RunbookVisualEvidence] = Field(default_factory=list)
-    content: str = Field(min_length=1, max_length=1_000_000)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    version: int = Field(default=1, ge=1)
-    updated_at: datetime = Field(default_factory=utc_now)
-
-    @field_validator("severities", mode="before")
-    @classmethod
-    def validate_severities(cls, value: Any) -> Any:
-        if isinstance(value, list):
-            normalized = list(dict.fromkeys(str(item).upper() for item in value))
-            valid = {item.value for item in Severity}
-            if set(normalized) - valid:
-                raise ValueError("severities must be CRITICAL, WARNING, or INFO")
-            return normalized
-        return value
-
-
-class RunbookReference(BaseModel):
-    runbook_id: str
-    section: str = "main"
-
-
-class ExternalKnowledgeReference(BaseModel):
+class KnowledgeReference(BaseModel):
+    source: str = Field(min_length=1, max_length=128)
     knowledge_id: str
     title: str
     source_uri: str
 
 
 class AnalysisBasisSource(StrEnum):
-    RUNBOOK = "RUNBOOK"
-    EXTERNAL_KNOWLEDGE = "EXTERNAL_KNOWLEDGE"
+    KNOWLEDGE = "KNOWLEDGE"
     AI = "AI"
 
 
 class AnalysisBasis(BaseModel):
     source: AnalysisBasisSource
     statement: str = Field(min_length=1)
-    source_ref: RunbookReference | ExternalKnowledgeReference | None = None
+    source_ref: KnowledgeReference | None = None
 
     @model_validator(mode="after")
     def validate_source_reference(self) -> AnalysisBasis:
-        if self.source == AnalysisBasisSource.RUNBOOK and not isinstance(
-            self.source_ref, RunbookReference
+        if self.source == AnalysisBasisSource.KNOWLEDGE and not isinstance(
+            self.source_ref, KnowledgeReference
         ):
-            raise ValueError("RUNBOOK analysis basis requires a runbook source_ref")
-        if self.source == AnalysisBasisSource.EXTERNAL_KNOWLEDGE and not isinstance(
-            self.source_ref, ExternalKnowledgeReference
-        ):
-            raise ValueError("EXTERNAL_KNOWLEDGE analysis basis requires an external source_ref")
+            raise ValueError("KNOWLEDGE analysis basis requires a knowledge source_ref")
         if self.source == AnalysisBasisSource.AI and self.source_ref is not None:
             raise ValueError("AI analysis basis must not contain source_ref")
         return self
@@ -347,7 +234,7 @@ class RecommendationStep(BaseModel):
     action: str
     expected_result: str | None = None
     caution: str | None = None
-    source_ref: RunbookReference | ExternalKnowledgeReference | None = None
+    source_ref: KnowledgeReference | None = None
 
 
 class RootCauseAssessment(BaseModel):
@@ -379,9 +266,7 @@ class Recommendation(BaseModel):
     steps: list[RecommendationStep]
     risks: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
-    manual_matched: bool
-    runbook_references: list[RunbookReference] = Field(default_factory=list)
-    external_knowledge_matches: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
+    knowledge_matches: list[KnowledgeExcerpt] = Field(default_factory=list)
     root_causes: list[RootCauseAssessment] = Field(default_factory=list)
 
 
@@ -484,9 +369,6 @@ class AnalysisConfigSnapshot(BaseModel):
     knowledge_sources: list[str] = Field(default_factory=list)
     external_knowledge_enabled: bool = False
     external_knowledge_base_url: str = ""
-    runbook_limit: int = 5
-    runbook_match_min_score: float = 12
-    runbook_match_min_confidence: float = 0.35
     external_knowledge_min_relevance: float = 0.60
     react_max_rounds: int = Field(default=8, ge=1, le=100)
     analysis_timeout_seconds: int = Field(default=1800, ge=30, le=86_400)
@@ -598,7 +480,6 @@ class StoredAlert(BaseModel):
     alert: NormalizedAlert
     status: AlertStatus
     recommendation: Recommendation | None = None
-    manual_matches: list[RunbookExcerpt] = Field(default_factory=list)
     advisor_metadata: AdvisorMetadata | None = None
     error: str | None = None
     latest_run: InvestigationRun | None = None
@@ -626,7 +507,6 @@ class AlertSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     current_stage: InvestigationStage | None = None
-    manual_matched: bool = False
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 

@@ -111,12 +111,7 @@ export function SettingsPage() {
     setError("");
     setNotice("");
     try {
-      const knowledgeSources: string[] = [];
-      if (form.get("knowledge_local_pdf") === "on") knowledgeSources.push("local_pdf");
-      if (form.get("knowledge_external") === "on") knowledgeSources.push("external_knowledge");
-      if (!knowledgeSources.length) {
-        throw new Error("请至少选择一种 Agent 知识参考来源。");
-      }
+      const knowledgeSources = externalKnowledgeSelected ? ["external_knowledge"] : [];
       if (!isAIProvider(selectedProvider)) {
         throw new Error("请选择受支持的 AI Provider。");
       }
@@ -133,9 +128,9 @@ export function SettingsPage() {
         ai_timeout_seconds: numberField(form, "ai_timeout_seconds"),
         ai_json_mode: form.get("ai_json_mode") === "on",
         ai_fallback_enabled: form.get("ai_fallback_enabled") === "on",
+        stream_main_agent_reasoning: form.get("stream_main_agent_reasoning") === "on",
         react_max_rounds: numberField(form, "react_max_rounds"),
         analysis_timeout_seconds: numberField(form, "analysis_timeout_seconds"),
-        runbook_limit: numberField(form, "runbook_limit"),
         scheduler_workers: numberField(form, "scheduler_workers"),
         knowledge_sources: knowledgeSources,
         flashduty_polling_enabled: form.get("flashduty_polling_enabled") === "on",
@@ -240,13 +235,11 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        <SectionCard eyebrow="KNOWLEDGE SOURCES" title="Agent 参考依据" description="本地 PDF 与外部知识库可独立选择或同时使用；选择外部知识库即启用连接，取消选择即停用连接。" action={<span className={`configured-chip ${externalKnowledgeSelected ? "yes" : "no"}`}><ShieldCheck size={13} />{externalKnowledgeSelected ? "外部知识库已选择" : "外部知识库未选择"}</span>}>
+        <SectionCard eyebrow="KNOWLEDGE SOURCE" title="Agent 参考依据" description="外部知识库是可选的参考来源；不可用、未命中或未选择都不会阻止实时证据分析。" action={<span className={`configured-chip ${externalKnowledgeSelected ? "yes" : "no"}`}><ShieldCheck size={13} />{externalKnowledgeSelected ? "外部知识库已选择" : "未选择知识来源"}</span>}>
           <div className="switch-stack">
-            <label className="switch-row"><span><Sparkles size={17} /><span><strong>本地 PDF 手册</strong><small>从本地 runbooks/pdfs-typed 目录检索已生成索引的 PDF 处置手册</small></span></span><input name="knowledge_local_pdf" type="checkbox" defaultChecked={settings.knowledge_sources.includes("local_pdf")} /><i /></label>
-            <label className="switch-row"><span><Eye size={17} /><span><strong>外部知识库</strong><small>选中后连接并检索 KnowledgePack 内容；取消后不再建立连接</small></span></span><input name="knowledge_external" type="checkbox" checked={externalKnowledgeSelected} onChange={(event) => setExternalKnowledgeSelected(event.target.checked)} /><i /></label>
+            <label className="switch-row"><span><Sparkles size={17} /><span><strong>外部知识库</strong><small>选中后连接并检索 KnowledgePack 内容；取消后仅使用告警、实时证据和通用推理</small></span></span><input name="knowledge_external" type="checkbox" checked={externalKnowledgeSelected} onChange={(event) => setExternalKnowledgeSelected(event.target.checked)} /><i /></label>
           </div>
           <div className="form-grid two-cols">
-            <label className="field"><span>本地 PDF 最低匹配置信度（部署配置）</span><input value={settings.runbook_match_min_confidence.toFixed(2)} readOnly /></label>
             <label className="field"><span>外部知识最低相关度（部署配置）</span><input value={settings.external_knowledge_min_relevance.toFixed(2)} readOnly /></label>
             <label className="field span-2"><span>外部知识库 Base URL（部署配置，只读）</span><input value={settings.external_knowledge_base_url} readOnly /></label>
             <label className="field span-2"><span>Knowledge API Key（只写，URL 变更后必须重新输入）</span><div className="secret-field"><input name="external_knowledge_api_key" type={showKnowledgeApiKey ? "text" : "password"} autoComplete="new-password" disabled={!externalKnowledgeSelected} placeholder={settings.external_knowledge_api_key_configured ? "已绑定当前 URL · 留空保持不变" : "认证可选；如服务启用认证请重新输入"} /><button type="button" onClick={() => setShowKnowledgeApiKey((value) => !value)} aria-label={showKnowledgeApiKey ? "隐藏 Knowledge API Key" : "显示 Knowledge API Key"}>{showKnowledgeApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
@@ -256,12 +249,12 @@ export function SettingsPage() {
         <SectionCard eyebrow="REACT" title="主 Agent 调查与校验" description="主 Agent 逐轮选择一个相关工具或结束调查，再统一分析根因；输出只经过程序侧契约校验，不会交给第二个模型裁决。">
           <div className="switch-stack">
             <label className="switch-row"><span><CircleAlert size={17} /><span><strong>启用保守降级建议</strong><small>模型超时或结构不合规时继续完成流程，并以结论不充分结束</small></span></span><input name="ai_fallback_enabled" type="checkbox" defaultChecked={settings.ai_fallback_enabled} /><i /></label>
+            <label className="switch-row"><span><Sparkles size={17} /><span><strong>实时展示主 Agent 思考过程</strong><small>开启后逐增量保存并刷新 reasoning；关闭后每次模型调用结束只记录一次完整 reasoning。修改仅影响之后创建的分析运行</small></span></span><input name="stream_main_agent_reasoning" type="checkbox" defaultChecked={settings.stream_main_agent_reasoning} /><i /></label>
           </div>
           <div className="form-grid two-cols settings-inline-fields">
             <label className="field"><span>并行分析告警数</span><input name="scheduler_workers" type="number" min="1" max="16" required defaultValue={settings.scheduler_workers} /></label>
             <label className="field"><span>ReAct 最大轮次</span><input name="react_max_rounds" type="number" min="1" max="100" required defaultValue={settings.react_max_rounds} /></label>
             <label className="field"><span>整次分析超时（秒）</span><input name="analysis_timeout_seconds" type="number" min="30" max="86400" required defaultValue={settings.analysis_timeout_seconds} /></label>
-            <label className="field"><span>单次手册召回上限</span><input name="runbook_limit" type="number" min="1" max="20" required defaultValue={settings.runbook_limit} /></label>
           </div>
         </SectionCard>
 

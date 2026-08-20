@@ -19,7 +19,6 @@ dependencies = [
   "langchain-core>=0.3,<1",
   "mcp>=1.27,<2",
   "openai>=1.66,<3",
-  "pypdf>=5,<7",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "python-dotenv>=0.21,<2",

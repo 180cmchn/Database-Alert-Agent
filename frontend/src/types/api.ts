@@ -13,7 +13,6 @@ export type InvestigationStage =
   | "RECEIVED"
   | "FINGERPRINTING"
   | "KNOWLEDGE_MATCHING"
-  | "RUNBOOK_MATCHING"
   | "INVESTIGATING"
   | "ADVISING"
   | "VALIDATING"
@@ -37,7 +36,6 @@ export interface AlertListItem {
   created_at: string;
   updated_at: string;
   current_stage: InvestigationStage | null;
-  manual_matched: boolean;
   confidence: number | null;
 }
 
@@ -95,18 +93,15 @@ export interface NormalizedAlert {
   raw_payload: Record<string, unknown>;
 }
 
-export interface RunbookReference {
-  runbook_id: string;
-  section: string;
-}
-
-export interface ExternalKnowledgeReference {
+export interface KnowledgeReference {
+  source: string;
   knowledge_id: string;
   title: string;
   source_uri: string;
 }
 
-export interface ExternalKnowledgeExcerpt {
+export interface KnowledgeExcerpt {
+  source: string;
   knowledge_id: string;
   title: string;
   content: string;
@@ -116,31 +111,18 @@ export interface ExternalKnowledgeExcerpt {
   metadata: Record<string, unknown>;
 }
 
-export interface RunbookExcerpt {
-  runbook_id: string;
-  title: string;
-  section: string;
-  content: string;
-  score: number;
-  match_confidence: number;
-  match_reasons: string[];
-  page_refs: number[];
-  knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
-  metadata: Record<string, unknown>;
-}
-
 export interface RecommendationStep {
   order: number;
   action: string;
   expected_result?: string | null;
   caution?: string | null;
-  source_ref?: RunbookReference | ExternalKnowledgeReference | null;
+  source_ref?: KnowledgeReference | null;
 }
 
 export interface AnalysisBasis {
-  source: "RUNBOOK" | "EXTERNAL_KNOWLEDGE" | "AI";
+  source: "KNOWLEDGE" | "AI";
   statement: string;
-  source_ref?: RunbookReference | ExternalKnowledgeReference | null;
+  source_ref?: KnowledgeReference | null;
 }
 
 export interface RootCauseAssessment {
@@ -163,9 +145,7 @@ export interface Recommendation {
   steps: RecommendationStep[];
   risks: string[];
   confidence: number;
-  manual_matched: boolean;
-  runbook_references: RunbookReference[];
-  external_knowledge_matches: ExternalKnowledgeExcerpt[];
+  knowledge_matches: KnowledgeExcerpt[];
   root_causes: RootCauseAssessment[];
 }
 
@@ -214,14 +194,12 @@ export interface AnalysisConfigSnapshot {
   knowledge_sources: string[];
   external_knowledge_enabled: boolean;
   external_knowledge_base_url: string;
-  runbook_limit: number;
-  runbook_match_min_score: number;
-  runbook_match_min_confidence: number;
   external_knowledge_min_relevance: number;
   react_max_rounds: number;
   analysis_timeout_seconds: number;
   validation_enabled: boolean;
   ai_fallback_enabled: boolean;
+  stream_main_agent_reasoning: boolean;
   ai_model: string;
   ai_provider: string;
 }
@@ -245,7 +223,6 @@ export interface StoredAlert {
   alert: NormalizedAlert;
   status: AlertStatus;
   recommendation?: Recommendation | null;
-  manual_matches: RunbookExcerpt[];
   advisor_metadata?: {
     provider: string;
     model: string;
@@ -339,35 +316,6 @@ export interface CanonicalAlertPayload {
   attributes?: Record<string, unknown>;
 }
 
-export interface RunbookRecord {
-  id: string;
-  title: string;
-  section: string;
-  reasons: string[];
-  keywords: string[];
-  severities: Severity[];
-  labels: Record<string, string>;
-  knowledge_type: "runbook" | "incident_case" | "reference" | "incomplete";
-  deprecated: boolean;
-  sections: Array<{ id: string; title: string; pages: number[]; content: string }>;
-  causes: Array<{
-    cause_id: string;
-    hypothesis: string;
-    supporting_evidence: string[];
-    contradicting_evidence: string[];
-  }>;
-  actions: Array<{
-    action: string;
-    execution_class: "read_only" | "change";
-    expected_result?: string | null;
-    approval_required: boolean;
-  }>;
-  content: string;
-  metadata: Record<string, unknown>;
-  version: number;
-  updated_at: string;
-}
-
 export type ReasoningEffort = "" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export const REASONING_EFFORT_OPTIONS: ReadonlyArray<{ value: ReasoningEffort; label: string }> = [
@@ -390,12 +338,12 @@ export interface AdminSettings {
   ai_timeout_seconds: number;
   ai_json_mode: boolean;
   ai_fallback_enabled: boolean;
+  stream_main_agent_reasoning: boolean;
   ai_react_model: string;
   ai_mcp_model: string;
   ai_react_reasoning_effort: ReasoningEffort;
   ai_reasoning_effort: ReasoningEffort;
   ai_mcp_reasoning_effort: ReasoningEffort;
-  runbook_limit: number;
   scheduler_workers: number;
   react_max_rounds: number;
   analysis_timeout_seconds: number;
@@ -415,7 +363,6 @@ export interface AdminSettings {
   external_knowledge_base_url: string;
   external_knowledge_api_key_configured: boolean;
   external_knowledge_min_relevance: number;
-  runbook_match_min_confidence: number;
   knowledge_sources: string[];
   revision: string;
   apply_status: "applied";
@@ -436,7 +383,7 @@ export interface AdminSettingsPatch {
   ai_timeout_seconds?: number;
   ai_json_mode?: boolean;
   ai_fallback_enabled?: boolean;
-  runbook_limit?: number;
+  stream_main_agent_reasoning?: boolean;
   scheduler_workers?: number;
   wecom_webhook_url?: string;
   wecom_page_base_url?: string;

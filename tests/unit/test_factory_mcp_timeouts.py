@@ -77,15 +77,12 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
     tmp_path: Path,
     ai_provider: str,
 ) -> None:
-    runbook_dir = tmp_path / "runbooks"
-    runbook_dir.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider=ai_provider,
         ai_api_key="test-key",
         ai_model="test-model",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=runbook_dir,
         mcp_settings_path=_write_mcp_catalog(tmp_path),
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-token",
@@ -117,8 +114,6 @@ async def test_declarative_mcp_uses_full_catalog_timeout(
     monkeypatch: pytest.MonkeyPatch,
     ai_provider: str,
 ) -> None:
-    runbook_dir = tmp_path / "runbooks"
-    runbook_dir.mkdir()
     monkeypatch.setenv("CUSTOM_MCP_URL", "https://custom.example.test/mcp")
     settings = Settings(
         _env_file=None,
@@ -126,7 +121,6 @@ async def test_declarative_mcp_uses_full_catalog_timeout(
         ai_api_key="test-key",
         ai_model="test-model",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=runbook_dir,
         mcp_settings_path=_write_mcp_catalog(tmp_path, include_custom=True),
     )
     runtime = build_runtime(settings)

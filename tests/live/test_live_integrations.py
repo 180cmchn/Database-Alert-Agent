@@ -166,7 +166,7 @@ async def test_live_ai_provider_returns_valid_schema_and_request_id(
     assert metadata.model == live_settings.ai_model
     assert metadata.request_id
     assert recommendation.summary.strip()
-    assert recommendation.manual_matched is False
+    assert recommendation.knowledge_matches == []
     assert recommendation.analysis_bases
     assert all(item.source.value == "AI" for item in recommendation.analysis_bases)
 
@@ -213,14 +213,11 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
     live_settings: Settings,
     flashduty_channel_ids: list[int],
 ) -> None:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = live_settings.model_copy(
         update={
             "app_env": "development",
             "database_url": f"sqlite+aiosqlite:///{tmp_path / 'live.db'}",
             "runtime_settings_path": tmp_path / "runtime-settings.json",
-            "runbook_pdf_dir": runbooks,
             "http_scheduler": "manual",
             "kafka_enabled": False,
             "wecom_webhook_url": "",

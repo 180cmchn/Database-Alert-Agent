@@ -18,17 +18,32 @@ from app.domain.models import (
     AnalysisBasisSource,
     AnalysisResultEvent,
     DatabaseTarget,
+    KnowledgeExcerpt,
+    KnowledgeReference,
     NormalizedAlert,
     Recommendation,
     RecommendationStep,
-    RunbookReference,
     Severity,
 )
 from app.logging_config import configure_logging
 
 
 def analysis_result_event(*, title: str = "数据库连接数接近上限") -> AnalysisResultEvent:
-    reference = RunbookReference(runbook_id="connection-limit", section="initial-triage")
+    knowledge = KnowledgeExcerpt(
+        source="incident_library",
+        knowledge_id="connection-limit",
+        title="连接使用率处置经验",
+        content="连接使用率过高时先执行只读核查。",
+        source_uri="https://knowledge.example.test/connection-limit",
+        score=0.9,
+        raw_score=0.1,
+    )
+    reference = KnowledgeReference(
+        source=knowledge.source,
+        knowledge_id=knowledge.knowledge_id,
+        title=knowledge.title,
+        source_uri=knowledge.source_uri,
+    )
     return AnalysisResultEvent(
         alert=NormalizedAlert(
             id=uuid4(),
@@ -53,8 +68,8 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             likely_causes=["连接池回收异常"],
             analysis_bases=[
                 AnalysisBasis(
-                    source=AnalysisBasisSource.RUNBOOK,
-                    statement="手册将连接使用率过高列为该告警的常见原因。",
+                    source=AnalysisBasisSource.KNOWLEDGE,
+                    statement="历史知识将连接使用率过高列为需核查的机制。",
                     source_ref=reference,
                 ),
                 AnalysisBasis(
@@ -71,8 +86,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             ],
             risks=["不要未经审批终止会话"],
             confidence=0.86,
-            manual_matched=True,
-            runbook_references=[reference],
+            knowledge_matches=[knowledge],
         ),
         status=AlertStatus.COMPLETED,
         message="分析完成；token=must-not-appear",

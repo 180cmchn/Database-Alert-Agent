@@ -446,7 +446,7 @@ def test_manifest_digest_is_stable_for_equivalent_content() -> None:
         agent_name="database-alert-agent",
         code_version="abc123",
         tool_schema_versions={"prometheus": "v1", "archery": "v2"},
-        configuration={"react": True, "sources": ["local_pdf"]},
+        configuration={"react": True, "sources": ["external_knowledge"]},
         created_at=created_at,
     )
     second = RunManifest(
@@ -454,7 +454,7 @@ def test_manifest_digest_is_stable_for_equivalent_content() -> None:
         agent_name="database-alert-agent",
         code_version="abc123",
         tool_schema_versions={"archery": "v2", "prometheus": "v1"},
-        configuration={"sources": ["local_pdf"], "react": True},
+        configuration={"sources": ["external_knowledge"], "react": True},
         created_at=created_at,
     )
 

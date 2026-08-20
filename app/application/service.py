@@ -14,8 +14,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.adapters.alert_sources import AlertSourceRegistry
-from app.adapters.external_knowledge import ExternalKnowledgeClient
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
+from app.adapters.knowledge import KnowledgeSourceRegistry
 from app.agent_runtime.contracts import RunManifest
 from app.agent_runtime.leases import LeaseLostError, RunLeaseGuard
 from app.agents.graph import InvestigationAgent
@@ -50,7 +50,6 @@ from app.domain.ports import (
     AlertRepository,
     ConclusionValidator,
     ManagementNotifier,
-    RunbookProvider,
     RunCancellationRequested,
     RunLeaseConflict,
     ToolResultAnalyzer,
@@ -70,7 +69,7 @@ class AlertAnalysisService:
         self,
         *,
         source_registry: AlertSourceRegistry,
-        runbook_provider: RunbookProvider,
+        knowledge_registry: KnowledgeSourceRegistry,
         advisor: AIAdvisor,
         notifier: ManagementNotifier,
         repository: AlertRepository,
@@ -80,7 +79,6 @@ class AlertAnalysisService:
         tool_result_analyzer: ToolResultAnalyzer | None = None,
         rule_validator: ConclusionValidator,
         fallback_advisor: AIAdvisor | None = None,
-        runbook_limit: int = 5,
         investigation_lease_seconds: int = 300,
         lease_heartbeat_interval_seconds: float | None = None,
         ai_fallback_enabled: bool = True,
@@ -88,16 +86,12 @@ class AlertAnalysisService:
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
         react_max_rounds: int = 8,
         analysis_timeout_seconds: int = 1800,
-        external_knowledge_client: ExternalKnowledgeClient | None = None,
-        external_knowledge_limit: int = 5,
         external_knowledge_min_relevance: float = 0.60,
-        runbook_match_min_score: float = 12,
-        runbook_match_min_confidence: float = 0.35,
         knowledge_sources: list[str] | None = None,
         runtime_manifest_config: dict[str, Any] | None = None,
     ) -> None:
         self.source_registry = source_registry
-        self.runbook_provider = runbook_provider
+        self.knowledge_registry = knowledge_registry
         self.advisor = advisor
         self.notifier = notifier
         self.repository = repository
@@ -107,7 +101,6 @@ class AlertAnalysisService:
         self.tool_result_analyzer = tool_result_analyzer
         self.rule_validator = rule_validator
         self.fallback_advisor = fallback_advisor
-        self.runbook_limit = runbook_limit
         self.investigation_lease_seconds = investigation_lease_seconds
         self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
         self.ai_fallback_enabled = ai_fallback_enabled
@@ -115,14 +108,8 @@ class AlertAnalysisService:
         self.alert_sanitizer = alert_sanitizer
         self.react_max_rounds = react_max_rounds
         self.analysis_timeout_seconds = analysis_timeout_seconds
-        self.external_knowledge_client = external_knowledge_client
-        self.external_knowledge_limit = external_knowledge_limit
         self.external_knowledge_min_relevance = external_knowledge_min_relevance
-        self.runbook_match_min_score = runbook_match_min_score
-        self.runbook_match_min_confidence = runbook_match_min_confidence
-        self.knowledge_sources = (
-            knowledge_sources if knowledge_sources is not None else ["local_pdf"]
-        )
+        self.knowledge_sources = knowledge_sources or []
         self.runtime_manifest_config = dict(runtime_manifest_config or {})
         self._active_analyses = 0
         self._retired_adapters: list[object] = []
@@ -134,7 +121,7 @@ class AlertAnalysisService:
         # Build the LangGraph agent
         self.agent = InvestigationAgent(
             repository=repository,
-            runbook_provider=runbook_provider,
+            knowledge_registry=knowledge_registry,
             advisor=advisor,
             fallback_advisor=fallback_advisor,
             rule_validator=rule_validator,
@@ -142,10 +129,6 @@ class AlertAnalysisService:
             tool_executor=tool_executor,
             tool_result_analyzer=tool_result_analyzer,
             alert_detail_enricher=alert_detail_enricher,
-            runbook_limit=runbook_limit,
-            external_knowledge_client=external_knowledge_client,
-            external_knowledge_limit=external_knowledge_limit,
-            external_knowledge_min_relevance=external_knowledge_min_relevance,
             knowledge_sources=knowledge_sources,
         )
 
@@ -519,7 +502,6 @@ class AlertAnalysisService:
                 message=message,
                 details=details,
             ),
-            runbooks=final_state.runbooks,
             recommendation=final_state.recommendation,
             advisor_metadata=final_state.advisor_metadata,
             error=final_state.error,
@@ -672,13 +654,9 @@ class AlertAnalysisService:
         tool_specs = self.tool_registry.available_specs()
         return AnalysisConfigSnapshot(
             knowledge_sources=list(self.knowledge_sources),
-            external_knowledge_enabled=self.external_knowledge_client is not None,
-            external_knowledge_base_url=(
-                self.external_knowledge_client.base_url if self.external_knowledge_client else ""
+            external_knowledge_enabled=(
+                "external_knowledge" in self.knowledge_registry.names()
             ),
-            runbook_limit=self.runbook_limit,
-            runbook_match_min_score=self.runbook_match_min_score,
-            runbook_match_min_confidence=self.runbook_match_min_confidence,
             external_knowledge_min_relevance=(
                 self.external_knowledge_min_relevance
             ),

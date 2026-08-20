@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -30,6 +31,308 @@ async def test_fresh_database_is_created_with_current_revision(tmp_path: Path) -
 
     assert revision == DATABASE_SCHEMA_REVISION
     await repository.close()
+
+
+def test_0014_to_0015_removes_local_pdf_and_preserves_generic_knowledge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "knowledge-contract-migration.db"
+    monkeypatch.setenv("DATABASE_URL", sqlite_url(database))
+    get_settings.cache_clear()
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+    now = "2026-08-20 00:00:00"
+    external_match = {
+        "knowledge_id": "external-1",
+        "title": "External connection guidance",
+        "content": "Check current connection consumers.",
+        "source_uri": "https://knowledge.example.test/external-1",
+        "score": 0.91,
+        "raw_score": 91,
+        "metadata": {"team": "database"},
+    }
+    local_match = {
+        "source": "local_pdf",
+        "knowledge_id": "pdf-1",
+        "title": "Legacy local PDF",
+        "content": "Removed local content.",
+        "source_uri": "file:///legacy.pdf",
+        "score": 0.95,
+        "raw_score": 0.95,
+        "metadata": {"source_type": "local_pdf"},
+    }
+    recommendation = {
+        "summary": "Historical analysis",
+        "knowledge_match_summary": "Historical match summary",
+        "analysis_bases": [
+            {
+                "source": "RUNBOOK",
+                "statement": "Legacy local manual basis",
+                "source_ref": {"runbook_id": "pdf-1", "section": "main"},
+            },
+            {
+                "source": "EXTERNAL_KNOWLEDGE",
+                "statement": "External knowledge basis",
+                "source_ref": {"knowledge_id": "external-1"},
+            },
+            {"source": "AI", "statement": "AI basis"},
+        ],
+        "steps": [
+            {
+                "order": 1,
+                "action": "Check external guidance",
+                "source_ref": {"knowledge_id": "external-1"},
+            },
+            {
+                "order": 2,
+                "action": "Ignore legacy local guidance",
+                "source_ref": {"runbook_id": "pdf-1", "section": "main"},
+            },
+        ],
+        "external_knowledge_matches": [external_match],
+        "knowledge_matches": [local_match],
+        "manual_matches": [local_match],
+        "runbook_excerpts": [local_match],
+    }
+    config_snapshot = {
+        "knowledge_sources": ["local_pdf", "external_knowledge"],
+        "runbook_limit": 7,
+        "external_knowledge_enabled": True,
+    }
+    manifest = {
+        "run_id": "run-1",
+        "agent_name": "database-alert-agent",
+        "configuration": config_snapshot,
+    }
+
+    try:
+        command.upgrade(config, "0014")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO alerts "
+                "(id, source, external_id, status, alert_json, recommendation_json, "
+                "runbooks_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "alert-1",
+                    "canonical",
+                    "migration-1",
+                    "INCONCLUSIVE",
+                    json.dumps({"title": "Migration fixture"}),
+                    json.dumps(recommendation),
+                    json.dumps([local_match]),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO investigation_runs "
+                "(id, alert_id, attempt, status, current_stage, created_at, updated_at, "
+                "config_snapshot_json, recommendation_json, runbooks_json, fencing_token, "
+                "manifest_json, manifest_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "run-1",
+                    "alert-1",
+                    1,
+                    "INCONCLUSIVE",
+                    "RUNBOOK_MATCHING",
+                    now,
+                    now,
+                    json.dumps(config_snapshot),
+                    json.dumps(recommendation),
+                    json.dumps([local_match]),
+                    1,
+                    json.dumps(manifest),
+                    "legacy-manifest-hash",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO investigation_progress "
+                "(id, alert_id, run_id, sequence, stage, message, details_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "progress-1",
+                    "alert-1",
+                    "run-1",
+                    1,
+                    "RUNBOOK_MATCHING",
+                    "Historical matching",
+                    json.dumps(
+                        {
+                            "stage": "RUNBOOK_MATCHING",
+                            "runbooks": [local_match],
+                            "external_knowledge_matches": [external_match],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO agent_events "
+                "(id, run_id, sequence, version, kind, payload_json, occurred_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "event-1",
+                    "run-1",
+                    1,
+                    1,
+                    "PROGRESS",
+                    json.dumps(
+                        {
+                            "stage": "RUNBOOK_MATCHING",
+                            "runbook_references": [local_match],
+                            "external_knowledge_matches": [external_match],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            for checkpoint_id, namespace in (
+                ("agent-checkpoint", "agent"),
+                ("mcp-checkpoint", "mcp:external"),
+            ):
+                connection.execute(
+                    "INSERT INTO agent_checkpoints "
+                    "(id, run_id, namespace, version, sequence, payload_json, state_hash, "
+                    "manifest_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        checkpoint_id,
+                        "run-1",
+                        namespace,
+                        1,
+                        1,
+                        json.dumps(
+                            {
+                                "state": {
+                                    "stage": "RUNBOOK_MATCHING",
+                                    "runbooks": [local_match],
+                                    "external_knowledge_matches": [external_match],
+                                },
+                                "manifest_hash": "legacy-manifest-hash",
+                            }
+                        ),
+                        "legacy-state-hash",
+                        "legacy-manifest-hash",
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO agent_checkpoint_writes "
+                    "(run_id, checkpoint_id, task_id, write_index, channel, value_type, "
+                    "value_base64, task_path, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "run-1",
+                        checkpoint_id,
+                        "task-1",
+                        0,
+                        "state",
+                        "json",
+                        "e30=",
+                        "task",
+                        now,
+                        now,
+                    ),
+                )
+            connection.commit()
+
+        command.upgrade(config, "0015")
+
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0015",
+            )
+            for table in ("alerts", "investigation_runs"):
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")}
+                assert "runbooks_json" not in columns
+
+            alert_recommendation = json.loads(
+                connection.execute(
+                    "SELECT recommendation_json FROM alerts WHERE id = 'alert-1'"
+                ).fetchone()[0]
+            )
+            run_row = connection.execute(
+                "SELECT current_stage, config_snapshot_json, manifest_json, manifest_hash, "
+                "recommendation_json FROM investigation_runs WHERE id = 'run-1'"
+            ).fetchone()
+            assert run_row is not None
+            run_recommendation = json.loads(run_row[4])
+            for migrated in (alert_recommendation, run_recommendation):
+                assert [item["knowledge_id"] for item in migrated["knowledge_matches"]] == [
+                    "external-1"
+                ]
+                assert migrated["knowledge_matches"][0]["source"] == "external_knowledge"
+                assert [item["source"] for item in migrated["analysis_bases"]] == [
+                    "KNOWLEDGE",
+                    "AI",
+                ]
+                assert migrated["analysis_bases"][0]["source_ref"] == {
+                    "source": "external_knowledge",
+                    "knowledge_id": "external-1",
+                    "title": "External connection guidance",
+                    "source_uri": "https://knowledge.example.test/external-1",
+                }
+                assert migrated["steps"][0]["source_ref"]["knowledge_id"] == "external-1"
+                assert migrated["steps"][1]["source_ref"] is None
+                assert not {
+                    "external_knowledge_matches",
+                    "manual_matches",
+                    "runbook_excerpts",
+                } & migrated.keys()
+
+            assert run_row[0] == "KNOWLEDGE_MATCHING"
+            migrated_snapshot = json.loads(run_row[1])
+            assert migrated_snapshot["knowledge_sources"] == ["external_knowledge"]
+            assert "runbook_limit" not in migrated_snapshot
+            migrated_manifest = json.loads(run_row[2])
+            assert migrated_manifest["configuration"]["knowledge_sources"] == [
+                "external_knowledge"
+            ]
+            assert "runbook_limit" not in migrated_manifest["configuration"]
+            assert run_row[3] != "legacy-manifest-hash"
+
+            progress_stage, progress_details_json = connection.execute(
+                "SELECT stage, details_json FROM investigation_progress WHERE id = 'progress-1'"
+            ).fetchone()
+            assert progress_stage == "KNOWLEDGE_MATCHING"
+            progress_details = json.loads(progress_details_json)
+            assert progress_details["stage"] == "KNOWLEDGE_MATCHING"
+            assert progress_details["knowledge_matches"][0]["knowledge_id"] == "external-1"
+            assert "runbooks" not in progress_details
+
+            event_payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM agent_events WHERE id = 'event-1'"
+                ).fetchone()[0]
+            )
+            assert event_payload["stage"] == "KNOWLEDGE_MATCHING"
+            assert event_payload["knowledge_matches"][0]["knowledge_id"] == "external-1"
+            assert "runbook_references" not in event_payload
+
+            assert connection.execute(
+                "SELECT COUNT(*) FROM agent_checkpoints WHERE id = 'agent-checkpoint'"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM agent_checkpoint_writes "
+                "WHERE checkpoint_id = 'agent-checkpoint'"
+            ).fetchone() == (0,)
+            mcp_checkpoint = connection.execute(
+                "SELECT payload_json, manifest_hash FROM agent_checkpoints "
+                "WHERE id = 'mcp-checkpoint'"
+            ).fetchone()
+            assert mcp_checkpoint is not None
+            mcp_payload = json.loads(mcp_checkpoint[0])
+            assert mcp_payload["state"]["stage"] == "KNOWLEDGE_MATCHING"
+            assert mcp_payload["state"]["knowledge_matches"][0]["knowledge_id"] == (
+                "external-1"
+            )
+            assert mcp_checkpoint[1] == run_row[3] == mcp_payload["manifest_hash"]
+            assert connection.execute(
+                "SELECT COUNT(*) FROM agent_checkpoint_writes "
+                "WHERE checkpoint_id = 'mcp-checkpoint'"
+            ).fetchone() == (1,)
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio

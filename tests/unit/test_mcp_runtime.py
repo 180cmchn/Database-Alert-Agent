@@ -738,7 +738,7 @@ async def test_wall_time_deadline_survives_checkpoint_downtime() -> None:
     snapshot = captured[0]
     assert snapshot.deadline is not None
     assert snapshot.wall_time_deadline == snapshot.deadline
-    assert snapshot.budget.consumed.wall_time_seconds > 0
+    assert 0 <= snapshot.budget.consumed.wall_time_seconds < 0.03
     await asyncio.sleep(0.04)
 
     connector = ReplayMCPConnector(

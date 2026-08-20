@@ -24,7 +24,6 @@ from app.api.schemas import (
     FlashDutyPollResponse,
     ReanalyzeRequest,
     ReanalyzeResponse,
-    RunbookListResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
 )
@@ -46,15 +45,12 @@ from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
     InvalidAlertPayloadError,
-    InvalidRunbookIdError,
-    RunbookNotFoundError,
     UnknownAlertSourceError,
 )
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
     DashboardSummary,
-    RunbookDocument,
     Severity,
     StoredAlert,
 )
@@ -75,7 +71,6 @@ def create_app(
     # Snapshot the deployment (.env) baseline before any runtime overrides are
     # applied so the reset endpoint can revert editable keys to it.
     deployment_baseline = settings.model_copy(deep=True)
-    runbook_store = runtime.runbook_store
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
         if settings.http_scheduler == "kafka":
@@ -121,7 +116,6 @@ def create_app(
     app.state.runtime = runtime
     app.state.scheduler = scheduler
     app.state.runtime_settings = runtime_settings
-    app.state.runbook_store = runbook_store
     app.state.audit_logger = audit_logger
     app.state.flashduty_poller = flashduty_poller
     app.state.retention_cleaner = retention_cleaner
@@ -331,30 +325,6 @@ def create_app(
             has_more=has_more,
             items=items,
         )
-
-    @app.get(
-        "/api/v1/admin/runbooks",
-        response_model=RunbookListResponse,
-        tags=["admin"],
-        dependencies=[Depends(require_admin)],
-    )
-    async def list_runbooks() -> RunbookListResponse:
-        items = await runbook_store.list()
-        return RunbookListResponse(items=items, total=len(items))
-
-    @app.get(
-        "/api/v1/admin/runbooks/{runbook_id}",
-        response_model=RunbookDocument,
-        tags=["admin"],
-        dependencies=[Depends(require_admin)],
-    )
-    async def get_runbook(runbook_id: str) -> RunbookDocument:
-        try:
-            return await runbook_store.get(runbook_id)
-        except InvalidRunbookIdError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except RunbookNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get(
         "/api/v1/admin/settings",

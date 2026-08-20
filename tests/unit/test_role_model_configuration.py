@@ -80,8 +80,7 @@ async def test_decide_investigation_uses_react_model_and_effort() -> None:
     advisor._complete = complete
     result = await advisor.decide_investigation(
         alert=make_alert(),
-        runbooks=[],
-        external_knowledge=[],
+        knowledge=[],
         knowledge_match_summary="",
         evidence=[],
         available_tools=[],
@@ -112,7 +111,6 @@ async def test_advise_uses_main_model_and_analysis_effort() -> None:
             analysis_bases=[],
             steps=[],
             confidence=0.5,
-            manual_matched=False,
         )
         metadata = ai_module.AdvisorMetadata(
             provider="test",

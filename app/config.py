@@ -43,7 +43,6 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_mcp_model",
         "ai_mcp_reasoning_effort",
         "stream_main_agent_reasoning",
-        "runbook_limit",
         "wecom_webhook_url",
         "wecom_page_base_url",
         "wecom_enabled",
@@ -89,8 +88,6 @@ class Settings(BaseSettings):
     # as 4096 do not end the response during the reasoning phase.
     ai_max_tokens: int = Field(default=16_384, ge=1024, le=131_072)
     ai_timeout_seconds: float = Field(default=300, gt=0)
-    # Legacy deployment compatibility for the offline PDF indexing command only.
-    # Online alert analysis deliberately ignores this finite retry setting.
     ai_max_retries: int = Field(default=2, ge=0)
     ai_json_mode: bool = True
     # Keep the investigation auditable when an OpenAI-compatible gateway is
@@ -109,11 +106,14 @@ class Settings(BaseSettings):
     ai_react_reasoning_effort: str = ""
     ai_reasoning_effort: str = ""
     ai_mcp_reasoning_effort: str = ""
-    # Persisting one durable event per main-Agent reasoning delta (insert
-    # plus a full-history idempotency read) dominates decision wall time, so
-    # durable delta streaming is opt-in; when disabled, each decision or
-    # final conclusion records its complete reasoning once instead.
-    stream_main_agent_reasoning: bool = True
+    # Required deployment baseline loaded from STREAM_MAIN_AGENT_REASONING.
+    # An admin runtime override may replace it until runtime overrides are reset.
+    stream_main_agent_reasoning: bool = Field(
+        validation_alias=AliasChoices(
+            "STREAM_MAIN_AGENT_REASONING",
+            "stream_main_agent_reasoning",
+        )
+    )
 
     @field_validator(
         "ai_react_reasoning_effort",
@@ -136,16 +136,6 @@ class Settings(BaseSettings):
     def strip_role_model(cls, value: str) -> str:
         return value.strip()
 
-    runbook_pdf_dir: Path = Path("./runbooks/pdfs-typed")
-    runbook_limit: int = Field(default=5, ge=1, le=20)
-    runbook_pdf_max_file_bytes: int = Field(
-        default=20_000_000, ge=100_000, le=200_000_000
-    )
-    runbook_pdf_max_text_chars: int = Field(
-        default=200_000, ge=10_000, le=1_000_000
-    )
-    runbook_match_min_score: float = Field(default=12, ge=0, le=200)
-    runbook_match_min_confidence: float = Field(default=0.35, ge=0, le=1)
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
@@ -213,9 +203,7 @@ class Settings(BaseSettings):
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
 
-    # External knowledge deployment coordinates are intentionally not runtime
-    # editable. External knowledge and local PDFs are peer sources; neither has
-    # a per-document quality or review state at runtime.
+    # External knowledge deployment coordinates are intentionally not runtime editable.
     external_knowledge_base_url: str = "http://knowledge:8000"
     external_knowledge_api_key: str = Field(default="", repr=False)
     external_knowledge_api_key_base_url: str = Field(default="", repr=False)
@@ -223,10 +211,10 @@ class Settings(BaseSettings):
     external_knowledge_limit: int = Field(default=5, ge=1, le=20)
     external_knowledge_min_relevance: float = Field(default=0.60, ge=0, le=1)
 
-    # Selectable knowledge sources for alert matching. At least one source
-    # should be enabled. Values: "local_pdf", "external_knowledge".
+    # Selectable knowledge-source names. Empty is valid: the Agent then uses the
+    # alert, live evidence, and general reasoning without advisory knowledge.
     knowledge_sources: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["local_pdf"]
+        default_factory=list
     )
 
     kafka_enabled: bool = False
@@ -401,15 +389,6 @@ class Settings(BaseSettings):
                 "FLASHDUTY_POLL_LOOKBACK_SECONDS must be greater than or equal to "
                 "FLASHDUTY_POLL_INTERVAL_SECONDS when polling is enabled"
             )
-        valid_sources = {"local_pdf", "external_knowledge"}
-        invalid_sources = set(self.knowledge_sources) - valid_sources
-        if invalid_sources:
-            raise ValueError(
-                f"KNOWLEDGE_SOURCES contains invalid values: {sorted(invalid_sources)}. "
-                f"Allowed: {sorted(valid_sources)}"
-            )
-        if not self.knowledge_sources:
-            raise ValueError("KNOWLEDGE_SOURCES must contain at least one source")
         return self
 
     @computed_field
@@ -555,20 +534,6 @@ class Settings(BaseSettings):
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
         if self.http_scheduler == "kafka" and not self.kafka_enabled:
             issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
-        if "local_pdf" in self.knowledge_sources:
-            if not self.runbook_pdf_dir.exists():
-                issues.append(
-                    f"PDF runbook directory does not exist: {self.runbook_pdf_dir}"
-                )
-            elif not self.runbook_pdf_dir.is_dir():
-                issues.append(
-                    f"PDF runbook path is not a directory: {self.runbook_pdf_dir}"
-                )
-            elif not any(self.runbook_pdf_dir.glob("*/*.pdf")):
-                issues.append(
-                    "No alert-type PDF runbook directories found in: "
-                    f"{self.runbook_pdf_dir}"
-                )
         if (
             "external_knowledge" in self.knowledge_sources
             and not self.external_knowledge_base_url.strip()

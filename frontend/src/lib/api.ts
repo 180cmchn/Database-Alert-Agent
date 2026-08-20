@@ -11,7 +11,6 @@ import type {
   DashboardSummary,
   ReanalyzeRequest,
   ReanalyzeResponse,
-  RunbookRecord,
   Severity,
   StoredAlert,
 } from "../types/api";
@@ -130,15 +129,6 @@ export const api = {
       { method: "POST" },
       token,
     ),
-
-  getRunbooks: async (token: string) => {
-    const data = await request<RunbookRecord[] | { items: RunbookRecord[] }>(
-      "/api/v1/admin/runbooks",
-      {},
-      token,
-    );
-    return Array.isArray(data) ? data : data.items;
-  },
 
   getSettings: (token: string) =>
     request<AdminSettings>("/api/v1/admin/settings", {}, token),

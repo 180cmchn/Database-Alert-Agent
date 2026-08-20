@@ -11,16 +11,14 @@ from app.domain.models import (
     AnalysisResultEvent,
     DashboardSummary,
     EvidenceRecord,
-    ExternalKnowledgeExcerpt,
     InvestigationContext,
     InvestigationDecisionResult,
     InvestigationRun,
     InvestigationStage,
+    KnowledgeExcerpt,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
-    RunbookDocument,
-    RunbookExcerpt,
     RunStatus,
     StoredAlert,
     ToolExecutionRequest,
@@ -124,16 +122,13 @@ class AlertDetailEnricher(Protocol):
     async def enrich(self, alert: NormalizedAlert) -> NormalizedAlert: ...
 
 
-class RunbookProvider(Protocol):
-    async def search(self, alert: NormalizedAlert, limit: int = 5) -> list[RunbookExcerpt]: ...
+class KnowledgeSource(Protocol):
+    """One independently deployable source of optional advisory knowledge."""
 
+    @property
+    def name(self) -> str: ...
 
-class RunbookStore(Protocol):
-    """Read-only inventory port for the same local PDFs exposed by the provider."""
-
-    async def list(self) -> list[RunbookDocument]: ...
-
-    async def get(self, runbook_id: str) -> RunbookDocument: ...
+    async def search(self, alert: NormalizedAlert) -> list[KnowledgeExcerpt]: ...
 
 
 class AIAdvisor(Protocol):
@@ -141,8 +136,7 @@ class AIAdvisor(Protocol):
         self,
         *,
         alert: NormalizedAlert,
-        runbooks: list[RunbookExcerpt],
-        external_knowledge: list[ExternalKnowledgeExcerpt],
+        knowledge: list[KnowledgeExcerpt],
         knowledge_match_summary: str,
         evidence: list[EvidenceRecord],
         available_tools: list[ToolSpec],
@@ -154,9 +148,8 @@ class AIAdvisor(Protocol):
     async def advise(
         self,
         alert: NormalizedAlert,
-        runbooks: list[RunbookExcerpt],
+        knowledge: list[KnowledgeExcerpt],
         evidence: list[EvidenceRecord] | None = None,
-        external_knowledge: list[ExternalKnowledgeExcerpt] | None = None,
         knowledge_match_summary: str = "",
         reasoning_callback: ReasoningTraceCallback | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]: ...
@@ -201,7 +194,6 @@ class ConclusionValidator(Protocol):
         alert: NormalizedAlert,
         recommendation: Recommendation,
         evidence: list[EvidenceRecord],
-        runbooks: list[RunbookExcerpt],
     ) -> ValidationRecord: ...
 
 
@@ -236,21 +228,10 @@ class AlertRepository(Protocol):
 
     async def set_status(self, alert_id: str, status: AlertStatus) -> None: ...
 
-    async def save_runbooks(
-        self,
-        alert_id: str,
-        runbooks: list[RunbookExcerpt],
-        *,
-        run_id: str,
-        lease_owner: str,
-        fencing_token: int,
-    ) -> None: ...
-
     async def save_analysis(
         self,
         alert_id: str,
         status: AlertStatus,
-        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
@@ -268,7 +249,6 @@ class AlertRepository(Protocol):
         final_stage: InvestigationStage,
         alert_status: AlertStatus,
         progress: ProgressRecord,
-        runbooks: list[RunbookExcerpt] | None = None,
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,

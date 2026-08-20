@@ -5,7 +5,7 @@ import type { InvestigationStage, ProgressRecord } from "../types/api";
 const CORE_STAGES: InvestigationStage[] = [
   "RECEIVED",
   "FINGERPRINTING",
-  "RUNBOOK_MATCHING",
+  "KNOWLEDGE_MATCHING",
   "INVESTIGATING",
   "ADVISING",
   "VALIDATING",

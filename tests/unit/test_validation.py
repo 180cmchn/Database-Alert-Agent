@@ -53,7 +53,6 @@ def make_recommendation(
         ],
         steps=[RecommendationStep(order=1, action=action)],
         confidence=0.5,
-        manual_matched=False,
         root_causes=causes,
     )
 
@@ -315,7 +314,7 @@ async def test_rule_validator_accepts_fixed_no_cause_as_evidence_insufficient() 
     run = InvestigationRun(alert_id=alert.id)
     recommendation = make_recommendation()
 
-    result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
     assert result.passed is True
     assert result.evidence_sufficient is False
@@ -328,7 +327,7 @@ async def test_rule_validator_rejects_empty_cause_with_noncanonical_summary() ->
     run = InvestigationRun(alert_id=alert.id)
     recommendation = make_recommendation(summary="可能是连接池问题。")
 
-    result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
     assert result.passed is False
     assert result.evidence_sufficient is False
@@ -358,7 +357,6 @@ async def test_rule_validator_accepts_supported_with_live_evidence() -> None:
         alert,
         recommendation,
         [evidence],
-        [],
     )
 
     assert result.passed is True
@@ -397,7 +395,6 @@ async def test_unrelated_no_data_does_not_invalidate_supported_relevant_evidence
         alert,
         recommendation,
         [relevant, target_not_configured],
-        [],
     )
 
     assert result.passed is True
@@ -438,7 +435,6 @@ async def test_rule_validator_rejects_historical_status_in_new_result(
         alert,
         recommendation,
         [evidence],
-        [],
     )
 
     assert result.passed is False
@@ -468,7 +464,6 @@ async def test_rule_validator_rejects_missing_partial_or_ineligible_support() ->
         alert,
         recommendation,
         [partial],
-        [],
     )
 
     assert result.passed is False
@@ -500,7 +495,6 @@ async def test_rule_validator_rejects_hypothesis_binding_in_new_result() -> None
         alert,
         recommendation,
         [evidence],
-        [],
     )
 
     assert result.passed is False
@@ -513,7 +507,7 @@ async def test_rule_validator_does_not_enforce_action_permissions() -> None:
     run = InvestigationRun(alert_id=alert.id)
     recommendation = make_recommendation(action="立即重启数据库实例恢复服务")
 
-    result = await RuleConclusionValidator().validate(run, alert, recommendation, [], [])
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
     assert result.passed is True
     assert result.issues == []

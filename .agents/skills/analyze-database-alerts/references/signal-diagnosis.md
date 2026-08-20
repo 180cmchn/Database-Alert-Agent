@@ -2,8 +2,8 @@
 
 Use this reference only to map a normalized alert signal to relevant read-only observations.
 Do not use it to generate or rank causes before collection completes. The table does not prove a
-cause. Vendor-specific names vary, and deployed local PDF and external knowledge sources are peer
-operational guidance.
+cause. Vendor-specific names vary, and deployed knowledge sources provide advisory operational
+guidance only.
 
 | Symptom family | Read-only observations to collect | Interpretation boundary |
 | --- | --- | --- |

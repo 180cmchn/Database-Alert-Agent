@@ -20,7 +20,6 @@ export const stageLabel: Record<InvestigationStage, string> = {
   RECEIVED: "接收告警",
   FINGERPRINTING: "识别问题指纹",
   KNOWLEDGE_MATCHING: "匹配历史经验",
-  RUNBOOK_MATCHING: "查询处置手册",
   INVESTIGATING: "采集现场证据",
   ADVISING: "生成处理建议",
   VALIDATING: "校验分析结论",

@@ -20,7 +20,7 @@ from app.adapters.archery_mcp import (
     ArcheryMCPClient,
     ArcherySlowLogEvidenceTool,
 )
-from app.adapters.external_knowledge import ExternalKnowledgeClient
+from app.adapters.external_knowledge import ExternalKnowledgeClient, ExternalKnowledgeSource
 from app.adapters.flashduty import (
     FlashDutyAlertDetailEnricher,
     FlashDutyAlertSourceAdapter,
@@ -33,11 +33,11 @@ from app.adapters.investigation import (
     ToolExecutor,
     build_default_tool_registry,
 )
+from app.adapters.knowledge import KnowledgeSourceRegistry
 from app.adapters.notification import (
     LogManagementNotifier,
     WeComManagementNotifier,
 )
-from app.adapters.pdf_runbooks import LocalPDFRunbookLibrary
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.adapters.prometheus_harness import PrometheusHarnessRuntimeDependencies
 from app.adapters.prometheus_mcp import (
@@ -55,8 +55,6 @@ from app.domain.ports import (
     AlertRepository,
     ConclusionValidator,
     ManagementNotifier,
-    RunbookProvider,
-    RunbookStore,
     ToolResultAnalyzer,
 )
 from app.domain.tool_calling import MCPToolCallingModel
@@ -73,8 +71,6 @@ class Runtime:
     settings: Settings
     repository: AlertRepository
     service: AlertAnalysisService
-    runbook_provider: RunbookProvider
-    runbook_store: RunbookStore
     flashduty_client: FlashDutyClient | None = None
 
 
@@ -164,6 +160,20 @@ def _build_external_knowledge_client(settings: Settings) -> ExternalKnowledgeCli
         api_key=settings.effective_external_knowledge_api_key(),
         timeout_seconds=settings.external_knowledge_timeout_seconds,
     )
+
+
+def _build_knowledge_registry(settings: Settings) -> KnowledgeSourceRegistry:
+    sources = []
+    client = _build_external_knowledge_client(settings)
+    if client is not None:
+        sources.append(
+            ExternalKnowledgeSource(
+                client,
+                limit=settings.external_knowledge_limit,
+                min_relevance=settings.external_knowledge_min_relevance,
+            )
+        )
+    return KnowledgeSourceRegistry(sources)
 
 
 def _build_archery_mcp_tool(
@@ -354,30 +364,6 @@ def _build_tool_registry(
     return registry
 
 
-def _resolve_runbook_adapters(
-    settings: Settings,
-    provider: RunbookProvider | None,
-    store: RunbookStore | None,
-) -> tuple[RunbookProvider, RunbookStore]:
-    """Resolve one searchable and inspectable runbook corpus as an atomic pair."""
-
-    if provider is None and store is None:
-        library = LocalPDFRunbookLibrary(
-            settings.runbook_pdf_dir,
-            max_file_bytes=settings.runbook_pdf_max_file_bytes,
-            max_text_chars=settings.runbook_pdf_max_text_chars,
-            min_score=settings.runbook_match_min_score,
-            min_confidence=settings.runbook_match_min_confidence,
-        )
-        return library, library
-    if provider is None or store is None:
-        raise ValueError(
-            "runbook_provider and runbook_store must be provided together so "
-            "administration and analysis use the same runbook corpus"
-        )
-    return provider, store
-
-
 def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     """Apply a validated runtime configuration without replacing stateful components."""
 
@@ -404,7 +390,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     for tool in mcp_tools:
         tool_registry.register(tool)  # type: ignore[arg-type]
     tool_executor = ToolExecutor(tool_registry)
-    external_knowledge_client = _build_external_knowledge_client(settings)
+    knowledge_registry = _build_knowledge_registry(settings)
     alert_detail_enricher = (
         FlashDutyAlertDetailEnricher(
             runtime.flashduty_client,
@@ -415,7 +401,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     )
     agent = InvestigationAgent(
         repository=service.repository,
-        runbook_provider=service.runbook_provider,
+        knowledge_registry=knowledge_registry,
         advisor=advisor,
         fallback_advisor=service.fallback_advisor,
         rule_validator=service.rule_validator,
@@ -423,10 +409,6 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
         tool_executor=tool_executor,
         tool_result_analyzer=tool_result_analyzer,
         alert_detail_enricher=alert_detail_enricher,
-        runbook_limit=settings.runbook_limit,
-        external_knowledge_client=external_knowledge_client,
-        external_knowledge_limit=settings.external_knowledge_limit,
-        external_knowledge_min_relevance=(settings.external_knowledge_min_relevance),
         knowledge_sources=settings.knowledge_sources,
     )
 
@@ -436,16 +418,12 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.tool_registry = tool_registry
     service.tool_executor = tool_executor
     service.tool_result_analyzer = tool_result_analyzer
-    service.runbook_limit = settings.runbook_limit
+    service.knowledge_registry = knowledge_registry
     service.react_max_rounds = settings.react_max_rounds
     service.analysis_timeout_seconds = settings.analysis_timeout_seconds
     service.ai_fallback_enabled = settings.ai_fallback_enabled
     service.stream_main_agent_reasoning = settings.stream_main_agent_reasoning
-    service.external_knowledge_client = external_knowledge_client
-    service.external_knowledge_limit = settings.external_knowledge_limit
     service.external_knowledge_min_relevance = settings.external_knowledge_min_relevance
-    service.runbook_match_min_score = settings.runbook_match_min_score
-    service.runbook_match_min_confidence = settings.runbook_match_min_confidence
     service.knowledge_sources = settings.knowledge_sources
     service.runtime_manifest_config = _runtime_manifest_config(settings)
     service.agent = agent
@@ -462,16 +440,12 @@ def build_runtime(
     repository: AlertRepository | None = None,
     advisor: AIAdvisor | None = None,
     notifier: ManagementNotifier | None = None,
-    runbook_provider: RunbookProvider | None = None,
-    runbook_store: RunbookStore | None = None,
+    knowledge_registry: KnowledgeSourceRegistry | None = None,
     source_registry: AlertSourceRegistry | None = None,
     tool_registry: InvestigationToolRegistry | None = None,
     rule_validator: ConclusionValidator | None = None,
     tool_result_analyzer: ToolResultAnalyzer | None = None,
 ) -> Runtime:
-    runbook_provider, runbook_store = _resolve_runbook_adapters(
-        settings, runbook_provider, runbook_store
-    )
     repository = repository or SQLAlchemyAlertRepository(settings.database_url)
     source_registry = source_registry or AlertSourceRegistry(
         [
@@ -497,7 +471,7 @@ def build_runtime(
         if flashduty_client is not None
         else None
     )
-    external_knowledge_client = _build_external_knowledge_client(settings)
+    knowledge_registry = knowledge_registry or _build_knowledge_registry(settings)
     if tool_registry is None:
         tool_registry = _build_tool_registry(
             settings,
@@ -510,7 +484,7 @@ def build_runtime(
 
     service = AlertAnalysisService(
         source_registry=source_registry,
-        runbook_provider=runbook_provider,
+        knowledge_registry=knowledge_registry,
         advisor=advisor,
         notifier=notifier,
         repository=repository,
@@ -520,17 +494,12 @@ def build_runtime(
         tool_result_analyzer=tool_result_analyzer,
         rule_validator=rule_validator,
         fallback_advisor=ConservativeFallbackAdvisor(),
-        runbook_limit=settings.runbook_limit,
         investigation_lease_seconds=settings.investigation_lease_seconds,
         ai_fallback_enabled=settings.ai_fallback_enabled,
         stream_main_agent_reasoning=settings.stream_main_agent_reasoning,
         react_max_rounds=settings.react_max_rounds,
         analysis_timeout_seconds=settings.analysis_timeout_seconds,
-        external_knowledge_client=external_knowledge_client,
-        external_knowledge_limit=settings.external_knowledge_limit,
         external_knowledge_min_relevance=(settings.external_knowledge_min_relevance),
-        runbook_match_min_score=settings.runbook_match_min_score,
-        runbook_match_min_confidence=settings.runbook_match_min_confidence,
         knowledge_sources=settings.knowledge_sources,
         runtime_manifest_config=_runtime_manifest_config(settings),
     )
@@ -538,7 +507,5 @@ def build_runtime(
         settings=settings,
         repository=repository,
         service=service,
-        runbook_provider=runbook_provider,
-        runbook_store=runbook_store,
         flashduty_client=flashduty_client,
     )

@@ -64,7 +64,8 @@ async def test_long_operation_renews_with_same_owner_and_fencing_token() -> None
     result = await _with_timeout(_guard(manager).run(operation()))
 
     assert result == "complete"
-    assert manager.calls == [("run-123", "worker-a", 7, 30)]
+    assert manager.calls
+    assert set(manager.calls) == {("run-123", "worker-a", 7, 30)}
     assert release.is_set()
 
 

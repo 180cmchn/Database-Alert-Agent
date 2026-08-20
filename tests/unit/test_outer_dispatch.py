@@ -625,7 +625,10 @@ async def test_frozen_outer_deadline_bounds_handler_execution(tmp_path: Path) ->
         result_analyzer=processor,
     ).execute(
         alert_id=alert_id,
-        request=_request(timeout_seconds=0.01),
+        # The frozen budget includes durable PENDING and STARTED writes. Leave
+        # enough room for those SQLite commits so this test reaches the handler
+        # boundary before verifying cancellation by the same persisted deadline.
+        request=_request(timeout_seconds=0.2),
         context=context,
         tool_spec=_spec(),
     )

@@ -13,14 +13,10 @@ data/*.bak
 data/runtime-settings.json
 data/*.audit.jsonl
 data/.*.lock
-**/.runbooks.lock
 frontend/node_modules/
 frontend/dist/
 dist/
 build/
 tmp/
 certs/
-runbooks/*
-!runbooks/README.md
-evaluation/datasets/
 log

@@ -1,6 +1,6 @@
 ---
 name: analyze-database-alerts
-description: Analyze database alerts with FlashDuty details, selected local PDF or external knowledge, optional MCP evidence, deterministic result projection, and a single main-Agent ReAct loop that returns either SUPPORTED or an explicit inconclusive result.
+description: Analyze database alerts with FlashDuty details, selected knowledge sources, optional MCP evidence, deterministic result projection, and a single main-Agent ReAct loop that returns either SUPPORTED or an explicit inconclusive result.
 ---
 
 # Analyze Database Alerts
@@ -36,11 +36,11 @@ identify useful observations. The vocabulary is a retrieval aid, not proof of a 
 
 Search every knowledge source selected for the run. The normalized FlashDuty detail participates in
 the query alongside alert type, engine, metric or error signature, resource, service, and environment.
-Local PDF and the external knowledge API are independent peer sources. For the external source, use
+For the external source, use
 [references/external-knowledge-api.yaml](references/external-knowledge-api.yaml).
 
-Apply each source's configured relevance threshold. Preserve the real runbook ID, section, page,
-knowledge ID, title, and source URI. Never invent a match, reference, cause, or URL. An empty or failed
+Apply each source's configured relevance threshold. Preserve the real source, knowledge ID, title,
+and source URI. Never invent a match, reference, cause, or URL. An empty or failed
 source is a knowledge gap, not proof that live evidence is insufficient. Knowledge can explain live
 facts but cannot prove that its described cause occurred in this incident.
 
@@ -175,7 +175,7 @@ root cause. A deterministic failure may only make the structurally invalid outpu
 Return a concise, traceable result:
 
 - summarize the symptom, scope, and impact without overstating certainty;
-- list actually retrieved PDF and external knowledge references before AI analysis bases;
+- list actually retrieved knowledge references before AI analysis bases;
 - attach qualifying live evidence IDs to every `SUPPORTED` root cause;
 - propose only read-only recovery verification or investigation steps;
 - place change actions under risks or approval-required notes rather than instructions to execute;

@@ -4,10 +4,8 @@ This adapter bridges the project's analyze-database-alerts skill contract with t
 actual KnowledgePack HTTP API. It follows the same defensive patterns as the
 FlashDuty adapter: typed errors, cancellation-aware retries, and graceful degradation.
 
-Per the deployment and skill contracts:
-- Results are advisory data, never live evidence.
-- KnowledgePack results and configured local PDFs are peer knowledge sources.
-- API failure or an empty response degrades gracefully to other selected sources.
+Results are advisory data, never live evidence. API failure or an empty response
+degrades gracefully and cannot prevent the investigation from continuing.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from urllib.parse import quote
 import httpx
 
 from app.application.sanitization import sanitize, sanitize_text
-from app.domain.models import ExternalKnowledgeExcerpt, NormalizedAlert
+from app.domain.models import KnowledgeExcerpt, NormalizedAlert
 
 
 class ExternalKnowledgeError(RuntimeError):
@@ -91,8 +89,8 @@ def build_search_query(alert: NormalizedAlert) -> str:
     """Build a natural-language search query from a normalized alert.
 
     The query prioritizes database engine, alert type, metric/error pattern, and
-    service context so that the vector store returns the most relevant runbooks,
-    incident cases, or references.
+    service context so that the vector store returns the most relevant operational
+    guides, incident cases, or references.
     """
 
     parts: list[str] = []
@@ -297,10 +295,10 @@ class ExternalKnowledgeClient:
 
 def format_items_for_advisor(
     items: list[KnowledgeSearchResult],
-) -> list[ExternalKnowledgeExcerpt]:
+) -> list[KnowledgeExcerpt]:
     """Create stable, bounded excerpts suitable for persisted citations."""
 
-    formatted: list[ExternalKnowledgeExcerpt] = []
+    formatted: list[KnowledgeExcerpt] = []
     seen_ids: set[str] = set()
     for index, item in enumerate(items):
         content = sanitize_text(item.content).strip()[:20_000]
@@ -313,7 +311,8 @@ def format_items_for_advisor(
             continue
         seen_ids.add(knowledge_id)
         formatted.append(
-            ExternalKnowledgeExcerpt(
+            KnowledgeExcerpt(
+                source="external_knowledge",
                 knowledge_id=knowledge_id,
                 title=source or f"External knowledge chunk {index + 1}",
                 content=content,
@@ -324,6 +323,30 @@ def format_items_for_advisor(
             )
         )
     return formatted
+
+
+class ExternalKnowledgeSource:
+    """Registered KnowledgePack source with deployment-specific result limits."""
+
+    name = "external_knowledge"
+
+    def __init__(
+        self,
+        client: ExternalKnowledgeClient,
+        *,
+        limit: int,
+        min_relevance: float,
+    ) -> None:
+        self._client = client
+        self._limit = limit
+        self._min_relevance = min_relevance
+
+    async def search(self, alert: NormalizedAlert) -> list[KnowledgeExcerpt]:
+        response = await self._client.search_alert(alert, top_k=self._limit)
+        accepted = [
+            item for item in response.items if item.relevance >= self._min_relevance
+        ]
+        return format_items_for_advisor(accepted)
 
 
 def _safe_source_uri(source: str) -> str:

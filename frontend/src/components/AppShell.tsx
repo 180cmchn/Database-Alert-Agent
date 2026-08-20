@@ -1,6 +1,5 @@
 import {
   BellRing,
-  BookOpenText,
   Bot,
   ChevronRight,
   CirclePlus,
@@ -16,7 +15,6 @@ const navigation = [
   { to: "/", label: "态势总览", icon: LayoutDashboard, end: true },
   { to: "/alerts", label: "告警中心", icon: BellRing },
   { to: "/alerts/new", label: "发起测试", icon: CirclePlus },
-  { to: "/runbooks", label: "处置手册", icon: BookOpenText, admin: true },
   { to: "/settings", label: "Agent 设置", icon: Settings2, admin: true },
 ];
 
@@ -25,7 +23,6 @@ const pageNames: Array<[RegExp, string]> = [
   [/^\/alerts\/new$/, "发起测试告警"],
   [/^\/alerts\/[^/]+$/, "告警分析详情"],
   [/^\/alerts$/, "告警中心"],
-  [/^\/runbooks$/, "处置手册"],
   [/^\/settings$/, "Agent 设置"],
 ];
 

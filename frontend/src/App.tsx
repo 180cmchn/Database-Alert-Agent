@@ -5,7 +5,6 @@ import { AlertsPage } from "./pages/AlertsPage";
 import { CreateAlertPage } from "./pages/CreateAlertPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
-import { RunbooksPage } from "./pages/RunbooksPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { WeComAlertViewPage } from "./pages/WeComAlertViewPage";
 
@@ -20,7 +19,6 @@ export default function App() {
         <Route path="alerts" element={<AlertsPage />} />
         <Route path="alerts/new" element={<CreateAlertPage />} />
         <Route path="alerts/:alertId" element={<AlertDetailPage />} />
-        <Route path="runbooks" element={<RunbooksPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

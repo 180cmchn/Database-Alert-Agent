@@ -35,13 +35,10 @@ def test_kafka_scheduler_construction_does_not_require_running_event_loop() -> N
 async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
     tmp_path: Path,
 ) -> None:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'scheduler.db'}",
-        runbook_pdf_dir=runbooks,
     )
     runtime = build_runtime(settings)
     await runtime.repository.initialize()
@@ -206,13 +203,10 @@ async def test_in_memory_scheduler_applies_runtime_worker_concurrency() -> None:
 async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     tmp_path: Path,
 ) -> None:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'poller.db'}",
-        runbook_pdf_dir=runbooks,
         flashduty_enabled=True,
         flashduty_app_key="test-app-key",
         flashduty_polling_enabled=True,

@@ -921,12 +921,9 @@ async def test_unavailable_monitor_target_is_skipped_as_missing_capability() -> 
 
 
 def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        runbook_pdf_dir=runbooks,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
         flashduty_enabled=True,
         flashduty_app_key="test-app-key",
@@ -952,13 +949,10 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
 def test_factory_disables_unaudited_flashduty_capabilities_by_default(
     tmp_path: Path,
 ) -> None:
-    runbooks = tmp_path / "runbooks-default-capabilities"
-    runbooks.mkdir()
     runtime = build_runtime(
         Settings(
             _env_file=None,
             ai_provider="fake",
-            runbook_pdf_dir=runbooks,
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'default-capabilities.db'}",
             flashduty_enabled=True,
             flashduty_app_key="test-app-key",
@@ -976,12 +970,9 @@ def test_factory_disables_unaudited_flashduty_capabilities_by_default(
 def test_flashduty_settings_require_official_endpoint_and_key_when_enabled(
     tmp_path: Path,
 ) -> None:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir()
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        runbook_pdf_dir=runbooks,
         flashduty_enabled=True,
     )
     assert any("FLASHDUTY_APP_KEY" in issue for issue in settings.readiness_issues())
@@ -990,6 +981,5 @@ def test_flashduty_settings_require_official_endpoint_and_key_when_enabled(
         Settings(
             _env_file=None,
             ai_provider="fake",
-            runbook_pdf_dir=runbooks,
             flashduty_base_url="https://example.test",
         )

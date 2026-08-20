@@ -21,7 +21,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
-COPY runbooks ./runbooks
 COPY config ./config
 COPY entrypoint.sh ./
 # The repository may be checked out on Windows with CRLF line endings.  A CR in

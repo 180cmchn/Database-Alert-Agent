@@ -1,4 +1,4 @@
 interface:
   display_name: "数据库告警根因分析"
-  short_description: "结合实时证据、本地PDF手册与外部知识准确定位数据库告警根因"
+  short_description: "结合实时证据与可选知识来源准确定位数据库告警根因"
   default_prompt: "Use $analyze-database-alerts to investigate this database alert with the single main-Agent ReAct loop, grounded knowledge, and traceable live evidence."

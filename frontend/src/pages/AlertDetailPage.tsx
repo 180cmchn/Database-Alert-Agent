@@ -2,7 +2,6 @@ import {
   AlertOctagon,
   ArrowLeft,
   Ban,
-  BookCheck,
   Bot,
   BrainCircuit,
   Check,
@@ -46,6 +45,7 @@ import {
   isRunCancellationPending,
   shouldPollAlertDetail,
 } from "../lib/investigationRun";
+import { buildKnowledgeCardModel } from "../lib/knowledgeMatchModel";
 import type {
   AnalysisBasis,
   AlertStatus,
@@ -64,17 +64,12 @@ const runStatusLabel: Record<InvestigationRun["status"], string> = {
 };
 
 function basisLabel(source: AnalysisBasis["source"]): string {
-  if (source === "RUNBOOK") return "本地 PDF";
-  if (source === "EXTERNAL_KNOWLEDGE") return "外部知识";
-  return "AI";
+  return source === "KNOWLEDGE" ? "知识来源" : "AI";
 }
 
 function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | null {
   if (!reference) return null;
-  if ("runbook_id" in reference) {
-    return `${reference.runbook_id} / ${reference.section}`;
-  }
-  return reference.title;
+  return `${reference.title} · ${reference.source}`;
 }
 
 export function AlertDetailPage() {
@@ -149,20 +144,6 @@ export function AlertDetailPage() {
     }, 2_500);
     return () => window.clearInterval(timer);
   }, [load, shouldPollDetail]);
-  const runbookSearchFinished = useMemo(
-    () => Boolean(record?.progress.some((item) => [
-      "INVESTIGATING",
-      "ADVISING",
-      "VALIDATING",
-      "REPORTING",
-      "COMPLETED",
-      "INCONCLUSIVE",
-      "FAILED",
-      "CANCELLED",
-    ].includes(item.stage))),
-    [record],
-  );
-
   function unlockReanalysis(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nextToken = unlockToken.trim();
@@ -231,6 +212,12 @@ export function AlertDetailPage() {
   const { alert, recommendation } = record;
   const visibleRootCauses = recommendation?.root_causes || [];
   const isActive = isTracking;
+  const knowledgeCard = buildKnowledgeCardModel({
+    run: selectedRun,
+    recommendation,
+    progress: record.progress,
+    resultAvailable: record.selected_run_result_available,
+  });
 
   return (
     <div className="page-stack detail-page">
@@ -268,7 +255,7 @@ export function AlertDetailPage() {
           <History size={18} />
           <div>
             <strong>正在查看第 {selectedRun.attempt} 次运行</strong>
-            <span>页面中的排查轨迹、PDF 命中、MCP 请求 JSON、AI 建议和校验均属于这一次运行。</span>
+            <span>页面中的排查轨迹、知识匹配、MCP 请求 JSON、AI 建议和校验均属于这一次运行。</span>
           </div>
           {record.latest_run && (
             <button type="button" className="button secondary small" onClick={() => showRun(record.latest_run!.id)}>
@@ -283,7 +270,7 @@ export function AlertDetailPage() {
         && !record.selected_run_result_available && (
           <div className="historical-result-warning">
             <CircleAlert size={17} />
-            <span>该运行早于运行级结果存储功能，原有进度、MCP 证据和校验仍可查看，但当时的 PDF 命中与 AI 建议已无法恢复。</span>
+            <span>该运行早于运行级结果存储功能，原有进度、MCP 证据和校验仍可查看，但当时的知识匹配与 AI 建议已无法恢复。</span>
           </div>
         )}
 
@@ -295,37 +282,61 @@ export function AlertDetailPage() {
         >
           <StageTimeline currentStage={currentStage} progress={record.progress} />
         </SectionCard>
-
         <SectionCard
-          eyebrow="LOCAL PDF"
-          title="本地 PDF 匹配"
-          description="启用本地来源时展示达到匹配阈值的手册"
-          action={record.manual_matches.length ? <span className="match-score"><BookCheck size={14} /> 命中 {record.manual_matches.length} 条</span> : undefined}
+          eyebrow="KNOWLEDGE"
+          title="知识匹配"
+          description="展示本次运行的知识来源配置、匹配进度与结果。"
+          className="knowledge-match-card"
+          action={knowledgeCard.state === "matched"
+            ? <span className="match-score"><ExternalLink size={14} /> 命中 {knowledgeCard.matches.length} 条</span>
+            : <span className={`knowledge-status knowledge-status-${knowledgeCard.state}`}>{knowledgeCard.state === "matching" && <Radio size={13} className="pulse" />}{knowledgeCard.headline}</span>}
         >
-          {record.manual_matches.length ? (
-            <div className="runbook-evidence-list">
-              {record.manual_matches.map((match) => (
-                <details key={`${match.runbook_id}-${match.section}`} className="runbook-evidence" open={record.manual_matches.length === 1}>
-                  <summary>
-                    <div><strong>{match.title}</strong><span>{match.runbook_id} / {match.section}</span></div>
-                    <span className="score-chip">置信度 {formatPercent(match.match_confidence)}</span>
-                  </summary>
-                  <div className="runbook-content">
-                    <p>页码：{match.page_refs.join("、") || "未标注"} · {match.match_reasons.join("；")}</p>
-                    {match.content}
-                  </div>
-                </details>
-              ))}
+          <div className={`knowledge-card-body knowledge-state-${knowledgeCard.state}`}>
+            <div className="knowledge-state-message">
+              <span className="knowledge-state-icon">
+                {knowledgeCard.state === "matched" ? <CheckCircle2 size={20} />
+                  : knowledgeCard.state === "matching" ? <Radio size={20} className="pulse" />
+                    : knowledgeCard.state === "unavailable_history" ? <History size={20} />
+                      : <CircleAlert size={20} />}
+              </span>
+              <div>
+                <strong>{knowledgeCard.headline}</strong>
+                <span>{knowledgeCard.description}</span>
+              </div>
             </div>
-          ) : selectedRun?.status !== "RUNNING" && !record.selected_run_result_available ? (
-            <EmptyState title="历史 PDF 结果不可恢复" description="该次运行只保留了进度和现场证据，未保存独立的 PDF 匹配结果。" />
-          ) : isActive && !runbookSearchFinished ? (
-            <div className="waiting-panel"><BookCheck size={24} /><strong>正在检索处置手册</strong><span>结果会在匹配阶段完成后显示</span></div>
-          ) : (
-            <EmptyState kind="runbook" title="未命中处置手册" description="Agent 的通用建议应降低置信度，并明确标记尚需补充的证据。" />
-          )}
-        </SectionCard>
 
+            {knowledgeCard.sources.length > 0 && (
+              <div className="knowledge-source-list">
+                <span>本次来源</span>
+                <div>{knowledgeCard.sources.map((source) => <code key={source}>{source}</code>)}</div>
+              </div>
+            )}
+
+            {knowledgeCard.matches.length > 0 && (
+              <div className="knowledge-evidence-list">
+                {knowledgeCard.matches.map((match) => (
+                  <details key={`${match.source}-${match.knowledge_id}`} className="knowledge-evidence" open={knowledgeCard.matches.length === 1}>
+                    <summary>
+                      <div><strong>{match.title}</strong><span>{match.source} · {match.knowledge_id}</span></div>
+                      <span className="score-chip">相关度 {formatPercent(match.score)}</span>
+                    </summary>
+                    <div className="knowledge-content">
+                      <p>来源：{match.source_uri}</p>
+                      {match.content}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            )}
+
+            {knowledgeCard.summary && (
+              <div className="knowledge-match-summary">
+                <CircleAlert size={18} />
+                <div><strong>知识匹配说明</strong><span>{knowledgeCard.summary}</span></div>
+              </div>
+            )}
+          </div>
+        </SectionCard>
       </section>
 
       {selectedRun && (
@@ -337,40 +348,6 @@ export function AlertDetailPage() {
         >
           <AgentTrace alertId={alertId} runId={selectedRun.id} active={isActive} />
         </SectionCard>
-      )}
-
-      {recommendation?.external_knowledge_matches.length ? (
-        <SectionCard
-          eyebrow="EXTERNAL KNOWLEDGE"
-          title="外部知识库匹配"
-          description="外部知识与本地 PDF 同级作为知识依据，但均不能单独证明本次事故根因。"
-          action={<span className="match-score"><ExternalLink size={14} /> 命中 {recommendation.external_knowledge_matches.length} 条</span>}
-        >
-          <div className="runbook-evidence-list">
-            {recommendation.external_knowledge_matches.map((match) => (
-              <details key={match.knowledge_id} className="runbook-evidence" open={recommendation.external_knowledge_matches.length === 1}>
-                <summary>
-                  <div><strong>{match.title}</strong><span>{match.knowledge_id}</span></div>
-                  <span className="score-chip">相关度 {formatPercent(match.score)}</span>
-                </summary>
-                <div className="runbook-content">
-                  <p>来源：{match.source_uri}</p>
-                  {match.content}
-                </div>
-              </details>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {recommendation?.knowledge_match_summary && (
-        <div className="knowledge-match-summary">
-          <CircleAlert size={18} />
-          <div>
-            <strong>知识匹配说明</strong>
-            <span>{recommendation.knowledge_match_summary}</span>
-          </div>
-        </div>
       )}
 
       <SectionCard
@@ -410,7 +387,7 @@ export function AlertDetailPage() {
           <div className="recommendation-hero">
             <div className="recommendation-mark"><BrainCircuit size={27} /></div>
             <div className="recommendation-copy">
-              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.manual_matched && <span className="manual-proof"><BookCheck size={13} /> 本地 PDF 命中</span>}{recommendation.external_knowledge_matches.length > 0 && <span className="manual-proof"><ExternalLink size={13} /> 外部知识命中</span>}</div>
+              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.knowledge_matches.length > 0 && <span className="knowledge-proof"><ExternalLink size={13} /> 知识命中</span>}</div>
               <h2>{recommendation.summary}</h2>
               <div className="recommendation-meta">
                 <span><Gauge size={15} /> 置信度 <strong>{formatPercent(recommendation.confidence)}</strong></span>
@@ -446,7 +423,7 @@ export function AlertDetailPage() {
                       <strong>{step.action}</strong>
                       {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
                       {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
-                      {step.source_ref && <span className="source-ref">{"knowledge_id" in step.source_ref ? <ExternalLink size={13} /> : <BookCheck size={13} />} {knowledgeReference(step.source_ref)}</span>}
+                      {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
                     </div>
                   </li>
                 ))}
@@ -455,7 +432,7 @@ export function AlertDetailPage() {
 
             <div className="advice-side">
               <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
-                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref">{basis.source === "EXTERNAL_KNOWLEDGE" ? <ExternalLink size={13} /> : <BookCheck size={13} />} {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
+                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref"><ExternalLink size={13} /> {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
               </SectionCard>
               <SectionCard eyebrow="RISK GUARD" title="风险提示" className="risk-card">
                 {recommendation.risks.length ? <ul className="risk-points">{recommendation.risks.map((risk) => <li key={risk}><Siren size={14} /> {risk}</li>)}</ul> : <p className="muted-copy">没有额外风险提示。</p>}
@@ -681,14 +658,6 @@ export function AlertDetailPage() {
                         </dd>
                       </div>
                       <div>
-                        <dt>手册上限</dt>
-                        <dd>{run.config_snapshot.runbook_limit}</dd>
-                      </div>
-                      <div>
-                        <dt>PDF 最低置信度</dt>
-                        <dd>{formatPercent(run.config_snapshot.runbook_match_min_confidence)}</dd>
-                      </div>
-                      <div>
                         <dt>外部知识最低相关度</dt>
                         <dd>{formatPercent(run.config_snapshot.external_knowledge_min_relevance)}</dd>
                       </div>
@@ -703,6 +672,10 @@ export function AlertDetailPage() {
                       <div>
                         <dt>AI Fallback</dt>
                         <dd>{run.config_snapshot.ai_fallback_enabled ? "启用" : "禁用"}</dd>
+                      </div>
+                      <div>
+                        <dt>Reasoning 实时展示</dt>
+                        <dd>{run.config_snapshot.stream_main_agent_reasoning ? "启用" : "禁用"}</dd>
                       </div>
                       <div>
                         <dt>AI 模型</dt>

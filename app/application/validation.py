@@ -8,14 +8,11 @@ from app.domain.models import (
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasisSource,
     EvidenceRecord,
-    ExternalKnowledgeReference,
     InvestigationRun,
     NormalizedAlert,
     Recommendation,
     RootCauseAssessment,
     RootCauseStatus,
-    RunbookExcerpt,
-    RunbookReference,
     ToolStatus,
     ValidationKind,
     ValidationRecord,
@@ -97,7 +94,6 @@ class RuleConclusionValidator:
         alert: NormalizedAlert,
         recommendation: Recommendation,
         evidence: list[EvidenceRecord],
-        runbooks: list[RunbookExcerpt],
     ) -> ValidationRecord:
         issues: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
@@ -167,92 +163,61 @@ class RuleConclusionValidator:
         # This mirrors whether the main Agent returned a structurally valid supported
         # result. It does not independently infer whether the cited facts prove causality.
         evidence_sufficient = has_supported_cause and bool(recommendation.root_causes)
-        manual_matched = recommendation.manual_matched
         sources = [item.source for item in recommendation.analysis_bases]
-        valid_runbook_refs = {(excerpt.runbook_id, excerpt.section) for excerpt in runbooks}
         if AnalysisBasisSource.AI not in sources:
             issues.append("判断依据必须至少包含一条 AI 分析依据")
-        if manual_matched:
-            if AnalysisBasisSource.RUNBOOK not in sources:
-                issues.append("命中手册时必须提供至少一条手册依据")
-            for index, basis in enumerate(recommendation.analysis_bases, start=1):
-                if basis.source != AnalysisBasisSource.RUNBOOK:
-                    continue
-                if not isinstance(basis.source_ref, RunbookReference):
-                    issues.append(f"手册依据 #{index} 缺少 source_ref")
-                    continue
-                ref_key = (basis.source_ref.runbook_id, basis.source_ref.section)
-                if ref_key not in valid_runbook_refs:
-                    issues.append(
-                        f"手册依据 #{index} 引用了无效章节："
-                        f"{basis.source_ref.runbook_id}/{basis.source_ref.section}"
-                    )
-            known_cause_ids = {cause.cause_id for excerpt in runbooks for cause in excerpt.causes}
-            for index, root_cause in enumerate(recommendation.root_causes, start=1):
-                if root_cause.cause_id and root_cause.cause_id not in known_cause_ids:
-                    issues.append(
-                        f"根因 #{index} 引用了手册中不存在的 cause_id：{root_cause.cause_id}"
-                    )
-        elif recommendation.runbook_references or any(
-            basis.source == AnalysisBasisSource.RUNBOOK for basis in recommendation.analysis_bases
-        ):
-            issues.append("未命中本地 PDF 时不得声称存在手册依据")
-
-        external_matches = recommendation.external_knowledge_matches
-        valid_external_refs = {
-            item.knowledge_id: (item.title, item.source_uri) for item in external_matches
+        knowledge_matches = recommendation.knowledge_matches
+        valid_knowledge_refs = {
+            (item.source, item.knowledge_id): (item.title, item.source_uri)
+            for item in knowledge_matches
         }
-        external_bases = [
+        knowledge_bases = [
             basis
             for basis in recommendation.analysis_bases
-            if basis.source == AnalysisBasisSource.EXTERNAL_KNOWLEDGE
+            if basis.source == AnalysisBasisSource.KNOWLEDGE
         ]
-        if external_matches and not external_bases:
-            issues.append("命中外部知识时必须提供至少一条外部知识依据")
-        if not external_matches and external_bases:
-            issues.append("未命中外部知识时不得声称存在外部知识依据")
+        if knowledge_matches and not knowledge_bases:
+            issues.append("命中知识时必须提供至少一条知识依据")
+        if not knowledge_matches and knowledge_bases:
+            issues.append("未命中知识时不得声称存在知识依据")
         for index, basis in enumerate(recommendation.analysis_bases, start=1):
-            if basis.source != AnalysisBasisSource.EXTERNAL_KNOWLEDGE:
+            if basis.source != AnalysisBasisSource.KNOWLEDGE:
                 continue
-            if not isinstance(basis.source_ref, ExternalKnowledgeReference):
-                issues.append(f"外部知识依据 #{index} 缺少合法 source_ref")
+            if basis.source_ref is None:
+                issues.append(f"知识依据 #{index} 缺少合法 source_ref")
                 continue
-            expected = valid_external_refs.get(basis.source_ref.knowledge_id)
+            expected = valid_knowledge_refs.get(
+                (basis.source_ref.source, basis.source_ref.knowledge_id)
+            )
             if expected is None:
                 issues.append(
-                    f"外部知识依据 #{index} 引用了未知条目：{basis.source_ref.knowledge_id}"
+                    f"知识依据 #{index} 引用了未知条目："
+                    f"{basis.source_ref.source}/{basis.source_ref.knowledge_id}"
                 )
             elif (basis.source_ref.title, basis.source_ref.source_uri) != expected:
-                issues.append(f"外部知识依据 #{index} 的标题或来源与检索结果不一致")
+                issues.append(f"知识依据 #{index} 的标题或来源与检索结果不一致")
 
-        knowledge_matched = manual_matched or bool(external_matches)
+        knowledge_matched = bool(knowledge_matches)
         for index, step in enumerate(recommendation.steps, start=1):
             source_ref = step.source_ref
             if not knowledge_matched:
                 if source_ref is not None:
                     issues.append(f"未命中知识时处理步骤 #{index} 不得提供 source_ref")
                 continue
-            if source_ref is None:
-                issues.append(f"命中知识时处理步骤 #{index} 必须提供 source_ref")
-            elif isinstance(source_ref, RunbookReference):
-                ref_key = (source_ref.runbook_id, source_ref.section)
-                if not manual_matched or ref_key not in valid_runbook_refs:
-                    issues.append(
-                        f"处理步骤 #{index} 引用了无效的手册章节："
-                        f"{source_ref.runbook_id}/{source_ref.section}"
-                    )
-            elif isinstance(source_ref, ExternalKnowledgeReference):
-                expected = valid_external_refs.get(source_ref.knowledge_id)
+            if source_ref is not None:
+                expected = valid_knowledge_refs.get(
+                    (source_ref.source, source_ref.knowledge_id)
+                )
                 if expected is None:
                     issues.append(
-                        f"处理步骤 #{index} 引用了未知外部知识：{source_ref.knowledge_id}"
+                        f"处理步骤 #{index} 引用了未知知识："
+                        f"{source_ref.source}/{source_ref.knowledge_id}"
                     )
                 elif (source_ref.title, source_ref.source_uri) != expected:
-                    issues.append(f"处理步骤 #{index} 的外部知识标题或来源不一致")
+                    issues.append(f"处理步骤 #{index} 的知识标题或来源不一致")
 
         source_rank = {
-            AnalysisBasisSource.RUNBOOK: 0,
-            AnalysisBasisSource.EXTERNAL_KNOWLEDGE: 0,
+            AnalysisBasisSource.KNOWLEDGE: 0,
             AnalysisBasisSource.AI: 1,
         }
         ranks = [source_rank[source] for source in sources]
@@ -271,7 +236,6 @@ class RuleConclusionValidator:
                 "checked_root_causes": len(recommendation.root_causes),
                 "checked_steps": len(recommendation.steps),
                 "evidence_count": len(evidence),
-                "runbook_count": len(runbooks),
-                "external_knowledge_count": len(external_matches),
+                "knowledge_count": len(knowledge_matches),
             },
         )

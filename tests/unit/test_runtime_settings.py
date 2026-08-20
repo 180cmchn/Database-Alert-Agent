@@ -15,7 +15,6 @@ from app.application.admin import (
 )
 from app.application.factory import _mcp_environment
 from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings
-from tests.pdf_fixtures import create_tikv_runbook_pdf
 
 
 def test_windows_file_lock_backend_uses_a_stable_lock_byte(
@@ -57,6 +56,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
                 "runbook_limit": 9,
                 "scheduler_workers": 4,
                 "analysis_timeout_seconds": 2400,
+                "stream_main_agent_reasoning": True,
                 "archery_mcp_max_agent_steps": 18,
                 "database_url": "sqlite+aiosqlite:///must-not-be-used.db",
                 "shadow_enabled": True,
@@ -70,6 +70,7 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///bootstrap.db")
     monkeypatch.setenv("AI_PROVIDER", "fake")
     monkeypatch.setenv("AI_MODEL", "environment-model")
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "false")
     get_settings.cache_clear()
     try:
         settings = get_settings()
@@ -77,9 +78,10 @@ def test_get_settings_loads_only_persisted_runtime_whitelist(
         get_settings.cache_clear()
 
     assert settings.ai_model == "persisted-model"
-    assert settings.runbook_limit == 9
+    assert not hasattr(settings, "runbook_limit")
     assert settings.scheduler_workers == 4
     assert settings.analysis_timeout_seconds == 2400
+    assert settings.stream_main_agent_reasoning is True
     assert settings.database_url == "sqlite+aiosqlite:///bootstrap.db"
     assert not hasattr(settings, "archery_mcp_max_agent_steps")
     assert not hasattr(settings, "shadow_enabled")
@@ -167,41 +169,14 @@ def test_ai_retry_count_is_not_a_runtime_setting() -> None:
         )
 
 
-def test_pdf_runbook_default_uses_generated_typed_directory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("RUNBOOK_PDF_DIR", raising=False)
+def test_knowledge_sources_are_deduplicated_and_can_be_empty() -> None:
+    defaults = Settings(_env_file=None, ai_provider="fake")
+    assert defaults.knowledge_sources == []
+    assert defaults.external_knowledge_enabled is False
 
-    settings = Settings(_env_file=None, ai_provider="fake")
-
-    assert settings.runbook_pdf_dir == Path("runbooks/pdfs-typed")
-
-
-def test_pdf_runbook_readiness_requires_directory_and_pdf(
-    tmp_path: Path,
-) -> None:
-    settings = Settings(
-        _env_file=None,
-        ai_provider="fake",
-        runbook_pdf_dir=tmp_path / "missing",
-    )
-
-    issues = settings.readiness_issues()
-
-    assert any("PDF runbook directory does not exist" in issue for issue in issues)
-
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    settings = Settings(_env_file=None, ai_provider="fake", runbook_pdf_dir=empty)
-    assert any(
-        "No alert-type PDF runbook directories found" in issue
-        for issue in settings.readiness_issues()
-    )
-
-
-def test_knowledge_sources_are_deduplicated_and_cannot_be_empty() -> None:
-    with pytest.raises(ValidationError, match="at least one source"):
-        Settings(_env_file=None, ai_provider="fake", knowledge_sources=[])
+    empty = Settings(_env_file=None, ai_provider="fake", knowledge_sources=[])
+    assert empty.knowledge_sources == []
+    assert empty.external_knowledge_enabled is False
 
     external_only = Settings(
         _env_file=None,
@@ -213,31 +188,10 @@ def test_knowledge_sources_are_deduplicated_and_cannot_be_empty() -> None:
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        knowledge_sources=["local_pdf", "external_knowledge", "local_pdf"],
+        knowledge_sources=["external_knowledge", "external_knowledge"],
     )
-    assert settings.knowledge_sources == ["local_pdf", "external_knowledge"]
+    assert settings.knowledge_sources == ["external_knowledge"]
     assert settings.external_knowledge_enabled is True
-
-    local_only = Settings(
-        _env_file=None,
-        ai_provider="fake",
-        external_knowledge_enabled=True,
-        knowledge_sources=["local_pdf"],
-    )
-    assert local_only.external_knowledge_enabled is False
-
-
-def test_external_only_source_does_not_require_local_pdf_directory(
-    tmp_path: Path,
-) -> None:
-    settings = Settings(
-        _env_file=None,
-        ai_provider="fake",
-        runbook_pdf_dir=tmp_path / "missing",
-        knowledge_sources=["external_knowledge"],
-    )
-
-    assert not any("PDF runbook" in issue for issue in settings.readiness_issues())
 
 
 @pytest.mark.parametrize(
@@ -466,12 +420,9 @@ def test_openai_responses_is_eligible_for_mcp_tool_calling_readiness(
 
 
 def runtime_test_settings(tmp_path: Path) -> Settings:
-    runbooks = tmp_path / "runbooks"
-    create_tikv_runbook_pdf(runbooks)
     return Settings(
         _env_file=None,
         ai_provider="fake",
-        runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
 
@@ -490,14 +441,17 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
             external_knowledge_enabled=True,
         )
 
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            runbook_limit=7,
+        )
     payload = RuntimeSettingsPatch(
         expected_revision="0123456789abcdef",
-        runbook_limit=7,
         scheduler_workers=4,
         analysis_timeout_seconds=2400,
     )
     assert payload.updates() == {
-        "runbook_limit": 7,
         "scheduler_workers": 4,
         "analysis_timeout_seconds": 2400,
     }
@@ -523,6 +477,24 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
         )
 
 
+def test_stream_main_agent_reasoning_requires_valid_deployment_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STREAM_MAIN_AGENT_REASONING", raising=False)
+    with pytest.raises(ValidationError, match="STREAM_MAIN_AGENT_REASONING"):
+        Settings(_env_file=None, ai_provider="fake")
+
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "true")
+    assert Settings(_env_file=None, ai_provider="fake").stream_main_agent_reasoning is True
+
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "false")
+    assert Settings(_env_file=None, ai_provider="fake").stream_main_agent_reasoning is False
+
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "not-a-boolean")
+    with pytest.raises(ValidationError, match="STREAM_MAIN_AGENT_REASONING"):
+        Settings(_env_file=None, ai_provider="fake")
+
+
 @pytest.mark.asyncio
 async def test_stream_main_agent_reasoning_is_runtime_editable(
     tmp_path: Path,
@@ -530,18 +502,18 @@ async def test_stream_main_agent_reasoning_is_runtime_editable(
     settings = runtime_test_settings(tmp_path)
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
 
-    assert settings.stream_main_agent_reasoning is True
+    assert settings.stream_main_agent_reasoning is False
     assert "stream_main_agent_reasoning" in RUNTIME_SETTINGS_KEYS
 
-    disabled, _, changed = await manager.patch(
+    enabled, _, changed = await manager.patch(
         settings,
-        {"stream_main_agent_reasoning": False},
+        {"stream_main_agent_reasoning": True},
         expected_revision=manager.revision,
     )
-    assert disabled.stream_main_agent_reasoning is False
+    assert enabled.stream_main_agent_reasoning is True
     assert changed == ["stream_main_agent_reasoning"]
     persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
-    assert persisted["stream_main_agent_reasoning"] is False
+    assert persisted["stream_main_agent_reasoning"] is True
 
 
 @pytest.mark.asyncio
@@ -555,16 +527,16 @@ async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_value
 
     first_settings, first_revision, changed = await first.patch(
         settings,
-        {"runbook_limit": 7},
+        {"react_max_rounds": 7},
         expected_revision=initial_revision,
     )
-    assert changed == ["runbook_limit"]
+    assert changed == ["react_max_rounds"]
     assert first_revision != initial_revision
 
     with pytest.raises(RuntimeSettingsConflictError) as conflict:
         await second.patch(
             settings,
-            {"runbook_limit": 8},
+            {"react_max_rounds": 8},
             expected_revision=initial_revision,
         )
     assert conflict.value.expected_revision == initial_revision
@@ -576,13 +548,13 @@ async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_value
         expected_revision=first_revision,
     )
     assert changed == ["scheduler_workers"]
-    assert merged.runbook_limit == 7
+    assert merged.react_max_rounds == 7
     assert merged.scheduler_workers == 2
     assert merged_revision not in {initial_revision, first_revision}
     persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
-    assert persisted["runbook_limit"] == 7
+    assert persisted["react_max_rounds"] == 7
     assert persisted["scheduler_workers"] == 2
-    assert first_settings.runbook_limit == 7
+    assert first_settings.react_max_rounds == 7
 
 
 @pytest.mark.asyncio
@@ -609,7 +581,7 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_removed_notifier_fi
     with pytest.raises(ValidationError, match="fake is not allowed in production"):
         await manager.patch(
             production_fake,
-            {"runbook_limit": 8},
+            {"react_max_rounds": 8},
             expected_revision=manager.revision,
         )
 
@@ -618,8 +590,6 @@ async def test_runtime_patch_rejects_unrunnable_provider_and_removed_notifier_fi
 async def test_runtime_patch_requires_external_notifier_in_production(
     tmp_path: Path,
 ) -> None:
-    runbooks = tmp_path / "runbooks"
-    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         app_env="production",
@@ -630,7 +600,6 @@ async def test_runtime_patch_requires_external_notifier_in_production(
         admin_api_token="configured-admin-token",
         wecom_enabled=True,
         wecom_page_base_url="https://alerts.example.test",
-        runbook_pdf_dir=runbooks,
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
     manager = RuntimeSettingsManager(settings.runtime_settings_path)
@@ -638,7 +607,7 @@ async def test_runtime_patch_requires_external_notifier_in_production(
     with pytest.raises(ValueError, match="WeCom webhook URL is required"):
         await manager.patch(
             settings,
-            {"runbook_limit": 7},
+            {"react_max_rounds": 7},
             expected_revision=manager.revision,
         )
 
@@ -666,6 +635,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["wecom_webhook_url_configured"] is False
     assert body["wecom_page_base_url"] == ""
     assert body["ai_fallback_enabled"] is True
+    assert body["stream_main_agent_reasoning"] is False
     assert "ai_max_retries" not in body
     assert body["scheduler_workers"] == 1
     assert body["flashduty_polling_enabled"] is False
@@ -752,7 +722,7 @@ async def test_runtime_knowledge_selection_is_the_external_connection_switch(
 
     enabled, enabled_revision, changed = await manager.patch(
         settings,
-        {"knowledge_sources": ["local_pdf", "external_knowledge"]},
+        {"knowledge_sources": ["external_knowledge"]},
         expected_revision=manager.revision,
     )
     assert enabled.external_knowledge_enabled is True
@@ -760,14 +730,14 @@ async def test_runtime_knowledge_selection_is_the_external_connection_switch(
 
     disabled, _, changed = await manager.patch(
         enabled,
-        {"knowledge_sources": ["local_pdf"]},
+        {"knowledge_sources": []},
         expected_revision=enabled_revision,
     )
     assert disabled.external_knowledge_enabled is False
     assert changed == ["knowledge_sources"]
 
     persisted = json.loads(settings.runtime_settings_path.read_text(encoding="utf-8"))
-    assert persisted["knowledge_sources"] == ["local_pdf"]
+    assert persisted["knowledge_sources"] == []
     assert "external_knowledge_enabled" not in persisted
 
 

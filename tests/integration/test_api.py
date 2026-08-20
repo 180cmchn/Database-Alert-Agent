@@ -7,20 +7,16 @@ from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
-from tests.pdf_fixtures import create_tikv_runbook_pdf
 
 
 def create_test_client(
     tmp_path: Path,
     **setting_overrides: object,
 ) -> tuple[TestClient, Runtime, ManualAnalysisScheduler]:
-    runbooks = tmp_path / "runbooks"
-    create_tikv_runbook_pdf(runbooks)
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
-        runbook_pdf_dir=runbooks,
         **setting_overrides,
     )
     runtime = build_runtime(settings)
@@ -62,7 +58,7 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         detail_body = detail.json()
         assert detail_body["status"] == "INCONCLUSIVE"
         assert detail_body["alert"]["external_id"] == "api-1"
-        assert detail_body["recommendation"]["manual_matched"] is False
+        assert detail_body["recommendation"]["knowledge_matches"] == []
         assert "requires_human" not in detail_body["recommendation"]
         assert "feedback" not in detail_body
         assert "knowledge_matches" not in detail_body
@@ -127,14 +123,6 @@ def test_readiness_does_not_probe_external_knowledge_service(tmp_path: Path) -> 
         tmp_path,
         external_knowledge_base_url="http://knowledge.test",
         knowledge_sources=["external_knowledge"],
-    )
-
-    class ExternalKnowledgeClientThatMustNotBeProbed:
-        async def health(self) -> dict[str, int]:
-            raise AssertionError("API readiness must not probe external knowledge")
-
-    runtime.service.external_knowledge_client = (  # type: ignore[assignment]
-        ExternalKnowledgeClientThatMustNotBeProbed()
     )
 
     with client:

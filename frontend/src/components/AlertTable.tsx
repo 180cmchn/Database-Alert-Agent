@@ -1,4 +1,4 @@
-import { ArrowRight, BookCheck } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { Link } from "react-router-dom";
 import { formatDateTime, relativeTime } from "../lib/format";
 import type { AlertListItem } from "../types/api";
@@ -26,11 +26,6 @@ export function AlertTable({ alerts, compact = false }: { alerts: AlertListItem[
                   <strong>{alert.title}</strong>
                   <span>{alert.reason}</span>
                 </Link>
-                <div className="row-flags">
-                  {alert.manual_matched && (
-                    <span title="已命中告警手册"><BookCheck size={13} /> 手册命中</span>
-                  )}
-                </div>
               </td>
               <td><SeverityBadge severity={alert.severity} /></td>
               <td><StatusBadge status={alert.status} /></td>

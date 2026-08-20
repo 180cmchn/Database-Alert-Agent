@@ -7,6 +7,7 @@ import pytest
 
 from app.adapters.ai import FakeAIAdvisor, OpenAICompatibleAdvisor
 from app.adapters.investigation import InvestigationToolRegistry
+from app.adapters.knowledge import KnowledgeSourceRegistry
 from app.adapters.notification import LogManagementNotifier
 from app.agent_runtime.events import AgentEvent, AgentEventKind
 from app.agent_runtime.persistence import RepositoryEventSink
@@ -65,21 +66,13 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
                 }
             )
 
-    class RecordingRunbookProvider:
-        async def search(self, alert, limit=5):  # type: ignore[no-untyped-def]
+    class RecordingKnowledgeSource:
+        name = "recording"
+
+        async def search(self, alert):  # type: ignore[no-untyped-def]
             events.append("KNOWLEDGE")
             seen_hosts.append(alert.database.host if alert.database else None)
             return []
-
-    class EmptyRunbookStore:
-        async def search(self, _alert, limit=5):  # type: ignore[no-untyped-def]
-            return []
-
-        async def list(self):  # type: ignore[no-untyped-def]
-            return []
-
-        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
-            raise AssertionError("not used")
 
     class RecordingTool:
         name = "detail_probe"
@@ -94,7 +87,6 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
             )
             return "detail endpoint observed", {"root_cause_eligible": False}
 
-    provider = RecordingRunbookProvider()
     advisor = ScriptedReActAdvisor(
         [
             InvestigationDecision(
@@ -107,10 +99,9 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
         events=events,
     )
     runtime = build_runtime(
-        settings_for(tmp_path),
+        settings_for(tmp_path).model_copy(update={"knowledge_sources": ["recording"]}),
         advisor=advisor,
-        runbook_provider=provider,
-        runbook_store=EmptyRunbookStore(),
+        knowledge_registry=KnowledgeSourceRegistry([RecordingKnowledgeSource()]),
         tool_registry=InvestigationToolRegistry([RecordingTool()]),
     )
     runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
@@ -212,7 +203,7 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root_cause(
+async def test_knowledge_failure_does_not_block_detail_evidence_root_cause(
     tmp_path: Path,
 ) -> None:
     class DetailEnricher:
@@ -255,12 +246,12 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
         async def advise(
             self,
             alert,
-            runbooks,
+            knowledge,
             evidence=None,
-            external_knowledge=None,
             knowledge_match_summary="",
         ):  # type: ignore[no-untyped-def]
-            del runbooks, external_knowledge
+            assert knowledge == []
+            assert "recording 查询失败（RuntimeError），已忽略" in knowledge_match_summary
             detail = next(
                 item for item in evidence or [] if item.tool_name == "flashduty_alert_info"
             )
@@ -286,7 +277,6 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
                     ],
                     risks=[],
                     confidence=0.9,
-                    manual_matched=False,
                     root_causes=[
                         RootCauseAssessment(
                             cause=cause,
@@ -304,18 +294,17 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
                 ),
             )
 
-    class EmptyRunbookStore:
-        async def list(self):  # type: ignore[no-untyped-def]
-            return []
+    class FailingKnowledgeSource:
+        name = "recording"
 
-        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
-            raise AssertionError("not used")
+        async def search(self, alert):  # type: ignore[no-untyped-def]
+            del alert
+            raise RuntimeError("knowledge service unavailable")
 
     runtime = build_runtime(
-        settings_for(tmp_path),
+        settings_for(tmp_path).model_copy(update={"knowledge_sources": ["recording"]}),
         advisor=DetailEvidenceAdvisor(),
-        runbook_provider=EmptyRunbookStore(),
-        runbook_store=EmptyRunbookStore(),
+        knowledge_registry=KnowledgeSourceRegistry([FailingKnowledgeSource()]),
     )
     runtime.service.agent.ctx.alert_detail_enricher = DetailEnricher()
     await runtime.repository.initialize()
@@ -337,6 +326,10 @@ async def test_zero_mcp_can_use_detail_evidence_but_reason_is_not_automatic_root
 
     assert result.status == AlertStatus.COMPLETED
     assert result.recommendation is not None
+    assert result.recommendation.knowledge_matches == []
+    assert "recording 查询失败（RuntimeError），已忽略" in (
+        result.recommendation.knowledge_match_summary
+    )
     assert result.recommendation.root_causes[0].cause != result.alert.reason
     assert len(result.validations) == 1
     assert result.validations[0].kind == ValidationKind.RULE
@@ -383,22 +376,16 @@ async def test_flashduty_detail_failure_closes_before_knowledge_and_mcp(
             calls.append("DETAIL")
             raise RuntimeError("detail unavailable")
 
-    class RecordingRunbookProvider:
-        async def search(self, _alert, limit=5):  # type: ignore[no-untyped-def]
+    class RecordingKnowledgeSource:
+        name = "recording"
+
+        async def search(self, _alert):  # type: ignore[no-untyped-def]
             calls.append("KNOWLEDGE")
             return []
 
-    class EmptyRunbookStore:
-        async def list(self):  # type: ignore[no-untyped-def]
-            return []
-
-        async def get(self, _runbook_id):  # type: ignore[no-untyped-def]
-            raise AssertionError("not used")
-
     runtime = build_runtime(
-        settings_for(tmp_path),
-        runbook_provider=RecordingRunbookProvider(),
-        runbook_store=EmptyRunbookStore(),
+        settings_for(tmp_path).model_copy(update={"knowledge_sources": ["recording"]}),
+        knowledge_registry=KnowledgeSourceRegistry([RecordingKnowledgeSource()]),
     )
     runtime.service.agent.ctx.alert_detail_enricher = UnusableDetailEnricher()  # type: ignore[assignment]
     await runtime.repository.initialize()
@@ -448,9 +435,8 @@ class RecordingAdvisor(FakeAIAdvisor):
     async def advise(  # type: ignore[no-untyped-def]
         self,
         alert,
-        runbooks,
+        knowledge,
         evidence=None,
-        external_knowledge=None,
         knowledge_match_summary="",
         reasoning_callback=None,
     ):
@@ -459,9 +445,8 @@ class RecordingAdvisor(FakeAIAdvisor):
         self.evidence_tool_names = [item.tool_name for item in evidence or []]
         return await super().advise(
             alert,
-            runbooks,
+            knowledge,
             evidence=evidence,
-            external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
             reasoning_callback=reasoning_callback,
         )
@@ -520,11 +505,11 @@ class FailingAdvisor:
     async def advise(  # type: ignore[no-untyped-def]
         self,
         alert,
-        runbooks,
+        knowledge,
         evidence=None,
-        external_knowledge=None,
         knowledge_match_summary="",
     ):
+        del alert, knowledge, evidence, knowledge_match_summary
         raise AdvisorError("provider unavailable")
 
 
@@ -535,9 +520,8 @@ class FlakyAdvisor(FakeAIAdvisor):
     async def advise(  # type: ignore[no-untyped-def]
         self,
         alert,
-        runbooks,
+        knowledge,
         evidence=None,
-        external_knowledge=None,
         knowledge_match_summary="",
     ):
         self.calls += 1
@@ -545,9 +529,8 @@ class FlakyAdvisor(FakeAIAdvisor):
             raise AdvisorError("temporary failure")
         return await super().advise(
             alert,
-            runbooks,
+            knowledge,
             evidence=evidence,
-            external_knowledge=external_knowledge,
             knowledge_match_summary=knowledge_match_summary,
         )
 
@@ -585,18 +568,16 @@ class StaticOutcomeTool(RecordingMCPStyleTool):
 
 
 def settings_for(tmp_path: Path) -> Settings:
-    runbooks = tmp_path / "runbooks"
-    runbooks.mkdir(exist_ok=True)
     return Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'alerts.db'}",
-        runbook_pdf_dir=runbooks,
+        knowledge_sources=[],
     )
 
 
 @pytest.mark.asyncio
-async def test_missing_pdf_semantic_match_is_reported_to_main_analysis(
+async def test_no_selected_knowledge_source_is_reported_to_main_analysis(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(settings_for(tmp_path))
@@ -605,7 +586,7 @@ async def test_missing_pdf_semantic_match_is_reported_to_main_analysis(
     result = await runtime.service.analyze(
         "canonical",
         {
-            "external_id": "missing-local-pdf-type",
+            "external_id": "no-knowledge-source",
             "severity": "WARNING",
             "title": "MySQL slow query alert",
             "reason": "mysql_slow_query_400",
@@ -613,11 +594,8 @@ async def test_missing_pdf_semantic_match_is_reported_to_main_analysis(
     )
 
     assert result.recommendation is not None
-    assert (
-        "本地 PDF 候选未达到匹配阈值，已拒绝匹配"
-        in result.recommendation.knowledge_match_summary
-    )
-    assert result.manual_matches == []
+    assert "未选择知识来源" in result.recommendation.knowledge_match_summary
+    assert result.recommendation.knowledge_matches == []
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1059,8 +1037,7 @@ async def test_react_node_supports_advisor_without_reasoning_callback(
             self,
             *,
             alert,
-            runbooks,
-            external_knowledge,
+            knowledge,
             knowledge_match_summary,
             evidence,
             available_tools,
@@ -1069,8 +1046,7 @@ async def test_react_node_supports_advisor_without_reasoning_callback(
         ):  # type: ignore[no-untyped-def]
             del (
                 alert,
-                runbooks,
-                external_knowledge,
+                knowledge,
                 knowledge_match_summary,
                 evidence,
                 available_tools,
@@ -1131,11 +1107,22 @@ class _CallbackProbingAdvisor(ScriptedReActAdvisor):
         self.advise_callbacks: list[object] = []
 
     async def decide_investigation(self, **kwargs):  # type: ignore[no-untyped-def]
-        self.decision_callbacks.append(kwargs.get("reasoning_callback", "absent"))
+        callback = kwargs.get("reasoning_callback", "absent")
+        self.decision_callbacks.append(callback)
+        if callable(callback):
+            decision_index = len(self.decision_callbacks) - 1
+            await callback(
+                f"round-{decision_index + 1} streamed reasoning",
+                f"probe-react-{decision_index}",
+                0,
+            )
         return await super().decide_investigation(**kwargs)
 
     async def advise(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        self.advise_callbacks.append(kwargs.get("reasoning_callback", "absent"))
+        callback = kwargs.get("reasoning_callback", "absent")
+        self.advise_callbacks.append(callback)
+        if callable(callback):
+            await callback("final streamed reasoning", "probe-final", 0)
         return await super().advise(*args, **kwargs)
 
 
@@ -1169,6 +1156,8 @@ async def test_stream_main_agent_reasoning_disabled_records_reasoning_once(
     assert advisor.advise_callbacks == ["absent"]
 
     assert result.latest_run is not None
+    assert result.latest_run.config_snapshot is not None
+    assert result.latest_run.config_snapshot.stream_main_agent_reasoning is False
     events = await runtime.repository.list_agent_events(str(result.latest_run.id))
     reasoning_events = [
         item for item in events if item.kind == AgentEventKind.TRACE_REASONING
@@ -1195,7 +1184,9 @@ async def test_stream_main_agent_reasoning_enabled_passes_delta_callback(
 ) -> None:
     advisor = _CallbackProbingAdvisor()
     runtime = build_runtime(
-        settings_for(tmp_path),
+        settings_for(tmp_path).model_copy(
+            update={"stream_main_agent_reasoning": True}
+        ),
         advisor=advisor,
         tool_registry=InvestigationToolRegistry([RecordingMCPStyleTool()]),
     )
@@ -1212,8 +1203,21 @@ async def test_stream_main_agent_reasoning_enabled_passes_delta_callback(
     )
 
     assert result.latest_run is not None
+    assert result.latest_run.config_snapshot is not None
+    assert result.latest_run.config_snapshot.stream_main_agent_reasoning is True
     assert all(callable(item) for item in advisor.decision_callbacks)
     assert callable(advisor.advise_callbacks[0])
+    events = await runtime.repository.list_agent_events(str(result.latest_run.id))
+    reasoning_events = [
+        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
+    ]
+    assert [item.payload["content"] for item in reasoning_events] == [
+        "round-1 streamed reasoning",
+        "round-2 streamed reasoning",
+        "final streamed reasoning",
+    ]
+    assert all(isinstance(item.payload.get("stream_id"), str) for item in reasoning_events)
+    assert [item.payload["delta_index"] for item in reasoning_events] == [0, 0, 0]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -1457,35 +1461,15 @@ async def test_persisted_react_reasoning_replays_idempotently_after_interruption
 
 @pytest.mark.asyncio
 async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Path) -> None:
-    class RecordingRunbookProvider:
-        def __init__(self) -> None:
-            self.limits: list[int] = []
-
-        async def search(self, alert, limit=5):  # type: ignore[no-untyped-def]
-            self.limits.append(limit)
-            return []
-
-    class EmptyRunbookStore:
-        async def list(self):  # type: ignore[no-untyped-def]
-            return []
-
-        async def get(self, runbook_id):  # type: ignore[no-untyped-def]
-            raise AssertionError("not used")
-
-    provider = RecordingRunbookProvider()
     settings = settings_for(tmp_path)
-    runtime = build_runtime(
-        settings,
-        runbook_provider=provider,
-        runbook_store=EmptyRunbookStore(),
-    )
+    runtime = build_runtime(settings)
     await runtime.repository.initialize()
     old_agent = runtime.service.agent
 
     updated = settings.model_copy(
         update={
-            "runbook_limit": 9,
             "react_max_rounds": 3,
+            "stream_main_agent_reasoning": True,
         }
     )
     apply_runtime_settings(runtime, updated)
@@ -1501,9 +1485,11 @@ async def test_runtime_settings_rebuild_agent_used_by_next_analysis(tmp_path: Pa
 
     assert runtime.service.agent is not old_agent
     assert runtime.service.agent.ctx.advisor is runtime.service.advisor
-    assert runtime.service.agent.ctx.runbook_limit == 9
     assert runtime.service.react_max_rounds == 3
-    assert provider.limits == [9]
+    assert result.latest_run is not None
+    assert result.latest_run.config_snapshot is not None
+    assert result.latest_run.config_snapshot.react_max_rounds == 3
+    assert result.latest_run.config_snapshot.stream_main_agent_reasoning is True
     assert result.status == AlertStatus.INCONCLUSIVE
     await runtime.repository.close()  # type: ignore[attr-defined]
 
@@ -1556,7 +1542,12 @@ async def test_runtime_refresh_does_not_change_claimed_analysis_generation(
     await claim_started.wait()
     apply_runtime_settings(
         runtime,
-        settings.model_copy(update={"runbook_limit": settings.runbook_limit + 4}),
+        settings.model_copy(
+            update={
+                "react_max_rounds": settings.react_max_rounds + 4,
+                "stream_main_agent_reasoning": True,
+            }
+        ),
     )
     release_claim.set()
 
@@ -1568,6 +1559,7 @@ async def test_runtime_refresh_does_not_change_claimed_analysis_generation(
     assert runtime.service.tool_executor is not old_executor
     assert result.latest_run is not None
     assert result.latest_run.config_snapshot is not None
-    assert result.latest_run.config_snapshot.runbook_limit == settings.runbook_limit
+    assert result.latest_run.config_snapshot.react_max_rounds == settings.react_max_rounds
+    assert result.latest_run.config_snapshot.stream_main_agent_reasoning is False
     await runtime.service.close()
     await runtime.repository.close()  # type: ignore[attr-defined]

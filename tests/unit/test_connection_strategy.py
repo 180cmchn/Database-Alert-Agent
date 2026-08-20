@@ -31,13 +31,10 @@ class RecordingTool:
 
 
 def make_settings(tmp_path: Path, name: str) -> Settings:
-    runbooks = tmp_path / f"runbooks-{name}"
-    runbooks.mkdir()
     return Settings(
         _env_file=None,
         ai_provider="fake",
         database_url=f"sqlite+aiosqlite:///{tmp_path / f'{name}.db'}",
-        runbook_pdf_dir=runbooks,
         flashduty_metrics_ds_name="prod-prom",
     )
 

@@ -10,14 +10,13 @@ from app.domain.models import (
     AdvisorMetadata,
     AlertStatus,
     EvidenceRecord,
-    ExternalKnowledgeExcerpt,
     InvestigationDecision,
     InvestigationRun,
     InvestigationStage,
+    KnowledgeExcerpt,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
-    RunbookExcerpt,
     RunStatus,
     StoredAlert,
     ToolExecutionRequest,
@@ -33,11 +32,6 @@ def merge_evidence(left: list[EvidenceRecord], right: list[EvidenceRecord]) -> l
 def merge_progress(left: list[ProgressRecord], right: list[ProgressRecord]) -> list[ProgressRecord]:
     """Merge progress records, appending new records to existing."""
     return left + right
-
-
-def merge_runbooks(left: list[RunbookExcerpt], right: list[RunbookExcerpt]) -> list[RunbookExcerpt]:
-    """Merge runbook lists, replacing with new list if provided."""
-    return right if right else left
 
 
 class AgentState(BaseModel):
@@ -58,8 +52,7 @@ class AgentState(BaseModel):
     run: InvestigationRun | None = None
 
     # Investigation data
-    runbooks: Annotated[list[RunbookExcerpt], merge_runbooks] = Field(default_factory=list)
-    external_knowledge: list[ExternalKnowledgeExcerpt] = Field(default_factory=list)
+    knowledge: list[KnowledgeExcerpt] = Field(default_factory=list)
     knowledge_match_summary: str = ""
     evidence: Annotated[list[EvidenceRecord], merge_evidence] = Field(default_factory=list)
 
@@ -97,7 +90,7 @@ class AgentState(BaseModel):
     # Configuration
     ai_fallback_enabled: bool = True
     stream_main_agent_reasoning: bool = True
-    knowledge_sources: list[str] = Field(default_factory=lambda: ["local_pdf"])
+    knowledge_sources: list[str] = Field(default_factory=list)
 
 
 def create_initial_state(
@@ -139,7 +132,5 @@ def create_initial_state(
         react_max_rounds=react_max_rounds,
         ai_fallback_enabled=ai_fallback_enabled,
         stream_main_agent_reasoning=stream_main_agent_reasoning,
-        knowledge_sources=(
-            knowledge_sources if knowledge_sources is not None else ["local_pdf"]
-        ),
+        knowledge_sources=knowledge_sources or [],
     )
