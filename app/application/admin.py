@@ -17,6 +17,7 @@ from app.config import (
     RUNTIME_SETTINGS_KEYS,
     Settings,
     load_runtime_overrides,
+    resolve_runtime_settings,
 )
 
 try:  # Unix file locking.
@@ -100,14 +101,32 @@ class RuntimeSettingsConflictError(RuntimeError):
 class RuntimeSettingsManager:
     """Validate and atomically persist the administrative runtime whitelist."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        deployment_baseline: Settings | None = None,
+    ) -> None:
         self.path = path
+        self._deployment_baseline = (
+            deployment_baseline.model_copy(deep=True)
+            if deployment_baseline is not None
+            else None
+        )
         self._lock = asyncio.Lock()
         self._overrides = load_runtime_overrides(path)
 
     @property
     def revision(self) -> str:
         return _revision_for(self._overrides)
+
+    def effective_settings(self, fallback: Settings | None = None) -> Settings:
+        """Resolve the captured override snapshot against the deployment baseline."""
+
+        baseline = self._deployment_baseline or fallback
+        if baseline is None:
+            raise ValueError("A deployment settings baseline is required")
+        return resolve_runtime_settings(baseline, self._overrides)
 
     async def patch(
         self,
@@ -151,8 +170,9 @@ class RuntimeSettingsManager:
             revision = hashlib.sha256(encoded).hexdigest()[:16]
             if revision == _revision_for(self._overrides):
                 return current, False, revision
-            updated = Settings.model_validate(
-                {**current.model_dump(mode="python"), **overrides}
+            updated = resolve_runtime_settings(
+                self._deployment_baseline or current,
+                overrides,
             )
             self._validate_runnable(updated)
             self._overrides = overrides
@@ -197,12 +217,15 @@ class RuntimeSettingsManager:
                     current_revision=latest_revision,
                 )
 
-            effective_current = Settings.model_validate(
-                {**current.model_dump(mode="python"), **latest_overrides}
+            baseline = self._deployment_baseline or current
+            effective_current = resolve_runtime_settings(
+                baseline,
+                latest_overrides,
             )
             candidate_overrides = {**latest_overrides, **updates}
-            candidate = Settings.model_validate(
-                {**current.model_dump(mode="python"), **candidate_overrides}
+            candidate = resolve_runtime_settings(
+                baseline,
+                candidate_overrides,
             )
             self._validate_runnable(candidate)
             current_values = effective_current.model_dump(mode="json")

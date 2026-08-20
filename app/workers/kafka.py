@@ -12,7 +12,7 @@ from app.application.admin import RuntimeSettingsManager
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
 from app.application.sanitization import sanitize
 from app.application.service import AlertAnalysisService
-from app.config import Settings, get_settings
+from app.config import Settings, get_deployment_settings
 from app.domain.errors import (
     InvalidAlertPayloadError,
     InvestigationLeaseUnavailableError,
@@ -112,13 +112,29 @@ class KafkaAlertWorker:
         service: AlertAnalysisService,
         *,
         runtime: Runtime | None = None,
+        runtime_settings_manager: RuntimeSettingsManager | None = None,
     ) -> None:
-        self.settings = settings
-        self.service = service
         self.runtime = runtime
         self.runtime_settings = (
-            RuntimeSettingsManager(settings.runtime_settings_path) if runtime else None
+            runtime_settings_manager
+            or RuntimeSettingsManager(
+                (runtime.deployment_settings or settings).runtime_settings_path,
+                deployment_baseline=runtime.deployment_settings or settings,
+            )
+            if runtime
+            else None
         )
+        if runtime is not None and self.runtime_settings is not None:
+            effective_settings = self.runtime_settings.effective_settings()
+            if (
+                runtime.settings.model_dump(mode="python")
+                != effective_settings.model_dump(mode="python")
+            ):
+                apply_runtime_settings(runtime, effective_settings)
+            settings = effective_settings
+            service = runtime.service
+        self.settings = settings
+        self.service = service
         self.consumer = AIOKafkaConsumer(
             settings.kafka_alert_topic,
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -220,13 +236,23 @@ class KafkaAlertWorker:
 
 
 async def main() -> None:
-    settings = get_settings()
+    deployment_settings = get_deployment_settings()
+    runtime_settings = RuntimeSettingsManager(
+        deployment_settings.runtime_settings_path,
+        deployment_baseline=deployment_settings,
+    )
+    settings = runtime_settings.effective_settings()
     configure_logging(settings.log_level)
     if not settings.kafka_enabled:
         raise RuntimeError("KAFKA_ENABLED must be true to start the Kafka worker")
-    runtime = build_runtime(settings)
+    runtime = build_runtime(settings, deployment_settings=deployment_settings)
     await runtime.repository.initialize()
-    worker = KafkaAlertWorker(settings, runtime.service, runtime=runtime)
+    worker = KafkaAlertWorker(
+        settings,
+        runtime.service,
+        runtime=runtime,
+        runtime_settings_manager=runtime_settings,
+    )
     try:
         await worker.run()
     finally:

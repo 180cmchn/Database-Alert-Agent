@@ -517,6 +517,42 @@ async def test_stream_main_agent_reasoning_is_runtime_editable(
 
 
 @pytest.mark.asyncio
+async def test_runtime_reload_reverts_removed_override_to_deployment_baseline(
+    tmp_path: Path,
+) -> None:
+    baseline = runtime_test_settings(tmp_path).model_copy(
+        update={"stream_main_agent_reasoning": False, "scheduler_workers": 1}
+    )
+    baseline.runtime_settings_path.write_text(
+        json.dumps(
+            {
+                "stream_main_agent_reasoning": True,
+                "scheduler_workers": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = RuntimeSettingsManager(
+        baseline.runtime_settings_path,
+        deployment_baseline=baseline,
+    )
+    effective = manager.effective_settings()
+    assert effective.stream_main_agent_reasoning is True
+    assert effective.scheduler_workers == 3
+
+    baseline.runtime_settings_path.write_text("{}\n", encoding="utf-8")
+    reverted, changed, revision = await manager.reload_if_changed(effective)
+
+    assert changed is True
+    assert revision == RuntimeSettingsManager(
+        baseline.runtime_settings_path,
+        deployment_baseline=baseline,
+    ).revision
+    assert reverted.stream_main_agent_reasoning is False
+    assert reverted.scheduler_workers == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_patch_detects_stale_revision_and_merges_latest_disk_values(
     tmp_path: Path,
 ) -> None:

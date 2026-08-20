@@ -458,6 +458,49 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
         assert '"action": "reset"' in audit
 
 
+def test_restart_reset_uses_deployment_baseline_instead_of_persisted_override(
+    tmp_path: Path,
+) -> None:
+    baseline = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        http_scheduler="manual",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'restart.db'}",
+        admin_api_token=ADMIN_TOKEN,
+        runtime_settings_path=tmp_path / "runtime-settings.json",
+        stream_main_agent_reasoning=False,
+    )
+    baseline.runtime_settings_path.write_text(
+        json.dumps(
+            {
+                "stream_main_agent_reasoning": True,
+                "scheduler_workers": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = create_app(baseline, scheduler=ManualAnalysisScheduler())
+
+    with TestClient(app) as client:
+        current = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS)
+        assert current.status_code == 200
+        assert current.json()["stream_main_agent_reasoning"] is True
+        assert current.json()["scheduler_workers"] == 3
+
+        reset = client.delete(
+            "/api/v1/admin/settings/runtime-overrides",
+            headers=ADMIN_HEADERS,
+            params={"expected_revision": current.json()["revision"]},
+        )
+        assert reset.status_code == 200
+        assert reset.json()["stream_main_agent_reasoning"] is False
+        assert reset.json()["scheduler_workers"] == 1
+        assert app.state.runtime.settings.stream_main_agent_reasoning is False
+        assert app.state.runtime.service.stream_main_agent_reasoning is False
+
+    assert json.loads(baseline.runtime_settings_path.read_text(encoding="utf-8")) == {}
+
+
 def test_alert_list_filters_paginates_and_dashboard_summarizes(tmp_path: Path) -> None:
     client, runtime = create_admin_client(tmp_path)
     with client:

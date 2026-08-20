@@ -1,8 +1,11 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from app.application.admin import RuntimeSettingsManager
+from app.application.factory import build_runtime
 from app.config import Settings
 from app.domain.errors import InvestigationLeaseUnavailableError
 from app.domain.models import AlertStatus
@@ -210,3 +213,49 @@ async def test_kafka_worker_processes_configured_batch_concurrently() -> None:
     assert service.max_active == 2
     assert consumer.commits == 1
     assert consumer.max_records == [2, 2]
+
+
+@pytest.mark.asyncio
+async def test_kafka_worker_applies_startup_snapshot_and_reverts_deleted_override(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        runtime_settings_path=tmp_path / "runtime-settings.json",
+        stream_main_agent_reasoning=False,
+    )
+    baseline.runtime_settings_path.write_text(
+        json.dumps({"stream_main_agent_reasoning": True}),
+        encoding="utf-8",
+    )
+    runtime = build_runtime(baseline, deployment_settings=baseline)
+    manager = RuntimeSettingsManager(
+        baseline.runtime_settings_path,
+        deployment_baseline=baseline,
+    )
+    monkeypatch.setattr(
+        "app.workers.kafka.AIOKafkaConsumer",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "app.workers.kafka.AIOKafkaProducer",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+
+    worker = KafkaAlertWorker(
+        baseline,
+        runtime.service,
+        runtime=runtime,
+        runtime_settings_manager=manager,
+    )
+    assert worker.settings.stream_main_agent_reasoning is True
+    assert runtime.service.stream_main_agent_reasoning is True
+
+    baseline.runtime_settings_path.write_text("{}\n", encoding="utf-8")
+    await worker._refresh_runtime_settings()
+
+    assert worker.settings.stream_main_agent_reasoning is False
+    assert runtime.settings.stream_main_agent_reasoning is False
+    assert runtime.service.stream_main_agent_reasoning is False

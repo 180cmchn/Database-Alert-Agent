@@ -40,7 +40,7 @@ from app.application.scheduler import (
     ManualAnalysisScheduler,
     WeeklyAlertRetentionCleaner,
 )
-from app.config import Settings, get_settings
+from app.config import Settings, get_deployment_settings
 from app.domain.errors import (
     AlertNotFoundError,
     AnalysisFailedError,
@@ -64,13 +64,26 @@ def create_app(
     settings: Settings | None = None,
     runtime: Runtime | None = None,
     scheduler: AnalysisJobScheduler | None = None,
+    *,
+    deployment_settings: Settings | None = None,
 ) -> FastAPI:
-    settings = settings or get_settings()
-    runtime = runtime or build_runtime(settings)
-    runtime_settings = RuntimeSettingsManager(settings.runtime_settings_path)
-    # Snapshot the deployment (.env) baseline before any runtime overrides are
-    # applied so the reset endpoint can revert editable keys to it.
-    deployment_baseline = settings.model_copy(deep=True)
+    deployment_baseline = (
+        deployment_settings
+        or (runtime.deployment_settings if runtime is not None else None)
+        or settings
+        or get_deployment_settings()
+    ).model_copy(deep=True)
+    runtime_settings = RuntimeSettingsManager(
+        deployment_baseline.runtime_settings_path,
+        deployment_baseline=deployment_baseline,
+    )
+    settings = runtime_settings.effective_settings()
+    if runtime is None:
+        runtime = build_runtime(settings, deployment_settings=deployment_baseline)
+    else:
+        runtime.deployment_settings = deployment_baseline
+        if runtime.settings.model_dump(mode="python") != settings.model_dump(mode="python"):
+            apply_runtime_settings(runtime, settings)
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
         if settings.http_scheduler == "kafka":

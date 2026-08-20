@@ -567,6 +567,33 @@ def load_runtime_overrides(path: Path) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key in RUNTIME_SETTINGS_KEYS}
 
 
+def resolve_runtime_settings(
+    deployment_baseline: Settings,
+    overrides: dict[str, Any] | None = None,
+) -> Settings:
+    """Layer persisted runtime overrides on an immutable deployment baseline."""
+
+    effective_overrides = (
+        load_runtime_overrides(deployment_baseline.runtime_settings_path)
+        if overrides is None
+        else overrides
+    )
+    if not effective_overrides:
+        return deployment_baseline.model_copy(deep=True)
+    return Settings.model_validate(
+        {
+            **deployment_baseline.model_dump(mode="python"),
+            **effective_overrides,
+        }
+    )
+
+
+def get_deployment_settings() -> Settings:
+    """Load deployment configuration without consulting runtime overrides."""
+
+    return Settings()
+
+
 @lru_cache
 def get_settings() -> Settings:
     # Deployment configuration (.env) is the bootstrap baseline. Runtime
@@ -574,8 +601,5 @@ def get_settings() -> Settings:
     # deployment values for every key in RUNTIME_SETTINGS_KEYS, so changes made
     # through the admin settings page remain authoritative until they are
     # explicitly cleared from the runtime file.
-    bootstrap = Settings()
-    overrides = load_runtime_overrides(bootstrap.runtime_settings_path)
-    if not overrides:
-        return bootstrap
-    return Settings.model_validate({**bootstrap.model_dump(), **overrides})
+    bootstrap = get_deployment_settings()
+    return resolve_runtime_settings(bootstrap)

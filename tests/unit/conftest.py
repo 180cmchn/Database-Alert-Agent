@@ -4,7 +4,6 @@ import os
 
 import pytest
 
-
 # Some modules construct the ASGI app during test collection, before fixtures run.
 os.environ["STREAM_MAIN_AGENT_REASONING"] = "false"
 

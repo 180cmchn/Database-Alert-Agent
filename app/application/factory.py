@@ -72,6 +72,7 @@ class Runtime:
     repository: AlertRepository
     service: AlertAnalysisService
     flashduty_client: FlashDutyClient | None = None
+    deployment_settings: Settings | None = None
 
 
 def _flashduty_tool_timeout(settings: Settings) -> float:
@@ -173,7 +174,10 @@ def _build_knowledge_registry(settings: Settings) -> KnowledgeSourceRegistry:
                 min_relevance=settings.external_knowledge_min_relevance,
             )
         )
-    return KnowledgeSourceRegistry(sources)
+    return KnowledgeSourceRegistry(
+        sources,
+        source_timeout_seconds=settings.external_knowledge_timeout_seconds,
+    )
 
 
 def _build_archery_mcp_tool(
@@ -437,6 +441,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
 def build_runtime(
     settings: Settings,
     *,
+    deployment_settings: Settings | None = None,
     repository: AlertRepository | None = None,
     advisor: AIAdvisor | None = None,
     notifier: ManagementNotifier | None = None,
@@ -508,4 +513,5 @@ def build_runtime(
         repository=repository,
         service=service,
         flashduty_client=flashduty_client,
+        deployment_settings=(deployment_settings or settings).model_copy(deep=True),
     )
