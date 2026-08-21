@@ -190,6 +190,64 @@ async def test_archery_passes_final_result_json_through_without_modification() -
 
 
 @pytest.mark.asyncio
+async def test_archery_projects_slow_query_analysis_separately_without_provenance() -> None:
+    payload = _archery_final_result_payload(
+        [
+            _archery_keyed_row(
+                row_id=24311020,
+                checksum="sql-a",
+                sample="UPDATE orders SET status='done' WHERE id=1",
+                query_time_sum=9.5,
+            )
+        ]
+    )
+    artifact_uri = "agent-artifact://supplemental-internal"
+    analysis = {
+        "status": "partial",
+        "source_history_row": payload["rows"][0],
+        "target": {"instance_id": 3, "db_name": "orders_prod"},
+        "explain_results": [{"result": {"rows": [{"type": "range"}]}}],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": ["table_structure", "indexes"],
+        "failures": [
+            {
+                "stage": "indexes",
+                "reason_code": "permission_denied",
+                "detail": "denied",
+                "artifact_uri": artifact_uri,
+                "request_id": "internal-request",
+                "raw_response": "secret-response",
+            }
+        ],
+    }
+
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        request={},
+        raw_result={
+            "status": "SUCCESS",
+            "structured_data": {
+                "final_result_payload": payload,
+                "slow_query_analysis": analysis,
+            },
+        },
+        artifact=_artifact(),
+    )
+
+    assert result.passthrough_payload == payload
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["status"] == "partial"
+    serialized = json.dumps(result.slow_query_analysis, ensure_ascii=False)
+    assert "permission_denied" in serialized
+    assert "artifact_uri" not in serialized
+    assert "agent-artifact://" not in serialized
+    assert "request_id" not in serialized
+    assert "raw_response" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_archery_unparseable_final_result_passes_raw_text_verbatim() -> None:
     raw_text = (
         "SQL 查询已执行。\n执行的SQL：SELECT id FROM mysql_slow_query_review_history "

@@ -489,6 +489,20 @@ class _CancelledBootstrapScenario(_Scenario):
         raise asyncio.CancelledError
 
 
+class _LocalResultScenario(_Scenario):
+    def prepare_call(
+        self,
+        action: Any,
+        *,
+        state: _ScenarioState,
+    ) -> PreparedCall:
+        prepared = super().prepare_call(action, state=state)
+        return prepared.model_copy(
+            update={"local_result": {"rejected": True, "reason": "unsafe"}},
+            deep=True,
+        )
+
+
 def _tool(
     *,
     input_schema: dict[str, Any] | None = None,
@@ -540,6 +554,26 @@ def _budget(**overrides: int | float) -> BudgetLedger:
     }
     limits.update(overrides)
     return BudgetLedger(limits)
+
+
+@pytest.mark.asyncio
+async def test_local_prepared_result_never_crosses_transport_or_remote_budget() -> None:
+    session = _TrackingSession()
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("locally-rejected"), _finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=InMemoryEventSink(),
+        budget=_budget(),
+    ).run(run_id=uuid4())
+
+    assert session.call_calls == 0
+    assert result.budget.consumed.remote_tool_calls == 0
+    assert result.state.successful_queries == ["locally-rejected"]
+    assert result.observations[0].payload == {
+        "query": "locally-rejected",
+        "result": {"rejected": True, "reason": "unsafe"},
+    }
 
 
 @pytest.mark.asyncio

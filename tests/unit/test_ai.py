@@ -247,6 +247,27 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
                 "provider": "deterministic_host",
                 "model": "none",
                 "prompt_version": "program-fact-projection-v3",
+                "slow_query_analysis": {
+                    "status": "partial",
+                    "source_history_row": {
+                        "checksum": business_checksum,
+                        "sample": "UPDATE orders SET status='done' WHERE id=1",
+                    },
+                    "target": {"instance_id": 3, "db_name": "orders_prod"},
+                    "explain_results": [{"result": {"rows": [{"type": "range"}]}}],
+                    "table_structure_results": [],
+                    "index_results": [],
+                    "missing_stages": ["table_structure", "indexes"],
+                    "failures": [
+                        {
+                            "stage": "indexes",
+                            "reason_code": "permission_denied",
+                            "artifact_uri": artifact_uri,
+                            "request_id": "supplemental-internal-request",
+                            "raw_response": "supplemental-secret",
+                        }
+                    ],
+                },
                 "source_artifact_id": str(uuid4()),
                 "source_sha256": digest,
                 "request_id": "projection-request-id",
@@ -363,10 +384,16 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
             "provider",
             "model",
             "prompt_version",
+            "slow_query_analysis",
         }
         assert analysis["observations"][0]["source_paths"] == ["/structured_data/rows/0"]
         assert business_checksum in analysis["observations"][0]["statement"]
         assert analysis["limitations"][1].endswith("[total_chars:9000]")
+        assert analysis["slow_query_analysis"]["status"] == "partial"
+        assert analysis["slow_query_analysis"]["failures"][0] == {
+            "stage": "indexes",
+            "reason_code": "permission_denied",
+        }
 
         assert detail_payload["structured_data"] == {
             "partial": False,

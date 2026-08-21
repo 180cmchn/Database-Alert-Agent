@@ -142,6 +142,26 @@ def _call(call_id: str, sql: str) -> MCPModelToolCall:
     )
 
 
+def _target_call(
+    call_id: str,
+    sql: str,
+    *,
+    instance_id: int,
+    db_name: str,
+) -> MCPModelToolCall:
+    return MCPModelToolCall(
+        call_id=call_id,
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={
+            "instance_id": instance_id,
+            "db_name": db_name,
+            "limit_num": 20,
+            "sql_content": sql,
+        },
+        request_id=f"request-{call_id}",
+    )
+
+
 def _finish(
     call_id: str = "finish",
     *,
@@ -1334,6 +1354,449 @@ async def test_truncated_id_retrieval_retry_then_projection_hint_recovers_row() 
     assert payload_rows[0]["sample"] == _PROJECTION_SAMPLE_PREFIX
     assert payload_rows[0]["sample_full_length"] == 321237
     assert result.payload["merged_query_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_history_followup_collects_dml_explain_structure_and_indexes() -> None:
+    sample = "UPDATE orders SET status = 'done' WHERE id = 1"
+    history_rows = [
+        {
+            "id": 101,
+            "checksum": "update-orders",
+            "sample": sample,
+            "Query_time_max": 12.5,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    explain_sql = f"EXPLAIN {sample}"
+    columns_sql = (
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    indexes_sql = (
+        "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    analysis_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "limit_num": 20,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("indexes", indexes_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-history-analysis",
+                tools=_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": explain_sql,
+                                "rows": [{"table": "orders", "type": "range", "key": "PRIMARY"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": columns_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": columns_sql,
+                                "rows": [
+                                    {"COLUMN_NAME": "id", "COLUMN_TYPE": "bigint"},
+                                    {"COLUMN_NAME": "status", "COLUMN_TYPE": "varchar(20)"},
+                                ],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": indexes_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": indexes_sql,
+                                "rows": [{"INDEX_NAME": "PRIMARY", "COLUMN_NAME": "id"}],
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    analysis = result.slow_query_analysis
+    assert analysis["status"] == "succeeded"
+    assert analysis["source_history_row"]["id"] == 101
+    assert analysis["source_history_row"]["sample"] == sample
+    assert analysis["target"]["instance_id"] == 3
+    assert analysis["target"]["db_name"] == "orders_prod"
+    assert analysis["explain_results"][0]["statement_type"] == "update"
+    assert analysis["explain_results"][0]["result"]["rows"][0]["key"] == "PRIMARY"
+    assert analysis["table_structure_results"][0]["result"]["row_count"] == 2
+    assert analysis["index_results"][0]["result"]["row_count"] == 1
+    assert analysis["missing_stages"] == []
+    assert analysis["failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_explain_analyze_is_rejected_before_mcp_and_history_is_preserved() -> None:
+    sample = "DELETE FROM orders WHERE id = 1"
+    history_rows = [
+        {
+            "id": 102,
+            "checksum": "delete-orders",
+            "sample": sample,
+            "Query_time_max": 9.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    unsafe_sql = f"EXPLAIN ANALYZE {sample}"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("unsafe", unsafe_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-explain-analyze",
+                tools=_tools(),
+                # There is deliberately no fixture for the rejected call.
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    analysis = result.slow_query_analysis
+    assert analysis["status"] == "failed"
+    assert analysis["failures"][0]["reason_code"] == "explain_analyze_forbidden"
+    assert result.model_tool_calls == (
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_dml_sample_is_rejected_before_mcp_and_history_is_preserved() -> None:
+    sample = "INSERT INTO order_archive SELECT * FROM orders WHERE id = 1"
+    history_rows = [
+        {
+            "id": 103,
+            "checksum": "insert-archive",
+            "sample": sample,
+            "Query_time_max": 8.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("unsafe-dml", sample, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-direct-dml",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["status"] == "failed"
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "sample_execution_forbidden"
+    )
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+
+
+@pytest.mark.asyncio
+async def test_dml_plain_explain_target_syntax_failure_does_not_replace_history() -> None:
+    sample = "DELETE FROM orders WHERE id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    history_rows = [
+        {
+            "id": 104,
+            "checksum": "delete-orders-unsupported",
+            "sample": sample,
+            "Query_time_max": 7.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-explain-not-supported",
+                tools=_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={
+                            "instance_id": 3,
+                            "db_name": "orders_prod",
+                            "limit_num": 20,
+                            "sql_content": explain_sql,
+                        },
+                        result={
+                            "structuredContent": {
+                                "status": "failed",
+                                "message": (
+                                    "You have an error in your SQL syntax; target does not support "
+                                    "EXPLAIN DELETE"
+                                ),
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["status"] == "failed"
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "explain_not_supported_by_target"
+    )
+
+
+def test_archery_restore_state_backfills_slow_query_fields_from_old_checkpoint() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    new_fields = (
+        "slow_query_explain_results",
+        "slow_query_table_structure_results",
+        "slow_query_index_results",
+        "slow_query_analysis_failures",
+    )
+    for field_name in new_fields:
+        delattr(state, field_name)
+
+    scenario.restore_state(state)
+
+    assert all(getattr(state, field_name) == [] for field_name in new_fields)
+
+
+@pytest.mark.asyncio
+async def test_history_without_explainable_sample_marks_analysis_not_applicable() -> None:
+    history_rows = [
+        {
+            "id": 105,
+            "checksum": "ddl-only",
+            "sample": "ALTER TABLE orders ADD COLUMN unsafe int",
+            "Query_time_max": 20.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-no-explainable-sample",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["status"] == "not_applicable"
+    assert result.slow_query_analysis["source_history_row"] is None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "no_explainable_sample"
+    )
+
+
+@pytest.mark.asyncio
+async def test_followup_allowlist_failure_preserves_history_and_remaining_facts() -> None:
+    sample = "SELECT * FROM orders WHERE customer_id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    columns_sql = (
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    indexes_sql = (
+        "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    history_rows = [
+        {
+            "id": 106,
+            "checksum": "orders-customer",
+            "sample": sample,
+            "Query_time_max": 11.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("indexes", indexes_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    analysis_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "limit_num": 20,
+    }
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-followup-allowlist-failure",
+                tools=_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "failed",
+                                "message": "实例不在白名单中，已拒绝执行（allowlist）",
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": columns_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": columns_sql,
+                                "rows": [{"COLUMN_NAME": "customer_id", "COLUMN_TYPE": "bigint"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": indexes_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": indexes_sql,
+                                "rows": [
+                                    {"INDEX_NAME": "idx_customer", "COLUMN_NAME": "customer_id"}
+                                ],
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 6
+    assert result.slow_query_analysis is not None
+    analysis = result.slow_query_analysis
+    assert analysis["status"] == "partial"
+    assert analysis["explain_results"] == []
+    assert analysis["table_structure_results"][0]["result"]["row_count"] == 1
+    assert analysis["index_results"][0]["result"]["rows"][0]["INDEX_NAME"] == (
+        "idx_customer"
+    )
+    assert analysis["failures"][0]["reason_code"] == "instance_not_allowlisted"
 
 
 @pytest.mark.asyncio

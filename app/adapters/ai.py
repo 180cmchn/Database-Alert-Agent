@@ -44,7 +44,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v21"
+PROMPT_VERSION = "database-alert-advisor-v22"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -315,6 +315,7 @@ _MODEL_TOOL_ANALYSIS_FIELDS = (
     "model",
     "prompt_version",
     "passthrough_payload",
+    "slow_query_analysis",
 )
 _MODEL_OBSERVATION_FIELDS = ("statement", "source_paths", "source_spans")
 _MODEL_SOURCE_SPAN_FIELDS = (
@@ -669,7 +670,10 @@ source、knowledge_id、title 和 source_uri；知识来源本身不能证明本
 MCP 原始响应只保存在内部审计 artifact，不会发送给你。tool_evidence 中的 Archery MCP 内容是最终
 查询结果（含内容过长被 MCP 截断后按 id 分次查询再合并的结果）：程序只把 result 文本内嵌 JSON 按
 column_list 更改格式为 JSON，不删改内容、不过滤、不聚合、不排序、不设大小限制，也不判断因果；
-其余 MCP 内容是程序按 provider 规则过滤、聚合和排序后形成的有界可追溯事实投影。程序输出只陈述
+Archery 的 slow_query_analysis 是程序从普通 EXPLAIN、表结构和索引结果构造的确定性补充事实，
+与完整 history 透传相互独立。补充分析失败只表示对应阶段证据缺失，不得因此丢弃、降级或忽略已经
+成功取得的 history，也不得改变 history 的可用性。程序不会根据执行计划决定根因；其余 MCP 内容是
+程序按 provider 规则过滤、聚合和排序后形成的有界可追溯事实投影。程序输出只陈述
 事实、异常、限制和来源路径，不提出、选择或判断根因，也不判断事实对候选根因是支持还是反驳。
 只有你这个主 Agent 能结合告警详情、知识来源和不同 MCP 证据判断根因。只有 status=SUCCESS、
 source_system 不是 alert_platform、结果可用且来源可追溯，并由你结合全部证据确认能建立因果机制的
@@ -713,8 +717,9 @@ capability、workflow 和 safety 自主判断是否相关；不是每一个告�
 action=finish 表示现有证据已足够进入最终根因汇总，或继续调用任何工具都没有分析价值。达到
 react_max_rounds 后 Host 也会正常结束调查。FlashDuty 告警详情已经先于本流程获取，alert.database
 中的 host/port 来自详情的 alarm_host/alarm_port，不得从标题推断。完整 MCP 原始响应只存内部审计
-artifact；evidence 中 Archery 最终查询结果是程序仅按 column_list 更改格式为 JSON、未删改的完整
-结果，其余 MCP 内容是程序确定性过滤、聚合和排序后的有界 observation；程序不判断因果。只有最终
+artifact；evidence 中 Archery 最终 history 查询结果是程序仅按 column_list 更改格式为 JSON、未删改
+的完整结果，slow_query_analysis 是独立的普通 EXPLAIN、表结构和索引确定性补充事实，其失败不影响
+history；其余 MCP 内容是程序确定性过滤、聚合和排序后的有界 observation；程序不判断因果。只有最终
 汇总阶段能结合不同证据判断根因，本轮不得替最终汇总输出根因。
 
 所有工具调用都必须保持只读。这是 Agent 行为要求；MCP Key 的权限由服务端配置，Host 不执行

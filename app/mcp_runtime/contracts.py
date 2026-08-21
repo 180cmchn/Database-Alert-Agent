@@ -35,7 +35,7 @@ class DiscoveredMCPTool(MCPRuntimeContract):
 
 
 class PreparedCall(MCPRuntimeContract):
-    """Arguments prepared for transport without Host-side policy enforcement."""
+    """Arguments prepared for transport or a deterministic local response."""
 
     tool_name: str = Field(min_length=1, max_length=256)
     objective: str = Field(min_length=1, max_length=4000)
@@ -44,6 +44,9 @@ class PreparedCall(MCPRuntimeContract):
     effective_arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # A provider scenario may reject a call locally when executing it would
+    # violate an explicit safety contract. The default remains transport-only.
+    local_result: Any | None = None
 
 
 class Finish(MCPRuntimeContract):

@@ -126,6 +126,9 @@ class ToolResultAnalysis(BaseModel):
     # text JSON into a JSON object and never judges causality.
     passthrough_payload: dict[str, Any] | None = Field(default=None)
     passthrough_parse_failed: bool = False
+    # Archery's deterministic EXPLAIN/schema/index facts are supplemental and
+    # never modify the unchanged final history passthrough above.
+    slow_query_analysis: dict[str, Any] | None = Field(default=None)
 
     @model_validator(mode="after")
     def validate_usability(self) -> ToolResultAnalysis:

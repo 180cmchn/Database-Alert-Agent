@@ -822,7 +822,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             await self._persist_invocation(ctx, invocation)
 
         ctx.active_call = prepared.model_copy(deep=True)
-        if invocation.invocation_id not in ctx.remote_debited_invocations:
+        if (
+            prepared.local_result is None
+            and invocation.invocation_id not in ctx.remote_debited_invocations
+        ):
             await self._debit(
                 ctx,
                 invocation_id=invocation.invocation_id,
@@ -839,6 +842,15 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         ctx.pending_retry = None
         ctx.retry_not_before = None
         await self._checkpoint(ctx)
+
+        if prepared.local_result is not None:
+            return await self._complete_response(
+                ctx,
+                prepared=prepared,
+                started=started,
+                fingerprint=fingerprint,
+                raw_result=deepcopy(prepared.local_result),
+            )
 
         try:
             assert ctx.session is not None
@@ -1069,6 +1081,18 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if invocation.status != ToolInvocationStatus.STARTED:
                 continue
             prepared = self._active_or_reconstructed_call(ctx, invocation)
+            if prepared.local_result is not None:
+                finish, _retry = await self._complete_response(
+                    ctx,
+                    prepared=prepared,
+                    started=invocation,
+                    fingerprint=invocation.fingerprint,
+                    raw_result=deepcopy(prepared.local_result),
+                )
+                if finish is not None:
+                    ctx.finish = finish
+                observed_invocations.add(invocation.invocation_id)
+                continue
             recovered_response = await self._load_remote_response(
                 ctx,
                 invocation=invocation,

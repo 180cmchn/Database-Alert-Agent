@@ -52,8 +52,8 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v26"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v1"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v27"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v2"
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
     "hostname_max",
@@ -203,6 +203,7 @@ class ArcherySlowLogQueryResult:
     metadata_resolution_tables: tuple[str, ...] = ()
     diagnostics: dict[str, Any] | None = None
     query_completed: bool = True
+    slow_query_analysis: dict[str, Any] | None = None
 
 
 def load_mcp_server_settings(
@@ -525,6 +526,316 @@ class ArcheryMCPClient:
             re.search(rf"(?is){boundary}{identifier}\s*=\s*\d", uncommented)
             or re.search(rf"(?is){boundary}{identifier}\s+in\s*\(", uncommented)
         )
+
+    @classmethod
+    def classify_explainable_statement(cls, sql: str) -> str | None:
+        """Return the top-level statement type accepted by a plain EXPLAIN.
+
+        This classifier deliberately differs from a read-only classifier. MySQL
+        and compatible engines can explain INSERT, UPDATE, DELETE, and REPLACE
+        without executing them. The Host still rejects the sample itself and
+        always rejects EXPLAIN ANALYZE, which does execute its inner statement.
+        """
+
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return None
+        first = re.match(r"(?is)^\s*([a-z]+)\b", statement)
+        if first is None:
+            return None
+        keyword = first.group(1).casefold()
+        if keyword in {"select", "insert", "update", "delete", "replace"}:
+            return keyword
+        if keyword != "with":
+            return None
+        return cls._with_terminal_statement_type(statement)
+
+    @classmethod
+    def classify_plain_explain(cls, sql: str) -> str | None:
+        """Return a safe, single inner statement from plain EXPLAIN SQL."""
+
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return None
+        match = re.match(r"(?is)^\s*explain\b(?P<tail>.*)$", statement)
+        if match is None:
+            return None
+        tail = match.group("tail").lstrip()
+        # MySQL EXPLAIN options may precede the statement. Skip only known,
+        # non-executing options and never accept an unknown prefix.
+        while True:
+            if re.match(r"(?is)^analyze\b", tail):
+                return None
+            option = re.match(
+                r"(?is)^(?:format\s*=\s*(?:traditional|json|tree)|partitions|extended)\b\s*",
+                tail,
+            )
+            if option is None:
+                break
+            tail = tail[option.end() :].lstrip()
+        return tail if cls.classify_explainable_statement(tail) is not None else None
+
+    @classmethod
+    def is_single_statement(cls, sql: str) -> bool:
+        """Return whether SQL contains exactly one complete statement."""
+
+        return cls._single_sql_statement(sql) is not None
+
+    # Backward-compatible descriptive aliases retained for callers that used
+    # the first implementation names.
+    explainable_statement_type = classify_explainable_statement
+    plain_explain_inner_sql = classify_plain_explain
+
+    @classmethod
+    def is_explain_analyze_query(cls, sql: str) -> bool:
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return False
+        match = re.match(r"(?is)^\s*explain\b(?P<tail>.*)$", statement)
+        if match is None:
+            return False
+        tail = match.group("tail").lstrip()
+        while True:
+            if re.match(r"(?is)^analyze\b", tail):
+                return True
+            option = re.match(
+                r"(?is)^(?:format\s*=\s*(?:traditional|json|tree)|partitions|extended)\b\s*",
+                tail,
+            )
+            if option is None:
+                return False
+            tail = tail[option.end() :].lstrip()
+
+    @classmethod
+    def is_information_schema_columns_query(cls, sql: str) -> bool:
+        return cls._is_information_schema_query(sql, "columns")
+
+    @classmethod
+    def is_information_schema_statistics_query(cls, sql: str) -> bool:
+        return cls._is_information_schema_query(sql, "statistics")
+
+    @classmethod
+    def select_explainable_history_rows(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Select one explainable row per checksum in deterministic priority order."""
+
+        candidates: list[dict[str, Any]] = []
+        for source_index, row in enumerate(cls._tabular_rows(payload)):
+            sample = cls._casefolded_value(row, "sample")
+            if not isinstance(sample, str) or cls.classify_explainable_statement(sample) is None:
+                continue
+            candidate = dict(row)
+            candidate["__source_index"] = source_index
+            candidates.append(candidate)
+
+        def numeric(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float("-inf")
+
+        candidates.sort(
+            key=lambda row: (
+                numeric(cls._casefolded_value(row, "query_time_max")),
+                numeric(cls._casefolded_value(row, "id")),
+                -int(row["__source_index"]),
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        checksums: set[str] = set()
+        for candidate in candidates:
+            checksum_value = cls._casefolded_value(candidate, "checksum")
+            checksum = str(checksum_value).strip().casefold() if checksum_value is not None else ""
+            dedupe_key = checksum or cls._canonical_sql(
+                str(cls._casefolded_value(candidate, "sample"))
+            )
+            if dedupe_key in checksums:
+                continue
+            checksums.add(dedupe_key)
+            candidate.pop("__source_index", None)
+            selected.append(candidate)
+        return selected
+
+    @classmethod
+    def history_row_for_explain(
+        cls,
+        explain_sql: str,
+        history_payload: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        inner_sql = cls.classify_plain_explain(explain_sql)
+        if inner_sql is None:
+            return None
+        canonical_inner = cls._canonical_sql(inner_sql)
+        return next(
+            (
+                row
+                for row in cls.select_explainable_history_rows(history_payload)
+                if cls._canonical_sql(str(cls._casefolded_value(row, "sample") or ""))
+                == canonical_inner
+            ),
+            None,
+        )
+
+    @classmethod
+    def slow_query_source_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        """Project only stable history identity and prioritization fields."""
+
+        projected: dict[str, Any] = {}
+        for field in ("id", "checksum", "sample", "Query_time_max", "hostname_max", "db_max"):
+            value = cls._casefolded_value(row, field.casefold())
+            if value is not None:
+                projected[field] = sanitize(value)
+        return projected
+
+    @classmethod
+    def structured_sql_result(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Project one SQL result without remote envelope or audit provenance."""
+
+        rows = cls._tabular_rows(payload)
+        columns = next(
+            (
+                [str(item) for item in value]
+                for container in cls._metadata_containers(payload)
+                for key in ("column_list", "columns")
+                if isinstance((value := container.get(key)), list)
+            ),
+            [],
+        )
+        return sanitize(
+            {
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+            }
+        )
+
+    @staticmethod
+    def information_schema_target(sql: str) -> dict[str, str]:
+        """Extract literal schema/table filters used by metadata projections."""
+
+        target: dict[str, str] = {}
+        for field, output in (("table_schema", "db_name"), ("table_name", "table_name")):
+            match = re.search(
+                rf"(?is)\b`?{field}`?\s*=\s*'(?P<value>(?:''|[^'])*)'",
+                sql,
+            )
+            if match is not None:
+                target[output] = match.group("value").replace("''", "'")
+        return target
+
+    @classmethod
+    def explainable_table_references(cls, sql: str) -> set[str]:
+        """Return traceable table references, including DML target tables."""
+
+        references = set(cls.sql_table_references(sql))
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return references
+        target = re.match(
+            r"(?is)^\s*(?:update\s+|(?:insert|replace)\s+(?:ignore\s+)?into\s+)"
+            r"(?P<table>(?:`[^`]+`|[a-zA-Z_][\w$]*)(?:\s*\.\s*"
+            r"(?:`[^`]+`|[a-zA-Z_][\w$]*))?)",
+            statement,
+        )
+        if target is not None:
+            references.add(cls.clean_table_name(target.group("table")))
+        return references
+
+    @staticmethod
+    def _casefolded_value(row: Mapping[str, Any], field: str) -> Any:
+        expected = field.casefold()
+        return next((value for key, value in row.items() if str(key).casefold() == expected), None)
+
+    @classmethod
+    def _is_information_schema_query(cls, sql: str, table: str) -> bool:
+        statement = cls._single_sql_statement(sql)
+        if statement is None or re.match(r"(?is)^\s*(?:select|with)\b", statement) is None:
+            return False
+        return bool(
+            re.search(
+                rf"(?is)\binformation_schema\s*\.\s*`?{re.escape(table)}`?\b",
+                statement,
+            )
+        )
+
+    @classmethod
+    def _single_sql_statement(cls, sql: str) -> str | None:
+        uncommented = cls._sql_without_comments(sql)
+        if uncommented is None:
+            return None
+        candidate = uncommented.strip()
+        while candidate.endswith(";"):
+            candidate = candidate[:-1].rstrip()
+        if not candidate or cls._contains_unquoted_semicolon(candidate):
+            return None
+        return candidate
+
+    @staticmethod
+    def _contains_unquoted_semicolon(sql: str) -> bool:
+        quote: str | None = None
+        index = 0
+        while index < len(sql):
+            character = sql[index]
+            if quote is None:
+                if character in {"'", '"', "`"}:
+                    quote = character
+                elif character == ";":
+                    return True
+                index += 1
+                continue
+            if character == "\\" and quote != "`":
+                index += 2
+                continue
+            if character == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+        return quote is not None
+
+    @staticmethod
+    def _with_terminal_statement_type(sql: str) -> str | None:
+        """Find the first top-level DML keyword after one or more CTE bodies."""
+
+        depth = 0
+        quote: str | None = None
+        index = 0
+        while index < len(sql):
+            character = sql[index]
+            if quote is not None:
+                if character == "\\" and quote != "`":
+                    index += 2
+                    continue
+                if character == quote:
+                    if index + 1 < len(sql) and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+                index += 1
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth = max(depth - 1, 0)
+            elif depth == 0 and (character.isalpha() or character == "_"):
+                end = index + 1
+                while end < len(sql) and (sql[end].isalnum() or sql[end] in {"_", "$"}):
+                    end += 1
+                keyword = sql[index:end].casefold()
+                if keyword in {"select", "insert", "update", "delete", "replace"}:
+                    return keyword
+                index = end
+                continue
+            index += 1
+        return None
 
     @classmethod
     def truncation_row_shortfall(
@@ -2030,6 +2341,8 @@ class ArcherySlowLogEvidenceTool:
         }
         if final_result_payload is not None:
             structured_data["final_result_payload"] = final_result_payload
+        if result.slow_query_analysis is not None:
+            structured_data["slow_query_analysis"] = result.slow_query_analysis
         if final_result_text is not None:
             structured_data["final_result_parse_failed"] = True
             structured_data["final_result_text"] = final_result_text

@@ -14,7 +14,7 @@ from app.application.sanitization import sanitize
 from app.domain.errors import AdvisorError
 from app.domain.models import ToolResultAnalysis, ToolResultObservation
 
-TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v4"
+TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v5"
 _MAX_SNIPPET_CHARS = 800
 _MAX_SELECTED_ITEMS = 20
 _PROMETHEUS_WINDOW_SECONDS = 300
@@ -73,11 +73,13 @@ _INTERNAL_PROVENANCE_KEYS = frozenset(
         "artifact_uri",
         "digest",
         "hash",
+        "request_id",
         "sha256",
         "source_artifact",
         "source_artifact_id",
         "source_sha256",
         "uri",
+        "usage",
     }
 )
 
@@ -130,6 +132,7 @@ def _analysis(
     analysis_usable: bool | None = None,
     passthrough_payload: dict[str, Any] | None = None,
     passthrough_parse_failed: bool = False,
+    slow_query_analysis: dict[str, Any] | None = None,
 ) -> ToolResultAnalysis:
     if artifact.sha256 is None:
         raise AdvisorError("tool-result artifact must have a SHA-256 before processing")
@@ -149,6 +152,7 @@ def _analysis(
         usage={},
         passthrough_payload=passthrough_payload,
         passthrough_parse_failed=passthrough_parse_failed,
+        slow_query_analysis=slow_query_analysis,
     )
 
 
@@ -199,6 +203,12 @@ class DeterministicToolResultProcessor:
 
         data = self._structured_data(raw_result)
         base = "/structured_data"
+        raw_slow_query_analysis = data.get("slow_query_analysis")
+        slow_query_analysis = (
+            _model_visible_projection(raw_slow_query_analysis)
+            if isinstance(raw_slow_query_analysis, Mapping)
+            else None
+        )
 
         if data.get("final_result_parse_failed") is True:
             raw_text = data.get("final_result_text")
@@ -227,6 +237,7 @@ class DeterministicToolResultProcessor:
                 analysis_usable=False,
                 passthrough_payload=({"final_result_text": text} if text else None),
                 passthrough_parse_failed=True,
+                slow_query_analysis=slow_query_analysis,
             )
 
         payload = data.get("final_result_payload")
@@ -262,6 +273,7 @@ class DeterministicToolResultProcessor:
                 limitations=limitations,
                 analysis_usable=isinstance(rows, list) and bool(rows),
                 passthrough_payload=dict(payload),
+                slow_query_analysis=slow_query_analysis,
             )
 
         return _analysis(
@@ -270,6 +282,7 @@ class DeterministicToolResultProcessor:
             observations=[],
             limitations=["Archery 本次调查没有产生最终查询结果，没有可透传的内容。"],
             analysis_usable=False,
+            slow_query_analysis=slow_query_analysis,
         )
 
     def _process_prometheus(

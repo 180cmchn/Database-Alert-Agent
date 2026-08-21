@@ -98,10 +98,14 @@ Do not add a provider selection branch to this skill or application code.
 
 ## 5. Apply provider workflows faithfully
 
-Archery provides slow-query logs. Use the FlashDuty detail endpoint and five-minute window, follow
-the configured metadata chain, and query `mysql_slow_query_review_history`. Authentication,
-`t_instance_member`, `sql_instance`, schema, and index responses are auxiliary audit material. Only
-the final history query has slow-query semantics useful to the main Agent.
+Archery provides slow-query evidence. Use the FlashDuty detail endpoint and five-minute window,
+follow the configured metadata chain, and query `mysql_slow_query_review_history`. The complete
+history result is the independent base evidence. After history succeeds, continue with safe
+supplemental collection: resolve `hostname_max` to a real allowlisted business instance, use
+`db_max`, and attempt plain EXPLAIN, table structure, and index queries. A plain EXPLAIN may wrap a
+supported DML sample, but never execute the sample itself and never use EXPLAIN ANALYZE. Follow-up
+successes are supplemental live facts; follow-up failures are structured evidence gaps and never
+invalidate or replace history.
 
 Prometheus provides database monitoring metrics. First discover which database targets and metrics
 are actually configured. If the alert database is covered, query relevant metrics for the exact
@@ -122,9 +126,12 @@ For Archery, the program passes the final `mysql_slow_query_review_history` quer
 merged result when content-length truncation forced per-id follow-up queries) through to the main
 Agent with a format conversion only: the JSON embedded in the `result` text becomes a JSON object
 and positional rows are labeled with `column_list`. It performs no filtering, aggregation,
-sorting, truncation, or size capping, and it never judges causality. When the embedded JSON
-cannot be parsed, the original text is passed through as-is and the record is marked
-`processing_status=unavailable`. Login and lookup responses stay internal.
+sorting, truncation, or size capping, and it never judges causality. Plain EXPLAIN, table-structure,
+and index results are exposed separately as deterministic `slow_query_analysis` facts; their
+failures expose only the missing stage and real error. They do not modify the history passthrough,
+its usability, or root-cause eligibility. When the history JSON cannot be parsed, the original text
+is passed through as-is and the record is marked `processing_status=unavailable`. Authentication
+and unrelated navigation responses stay internal.
 
 For every other provider, program-side processing may deterministically filter, aggregate, sort,
 calculate statistics, and select traceable snippets. Every projected fact or anomaly must

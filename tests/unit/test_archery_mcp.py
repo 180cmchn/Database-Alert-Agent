@@ -2393,3 +2393,107 @@ async def test_slow_log_evidence_keeps_raw_text_when_json_unparseable() -> None:
     assert structured["final_result_parse_failed"] is True
     assert structured["final_result_text"] == raw_text
     assert "final_result_payload" not in structured
+
+
+@pytest.mark.parametrize(
+    ("sample", "statement_type"),
+    [
+        ("SELECT * FROM orders WHERE id = 1", "select"),
+        ("UPDATE orders SET status = 'done' WHERE id = 1", "update"),
+        ("DELETE FROM orders WHERE id = 1", "delete"),
+        ("INSERT INTO archive SELECT * FROM orders WHERE id = 1", "insert"),
+        ("REPLACE INTO cache_rows(id) VALUES (1)", "replace"),
+        ("WITH selected AS (SELECT 1 AS id) UPDATE orders SET status='done'", "update"),
+    ],
+)
+def test_archery_mcp_accepts_supported_dml_as_plain_explain_inner_statement(
+    sample: str,
+    statement_type: str,
+) -> None:
+    assert ArcheryMCPClient.explainable_statement_type(sample) == statement_type
+    assert ArcheryMCPClient.plain_explain_inner_sql(f"EXPLAIN {sample}") == sample
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "EXPLAIN ANALYZE SELECT * FROM orders",
+        "EXPLAIN FORMAT=TREE ANALYZE SELECT * FROM orders",
+        "EXPLAIN UPDATE orders SET status='done'; DELETE FROM orders",
+        "EXPLAIN ALTER TABLE orders ADD COLUMN unsafe int",
+        "EXPLAIN CALL refresh_orders()",
+    ],
+)
+def test_archery_mcp_rejects_executing_or_non_explainable_explain_variants(sql: str) -> None:
+    assert ArcheryMCPClient.plain_explain_inner_sql(sql) is None
+
+
+def test_archery_mcp_selects_explainable_rows_by_query_time_id_and_checksum() -> None:
+    payload = {
+        "rows": [
+            {
+                "id": 7,
+                "checksum": "same",
+                "sample": "SELECT * FROM older",
+                "Query_time_max": 10,
+            },
+            {
+                "id": 9,
+                "checksum": "same",
+                "sample": "UPDATE newest SET value = 1",
+                "Query_time_max": 10,
+            },
+            {
+                "id": 10,
+                "checksum": "ddl",
+                "sample": "ALTER TABLE unsafe ADD COLUMN value int",
+                "Query_time_max": 99,
+            },
+            {
+                "id": 8,
+                "checksum": "second",
+                "sample": "DELETE FROM second WHERE id = 1",
+                "Query_time_max": 8,
+            },
+        ]
+    }
+
+    selected = ArcheryMCPClient.select_explainable_history_rows(payload)
+
+    assert [row["id"] for row in selected] == [9, 8]
+    assert selected[0]["sample"].startswith("UPDATE")
+
+
+def test_slow_log_evidence_keeps_history_and_adds_independent_analysis() -> None:
+    payload = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 1, "sample": "UPDATE orders SET value=1"}],
+    }
+    analysis = {
+        "status": "partial",
+        "source_history_row": {"id": 1, "sample": "UPDATE orders SET value=1"},
+        "target": {"instance_id": 3, "db_name": "orders_prod"},
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": ["explain", "table_structure", "indexes"],
+        "failures": [{"stage": "explain", "reason_code": "permission_denied"}],
+    }
+    client = RecordingArcheryClient(payload=payload)
+    tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
+    result = ArcherySlowLogQueryResult(
+        payload=payload,
+        requested_sql=payload["full_sql"],
+        window_start=TEST_WINDOW_START,
+        window_end=TEST_WINDOW_END,
+        slow_query_analysis=analysis,
+    )
+
+    structured = tool._build_slow_query_evidence(
+        result,
+        session_attempts=1,
+        root_cause_ineligible_reason="",
+    )
+
+    assert structured["final_result_payload"] == payload
+    assert structured["slow_query_analysis"] == analysis
