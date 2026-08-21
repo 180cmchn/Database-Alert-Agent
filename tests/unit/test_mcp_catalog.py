@@ -82,6 +82,60 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     )
     assert "occurred_at - 5 分钟" in prometheus.prompts.workflow
     assert "database_not_monitored" in prometheus.prompts.workflow
+    assert all(
+        tool_suffix in prometheus.prompts.workflow
+        for tool_suffix in (
+            "*_execute_query",
+            "*_execute_range_query",
+            "*_list_metrics",
+            "*_get_targets",
+        )
+    )
+    assert all(
+        routing_rule in prometheus.prompts.workflow
+        for routing_rule in (
+            "MySQL 优先 `mysql_*`",
+            "MongoDB/Mongo 优先 `mongo_*`",
+            "OceanBase/OB 优先 `prod_ob4_*`",
+            "TiDB 优先 `mcd_tidb_*`",
+        )
+    )
+    assert all(
+        instance_prefix in prometheus.prompts.workflow
+        for instance_prefix in (
+            "mcd_tidb_coupon_*",
+            "mcd_tidb_oms_*",
+            "mcd_tidb_analytics_*",
+            "mcd_tidb_crm_mbr_3az_*",
+            "mcd_tidb_crm_pnt_*",
+            "mcd_tidb_oms_cold_*",
+            "mcd_tidb_payment_*",
+            "mcd_tidb_stld_*",
+        )
+    )
+    assert all(
+        prometheus_usage in prometheus.prompts.workflow
+        for prometheus_usage in (
+            'node_cpu_seconds_total{mode="idle"}',
+            "node_memory_MemAvailable_bytes",
+            "node_filesystem_avail_bytes",
+            'ALERTS{alertstate="firing"}',
+            "mysql_global_status_slow_queries",
+            "tidb_server_uptime",
+        )
+    )
+    assert "动态 Schema 为参数契约" in prometheus.prompts.workflow
+    assert "不得执行手册中的 Docker、配置、重启、健康检查等运维命令" in (
+        prometheus.prompts.workflow
+    )
+    assert "`*_get_targets` 是可选的目标发现手段" in prometheus.prompts.workflow
+    assert "返回 404" in prometheus.prompts.workflow
+    assert "不设固定的 provider 调用顺序、重试次数上限" in prometheus.prompts.workflow
+    assert "`target=\"<alarm_host>:<alarm_port>\"`" in prometheus.prompts.workflow
+    assert "`instance` 可能是同主机的采集端口" in prometheus.prompts.workflow
+    assert "`mysql:cpu:usage` 是累计 CPU tick" in prometheus.prompts.workflow
+    assert "`mysql:cpu:limit`" in prometheus.prompts.workflow
+    assert "`*_execute_range_query`" in prometheus.prompts.workflow
     assert prometheus.provider_options == {}
 
 

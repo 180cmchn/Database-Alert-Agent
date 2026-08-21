@@ -38,7 +38,7 @@ from app.mcp_catalog import (
 PROMETHEUS_MCP_SERVER_NAME: Final = "prometheus"
 PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v9"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v14"
 PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v2"
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _FINISH_TOOL_NAME: Final = "finish_prometheus_investigation"
@@ -80,6 +80,12 @@ _TARGET_INSTANCE_LABEL_KEYS: Final = {
     "databaseinstance",
     "dbinstance",
     "instance",
+}
+# These labels identify the monitored database endpoint with higher confidence than
+# exporter-oriented labels such as `instance` or inventory labels such as `server`.
+_TARGET_ENDPOINT_LABEL_KEYS: Final = {
+    "endpoint",
+    "target",
 }
 _TARGET_PORT_LABEL_KEYS: Final = {
     "alarmport",
@@ -615,32 +621,60 @@ class PrometheusMCPClient:
         database = alert.database
         matched: list[str] = []
         host_values = cls._label_values(labels, _TARGET_HOST_LABEL_KEYS)
+        preferred_endpoint_values = cls._label_values(labels, _TARGET_ENDPOINT_LABEL_KEYS)
+        preferred_endpoint_matched = False
 
         if database is not None and database.host:
-            for value in host_values:
-                endpoint = cls._label_endpoint(value)
-                if endpoint is not None and endpoint[0].casefold() != (
-                    database.host.strip().casefold()
+            expected_host = database.host.strip().casefold()
+            preferred_endpoints = [
+                endpoint
+                for value in preferred_endpoint_values
+                if (endpoint := cls._label_endpoint(value)) is not None
+            ]
+            if preferred_endpoints:
+                if any(
+                    endpoint[0].casefold() != expected_host
+                    for endpoint in preferred_endpoints
                 ):
                     return []
-                if cls._label_matches_host(value, database.host):
-                    matched.append("database.host")
-            if "database.host" not in matched:
-                return []
+                if database.port is not None:
+                    endpoint_ports = {
+                        port
+                        for _host, port in preferred_endpoints
+                        if port is not None
+                    }
+                    if any(port != database.port for port in endpoint_ports):
+                        return []
+                    if database.port in endpoint_ports:
+                        matched.append("database.endpoint")
+                matched.append("database.host")
+                preferred_endpoint_matched = True
+            else:
+                for value in host_values:
+                    endpoint = cls._label_endpoint(value)
+                    if endpoint is not None and endpoint[0].casefold() != expected_host:
+                        return []
+                    if cls._label_matches_host(value, database.host):
+                        matched.append("database.host")
+                if "database.host" not in matched:
+                    return []
 
         if database is not None and database.port is not None:
-            for value in host_values:
-                endpoint = cls._label_endpoint(value)
-                if endpoint is not None and endpoint[1] is not None:
-                    if endpoint[1] != database.port:
-                        return []
-                    matched.append("database.endpoint")
+            if not preferred_endpoint_matched:
+                for value in host_values:
+                    endpoint = cls._label_endpoint(value)
+                    if endpoint is not None and endpoint[1] is not None:
+                        if endpoint[1] != database.port:
+                            return []
+                        matched.append("database.endpoint")
             for value in cls._label_values(labels, _TARGET_PORT_LABEL_KEYS):
                 port = cls._label_port(value)
                 if port is not None and port != database.port:
                     return []
 
-        if database is not None and database.instance:
+        # A target/endpoint label that matches the authoritative database endpoint
+        # outranks `instance`, which commonly identifies the exporter scrape port.
+        if database is not None and database.instance and not preferred_endpoint_matched:
             for key in _TARGET_INSTANCE_LABEL_KEYS:
                 value = labels.get(key)
                 if not cls._has_label_value(value):

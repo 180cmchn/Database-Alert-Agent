@@ -872,6 +872,126 @@ def test_prometheus_query_target_text_does_not_attribute_unlabelled_series() -> 
     assert projection is None
 
 
+def test_prometheus_range_projection_prefers_database_target_over_collector_instance() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "cluster": "mysql-prod-devops",
+            "database": context.alert.database.model_copy(
+                update={
+                    "host": "100.84.97.124",
+                    "instance": "100.84.97.124:3311",
+                    "port": 3311,
+                }
+            ),
+        }
+    )
+    raw_result = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "resultType": "matrix",
+                        "result": [
+                            {
+                                "metric": {
+                                    "__name__": "mysql:cpu:usage",
+                                    "group": "mysql-prod-devops",
+                                    "instance": "100.84.97.124:5706",
+                                    "port": "3311",
+                                    "server": "server-mysql_124",
+                                    "service": "mysql",
+                                    "target": "100.84.97.124:3311",
+                                },
+                                "values": [
+                                    [1786067700, "10191762286"],
+                                    [1786068000, "10191964447"],
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            }
+        ],
+        "isError": False,
+        "structuredContent": None,
+    }
+
+    payload = PrometheusMCPClient.call_result(raw_result).payload
+    projection = PrometheusMCPClient.project_alert_window_range(
+        payload,
+        arguments={
+            "query": 'mysql:cpu:usage{target="100.84.97.124:3311"}',
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+            "step": "30s",
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is not None
+    assert projection["target_match"]["authoritative_fields"] == [
+        "database.endpoint",
+        "database.host",
+    ]
+    assert projection["timeseries"]["series_count"] == 1
+    assert projection["timeseries"]["sample_count"] == 2
+    assert projection["timeseries"]["series"][0] == {
+        "metric": {"__name__": "mysql:cpu:usage"},
+        "sample_count": 2,
+        "min": 10191762286,
+        "max": 10191964447,
+        "avg": 10191863366.5,
+        "latest": 10191964447,
+        "delta": 202161,
+    }
+
+
+def test_prometheus_range_projection_rejects_wrong_database_target_over_instance() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(
+                update={
+                    "host": "100.84.97.124",
+                    "instance": "100.84.97.124:3311",
+                    "port": 3311,
+                }
+            ),
+        }
+    )
+
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "mysql:cpu:usage",
+                        "instance": "100.84.97.124:3311",
+                        "port": "3311",
+                        "target": "100.84.97.125:3311",
+                    },
+                    "values": [[1786067700, "8"], [1786068000, "15"]],
+                }
+            ],
+        },
+        arguments={
+            "query": 'mysql:cpu:usage{target="100.84.97.124:3311"}',
+            "start": "2026-08-07T01:55:00+00:00",
+            "end": "2026-08-07T02:00:00+00:00",
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
+
+
 def test_prometheus_range_projection_keeps_only_series_matching_alert_labels() -> None:
     projection = PrometheusMCPClient.project_alert_window_range(
         {

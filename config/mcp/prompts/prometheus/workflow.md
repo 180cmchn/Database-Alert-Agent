@@ -1,13 +1,10 @@
-1. 使用 target discovery、服务发现目标、标签、抓取地址、job、指标目录或元数据，先确认 Prometheus MCP 中实际配置了哪些数据库及数据库目标的监控指标。不能仅凭 MCP 名称、经验或筛选后的空结果推断监控范围。
-2. 使用 FlashDuty 告警详情中的数据库身份、alarm_host 和 alarm_port 与发现到的监控目标进行匹配；不得从告警标题推断 host 或 port。
-3. 若告警数据库在已确认的监控范围内，选择与告警信号最相关的指标，按工具 Schema 提供完整参数，查询 [occurred_at - 5 分钟, occurred_at] 时间窗口。不得改用即时查询或其它时间范围。
-4. 若告警数据库不在已确认的监控范围内，不再执行范围查询，返回 reason_code=database_not_monitored，并明确说明“Prometheus MCP 中没有配置告警数据库对应的监控信息”。该结果表示工具不适用，不表示其它可用证据不足。
-5. 若发现结果不足以确认范围，明确返回无法确认监控范围；不得虚构指标、目标或查询结果。
-
-根据 MCP 动态发现的工具描述和 Schema 自主选择调用，每次调用后根据真实返回决定下一步。用于目标发现、目录和元数据的结果只用于确认监控归属、指标、标签和能力，本身不是告警窗口实时证据。若同时提供即时查询和范围查询，应选择能查询指定时间范围的工具；不得用当前时刻即时结果或其它时段数据作为本次告警证据。
-
-范围查询必须使用 required_target 中来自 FlashDuty 告警详情的引擎、集群、alarm_host 和 alarm_port 约束 PromQL，不得用未限定目标的跨集群聚合结果或其它数据库、集群、引擎的数据替代。返回目标不匹配时，可根据实际结果修正指标或标签；无法取得告警目标证据时如实说明。
-
-发现指标、标签或能力后，使用与告警信号最相关的范围查询。避免无意义地重复同一工具和相同参数，也不要反复枚举完整指标目录。目录指标必须与告警信号语义相关，例如慢查询告警需要 slow/query 语义，不能把仅共享 mysql 前缀的采集链路指标当作替代证据。没有可继续追查的事实依据时停止，不得继续猜测指标。
-
-取得足够监控返回、确认告警数据库不在监控范围内，或确认没有适用工具时结束调查。目标发现、指标目录和元数据等辅助响应只作为内部审计 artifact 保存；告警窗口时序结果经过程序侧统计、聚合和异常排序后进入主 Agent 上下文。
+1. 读取 MCP 动态发现的全部工具名称、描述和 Schema；只调用本轮真实发现的工具，并以动态 Schema 为参数契约，不得根据本提示虚构工具或参数。聚合 Prometheus MCP 的标准只读能力是：`*_execute_query` 使用 `query` 执行 PromQL 即时查询，`*_execute_range_query` 使用 `query`、`start`、`end`、`step` 执行范围查询，`*_list_metrics` 无参数列出指标名，`*_get_targets` 无参数获取抓取目标。实际 Schema 与上述手册摘要不同时以实际 Schema 为准，所有调用均声明并保持只读意图。
+2. 把数据库类型映射仅作为首选路由而非固定调用链：MySQL 优先 `mysql_*`；MongoDB/Mongo 优先 `mongo_*`；OceanBase/OB 优先 `prod_ob4_*`；TiDB 优先 `mcd_tidb_*`，再结合告警集群、实例、服务或环境在已发现的 `mcd_tidb_coupon_*`、`mcd_tidb_oms_*`、`mcd_tidb_analytics_*`、`mcd_tidb_crm_mbr_3az_*`、`mcd_tidb_crm_pnt_*`、`mcd_tidb_oms_cold_*`、`mcd_tidb_payment_*`、`mcd_tidb_stld_*` 中选择有事实关联的前缀。类型不明确、首选实例缺少某类接口，或真实返回表明监控数据位于另一个已发现实例时，可以继续检查有事实关联的候选工具；最终证据仍必须匹配告警数据库和端点，不能用其它数据库或目标的数据替代，也不得依赖手册中的静态 URL 推断当前拓扑。
+3. 使用 `required_target` 中来自 FlashDuty 告警详情的数据库引擎、集群、`alarm_host` 和 `alarm_port`，将 `alarm_host:alarm_port` 作为权威数据库端点。不得从形如“数据库类型/告警名/host:port”的标题解析、恢复或补充 host、port；字段缺失时如实说明。将调查目标表达为“用对应 Prometheus 实例查询该端点在 `[occurred_at - 5 分钟, occurred_at]` 内与告警信号对应的指标”，然后自主选择最能减少不确定性的下一次只读调用；不存在必须严格遵循的固定工具顺序。
+4. `*_get_targets` 是可选的目标发现手段，不是执行指标查询的前置条件。若它成功，使用返回的真实目标、标签、抓取地址和 job 确认归属；若它返回 404、接口不支持、空结果、超时或其它错误，不得仅据此判定数据库未监控，也不要原样反复调用同一不可用接口。应改用同前缀的 `*_list_metrics`、`*_execute_query` 或其它动态发现的只读查询能力继续发现指标、标签和目标。只有真实监控范围信息明确排除告警数据库时，才可使用 `monitoring_scope_status=out_of_scope`，外层将据此返回 `reason_code=database_not_monitored`；只有发现链路不足时使用 `unknown`。
+5. 先从告警信号、`metric_candidates` 和 `*_list_metrics` 的真实目录选择少量语义直接相关的候选指标。手册中的常用 PromQL 只能作为候选检索模板：节点 CPU `100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100`、内存 `(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100`、磁盘 `100 - (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100`、触发中告警 `ALERTS{alertstate="firing"}`、在线状态 `up`、MySQL 慢查询 `rate(mysql_global_status_slow_queries[5m])`、TiDB 状态 `sum(tidb_server_uptime)`。不得假定这些指标必然存在或直接把未限定目标的模板作为证据；必须先用实际目录和查询返回确认指标名、标签、类型、单位及其与本次告警信号的关系，再补上权威端点限制并按真实语义调整聚合。
+6. `*_execute_query` 可用于指标存在性、当前状态、标签和值语义探测；趋势或告警窗口证据使用 `*_execute_range_query`。目录失败时也可以通过有边界的即时查询验证合理候选。为避免返回过大，优先使用精确指标名、权威端点等值筛选、`count by (...)`、聚合或其它低基数查询；若确需查看样例标签，限制为单个候选指标并尽快加入目标条件，不要无约束拉取高基数全量时序。即时结果和当前状态只属于辅助发现，不能替代最终告警窗口证据。
+7. 标签必须以查询真实返回为准，不得假定数据库端点一定在 `instance`。本次已验证的 mysql 监控中，数据库端点位于 `target="<alarm_host>:<alarm_port>"`，而 `instance` 可能是同主机的采集端口（例如 `:5706`）；因此 MySQL 查询应优先尝试 `target` 精确匹配。若空结果，可依据指标样例和聚合返回依次验证 `target`、`instance`、`host`、`endpoint`、独立 `port` 或其它真实标签，每次重试至少改变一个有依据的标签、指标或查询结构。返回中哪个标签完整匹配权威端点，就在最终 PromQL 中使用哪个标签；不得把采集端点误当数据库端点。
+8. 指标值的语义也必须先验证。对于当前 mysql 指标体系，`mysql:cpu:usage` 是累计 CPU tick，不能把原始大整数直接当百分比；若目录和即时查询确认同时存在目标匹配的 `mysql:cpu:usage` 与 `mysql:cpu:limit`，CPU 百分比优先使用 `rate(mysql:cpu:usage{target="<alarm_host>:<alarm_port>"}[5m]) / on(target) group_left mysql:cpu:limit{target="<alarm_host>:<alarm_port>"}`。若真实标签键、指标类型或单位不同，应根据返回自主调整向量匹配、`rate`、聚合和换算，不得机械套用该公式。
+9. 根据失败类型自主选择有信息增益的重试，不设固定的 provider 调用顺序、重试次数上限或空结果次数上限，调查只受外层墙钟时间和显式结束控制：工具列表为空或预期前缀未发现时如实记录能力缺失；404/不支持时切换能力；Schema 或参数错误时按动态 Schema 修正参数；PromQL 解析或类型错误时按真实错误修改表达式；空结果时先用 `*_list_metrics` 核实指标名并更换有依据的目标标签；结果过大或超时时收紧指标和标签、先聚合、增大 `step`，但不得改变告警窗口；临时连接错误、5xx 或超时在仍有恢复可能时可以重试同一调用。每次重试都应说明依据和变化；除明确的瞬时传输故障外，不原样重复已证明无效的调用。401/403 等认证或权限错误应如实保留，不得尝试读取、修改认证配置，只有存在不同且可能可用的只读路径时才继续；不得执行手册中的 Docker、配置、重启、健康检查等运维命令。
+10. 最终告警证据必须来自目标匹配的 `*_execute_range_query`，并按真实 Schema 提供完整参数：`start` 严格等于 `occurred_at - 5 分钟`，`end` 严格等于 `occurred_at`，`step` 使用 Schema 接受的格式，`query` 使用已验证且严格限定权威端点的 PromQL。不得把当前时刻即时结果、其它时段数据、未限定目标的聚合或辅助发现响应作为本次告警的实时证据。取得足够的范围时序或确认没有还能减少不确定性的只读路径时，调用 `finish_prometheus_investigation`；目标发现、指标目录、标签探测、错误和即时查询只作为内部审计 artifact，只有告警窗口范围查询经过程序侧目标与时间匹配、统计、聚合和异常排序后进入主 Agent 上下文。
