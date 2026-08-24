@@ -10,7 +10,7 @@ from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 import httpx
@@ -22,8 +22,12 @@ from app.adapters.archery_mcp import (
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
+    ARCHERY_MCP_QUERY_TOOL_NAME,
+    ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE,
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+    ArcheryMCPClient,
     ArcheryMCPConfigurationError,
     ArcheryMCPError,
     ArcheryMCPModelError,
@@ -34,6 +38,7 @@ from app.adapters.archery_mcp import (
     nested_archery_error,
     safe_error_detail,
 )
+from app.adapters.archery_sql import SQLTableReference, unquoted_words
 from app.agent_runtime import (
     ArtifactRef,
     BudgetLedger,
@@ -67,13 +72,9 @@ from app.mcp_runtime import (
     ScenarioTransition,
 )
 
-if TYPE_CHECKING:
-    from app.adapters.archery_mcp import ArcheryMCPClient
-
-
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v2"
-ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v2"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v3"
+ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v3"
 _FINISH_TOOL_NAME = "finish_archery_investigation"
 _FINISH_TOOL = {
     "type": "function",
@@ -142,12 +143,127 @@ class ArcheryHarnessState:
     history_merge_sources: list[dict[str, Any]] = field(default_factory=list)
     truncation_retry_hinted_sqls: set[str] = field(default_factory=set)
     truncation_projection_hinted_sqls: set[str] = field(default_factory=set)
-    history_positional_rows: list[list[Any]] = field(default_factory=list)
+    history_positional_rows: list[Any] = field(default_factory=list)
+    history_positional_reference_columns: list[str] = field(default_factory=list)
     window_positional_hint_given: bool = False
     slow_query_explain_results: list[dict[str, Any]] = field(default_factory=list)
     slow_query_table_structure_results: list[dict[str, Any]] = field(default_factory=list)
     slow_query_index_results: list[dict[str, Any]] = field(default_factory=list)
     slow_query_analysis_failures: list[dict[str, Any]] = field(default_factory=list)
+    analysis_instance_endpoints: dict[int, set[str]] = field(default_factory=dict)
+    analysis_database_names: dict[int, set[str]] = field(default_factory=dict)
+    history_result_target: tuple[int, str] | None = None
+    history_recovery_ids: set[int] = field(default_factory=set)
+    history_recovery_required: bool = False
+    history_recovery_listing_completed: bool = False
+    history_recovery_terminal_failure: bool = False
+    # A projected sample remains a prefix even when its length marker is
+    # missing or malformed. It is cleared only by a verified complete SELECT *
+    # per-id row or an exact-width decoded SELECT * window row.
+    history_sample_prefix_ids: set[int] = field(default_factory=set)
+    history_full_row_ids: set[int] = field(default_factory=set)
+    supplemental_analysis_started: bool = False
+
+
+def _history_recovery_resolved_ids(state: ArcheryHarnessState) -> set[int]:
+    """Return listed rows whose sample provenance is explicit and usable."""
+
+    provenance_ids = set(state.history_full_row_ids) | set(
+        state.history_sample_prefix_ids
+    )
+    return {
+        row_id
+        for row_id in provenance_ids
+        if isinstance((row := state.history_id_rows.get(row_id)), Mapping)
+        and isinstance(ArcheryMCPClient._casefolded_value(row, "sample"), str)
+    }
+
+
+def _history_recovery_missing_ids(state: ArcheryHarnessState) -> set[int]:
+    return set(state.history_recovery_ids) - _history_recovery_resolved_ids(state)
+
+
+def _history_recovery_unlisted_ids(state: ArcheryHarnessState) -> set[int]:
+    if not state.history_recovery_listing_completed:
+        return set()
+    positional_ids: set[int] = set()
+    for row in state.history_positional_rows:
+        raw_id: Any = None
+        if isinstance(row, Mapping):
+            raw_id = ArcheryMCPClient._casefolded_value(row, "id")
+        elif isinstance(row, (list, tuple)) and row:
+            raw_id = row[0]
+        row_id = ArcheryMCPClient._coerce_positive_integer(raw_id)
+        if row_id is not None:
+            positional_ids.add(row_id)
+    return (set(state.history_id_rows) | positional_ids) - set(
+        state.history_recovery_ids
+    )
+
+
+def _history_recovery_complete(state: ArcheryHarnessState) -> bool:
+    if not state.history_recovery_required:
+        return True
+    return bool(
+        state.history_recovery_listing_completed
+        and not _history_recovery_missing_ids(state)
+        and not _history_recovery_unlisted_ids(state)
+        and not state.history_positional_rows
+    )
+
+
+def _history_payload_with_recovery_status(
+    payload: Mapping[str, Any],
+    state: ArcheryHarnessState,
+) -> dict[str, Any]:
+    projected = dict(payload)
+    if _history_recovery_complete(state):
+        return ArcheryMCPClient.with_result_completeness(projected)
+    projected["rows_recovered_from_truncated_json"] = True
+    projected["history_recovery_complete"] = False
+    projected["history_recovery_id_listing_complete"] = (
+        state.history_recovery_listing_completed
+    )
+    missing_ids = sorted(_history_recovery_missing_ids(state))
+    if missing_ids:
+        projected["history_recovery_missing_ids"] = missing_ids
+    unlisted_ids = sorted(_history_recovery_unlisted_ids(state))
+    if unlisted_ids:
+        projected["history_recovery_unlisted_ids"] = unlisted_ids
+    return ArcheryMCPClient.with_result_completeness(projected)
+
+
+def _record_history_recovery_terminal_failure(
+    state: ArcheryHarnessState,
+    *,
+    detail: str,
+) -> None:
+    if (
+        not state.history_recovery_required
+        or _history_recovery_complete(state)
+        or state.history_recovery_terminal_failure
+    ):
+        return
+    state.history_recovery_terminal_failure = True
+    target: dict[str, Any] = {}
+    if state.history_result_target is not None:
+        target = {
+            "instance_id": state.history_result_target[0],
+            "db_name": state.history_result_target[1],
+        }
+    failure: dict[str, Any] = {
+        "stage": "history_recovery",
+        "target": target,
+        "error_type": "incomplete_result",
+        "reason_code": "history_recovery_incomplete",
+        "detail": detail,
+    }
+    missing_ids = sorted(_history_recovery_missing_ids(state))
+    if missing_ids:
+        failure["missing_ids"] = missing_ids
+    if not state.history_recovery_listing_completed:
+        failure["id_listing_completed"] = False
+    state.slow_query_analysis_failures.append(failure)
 
 
 @dataclass(slots=True)
@@ -409,6 +525,13 @@ class ArcheryHarnessPlanner:
         self.state.model_decision_count += 1
         if call.name == _FINISH_TOOL_NAME:
             reason = call.arguments.get("reason")
+            _record_history_recovery_terminal_failure(
+                self.state,
+                detail=(
+                    "Archery 内层 Agent 在 history 截断恢复完成前结束调查；"
+                    "当前仅保留已恢复行并明确标记为不完整证据。"
+                ),
+            )
             return {
                 "action": "finish",
                 "reason": RuntimeStopReason.COMPLETED.value,
@@ -631,12 +754,29 @@ class ArcheryHarnessScenario:
         self.state = state
         self.registry = registry
         self._last_failure: BaseException | None = None
+        self._allowed_non_sql_followup_tools = {
+            ARCHERY_MCP_COLUMNS_TOOL_NAME,
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+        }
+        self._allowed_dynamic_auth_tools: set[str] = set()
 
     @property
     def current_state(self) -> ArcheryHarnessState:
         return self.state
 
     def restore_state(self, state: ArcheryHarnessState) -> None:
+        legacy_accumulator = bool(
+            getattr(state, "history_id_rows", {})
+            or getattr(state, "history_merge_sources", [])
+            or getattr(state, "history_positional_rows", [])
+        )
+        incomplete_final_result = bool(
+            state.final_result is not None
+            and self.client.is_result_incomplete(state.final_result.payload)
+        )
         for field_name in (
             "slow_query_explain_results",
             "slow_query_table_structure_results",
@@ -645,6 +785,68 @@ class ArcheryHarnessScenario:
         ):
             if not hasattr(state, field_name):
                 setattr(state, field_name, [])
+        for field_name in (
+            "analysis_instance_endpoints",
+            "analysis_database_names",
+        ):
+            if not hasattr(state, field_name):
+                setattr(state, field_name, {})
+        if not hasattr(state, "history_result_target"):
+            state.history_result_target = None
+        if not hasattr(state, "history_recovery_ids"):
+            state.history_recovery_ids = set()
+        if not hasattr(state, "history_recovery_required"):
+            state.history_recovery_required = (
+                incomplete_final_result
+                or bool(state.history_recovery_ids)
+                or legacy_accumulator
+            )
+        elif (
+            legacy_accumulator or incomplete_final_result
+        ) and not state.history_recovery_required:
+            # Accumulators and incomplete final results exist only on the
+            # recovery path. A checkpoint claiming otherwise is inconsistent.
+            state.history_recovery_required = True
+            state.history_recovery_listing_completed = False
+        if not hasattr(state, "history_recovery_listing_completed"):
+            # Accumulated rows alone cannot prove that the id listing finished.
+            # Older checkpoints did not retain enough provenance to infer it.
+            state.history_recovery_listing_completed = bool(
+                state.history_recovery_ids and not legacy_accumulator
+            )
+        if not hasattr(state, "history_recovery_terminal_failure"):
+            state.history_recovery_terminal_failure = False
+        if not hasattr(state, "history_positional_reference_columns"):
+            state.history_positional_reference_columns = []
+        if not hasattr(state, "history_sample_prefix_ids"):
+            # Older checkpoints have no response-level provenance. Treat every
+            # accumulated id as prefix/unknown until a new, currently verified
+            # full per-id response proves otherwise.
+            state.history_recovery_listing_completed = False
+            prefix_ids: set[int] = {
+                parsed_id
+                for row_id in getattr(state, "history_id_rows", {})
+                if (
+                    parsed_id := self.client._coerce_positive_integer(row_id)
+                )
+                is not None
+            }
+            for source in getattr(state, "history_merge_sources", []):
+                sql = source.get("full_sql") if isinstance(source, Mapping) else None
+                retrieval = (
+                    self.client.history_id_retrieval(sql)
+                    if isinstance(sql, str)
+                    else None
+                )
+                if retrieval is not None and retrieval[1] == "sample_prefix":
+                    prefix_ids.add(retrieval[0])
+            state.history_sample_prefix_ids = prefix_ids
+        if not hasattr(state, "history_full_row_ids"):
+            # Legacy checkpoints cannot prove actual-SQL verification, lack of
+            # truncation, exact id cardinality, and presence of a full sample.
+            state.history_full_row_ids = set()
+        if not hasattr(state, "supplemental_analysis_started"):
+            state.supplemental_analysis_started = False
         self.state = state
 
     def initial_state(self) -> ArcheryHarnessState:
@@ -669,6 +871,13 @@ class ArcheryHarnessScenario:
         return state
 
     def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
+        self._allowed_dynamic_auth_tools = {
+            item.name
+            for item in tools
+            if item.annotations.get("readOnlyHint") is True
+            and item.annotations.get("destructiveHint") is not True
+            and re.search(r"(?i)(?:auth|login|session)", item.name)
+        }
         specs: list[ToolSpec] = []
         for item in tools:
             specs.append(
@@ -683,6 +892,11 @@ class ArcheryHarnessScenario:
                 )
             )
         return specs
+
+    def _is_allowed_non_sql_followup_tool(self, tool_name: str) -> bool:
+        return tool_name in (
+            self._allowed_non_sql_followup_tools | self._allowed_dynamic_auth_tools
+        )
 
     def prepare_call(
         self,
@@ -719,9 +933,34 @@ class ArcheryHarnessScenario:
             metadata["trace_index"] = len(state.query_trace) - 1
             state.last_query_target = self.client.target_key(action.arguments)
 
-            rejection = self._local_followup_rejection(state, sql)
-            if rejection is not None:
-                metadata["local_rejection"] = rejection
+        rejection, binding = self._post_history_call_decision(
+            state,
+            tool_name=action.tool_name,
+            arguments=action.arguments,
+        )
+        if rejection is not None:
+            metadata["local_rejection"] = rejection
+        if binding is not None:
+            metadata["analysis_binding"] = binding
+        if (
+            rejection is None
+            and isinstance(sql, str)
+            and self.client.has_slow_log_reference(sql)
+            and self.client.is_history_recovery_query(sql)
+        ):
+            metadata["history_query_authorized"] = True
+        if (
+            rejection is None
+            and isinstance(sql, str)
+            and not self._has_history_context(state)
+            and not self.client.has_slow_log_reference(sql)
+            and self._is_safe_pre_history_select(
+                state,
+                sql,
+                arguments=action.arguments,
+            )
+        ):
+            metadata["pre_history_metadata_authorized"] = True
 
         return PreparedCall(
             tool_name=action.tool_name,
@@ -738,104 +977,1243 @@ class ArcheryHarnessScenario:
             ),
         )
 
-    def _local_followup_rejection(
+    def _post_history_call_decision(
         self,
         state: ArcheryHarnessState,
-        sql: str,
-    ) -> dict[str, Any] | None:
-        if not self._has_history_result(state):
-            return None
-        target = self._analysis_target_from_arguments(state.last_query_target, {})
-        if self.client.is_explain_analyze_query(sql):
-            return {
-                "stage": "explain",
-                "target": target,
-                "error_type": "unsafe_statement",
-                "reason_code": "explain_analyze_forbidden",
-                "detail": "EXPLAIN ANALYZE 会实际执行内层语句，已在发送到 MCP 前拒绝。",
-            }
-        if not self.client.is_single_statement(sql):
-            return {
-                "stage": "explain",
-                "target": target,
-                "error_type": "unsafe_statement",
-                "reason_code": "multi_statement_forbidden",
-                "detail": "补充分析调用必须只包含一个 SQL 语句。",
-            }
-        statement = self.client._single_sql_statement(sql)
-        assert statement is not None
-        if re.match(r"(?is)^\s*explain\b", statement):
-            if self.client.classify_plain_explain(statement) is None:
-                return {
-                    "stage": "explain",
-                    "target": target,
-                    "error_type": "unsafe_statement",
-                    "reason_code": "invalid_explain_statement",
-                    "detail": "仅允许普通 EXPLAIN 包裹可解释的单语句。",
-                }
-            if self.client.history_row_for_explain(
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        sql = arguments.get("sql_content")
+        has_history_context = self._has_history_context(state)
+        if isinstance(sql, str) and tool_name != ARCHERY_MCP_QUERY_TOOL_NAME:
+            if has_history_context:
+                state.supplemental_analysis_started = True
+            return self._local_rejection(
+                stage="target_resolution",
+                target=self._analysis_target_from_arguments(
+                    self.client.target_key(arguments), arguments
+                ),
+                reason_code="sql_tool_forbidden",
+                detail="SQL 只能通过已知 Archery SQL 查询工具发送。",
+            ), None
+        statement: str | None = None
+        if isinstance(sql, str):
+            target = self._analysis_target_from_arguments(
+                self.client.target_key(arguments),
+                arguments,
+            )
+            statement = self.client._single_sql_statement(sql)
+            if statement is None:
+                if has_history_context:
+                    state.supplemental_analysis_started = True
+                return self._local_rejection(
+                    stage="explain" if has_history_context else "target_resolution",
+                    target=target,
+                    reason_code="multi_statement_forbidden",
+                    detail="Archery SQL 调用必须只包含一个完整语句。",
+                ), None
+            if self.client.is_explain_analyze_query(statement):
+                if has_history_context:
+                    state.supplemental_analysis_started = True
+                return self._local_rejection(
+                    stage="explain",
+                    target=target,
+                    reason_code="explain_analyze_forbidden",
+                    detail="EXPLAIN ANALYZE 会实际执行内层语句，已在发送到 MCP 前拒绝。",
+                ), None
+        if not has_history_context:
+            if not isinstance(sql, str):
+                if self._is_allowed_non_sql_followup_tool(tool_name):
+                    return None, None
+                return self._local_rejection(
+                    stage="target_resolution",
+                    target=self._analysis_target_from_arguments(
+                        self.client.target_key(arguments),
+                        arguments,
+                    ),
+                    reason_code="pre_history_tool_forbidden",
+                    detail=(
+                        "history 前仅允许已知只读导航工具、已验证认证工具，或包含字符串 "
+                        "sql_content 的正式 Archery SQL 查询工具。"
+                    ),
+                ), None
+            assert statement is not None
+            if self.client.has_slow_log_reference(statement):
+                if not self.client.is_history_recovery_query(statement):
+                    return self._local_rejection(
+                        stage="history_recovery",
+                        target=target,
+                        reason_code="history_recovery_query_forbidden",
+                        detail=(
+                            "任何 slow-log/history 数据源都必须使用封闭的单一 "
+                            "history 查询形态。"
+                        ),
+                    ), None
+                if self.client.is_history_id_only_projection(statement):
+                    if not self._is_scoped_history_id_listing(state, statement):
+                        return self._local_rejection(
+                            stage="history_recovery",
+                            target=target,
+                            reason_code="history_recovery_query_forbidden",
+                            detail="id 清单必须使用单一 history 数据源并严格保留告警窗口约束。",
+                        ), None
+                    if self._is_initial_history_target(
+                        state,
+                        arguments=arguments,
+                        sql=statement,
+                    ):
+                        return None, None
+                    return self._local_rejection(
+                        stage="history_recovery",
+                        target=target,
+                        reason_code="history_target_mismatch",
+                        detail="history 查询必须发送到已验证的 Archery 元数据库目标。",
+                    ), None
+                if self.client.is_history_id_retrieval_query(statement):
+                    return self._local_rejection(
+                        stage="history_recovery",
+                        target=target,
+                        reason_code="history_recovery_query_forbidden",
+                        detail="单 id 恢复前必须先取得受约束 id 清单。",
+                    ), None
+                if not self._is_scoped_history_window_query(state, statement):
+                    return self._local_rejection(
+                        stage="history_recovery",
+                        target=target,
+                        reason_code="history_recovery_query_forbidden",
+                        detail="首次 history 查询必须使用 SELECT *、单一数据源并严格绑定告警窗口。",
+                    ), None
+                if self._is_initial_history_target(
+                    state,
+                    arguments=arguments,
+                    sql=statement,
+                ):
+                    return None, None
+                return self._local_rejection(
+                    stage="history_recovery",
+                    target=target,
+                    reason_code="history_target_mismatch",
+                    detail="history 查询必须发送到已验证的 Archery 元数据库目标。",
+                ), None
+            if re.match(r"(?is)^\s*explain\b", statement):
+                return self._local_rejection(
+                    stage="explain",
+                    target=target,
+                    reason_code="unbound_explain_forbidden",
+                    detail="只有与已验证 history sample 关联的普通 EXPLAIN 可以执行。",
+                ), None
+            if not self._is_safe_pre_history_select(
+                state,
                 statement,
-                self._history_payload(state),
-            ) is None:
-                return {
-                    "stage": "explain",
-                    "target": target,
-                    "error_type": "sample_parse_failed",
-                    "reason_code": "explain_sample_not_in_history",
-                    "detail": "EXPLAIN 内层 SQL 无法与已取得的 history sample 关联。",
-                }
-            return None
+                arguments=arguments,
+            ):
+                return self._local_rejection(
+                    stage="target_resolution",
+                    target=target,
+                    reason_code="direct_statement_forbidden",
+                    detail="history 之前仅允许封闭的单表直接投影元数据 SELECT。",
+                ), None
+            return None, None
+
+        if not isinstance(sql, str):
+            if self._history_recovery_blocks_supplemental(state):
+                return self._history_recovery_pending_rejection(
+                    state,
+                    arguments=arguments,
+                ), None
+            state.supplemental_analysis_started = True
+            return self._non_sql_followup_decision(
+                state,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+
+        target = self._analysis_target_from_arguments(
+            self.client.target_key(arguments),
+            arguments,
+        )
+        assert statement is not None
+        if self.client.has_slow_log_reference(statement):
+            if self.client.is_history_recovery_query(
+                statement
+            ) and self._is_allowed_history_recovery(state, statement, arguments):
+                return None, None
+            return self._local_rejection(
+                stage="history_recovery",
+                target=target,
+                reason_code="history_recovery_query_forbidden",
+                detail="history 恢复只允许原 window 重试、id 清单或单 id 查询。",
+            ), None
 
         canonical = self.client._canonical_sql(statement)
         samples = {
-            self.client._canonical_sql(str(row.get("sample") or ""))
-            for row in self.client.select_explainable_history_rows(self._history_payload(state))
+            self.client._canonical_sql(
+                str(self.client._casefolded_value(row, "sample") or "")
+            )
+            for row in self.client._tabular_rows(self._history_payload(state))
+            if self.client._casefolded_value(row, "sample") not in (None, "")
         }
-        if canonical in samples or self.client.classify_explainable_statement(statement) in {
-            "insert",
-            "update",
-            "delete",
-            "replace",
+        if canonical in samples:
+            state.supplemental_analysis_started = True
+            return self._local_rejection(
+                stage="explain",
+                target=target,
+                reason_code="sample_execution_forbidden",
+                detail="history sample 只能作为普通 EXPLAIN 的内层语句，禁止直接执行。",
+            ), None
+
+        if self._history_recovery_blocks_supplemental(state):
+            return self._history_recovery_pending_rejection(
+                state,
+                arguments=arguments,
+            ), None
+
+        state.supplemental_analysis_started = True
+
+        if re.match(r"(?is)^\s*explain\b", statement):
+            if self.client.classify_plain_explain(statement) is None:
+                return self._local_rejection(
+                    stage="explain",
+                    target=target,
+                    reason_code="invalid_explain_statement",
+                    detail="仅允许普通 EXPLAIN 包裹可解释的单语句。",
+                ), None
+            source_row = self.client.history_row_for_explain(
+                statement,
+                self._history_payload(state),
+                sample_prefix_ids=state.history_sample_prefix_ids,
+            )
+            if source_row is None:
+                return self._local_rejection(
+                    stage="explain",
+                    target=target,
+                    error_type="sample_parse_failed",
+                    reason_code="explain_sample_not_in_history",
+                    detail="EXPLAIN 内层 SQL 无法与已取得的 history sample 关联。",
+                ), None
+            inner_sql = self.client.classify_plain_explain(statement) or ""
+            tables = sorted(
+                self.client.explainable_table_references(inner_sql),
+                key=str.casefold,
+            )
+            rejection, binding = self._bind_supplemental_target(
+                state,
+                source_row=source_row,
+                arguments=arguments,
+                stage="explain",
+                table_names=tables,
+            )
+            if rejection is not None or binding is None:
+                return rejection, None
+            if not self._table_structure_resolved(state, binding):
+                return self._local_rejection(
+                    stage="explain",
+                    target=dict(binding["target"]),
+                    error_type="prerequisite_missing",
+                    reason_code="table_structure_required",
+                    detail="普通 EXPLAIN 前必须先取得真实字段结构或记录该阶段失败。",
+                    source_history_row=dict(binding["source_history_row"]),
+                ), None
+            return None, binding
+
+        metadata_stage: str | None = None
+        if self.client.is_information_schema_columns_query(statement):
+            metadata_stage = "table_structure"
+        elif self.client.is_information_schema_statistics_query(statement):
+            metadata_stage = "indexes"
+        if metadata_stage is not None:
+            sql_target = self.client.information_schema_target(statement)
+            db_name = sql_target.get("db_name")
+            table_name = sql_target.get("table_name")
+            if (
+                not db_name
+                or not table_name
+                or not self.client.has_exact_information_schema_target_filters(statement)
+            ):
+                return self._local_rejection(
+                    stage=metadata_stage,
+                    target=target,
+                    reason_code="metadata_target_filter_required",
+                    detail="元数据查询必须同时按 TABLE_SCHEMA 和 TABLE_NAME 等值过滤。",
+                ), None
+            source_row = self._history_row_for_table(
+                state,
+                db_name=db_name,
+                table_name=table_name,
+            )
+            if source_row is None:
+                return self._local_rejection(
+                    stage=metadata_stage,
+                    target=target,
+                    error_type="target_mismatch",
+                    reason_code="metadata_table_not_in_sample",
+                    detail="元数据目标无法与已选择的 history sample 引用表关联。",
+                ), None
+            return self._bind_supplemental_target(
+                state,
+                source_row=source_row,
+                arguments=arguments,
+                stage=metadata_stage,
+                table_names=[table_name],
+            )
+
+        return self._local_rejection(
+            stage="explain",
+            target=target,
+            reason_code="direct_statement_forbidden",
+            detail="补充分析只允许受约束的 history 恢复、元数据查询和普通 EXPLAIN。",
+        ), None
+
+    def _is_safe_pre_history_select(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+        *,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        """Allow only the closed, single-table metadata-resolution shape."""
+
+        if (
+            not self._is_archery_metadata_target(arguments)
+            or self.client.classify_explainable_statement(sql) != "select"
+            or not self.client.is_simple_metadata_select(sql)
+        ):
+            return False
+        references = self.client.explainable_physical_table_reference_sequence(sql)
+        if references is None or len(references) != 1:
+            return False
+        reference = references[0]
+        if not self._is_pre_history_metadata_reference(reference):
+            return False
+        target = self.client.target_key(arguments)
+        assert target is not None
+        words = unquoted_words(sql)
+        if words is None or "or" in words:
+            return False
+        schema = reference.schema.casefold() if reference.schema is not None else None
+        table = reference.table.casefold()
+        if schema == "information_schema":
+            return bool(
+                (
+                    self.client.is_information_schema_columns_query(sql)
+                    or self.client.is_information_schema_statistics_query(sql)
+                )
+                and self.client.has_exact_information_schema_target_filters(sql)
+            )
+        columns = state.table_columns.get(target, {}).get(table, set())
+        if table == "t_instance_member":
+            return bool(
+                self.client._member_query_selects_instance_id(sql, columns)
+                and self.client.is_exact_member_endpoint_lookup(
+                    sql,
+                    alert_endpoint=state.alert_endpoint,
+                    discovered_columns=columns,
+                )
+            )
+        known_ids = state.member_instance_ids.get(target, set())
+        return bool(
+            table == "sql_instance"
+            and known_ids
+            and self.client.is_exact_sql_instance_lookup(
+                sql,
+                known_ids=known_ids,
+                discovered_columns=columns,
+            )
+            and self.client._sql_instance_query_selects_endpoint(sql, columns)
+        )
+
+    def _is_archery_metadata_target(self, arguments: Mapping[str, Any]) -> bool:
+        target = self.client.target_key(arguments)
+        return target is not None and target[1] == "archery"
+
+    def _is_initial_history_target(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        arguments: Mapping[str, Any],
+        sql: str,
+    ) -> bool:
+        if not self._is_archery_metadata_target(arguments):
+            return False
+        target = self.client.target_key(arguments)
+        assert target is not None
+        endpoint_match = re.search(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?hostname_max`?\s*=\s*'(?P<endpoint>(?:''|[^'])*)'",
+            sql,
+        )
+        endpoint = (
+            self.client._normalize_endpoint(
+                endpoint_match.group("endpoint").replace("''", "'")
+            )
+            if endpoint_match is not None
+            else None
+        )
+        return endpoint is not None and endpoint.casefold() in {
+            item.casefold() for item in state.resolved_endpoints.get(target, set())
+        }
+
+    def _is_pre_history_metadata_reference(self, reference: SQLTableReference) -> bool:
+        schema = reference.schema.casefold() if isinstance(reference.schema, str) else None
+        table = reference.table.casefold()
+        if schema is not None and schema not in {"archery", "information_schema"}:
+            return False
+        if schema == "information_schema":
+            return table in {"columns", "statistics"}
+        return table in {"t_instance_member", "sql_instance"}
+
+    def _non_sql_followup_decision(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if tool_name in {
+            ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
+            ARCHERY_MCP_INSTANCES_TOOL_NAME,
         }:
-            return {
-                "stage": "explain",
-                "target": target,
-                "error_type": "unsafe_statement",
-                "reason_code": "sample_execution_forbidden",
-                "detail": "history sample 只能作为普通 EXPLAIN 的内层语句，禁止直接执行。",
+            return None, None
+        if tool_name == ARCHERY_MCP_DATABASES_TOOL_NAME:
+            return self._validate_database_discovery_target(state, arguments), None
+        if not self._is_allowed_non_sql_followup_tool(tool_name):
+            return self._local_rejection(
+                stage="target_resolution",
+                target=self._analysis_target_from_arguments(
+                    self.client.target_key(arguments),
+                    arguments,
+                ),
+                reason_code="followup_tool_forbidden",
+                detail="history 后只允许只读认证、目标发现、字段发现和受约束 SQL 工具。",
+            ), None
+        if tool_name not in {ARCHERY_MCP_TABLES_TOOL_NAME, ARCHERY_MCP_COLUMNS_TOOL_NAME}:
+            return None, None
+        db_name = arguments.get("db_name")
+        table_name = arguments.get("tb_name")
+        if tool_name == ARCHERY_MCP_TABLES_TOOL_NAME:
+            return self._bind_database_target(state, arguments)
+        if not isinstance(db_name, str) or not isinstance(table_name, str):
+            return self._local_rejection(
+                stage="table_structure",
+                target=self._analysis_target_from_arguments(
+                    self.client.target_key(arguments),
+                    arguments,
+                ),
+                reason_code="metadata_target_required",
+                detail="字段发现必须提供真实 instance_id、db_name 和 tb_name。",
+            ), None
+        source_row = self._history_row_for_table(
+            state,
+            db_name=db_name,
+            table_name=table_name,
+        )
+        if source_row is None:
+            return self._local_rejection(
+                stage="table_structure",
+                target=self._analysis_target_from_arguments(
+                    self.client.target_key(arguments),
+                    arguments,
+                    table_name=table_name,
+                ),
+                error_type="target_mismatch",
+                reason_code="metadata_table_not_in_sample",
+                detail="字段发现目标无法与已选择的 history sample 引用表关联。",
+            ), None
+        return self._bind_supplemental_target(
+            state,
+            source_row=source_row,
+            arguments=arguments,
+            stage="table_structure",
+            table_names=[table_name],
+        )
+
+    def _is_allowed_history_recovery(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        if (
+            state.history_result_target is None
+            or self.client.target_key(arguments) != state.history_result_target
+        ):
+            return False
+        uncommented = self.client._sql_without_comments(sql) or ""
+        if re.search(r"(?is)(?<![A-Za-z0-9_$])`?id`?\s+in\s*\(", uncommented):
+            return False
+        if self.client.is_history_id_only_projection(sql):
+            if re.search(r"(?is)(?<![A-Za-z0-9_$])`?id`?\s*(?:=|\bin\b)", uncommented):
+                return False
+            return self._is_scoped_history_id_listing(state, uncommented)
+        if (
+            not state.supplemental_analysis_started
+            and self._is_scoped_history_window_query(state, uncommented)
+        ):
+            return True
+        retrieval = self.client.history_id_retrieval(sql)
+        if retrieval is not None:
+            row_id, _projection = retrieval
+            max_result_chars = arguments.get("max_result_chars")
+            return row_id in state.history_recovery_ids and max_result_chars in (
+                None,
+                24000,
+            )
+        permitted_sqls: list[str] = []
+        if state.final_result is not None:
+            permitted_sqls.extend(
+                filter(
+                    None,
+                    (state.final_result.requested_sql, state.final_result.executed_sql),
+                )
+            )
+        permitted_sqls.extend(
+            str(source.get("full_sql") or "") for source in state.history_merge_sources
+        )
+        return any(self.client.sql_equivalent(item, sql) for item in permitted_sqls)
+
+    @staticmethod
+    def _history_recovery_blocks_supplemental(state: ArcheryHarnessState) -> bool:
+        return bool(
+            state.history_recovery_required
+            and not state.history_recovery_terminal_failure
+            and not _history_recovery_complete(state)
+        )
+
+    def _history_recovery_pending_rejection(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        missing_ids = sorted(_history_recovery_missing_ids(state))
+        if not state.history_recovery_listing_completed:
+            detail = (
+                "history 结果发生截断，必须先取得完整受约束 id 清单并恢复全部行，"
+                "之后才能开始目标发现、元数据或 EXPLAIN。"
+            )
+        elif missing_ids:
+            detail = (
+                "history 截断恢复仍缺少 id："
+                + ", ".join(str(row_id) for row_id in missing_ids)
+                + "；恢复完成前禁止目标发现、元数据和 EXPLAIN。"
+            )
+        elif unlisted_ids := sorted(_history_recovery_unlisted_ids(state)):
+            detail = (
+                "history 已恢复行中存在未出现在完整 id 清单的 id："
+                + ", ".join(str(row_id) for row_id in unlisted_ids)
+                + "；清单与恢复结果一致前禁止目标发现、元数据和 EXPLAIN。"
+            )
+        else:
+            detail = (
+                "history 截断结果仍有无法按列名解码的位置行；"
+                "完整恢复前禁止目标发现、元数据和 EXPLAIN。"
+            )
+        return self._local_rejection(
+            stage="history_recovery",
+            target=self._analysis_target_from_arguments(
+                self.client.target_key(arguments),
+                arguments,
+            ),
+            error_type="prerequisite_missing",
+            reason_code="history_recovery_pending",
+            detail=detail,
+        )
+
+    def _is_scoped_history_id_listing(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+    ) -> bool:
+        if (
+            not self.client.is_history_id_only_projection(sql)
+            or not self._has_simple_history_source(sql, projection="id")
+        ):
+            return False
+        if not self._has_scoped_history_window_predicates(
+            state,
+            sql,
+            require_ts_max=True,
+        ):
+            return False
+        tail = re.search(r"(?is)\b(?:order\s+by|limit)\b.*$", sql)
+        return tail is None or re.fullmatch(
+            r"(?is)\s*(?:order\s+by\s+`?id`?(?:\s+(?:asc|desc))?\s*)?"
+            r"(?:limit\s+\d+\s*)?;?\s*",
+            tail.group(0),
+        ) is not None
+
+    def _is_scoped_history_window_query(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+    ) -> bool:
+        if (
+            not self.client.is_history_result_query(sql)
+            or not self._has_simple_history_source(sql, projection="*")
+            or not self._has_scoped_history_window_predicates(
+                state,
+                sql,
+                require_ts_max=False,
+            )
+        ):
+            return False
+        tail = re.search(r"(?is)\b(?:order\s+by|limit)\b.*$", sql)
+        return tail is None or re.fullmatch(
+            r"(?is)\s*(?:order\s+by\s+(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?[A-Za-z_][A-Za-z0-9_$]*`?(?:\s+(?:asc|desc))?\s*)?"
+            r"(?:limit\s+\d+\s*)?;?\s*",
+            tail.group(0),
+        ) is not None
+
+    def _has_simple_history_source(self, sql: str, *, projection: str) -> bool:
+        """Match the fixed, single-source shape used by history recovery."""
+
+        statement = self.client._single_sql_statement(sql)
+        if statement is None:
+            return False
+        if projection == "*":
+            projection_pattern = r"\*"
+        elif projection == "id":
+            projection_pattern = (
+                r"(?:(?:`?[A-Za-z_][A-Za-z0-9_$]*`?)\s*\.\s*)?`?id`?"
+            )
+        else:
+            return False
+        return re.fullmatch(
+            rf"(?is)\s*select\s+{projection_pattern}\s+from\s+"
+            rf"`?{re.escape(ARCHERY_SLOW_QUERY_REVIEW_TABLE)}`?"
+            r"(?:\s+(?:as\s+)?`?[A-Za-z_][A-Za-z0-9_$]*`?)?\s+"
+            r"where\s+.+\s*",
+            statement,
+        ) is not None
+
+    def _has_scoped_history_window_predicates(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+        *,
+        require_ts_max: bool,
+    ) -> bool:
+        endpoint_match = re.search(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?hostname_max`?\s*=\s*'(?P<endpoint>(?:''|[^'])*)'",
+            sql,
+        )
+        if endpoint_match is None:
+            return False
+        endpoint = self.client._normalize_endpoint(
+            endpoint_match.group("endpoint").replace("''", "'")
+        )
+        if endpoint is None:
+            return False
+        allowed_endpoints = {
+            normalized.casefold()
+            for row in self.client._tabular_rows(self._history_payload(state))
+            if (
+                normalized := self.client._normalize_endpoint(
+                    self.client._casefolded_value(row, "hostname_max")
+                )
+            )
+            is not None
+        }
+        allowed_endpoints.update(
+            item.casefold()
+            for endpoints in state.resolved_endpoints.values()
+            for item in endpoints
+        )
+        if endpoint.casefold() not in allowed_endpoints:
+            return False
+        where_body = self.client._where_body(sql)
+        if where_body is None:
+            return False
+        remainder = where_body
+        literal = r"(?P<literal>from_unixtime\s*\(\s*\d+\s*\)|'(?:''|[^'])*')"
+        hostname = re.compile(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?hostname_max`?\s*=\s*'(?:''|[^'])*'"
+        )
+        time_predicates = (
+            (
+                re.compile(
+                    rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                    rf"`?ts_min`?\s*>=\s*{literal}"
+                ),
+                "lower",
+                True,
+            ),
+            (
+                re.compile(
+                    rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                    rf"`?ts_min`?\s*<(?!=)\s*{literal}"
+                ),
+                "upper",
+                True,
+            ),
+            (
+                re.compile(
+                    rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                    rf"`?ts_max`?\s*>=\s*{literal}"
+                ),
+                "ts_max",
+                require_ts_max,
+            ),
+        )
+        hostname_matches = list(hostname.finditer(remainder))
+        if len(hostname_matches) != 1:
+            return False
+        match = hostname_matches[0]
+        remainder = remainder[: match.start()] + " " + remainder[match.end() :]
+        time_literals: dict[str, str] = {}
+        for predicate, name, required in time_predicates:
+            matches = list(predicate.finditer(remainder))
+            if len(matches) > 1 or (required and len(matches) != 1):
+                return False
+            if not matches:
+                continue
+            match = matches[0]
+            time_literals[name] = match.group("literal")
+            remainder = remainder[: match.start()] + " " + remainder[match.end() :]
+        if re.sub(r"(?is)\band\b|[\s()]", "", remainder):
+            return False
+        if not self._history_time_literal_matches(
+            time_literals["upper"], state.window_end
+        ):
+            return False
+        has_overlap_predicate = "ts_max" in time_literals
+        if has_overlap_predicate and not self._history_time_literal_matches(
+            time_literals["ts_max"], state.window_start
+        ):
+            return False
+        expected_lower = (
+            state.window_start - timedelta(hours=1)
+            if has_overlap_predicate
+            else state.window_start
+        )
+        return self._history_time_literal_matches(
+            time_literals["lower"], expected_lower
+        )
+
+    @staticmethod
+    def _history_time_literal_matches(literal: str, expected: datetime) -> bool:
+        epoch = re.fullmatch(
+            r"(?is)from_unixtime\s*\(\s*(?P<value>\d+)\s*\)",
+            literal,
+        )
+        if epoch is not None:
+            return int(epoch.group("value")) == int(expected.timestamp())
+        quoted = re.fullmatch(r"'(?P<value>(?:''|[^'])*)'", literal)
+        if quoted is None:
+            return False
+        expected_text = expected.astimezone(
+            ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        return quoted.group("value").replace("''", "'") == expected_text
+
+    def _history_row_for_table(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        db_name: str,
+        table_name: str,
+    ) -> dict[str, Any] | None:
+        expected_db = db_name.strip()
+        expected_table = self.client.clean_table_name(table_name)
+        return next(
+            (
+                row
+                for row in self.client.select_explainable_history_rows(
+                    self._history_payload(state),
+                    sample_prefix_ids=state.history_sample_prefix_ids,
+                )
+                if str(self.client._casefolded_value(row, "db_max") or "")
+                .strip()
+                == expected_db
+                and expected_table
+                in {
+                    self.client.clean_table_name(item)
+                    for item in self.client.explainable_table_references(
+                        str(self.client._casefolded_value(row, "sample") or "")
+                    )
+                }
+            ),
+            None,
+        )
+
+    def _bind_supplemental_target(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        source_row: Mapping[str, Any],
+        arguments: Mapping[str, Any],
+        stage: str,
+        table_names: Sequence[str],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        source = self.client.slow_query_source_row(source_row)
+        endpoint = self.client._normalize_endpoint(source.get("hostname_max"))
+        expected_db_value = source.get("db_max")
+        expected_db = (
+            expected_db_value.strip()
+            if isinstance(expected_db_value, str) and expected_db_value.strip()
+            else None
+        )
+        target_key = self.client.target_key(arguments)
+        target = self._analysis_target_from_arguments(
+            target_key,
+            arguments,
+            table_name=(
+                self.client.clean_table_name(table_names[0]) if len(table_names) == 1 else None
+            ),
+        )
+        if endpoint is None or expected_db is None:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=target,
+                error_type="target_unresolved",
+                reason_code="history_target_incomplete",
+                detail="history 行缺少可严格解析的 hostname_max 或 db_max。",
+                source_history_row=source,
+            ), None
+        endpoint = endpoint.casefold()
+        matching_ids = sorted(
+            instance_id
+            for instance_id, endpoints in state.analysis_instance_endpoints.items()
+            if endpoint in {item.casefold() for item in endpoints}
+        )
+        if len(matching_ids) != 1:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=target,
+                error_type="target_unresolved",
+                reason_code=(
+                    "instance_target_ambiguous"
+                    if len(matching_ids) > 1
+                    else "instance_not_allowlisted"
+                ),
+                detail=(
+                    "history hostname_max 在 allowlist 中匹配到多个实例。"
+                    if len(matching_ids) > 1
+                    else "history hostname_max 未匹配到 allowlist 中的真实实例。"
+                ),
+                source_history_row=source,
+            ), None
+        expected_instance_id = matching_ids[0]
+        if target_key is None or target_key[0] != expected_instance_id:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=target,
+                error_type="target_mismatch",
+                reason_code="instance_target_mismatch",
+                detail="调用 instance_id 与 history hostname_max 绑定的 allowlist 实例不一致。",
+                source_history_row=source,
+            ), None
+        requested_db = arguments.get("db_name")
+        if not isinstance(requested_db, str) or requested_db.strip() != expected_db:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=target,
+                error_type="target_mismatch",
+                reason_code="database_target_mismatch",
+                detail="调用 db_name 与 history db_max 不一致。",
+                source_history_row=source,
+            ), None
+        databases = state.analysis_database_names.get(expected_instance_id, set())
+        if expected_db not in databases:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=target,
+                error_type="target_unresolved",
+                reason_code="database_not_allowlisted",
+                detail="history db_max 未出现在该实例真实返回的数据库列表中。",
+                source_history_row=source,
+            ), None
+        sample = str(source.get("sample") or "")
+        mismatched_schemas = sorted(
+            {
+                reference.schema
+                for reference in self.client.explainable_physical_table_references(
+                    sample
+                )
+                if reference.schema is not None and reference.schema != expected_db
             }
-        first_keyword = re.match(r"(?is)^\s*([a-z]+)\b", statement)
-        if first_keyword is not None and first_keyword.group(1).casefold() in {
-            "alter",
-            "analyze",
-            "begin",
-            "call",
-            "commit",
-            "create",
-            "drop",
-            "grant",
-            "handler",
-            "kill",
-            "load",
-            "lock",
-            "optimize",
-            "rename",
-            "repair",
-            "revoke",
-            "rollback",
-            "set",
-            "start",
-            "truncate",
-            "unlock",
-        }:
-            return {
-                "stage": "explain",
-                "target": target,
-                "error_type": "unsafe_statement",
-                "reason_code": "direct_statement_forbidden",
-                "detail": "补充分析只允许普通 EXPLAIN 和只读元数据查询。",
+        )
+        if mismatched_schemas:
+            return self._local_rejection(
+                stage=stage,
+                target=target,
+                error_type="target_mismatch",
+                reason_code="sample_schema_mismatch",
+                detail=(
+                    "history sample 的显式 schema 与 db_max 不一致："
+                    + ", ".join(mismatched_schemas)
+                ),
+                source_history_row=source,
+            ), None
+        clean_tables = [self.client.clean_table_name(item) for item in table_names]
+        bound_target: dict[str, Any] = {
+            "instance_id": expected_instance_id,
+            "db_name": expected_db_value.strip(),
+            "endpoint": endpoint,
+        }
+        if len(clean_tables) == 1:
+            bound_target["table_name"] = clean_tables[0]
+        return None, {
+            "stage": stage,
+            "source_history_row": source,
+            "target": bound_target,
+            "table_names": clean_tables,
+        }
+
+    def _validate_database_discovery_target(
+        self,
+        state: ArcheryHarnessState,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        requested_id = self.client._coerce_positive_integer(arguments.get("instance_id"))
+        candidates = self.client.select_explainable_history_rows(
+            self._history_payload(state),
+            sample_prefix_ids=state.history_sample_prefix_ids,
+        )
+        valid_ids: set[int] = set()
+        ambiguous = False
+        for row in candidates:
+            endpoint = self.client._normalize_endpoint(
+                self.client._casefolded_value(row, "hostname_max")
+            )
+            if endpoint is None:
+                continue
+            matching = {
+                instance_id
+                for instance_id, endpoints in state.analysis_instance_endpoints.items()
+                if endpoint.casefold() in {item.casefold() for item in endpoints}
             }
-        return None
+            if len(matching) == 1:
+                valid_ids.update(matching)
+            elif len(matching) > 1:
+                ambiguous = True
+        if requested_id is not None and requested_id in valid_ids:
+            return None
+        return self._local_rejection(
+            stage="target_resolution",
+            target=(
+                {"instance_id": requested_id} if requested_id is not None else {}
+            ),
+            error_type="target_unresolved",
+            reason_code=("instance_target_ambiguous" if ambiguous else "instance_not_allowlisted"),
+            detail=(
+                "history hostname_max 在 allowlist 中匹配到多个实例。"
+                if ambiguous
+                else "数据库发现只能使用与 history hostname_max 唯一匹配的 allowlist 实例。"
+            ),
+        )
+
+    def _bind_database_target(
+        self,
+        state: ArcheryHarnessState,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        db_name = arguments.get("db_name")
+        if not isinstance(db_name, str):
+            return self._local_rejection(
+                stage="target_resolution",
+                target={},
+                reason_code="database_target_required",
+                detail="表发现必须提供已绑定的 instance_id 和 db_name。",
+            ), None
+        source_rows = [
+            row
+            for row in self.client.select_explainable_history_rows(
+                self._history_payload(state),
+                sample_prefix_ids=state.history_sample_prefix_ids,
+            )
+            if str(self.client._casefolded_value(row, "db_max") or "").strip()
+            == db_name.strip()
+        ]
+        if not source_rows:
+            return self._local_rejection(
+                stage="target_resolution",
+                target=self._analysis_target_from_arguments(
+                    self.client.target_key(arguments),
+                    arguments,
+                ),
+                error_type="target_mismatch",
+                reason_code="database_target_mismatch",
+                detail="表发现 db_name 无法与 history db_max 关联。",
+            ), None
+        first_rejection: dict[str, Any] | None = None
+        for source_row in source_rows:
+            rejection, binding = self._bind_supplemental_target(
+                state,
+                source_row=source_row,
+                arguments=arguments,
+                stage="target_resolution",
+                table_names=[],
+            )
+            if binding is not None:
+                return None, binding
+            if first_rejection is None:
+                first_rejection = rejection
+        return first_rejection, None
+
+    @staticmethod
+    def _source_key(source: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(source.get("id") or ""),
+            str(source.get("checksum") or "").casefold(),
+            str(source.get("sample") or ""),
+        )
+
+    def _table_structure_resolved(
+        self,
+        state: ArcheryHarnessState,
+        binding: Mapping[str, Any],
+    ) -> bool:
+        tables = {
+            self.client.clean_table_name(str(item))
+            for item in binding.get("table_names", [])
+        }
+        if not tables:
+            return True
+        source = binding.get("source_history_row")
+        target = binding.get("target")
+        if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+            return False
+        expected_instance = target.get("instance_id")
+        expected_db = str(target.get("db_name") or "")
+        resolved: set[str] = set()
+        for item in [
+            *state.slow_query_table_structure_results,
+            *state.slow_query_analysis_failures,
+        ]:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("stage") not in (None, "table_structure"):
+                continue
+            item_target = item.get("target")
+            if not isinstance(item_target, Mapping):
+                continue
+            if item_target.get("instance_id") != expected_instance:
+                continue
+            if str(item_target.get("db_name") or "") != expected_db:
+                continue
+            table_name = item_target.get("table_name")
+            if isinstance(table_name, str):
+                resolved.add(self.client.clean_table_name(table_name))
+        return tables <= resolved
+
+    @staticmethod
+    def _local_rejection(
+        *,
+        stage: str,
+        target: Mapping[str, Any],
+        reason_code: str,
+        detail: str,
+        error_type: str = "unsafe_statement",
+        source_history_row: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        failure: dict[str, Any] = {
+            "stage": stage,
+            "target": dict(target),
+            "error_type": error_type,
+            "reason_code": reason_code,
+            "detail": detail,
+        }
+        if source_history_row is not None:
+            failure["source_history_row"] = dict(source_history_row)
+        return failure
+
+    def _response_mismatch(
+        self,
+        call: PreparedCall,
+        payload: Mapping[str, Any],
+        *,
+        raw_payload: Mapping[str, Any] | None = None,
+        supplemental_text: Sequence[str] = (),
+        executed_sql: str | None,
+        actual_sql_verified: bool,
+    ) -> dict[str, Any] | None:
+        binding = call.metadata.get("analysis_binding")
+        source = (
+            binding.get("source_history_row")
+            if isinstance(binding, Mapping)
+            else None
+        )
+        bound_target = binding.get("target") if isinstance(binding, Mapping) else None
+        target = (
+            dict(bound_target)
+            if isinstance(bound_target, Mapping)
+            else self._analysis_target(call)
+        )
+        requested_sql = call.effective_arguments.get("sql_content")
+        stage = (
+            str(binding.get("stage") or "target_resolution")
+            if isinstance(binding, Mapping)
+            else "history_recovery"
+            if isinstance(requested_sql, str)
+            and self.client.is_history_result_query(requested_sql)
+            else "target_resolution"
+        )
+        if executed_sql is not None and isinstance(requested_sql, str) and not actual_sql_verified:
+            return self._local_rejection(
+                stage=stage,
+                target=target,
+                error_type="result_mismatch",
+                reason_code="actual_sql_mismatch",
+                detail="MCP 回显的实际执行 SQL 与已验证请求不一致，结果未投影。",
+                source_history_row=source if isinstance(source, Mapping) else None,
+            )
+        reported_values = self.client.reported_execution_target_values(
+            payload,
+            supplemental_text=supplemental_text,
+        )
+        if raw_payload is not None and raw_payload is not payload:
+            for field, values in self.client.reported_execution_target_values(
+                raw_payload,
+                supplemental_text=supplemental_text,
+            ).items():
+                reported_values.setdefault(field, set()).update(values)
+        metadata_rows_are_physical_targets = isinstance(requested_sql, str) and (
+            (
+                stage == "table_structure"
+                and self.client.is_information_schema_columns_query(requested_sql)
+            )
+            or (
+                stage == "indexes"
+                and self.client.is_information_schema_statistics_query(requested_sql)
+            )
+        )
+        if metadata_rows_are_physical_targets:
+            for field, values in self.client.reported_metadata_row_target_values(
+                payload,
+                supplemental_text=supplemental_text,
+            ).items():
+                reported_values.setdefault(field, set()).update(values)
+            if raw_payload is not None and raw_payload is not payload:
+                for field, values in self.client.reported_metadata_row_target_values(
+                    raw_payload,
+                    supplemental_text=supplemental_text,
+                ).items():
+                    reported_values.setdefault(field, set()).update(values)
+        expected_values = {
+            "instance_id": target.get("instance_id"),
+            "db_name": (
+                target.get("db_name")
+                if isinstance(bound_target, Mapping)
+                else call.effective_arguments.get("db_name")
+            ),
+            "endpoint": target.get("endpoint"),
+            "table_name": (
+                target.get("table_name")
+                or call.effective_arguments.get("tb_name")
+                or call.effective_arguments.get("table_name")
+            ),
+        }
+
+        def normalized_target_value(field: str, value: Any) -> Any:
+            if field == "instance_id":
+                return self.client._coerce_positive_integer(value)
+            if field == "endpoint":
+                endpoint = self.client._normalize_endpoint(value)
+                return endpoint.casefold() if endpoint is not None else None
+            if field == "table_name" and isinstance(value, str):
+                return self.client.clean_table_name(value)
+            if field == "db_name" and isinstance(value, str):
+                return value.strip().strip("`\"")
+            if isinstance(value, str):
+                return value.strip()
+            return value
+
+        mismatched_fields = {
+            field
+            for field, values in reported_values.items()
+            if len({normalized_target_value(field, value) for value in values}) > 1
+            or (
+                expected_values.get(field) not in (None, "")
+                and any(
+                    normalized_target_value(field, value)
+                    != normalized_target_value(field, expected_values[field])
+                    for value in values
+                )
+            )
+        }
+        if not mismatched_fields:
+            return None
+        return self._local_rejection(
+            stage=stage,
+            target=target,
+            error_type="result_mismatch",
+            reason_code="actual_target_mismatch",
+            detail=(
+                "MCP 回显的实际目标与已绑定目标不一致，结果未投影："
+                + ", ".join(sorted(mismatched_fields))
+            ),
+            source_history_row=source if isinstance(source, Mapping) else None,
+        )
+
+    def _supplemental_incomplete_result_failure(
+        self,
+        call: PreparedCall,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reject partial supplemental facts while retaining their raw artifact."""
+
+        binding = call.metadata.get("analysis_binding")
+        if not isinstance(binding, Mapping) or not self.client.is_result_incomplete(payload):
+            return None
+        target = binding.get("target")
+        source = binding.get("source_history_row")
+        reasons = self.client.result_incomplete_reasons(payload)
+        return self._local_rejection(
+            stage=str(binding.get("stage") or "target_resolution"),
+            target=dict(target) if isinstance(target, Mapping) else {},
+            error_type="incomplete_result",
+            reason_code="supplemental_result_incomplete",
+            detail=(
+                "补充查询结果不完整，未投影为成功事实"
+                + (f"：{', '.join(reasons)}" if reasons else "。")
+            ),
+            source_history_row=dict(source) if isinstance(source, Mapping) else None,
+        )
+
+    def _collect_table_columns_result(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        payload: Mapping[str, Any],
+    ) -> None:
+        binding = call.metadata.get("analysis_binding")
+        if not isinstance(binding, Mapping):
+            return
+        source = binding.get("source_history_row")
+        target = binding.get("target")
+        if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+            return
+        columns = self.client.table_columns_from_payload(payload)
+        if not columns:
+            state.slow_query_analysis_failures.append(
+                self._local_rejection(
+                    stage="table_structure",
+                    target=target,
+                    error_type="empty_result",
+                    reason_code="empty_table_structure_result",
+                    detail="字段发现成功返回，但没有可投影的真实字段。",
+                    source_history_row=source,
+                )
+            )
+            return
+        state.slow_query_table_structure_results.append(
+            {
+                "stage": "table_structure",
+                "source_history_row": dict(source),
+                "target": dict(target),
+                "source": "list_table_columns",
+                "result": {
+                    "columns": sorted(columns, key=str.casefold),
+                    "rows": [],
+                    "row_count": len(columns),
+                },
+            }
+        )
 
     def _collect_slow_query_analysis_result(
         self,
@@ -845,58 +2223,92 @@ class ArcheryHarnessScenario:
         *,
         result_sql: str,
     ) -> bool:
-        history_payload = self._history_payload(state)
-        requested_sql = call.effective_arguments.get("sql_content")
-        explain_sql = (
-            requested_sql
-            if isinstance(requested_sql, str)
-            and self.client.classify_plain_explain(requested_sql) is not None
-            else result_sql
-        )
-        source_row = self.client.history_row_for_explain(explain_sql, history_payload)
-        if source_row is not None:
-            inner_sql = self.client.classify_plain_explain(explain_sql)
-            table_names = sorted(
-                self.client.explainable_table_references(inner_sql or ""),
-                key=str.casefold,
+        binding = call.metadata.get("analysis_binding")
+        if not isinstance(binding, Mapping):
+            return False
+        source = binding.get("source_history_row")
+        target = binding.get("target")
+        stage = binding.get("stage")
+        if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+            return False
+        projected_result = self.client.structured_sql_result(payload)
+
+        if stage == "explain":
+            source_row = self.client.history_row_for_explain(
+                result_sql,
+                self._history_payload(state),
+                sample_prefix_ids=state.history_sample_prefix_ids,
             )
+            if source_row is None or self._source_key(
+                self.client.slow_query_source_row(source_row)
+            ) != self._source_key(source):
+                state.slow_query_analysis_failures.append(
+                    self._local_rejection(
+                        stage="explain",
+                        target=target,
+                        error_type="result_mismatch",
+                        reason_code="actual_sql_sample_mismatch",
+                        detail="MCP 实际执行 SQL 无法与已绑定的 history sample 关联。",
+                        source_history_row=source,
+                    )
+                )
+                return True
+            inner_sql = self.client.classify_plain_explain(result_sql) or ""
+            if projected_result["row_count"] == 0:
+                state.slow_query_analysis_failures.append(
+                    self._local_rejection(
+                        stage="explain",
+                        target=target,
+                        error_type="empty_result",
+                        reason_code="empty_explain_result",
+                        detail="普通 EXPLAIN 成功返回，但没有可投影的执行计划行。",
+                        source_history_row=source,
+                    )
+                )
+                return True
             state.slow_query_explain_results.append(
                 {
-                    "source_history_row": self.client.slow_query_source_row(source_row),
-                    "target": self._analysis_target(
-                        call,
-                        table_name=table_names[0] if table_names else None,
-                    ),
-                    "statement_type": self.client.classify_explainable_statement(inner_sql or ""),
-                    "result": self.client.structured_sql_result(payload),
+                    "stage": "explain",
+                    "source_history_row": dict(source),
+                    "target": dict(target),
+                    "statement_type": self.client.classify_explainable_statement(inner_sql),
+                    "result": projected_result,
                 }
             )
             return True
-        if self.client.is_information_schema_columns_query(result_sql):
-            sql_target = self.client.information_schema_target(result_sql)
+        if stage == "table_structure" and self.client.is_information_schema_columns_query(
+            result_sql
+        ):
+            if projected_result["row_count"] == 0:
+                state.slow_query_analysis_failures.append(
+                    self._local_rejection(
+                        stage="table_structure",
+                        target=target,
+                        error_type="empty_result",
+                        reason_code="empty_table_structure_result",
+                        detail="字段结构查询成功返回，但没有可投影的字段。",
+                        source_history_row=source,
+                    )
+                )
+                return True
             state.slow_query_table_structure_results.append(
                 {
-                    "target": self._analysis_target(
-                        call,
-                        db_name=sql_target.get("db_name"),
-                        table_name=sql_target.get("table_name"),
-                    ),
+                    "stage": "table_structure",
+                    "source_history_row": dict(source),
+                    "target": dict(target),
                     "source": "information_schema.COLUMNS",
-                    "result": self.client.structured_sql_result(payload),
+                    "result": projected_result,
                 }
             )
             return True
-        if self.client.is_information_schema_statistics_query(result_sql):
-            sql_target = self.client.information_schema_target(result_sql)
+        if stage == "indexes" and self.client.is_information_schema_statistics_query(result_sql):
             state.slow_query_index_results.append(
                 {
-                    "target": self._analysis_target(
-                        call,
-                        db_name=sql_target.get("db_name"),
-                        table_name=sql_target.get("table_name"),
-                    ),
+                    "stage": "indexes",
+                    "source_history_row": dict(source),
+                    "target": dict(target),
                     "source": "information_schema.STATISTICS",
-                    "result": self.client.structured_sql_result(payload),
+                    "result": projected_result,
                 }
             )
             return True
@@ -913,7 +2325,11 @@ class ArcheryHarnessScenario:
                 return "indexes"
         if call.tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME:
             return "table_structure"
-        if call.tool_name in {ARCHERY_MCP_INSTANCES_TOOL_NAME, ARCHERY_MCP_DATABASES_TOOL_NAME}:
+        if call.tool_name in {
+            ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            ARCHERY_MCP_TABLES_TOOL_NAME,
+        }:
             return "target_resolution"
         return None
 
@@ -973,17 +2389,33 @@ class ArcheryHarnessScenario:
                     ),
                     table_name,
                 )
-        return {
+        binding = call.metadata.get("analysis_binding")
+        bound_target = (
+            binding.get("target") if isinstance(binding, Mapping) else None
+        )
+        failure: dict[str, Any] = {
             "stage": stage,
-            "target": self._analysis_target(
-                call,
-                db_name=db_name,
-                table_name=table_name if isinstance(table_name, str) else None,
+            "target": (
+                dict(bound_target)
+                if isinstance(bound_target, Mapping)
+                else self._analysis_target(
+                    call,
+                    db_name=db_name,
+                    table_name=table_name if isinstance(table_name, str) else None,
+                )
             ),
             "error_type": classified_type,
             "reason_code": reason_code,
             "detail": normalized_detail,
         }
+        bound_source = (
+            binding.get("source_history_row")
+            if isinstance(binding, Mapping)
+            else None
+        )
+        if isinstance(bound_source, Mapping):
+            failure["source_history_row"] = dict(bound_source)
+        return failure
 
     def _analysis_target(
         self,
@@ -1027,13 +2459,24 @@ class ArcheryHarnessScenario:
             state.history_merge_sources and state.history_id_rows
         )
 
+    @classmethod
+    def _has_history_context(cls, state: ArcheryHarnessState) -> bool:
+        return cls._has_history_result(state) or state.history_result_target is not None
+
     def _history_payload(self, state: ArcheryHarnessState) -> dict[str, Any]:
         if state.history_merge_sources and state.history_id_rows:
-            return self.client.merged_history_payload(
-                state.history_id_rows,
-                state.history_merge_sources,
+            return _history_payload_with_recovery_status(
+                self.client.merged_history_payload(
+                    state.history_id_rows,
+                    state.history_merge_sources,
+                ),
+                state,
             )
-        return dict(state.final_result.payload) if state.final_result is not None else {}
+        return (
+            _history_payload_with_recovery_status(state.final_result.payload, state)
+            if state.final_result is not None
+            else {}
+        )
 
     def on_result(
         self,
@@ -1047,11 +2490,13 @@ class ArcheryHarnessScenario:
         local_rejection = call.metadata.get("local_rejection")
         if isinstance(local_rejection, Mapping):
             failure = dict(local_rejection)
-            state.slow_query_analysis_failures.append(failure)
+            if self._has_history_context(state) or state.supplemental_analysis_started:
+                state.slow_query_analysis_failures.append(failure)
             trace = self._trace(state, call)
             if trace is not None:
                 trace["outcome"] = "rejected_locally"
                 trace["error_type"] = failure.get("error_type")
+                trace["reason_code"] = failure.get("reason_code")
                 trace["error_detail"] = failure.get("detail")
             return self._internal_only_transition(
                 state,
@@ -1060,14 +2505,116 @@ class ArcheryHarnessScenario:
             )
         self._record_remote_call(state, call)
         payload = self.client.extract_tool_payload(result)
+        text_blocks = self.client.tool_text_blocks(result)
         self.client.validate_business_success(
             payload,
             tool_name=call.tool_name,
-            supplemental_text=self.client.tool_text_blocks(result),
+            supplemental_text=text_blocks,
         )
         trace = self._trace(state, call)
         if trace is not None:
             trace["outcome"] = "ok"
+
+        requested_sql = call.effective_arguments.get("sql_content")
+        requested_sql = requested_sql if isinstance(requested_sql, str) else ""
+        normalized_payload, executed_sql, actual_sql_verified = (
+            self.client.normalize_query_payload(
+                payload,
+                requested_sql=requested_sql,
+                supplemental_text=text_blocks,
+            )
+        )
+        mismatch = self._response_mismatch(
+            call,
+            normalized_payload,
+            raw_payload=payload,
+            supplemental_text=text_blocks,
+            executed_sql=executed_sql,
+            actual_sql_verified=actual_sql_verified,
+        )
+        if mismatch is not None:
+            if self._has_history_context(state) or state.supplemental_analysis_started:
+                state.slow_query_analysis_failures.append(mismatch)
+            if trace is not None:
+                trace["outcome"] = "result_mismatch"
+                trace["error_type"] = mismatch["error_type"]
+                trace["reason_code"] = mismatch["reason_code"]
+                trace["error_detail"] = mismatch["detail"]
+            return self._internal_only_transition(
+                state,
+                call,
+                raw_result=result,
+            )
+
+        incomplete_failure = self._supplemental_incomplete_result_failure(
+            call,
+            normalized_payload,
+        )
+        if incomplete_failure is not None:
+            state.slow_query_analysis_failures.append(incomplete_failure)
+            if trace is not None:
+                trace["outcome"] = "incomplete_result"
+                trace["error_type"] = incomplete_failure["error_type"]
+                trace["reason_code"] = incomplete_failure["reason_code"]
+                trace["error_detail"] = incomplete_failure["detail"]
+            return self._internal_only_transition(
+                state,
+                call,
+                raw_result=result,
+            )
+
+        if self._has_history_result(state) and call.tool_name == ARCHERY_MCP_INSTANCES_TOOL_NAME:
+            for instance_id, endpoints in self.client.allowlisted_instance_endpoints(
+                payload
+            ).items():
+                state.analysis_instance_endpoints.setdefault(instance_id, set()).update(
+                    endpoints
+                )
+
+        if self._has_history_result(state) and call.tool_name == ARCHERY_MCP_DATABASES_TOOL_NAME:
+            instance_id = self.client._coerce_positive_integer(
+                call.effective_arguments.get("instance_id")
+            )
+            if instance_id is not None:
+                reported_values = self.client.reported_execution_target_values(
+                    payload,
+                    supplemental_text=text_blocks,
+                )
+                reported_instances = reported_values.get("instance_id", set())
+                reported_endpoints = {
+                    str(item).casefold()
+                    for item in reported_values.get("endpoint", set())
+                }
+                expected_endpoints = {
+                    item.casefold()
+                    for item in state.analysis_instance_endpoints.get(instance_id, set())
+                }
+                discovery_mismatch = any(
+                    reported_instance != instance_id
+                    for reported_instance in reported_instances
+                ) or any(
+                    reported_endpoint not in expected_endpoints
+                    for reported_endpoint in reported_endpoints
+                )
+                if discovery_mismatch:
+                    state.slow_query_analysis_failures.append(
+                        self._local_rejection(
+                            stage="target_resolution",
+                            target={"instance_id": instance_id},
+                            error_type="result_mismatch",
+                            reason_code="actual_target_mismatch",
+                            detail=(
+                                "数据库发现结果回显的实际实例与已绑定请求不一致，"
+                                "返回数据库未用于授权补充查询。"
+                            ),
+                        )
+                    )
+                else:
+                    databases = self.client.allowlisted_database_names(payload)
+                    if databases:
+                        state.analysis_database_names.setdefault(instance_id, set()).update(
+                            databases
+                        )
 
         if call.tool_name == ARCHERY_MCP_TABLES_TOOL_NAME:
             target = self.client.target_key(call.effective_arguments)
@@ -1085,27 +2632,8 @@ class ArcheryHarnessScenario:
                     state.table_columns.setdefault(target, {})[
                         self.client.clean_table_name(table_name).casefold()
                     ] = columns
-                if state.final_result is not None:
-                    state.slow_query_table_structure_results.append(
-                        {
-                            "target": self._analysis_target(
-                                call,
-                                table_name=self.client.clean_table_name(table_name),
-                            ),
-                            "source": "list_table_columns",
-                            "result": {
-                                "columns": sorted(columns, key=str.casefold),
-                                "rows": [],
-                                "row_count": len(columns),
-                            },
-                        }
-                    )
-
-        requested_sql = call.effective_arguments.get("sql_content")
-        requested_sql = requested_sql if isinstance(requested_sql, str) else ""
-        normalized_payload, executed_sql, actual_sql_verified = (
-            self.client.normalize_query_payload(payload, requested_sql=requested_sql)
-        )
+        if call.tool_name == ARCHERY_MCP_COLUMNS_TOOL_NAME and self._has_history_result(state):
+            self._collect_table_columns_result(state, call, normalized_payload)
         result_sql = executed_sql or requested_sql
         if not result_sql:
             return self._internal_only_transition(
@@ -1113,6 +2641,7 @@ class ArcheryHarnessScenario:
                 call,
                 raw_result=result,
             )
+        target = self.client.target_key(call.effective_arguments)
         if self._trace(state, call) is None:
             state.query_trace.append(
                 {
@@ -1128,8 +2657,32 @@ class ArcheryHarnessScenario:
                 }
             )
         is_final_history_result = self.client.is_history_result_query(result_sql)
+        if (
+            is_final_history_result
+            and call.metadata.get("history_query_authorized") is not True
+        ):
+            failure = self._local_rejection(
+                stage="history_recovery",
+                target=self._analysis_target_from_arguments(
+                    target,
+                    call.effective_arguments,
+                ),
+                error_type="authorization_missing",
+                reason_code="history_query_not_authorized",
+                detail="history 结果缺少当前策略生成的调用授权，结果未被采用。",
+            )
+            if trace is not None:
+                trace["outcome"] = "result_mismatch"
+                trace["error_type"] = failure["error_type"]
+                trace["reason_code"] = failure["reason_code"]
+                trace["error_detail"] = failure["detail"]
+            return self._internal_only_transition(
+                state,
+                call,
+                raw_result=result,
+            )
         if not is_final_history_result:
-            if state.final_result is not None and self._collect_slow_query_analysis_result(
+            if self._has_history_result(state) and self._collect_slow_query_analysis_result(
                 state,
                 call,
                 normalized_payload,
@@ -1141,7 +2694,10 @@ class ArcheryHarnessScenario:
                     raw_result=result,
                 )
             target = self.client.target_key(call.effective_arguments)
-            if target is not None:
+            if (
+                target is not None
+                and call.metadata.get("pre_history_metadata_authorized") is True
+            ):
                 self.client.record_metadata_resolution_evidence(
                     resolution_steps=state.metadata_resolution_steps,
                     member_instance_ids=state.member_instance_ids,
@@ -1158,11 +2714,62 @@ class ArcheryHarnessScenario:
                 raw_result=result,
             )
 
-        target = self.client.target_key(call.effective_arguments)
+        if state.history_result_target is None:
+            state.history_result_target = target
+        elif target != state.history_result_target:
+            failure = self._local_rejection(
+                stage="history_recovery",
+                target=self._analysis_target_from_arguments(
+                    target, call.effective_arguments
+                ),
+                error_type="result_mismatch",
+                reason_code="history_target_mismatch",
+                detail="history 结果目标与首次已验证的 history 目标不一致，结果未被采用。",
+            )
+            state.slow_query_analysis_failures.append(failure)
+            if trace is not None:
+                trace["outcome"] = "result_mismatch"
+                trace["error_type"] = failure["error_type"]
+                trace["error_detail"] = failure["detail"]
+            return self._internal_only_transition(
+                state,
+                call,
+                raw_result=result,
+            )
         # Truncation-recovery navigation: an id listing or a per-id retrieval
         # query must never become the final slow-log result (run 2970f801 lost
         # 5 of 6 window rows because each history SELECT overwrote it).
         if self.client.is_history_id_only_projection(result_sql):
+            if not self._is_scoped_history_id_listing(state, result_sql):
+                failure = self._local_rejection(
+                    stage="history_recovery",
+                    target=self._analysis_target_from_arguments(
+                        target, call.effective_arguments
+                    ),
+                    error_type="result_mismatch",
+                    reason_code="history_recovery_query_forbidden",
+                    detail="MCP 实际执行的 id 清单没有保留严格窗口约束，返回 id 未获授权。",
+                )
+                state.slow_query_analysis_failures.append(failure)
+                return self._internal_only_transition(
+                    state,
+                    call,
+                    raw_result=result,
+                )
+            listed_ids = self.client.history_row_ids(normalized_payload)
+            listing_row_count = self.client.payload_row_count(normalized_payload)
+            valid_id_listing = (
+                listing_row_count is not None
+                and len(listed_ids) == listing_row_count
+            )
+            state.history_recovery_required = True
+            state.history_recovery_terminal_failure = False
+            state.history_recovery_ids = listed_ids
+            state.history_recovery_listing_completed = (
+                valid_id_listing
+                and not self.client.is_result_incomplete(normalized_payload)
+            )
+            self._resolve_deferred_positional_rows(state)
             return self._history_observation_transition(
                 state,
                 call,
@@ -1171,12 +2778,86 @@ class ArcheryHarnessScenario:
                 result_sql=result_sql,
             )
         if self.client.is_history_id_retrieval_query(result_sql):
+            retrieval = self.client.history_id_retrieval(result_sql)
+            assert retrieval is not None
+            row_id, projection = retrieval
+            returned_ids = self.client.history_row_ids(normalized_payload)
+            if returned_ids - {row_id}:
+                failure = self._local_rejection(
+                    stage="history_recovery",
+                    target=self._analysis_target_from_arguments(
+                        target, call.effective_arguments
+                    ),
+                    error_type="result_mismatch",
+                    reason_code="history_row_id_mismatch",
+                    detail="per-id 恢复结果包含请求 id 之外的行，结果未进入合并证据。",
+                )
+                state.slow_query_analysis_failures.append(failure)
+                return self._internal_only_transition(
+                    state,
+                    call,
+                    raw_result=result,
+                )
+            named_rows = self.client._tabular_rows(normalized_payload)
+            trusted_full_row = (
+                projection == "full"
+                and actual_sql_verified
+                and not self.client.is_result_incomplete(normalized_payload)
+                and self.client.payload_row_count(normalized_payload) == 1
+                and len(named_rows) == 1
+                and returned_ids == {row_id}
+                and self.client._coerce_positive_integer(
+                    self.client._casefolded_value(named_rows[0], "id")
+                )
+                == row_id
+                and any(str(key).casefold() == "sample" for key in named_rows[0])
+                and isinstance(
+                    self.client._casefolded_value(named_rows[0], "sample"), str
+                )
+            )
+            if (
+                projection == "sample_prefix"
+                and returned_ids == {row_id}
+                and len(named_rows) == 1
+                and isinstance(
+                    self.client._casefolded_value(named_rows[0], "sample"), str
+                )
+            ):
+                if row_id not in state.history_full_row_ids:
+                    state.history_sample_prefix_ids.add(row_id)
+            elif projection == "full" and trusted_full_row:
+                state.history_full_row_ids.add(row_id)
+                state.history_sample_prefix_ids.discard(row_id)
+                reference_columns = [str(column) for column in named_rows[0]]
+                if (
+                    reference_columns
+                    and reference_columns[0].casefold() == "id"
+                    and len({column.casefold() for column in reference_columns})
+                    == len(reference_columns)
+                ):
+                    state.history_positional_reference_columns = reference_columns
+            elif (
+                projection == "full"
+                and returned_ids == {row_id}
+                and any(
+                    str(key).casefold() == "sample"
+                    for row in named_rows
+                    for key in row
+                )
+            ):
+                state.history_full_row_ids.discard(row_id)
+                state.history_sample_prefix_ids.add(row_id)
             self.client.accumulate_history_rows(
                 state.history_id_rows,
                 state.history_merge_sources,
                 normalized_payload,
                 sql=result_sql,
                 include_source=True,
+                projection=(
+                    "unverified_full"
+                    if projection == "full" and not trusted_full_row
+                    else projection
+                ),
             )
             self._resolve_deferred_positional_rows(state)
             return self._history_observation_transition(
@@ -1187,10 +2868,20 @@ class ArcheryHarnessScenario:
                 result_sql=result_sql,
             )
         window_note: str | None = None
-        if normalized_payload.get("rows_recovered_from_truncated_json") is True:
+        if self.client.is_result_incomplete(normalized_payload):
             # Truncated window query: recovered rows join the accumulation
             # while final_result keeps recording this query as the window
             # baseline; the merge itself happens in _query_result.
+            state.history_id_rows.clear()
+            state.history_merge_sources.clear()
+            state.history_recovery_ids.clear()
+            state.history_positional_rows = []
+            state.history_positional_reference_columns = []
+            state.history_sample_prefix_ids.clear()
+            state.history_full_row_ids.clear()
+            state.history_recovery_required = True
+            state.history_recovery_listing_completed = False
+            state.history_recovery_terminal_failure = False
             self.client.accumulate_history_rows(
                 state.history_id_rows,
                 state.history_merge_sources,
@@ -1198,25 +2889,41 @@ class ArcheryHarnessScenario:
                 sql=result_sql,
                 include_source=False,
             )
+            if actual_sql_verified:
+                state.history_full_row_ids.update(
+                    row_id
+                    for row in self.client._tabular_rows(normalized_payload)
+                    if (
+                        row_id := self.client._coerce_positive_integer(
+                            self.client._casefolded_value(row, "id")
+                        )
+                    )
+                    is not None
+                    and isinstance(self.client._casefolded_value(row, "sample"), str)
+                )
             recovered_rows = normalized_payload.get("rows")
-            has_columns = isinstance(
-                normalized_payload.get("column_list")
-                or normalized_payload.get("columns"),
-                list,
-            )
-            if (
-                isinstance(recovered_rows, list)
-                and recovered_rows
-                and not has_columns
+            if isinstance(recovered_rows, list) and recovered_rows and any(
+                not isinstance(row, Mapping) for row in recovered_rows
             ):
                 # Archery places column_list after "rows", so a mid-rows
                 # truncation leaves recovered rows positional. Defer them until
                 # a structured row reveals the table column order.
                 state.history_positional_rows = [
-                    list(row)
+                    deepcopy(row)
                     for row in recovered_rows
-                    if isinstance(row, (list, tuple))
+                    if not isinstance(row, Mapping)
                 ]
+                declared_columns = normalized_payload.get(
+                    "columns"
+                ) or normalized_payload.get("column_list")
+                if (
+                    isinstance(declared_columns, list)
+                    and declared_columns
+                    and all(isinstance(column, str) for column in declared_columns)
+                    and len({column.casefold() for column in declared_columns})
+                    == len(declared_columns)
+                ):
+                    state.history_positional_reference_columns = list(declared_columns)
                 self._resolve_deferred_positional_rows(state)
                 if not state.window_positional_hint_given:
                     state.window_positional_hint_given = True
@@ -1235,7 +2942,14 @@ class ArcheryHarnessScenario:
             # earlier accumulation so stale rows cannot leak into the result.
             state.history_id_rows.clear()
             state.history_merge_sources.clear()
+            state.history_recovery_ids.clear()
             state.history_positional_rows = []
+            state.history_positional_reference_columns = []
+            state.history_sample_prefix_ids.clear()
+            state.history_full_row_ids.clear()
+            state.history_recovery_required = False
+            state.history_recovery_listing_completed = False
+            state.history_recovery_terminal_failure = False
         state.final_result = ArcherySlowLogQueryResult(
             payload=normalized_payload,
             requested_sql=requested_sql or result_sql,
@@ -1351,35 +3065,34 @@ class ArcheryHarnessScenario:
             ),
         )
 
-    @staticmethod
-    def _projection_retry_template(result_sql: str) -> str:
+    def _projection_retry_template(self, result_sql: str) -> str:
         """Build the column-projection SQL suggested after a fatal truncation."""
 
         match = re.search(r"(?i)\bid\s*=\s*(\d+)", result_sql)
-        row_id = match.group(1) if match else "<该行id>"
-        return (
-            "SELECT id, hostname_max, client_max, user_max, db_max, checksum, "
-            "ts_min, ts_max, ts_cnt, Query_time_sum, Query_time_min, "
-            "Query_time_max, Query_time_pct_95, Query_time_median, Lock_time_sum, "
-            "Lock_time_max, Rows_sent_sum, Rows_examined_sum, Full_scan_cnt, "
-            "Tmp_table_cnt, Filesort_cnt, Bytes_sum, LEFT(sample, '4000') AS sample, "
-            "LENGTH(sample) AS sample_full_length FROM "
-            f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
-        )
+        if match is None:
+            return "无法生成字段级恢复 SQL：原查询缺少单一数字 id。"
+        return self.client.history_sample_projection_sql(int(match.group(1)))
 
     def _resolve_deferred_positional_rows(self, state: ArcheryHarnessState) -> None:
-        """Decode deferred window rows once a structured row provides columns."""
+        """Decode deferred rows only from a verified full-row column order."""
 
-        if not state.history_positional_rows or not state.history_id_rows:
+        if not state.history_positional_rows:
             return
-        reference_row = next(iter(state.history_id_rows.values()))
-        decoded = self.client.merge_positional_rows_with_reference(
+        unresolved = self.client.merge_positional_rows_with_reference(
             state.history_id_rows,
             state.history_positional_rows,
-            reference_row,
+            state.history_positional_reference_columns,
+            allowed_ids=(
+                set(state.history_recovery_ids)
+                if state.history_recovery_listing_completed
+                else set()
+            ),
+            trusted_full_row_ids=state.history_full_row_ids,
+            sample_prefix_ids=state.history_sample_prefix_ids,
         )
-        if decoded:
-            state.history_positional_rows = []
+        state.history_positional_rows = unresolved
+        if not unresolved:
+            state.history_positional_reference_columns = []
 
     def _append_missing_id_hint(
         self,
@@ -1433,7 +3146,7 @@ class ArcheryHarnessScenario:
         requested_sql = call.effective_arguments.get("sql_content")
         if isinstance(requested_sql, str):
             state.last_query_error = error.message
-        if state.final_result is not None:
+        if self._has_history_result(state):
             stage = self._slow_query_analysis_stage(call)
             if stage is not None:
                 state.slow_query_analysis_failures.append(
@@ -1797,6 +3510,13 @@ def _query_result(
     harness: MCPHarnessResult[ArcheryHarnessState, dict[str, Any]],
 ) -> ArcherySlowLogQueryResult:
     state = harness.state
+    _record_history_recovery_terminal_failure(
+        state,
+        detail=(
+            "Archery 调查已终止，但 history 截断恢复尚未完成；"
+            "当前仅保留已恢复行并明确标记为不完整证据。"
+        ),
+    )
     if (
         state.final_result is None
         and state.history_merge_sources
@@ -1808,7 +3528,7 @@ def _query_result(
         # set final_result, so the main Agent received "no passthrough result"
         # and the whole evidence set was lost). Rebuild the final result from
         # the accumulated rows so the merged row set stays available.
-        raw_target = state.last_query_target
+        raw_target = state.history_result_target or state.last_query_target
         fallback_target = (
             (raw_target[0], raw_target[1])
             if isinstance(raw_target, (list, tuple))
@@ -1832,9 +3552,12 @@ def _query_result(
                 )
             resolution_tables = tuple(resolved_steps or ())
         state.final_result = ArcherySlowLogQueryResult(
-            payload=client.merged_history_payload(
-                state.history_id_rows,
-                state.history_merge_sources,
+            payload=_history_payload_with_recovery_status(
+                client.merged_history_payload(
+                    state.history_id_rows,
+                    state.history_merge_sources,
+                ),
+                state,
             ),
             requested_sql=str(state.history_merge_sources[0].get("full_sql") or ""),
             window_start=state.window_start,
@@ -1867,9 +3590,20 @@ def _query_result(
             # last single query (run 2970f801 lost 5 of 6 rows without this).
             final_result = replace(
                 final_result,
-                payload=client.merged_history_payload(
-                    state.history_id_rows,
-                    state.history_merge_sources,
+                payload=_history_payload_with_recovery_status(
+                    client.merged_history_payload(
+                        state.history_id_rows,
+                        state.history_merge_sources,
+                    ),
+                    state,
+                ),
+            )
+        else:
+            final_result = replace(
+                final_result,
+                payload=_history_payload_with_recovery_status(
+                    final_result.payload,
+                    state,
                 ),
             )
         diagnostics = dict(final_result.diagnostics or {})
@@ -1881,6 +3615,13 @@ def _query_result(
         )
         diagnostics["harness_stop_reason"] = (
             harness.finish.reason.value if harness.finish is not None else None
+        )
+        diagnostics["history_recovery_complete"] = _history_recovery_complete(state)
+        diagnostics["history_recovery_id_listing_complete"] = (
+            state.history_recovery_listing_completed
+        )
+        diagnostics["history_recovery_missing_ids"] = sorted(
+            _history_recovery_missing_ids(state)
         )
         return replace(
             final_result,
@@ -1974,57 +3715,159 @@ def _build_slow_query_analysis(
     table_results = deepcopy(getattr(state, "slow_query_table_structure_results", []))
     index_results = deepcopy(getattr(state, "slow_query_index_results", []))
     failures = deepcopy(getattr(state, "slow_query_analysis_failures", []))
-    candidates = client.select_explainable_history_rows(history_payload)
+    candidates = client.select_explainable_history_rows(
+        history_payload,
+        sample_prefix_ids=getattr(state, "history_sample_prefix_ids", set()),
+    )
     source_history_row = (
         client.slow_query_source_row(candidates[0]) if candidates else None
     )
 
-    target: dict[str, Any] = {}
-    analysis_items = [*explain_results, *table_results, *index_results, *failures]
-    analysis_target = next(
-        (
-            item["target"]
-            for item in analysis_items
-            if isinstance(item, Mapping) and isinstance(item.get("target"), Mapping)
-        ),
-        None,
-    )
-    if analysis_target is not None:
-        target.update(analysis_target)
-    elif state.final_result is not None:
-        if state.final_result.instance_id is not None:
-            target["instance_id"] = state.final_result.instance_id
-    if source_history_row is not None:
-        if source_history_row.get("db_max") is not None and "db_name" not in target:
-            target["db_name"] = source_history_row["db_max"]
-        if source_history_row.get("hostname_max") is not None:
-            target["hostname"] = source_history_row["hostname_max"]
+    def source_key(source: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(source.get("id") or ""),
+            str(source.get("checksum") or "").casefold(),
+            str(source.get("sample") or ""),
+        )
 
-    succeeded_stages: set[str] = set()
-    if explain_results:
-        succeeded_stages.add("explain")
-    if table_results:
-        succeeded_stages.add("table_structure")
-    if index_results:
-        succeeded_stages.add("indexes")
-    required_stages = ("explain", "table_structure", "indexes")
-    missing_stages = [stage for stage in required_stages if stage not in succeeded_stages]
+    expected: list[dict[str, Any]] = []
+    for row in candidates:
+        source = client.slow_query_source_row(row)
+        endpoint = client._normalize_endpoint(source.get("hostname_max"))
+        matching_ids = (
+            sorted(
+                instance_id
+                for instance_id, endpoints in state.analysis_instance_endpoints.items()
+                if endpoint is not None
+                and endpoint.casefold() in {item.casefold() for item in endpoints}
+            )
+            if endpoint is not None
+            else []
+        )
+        instance_id = matching_ids[0] if len(matching_ids) == 1 else None
+        db_name = source.get("db_max")
+        db_is_allowlisted = bool(
+            instance_id is not None
+            and isinstance(db_name, str)
+            and db_name.strip() in state.analysis_database_names.get(instance_id, set())
+        )
+        sample = str(source.get("sample") or "")
+        expected.append(
+            {
+                "source": source,
+                "source_key": source_key(source),
+                "instance_id": instance_id,
+                "db_name": db_name.strip() if isinstance(db_name, str) else None,
+                "target_bound": instance_id is not None and db_is_allowlisted,
+                "endpoint": endpoint.casefold() if endpoint is not None else None,
+                "tables": {
+                    client.clean_table_name(item)
+                    for item in client.explainable_table_references(sample)
+                },
+            }
+        )
+
+    def matching_result(
+        items: Sequence[Mapping[str, Any]],
+        work: Mapping[str, Any],
+        *,
+        table_name: str | None = None,
+        require_nonempty: bool = False,
+        require_source: bool = False,
+    ) -> bool:
+        if not work.get("target_bound"):
+            return False
+        for item in items:
+            item_source = item.get("source_history_row")
+            item_target = item.get("target")
+            result = item.get("result")
+            if not isinstance(item_target, Mapping):
+                continue
+            if require_source and (
+                not isinstance(item_source, Mapping)
+                or source_key(item_source) != work["source_key"]
+            ):
+                continue
+            if item_target.get("instance_id") != work["instance_id"]:
+                continue
+            if str(item_target.get("db_name") or "") != str(work.get("db_name") or ""):
+                continue
+            if table_name is not None and client.clean_table_name(
+                str(item_target.get("table_name") or "")
+            ).casefold() != client.clean_table_name(table_name).casefold():
+                continue
+            if require_nonempty and (
+                not isinstance(result, Mapping) or not result.get("row_count")
+            ):
+                continue
+            return True
+        return False
+
+    missing_stage_names: set[str] = set()
+    completed_work = 0
+    total_work = 0
+    for work in expected:
+        total_work += 1
+        if matching_result(
+            explain_results,
+            work,
+            require_nonempty=True,
+            require_source=True,
+        ):
+            completed_work += 1
+        else:
+            missing_stage_names.add("explain")
+        for table_name in work["tables"]:
+            total_work += 1
+            if matching_result(
+                table_results,
+                work,
+                table_name=table_name,
+                require_nonempty=True,
+            ):
+                completed_work += 1
+            else:
+                missing_stage_names.add("table_structure")
+            total_work += 1
+            if matching_result(index_results, work, table_name=table_name):
+                completed_work += 1
+            else:
+                missing_stage_names.add("indexes")
+    missing_stages = [
+        stage
+        for stage in ("explain", "table_structure", "indexes")
+        if stage in missing_stage_names
+    ]
+
+    target: dict[str, Any] = {}
+    if expected:
+        primary = expected[0]
+        if primary["instance_id"] is not None:
+            target["instance_id"] = primary["instance_id"]
+        if primary["db_name"] is not None:
+            target["db_name"] = primary["db_name"]
+        if primary["endpoint"] is not None:
+            target["hostname"] = primary["endpoint"]
 
     if not candidates:
         status = "not_applicable"
-        if not any(item.get("reason_code") == "no_explainable_sample" for item in failures):
+        missing_stages = []
+        if not any(
+            item.get("reason_code") == "no_safe_explainable_sample"
+            for item in failures
+        ):
             failures.append(
                 {
                     "stage": "explain",
                     "target": target,
                     "error_type": "sample_parse_failed",
-                    "reason_code": "no_explainable_sample",
+                    "reason_code": "no_safe_explainable_sample",
                     "detail": "history 结果中没有可由普通 EXPLAIN 安全分析的单语句 sample。",
                 }
             )
-    elif succeeded_stages == set(required_stages) and not failures:
+    elif total_work > 0 and completed_work == total_work and not failures:
         status = "succeeded"
-    elif succeeded_stages:
+    elif completed_work:
         status = "partial"
     else:
         status = "failed"

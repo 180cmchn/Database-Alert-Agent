@@ -58,6 +58,9 @@ from app.mcp_runtime.contracts import (
 )
 
 _UNSET = object()
+_DURABLE_CALL_CONTEXT_METADATA_KEYS = frozenset(
+    {"call_id", "provider_output_items", "request_id", "trace_index"}
+)
 
 
 class HarnessInfrastructureError(RuntimeError):
@@ -301,6 +304,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     tool_name=item.tool_name,
                     arguments=deepcopy(item.arguments),
                     response=deepcopy(item.response),
+                    is_remote=bool(getattr(item, "is_remote", True)),
                 )
                 for item in snapshot.remote_responses
             },
@@ -427,9 +431,17 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         scenario_finish = self.scenario.completion(ctx.state, tuple(ctx.observations))
         if scenario_finish is not None:
             return scenario_finish
-        session_finish = await self._ensure_session(ctx)
-        if session_finish is not None:
-            return session_finish
+        settled_local_pending, local_finish = await self._settle_pending_local_call(ctx)
+        if local_finish is not None:
+            return local_finish
+        if self._deadline_reached(ctx):
+            return self._deadline_finish(
+                "The MCP investigation deadline was reached before session setup."
+            )
+        if not settled_local_pending:
+            session_finish = await self._ensure_session(ctx)
+            if session_finish is not None:
+                return session_finish
         while True:
             if self._deadline_reached(ctx):
                 return Finish(
@@ -456,6 +468,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 assert ctx.pending_retry is not None
                 prepared = ctx.pending_retry.model_copy(deep=True)
 
+            if prepared.local_result is None and ctx.session is None:
+                session_finish = await self._ensure_session(ctx)
+                if session_finish is not None:
+                    return session_finish
             finish, retry = await self._execute_call(ctx, prepared)
             if finish is not None:
                 return finish
@@ -463,6 +479,25 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 raise HarnessInfrastructureError(
                     "retry directive was returned without a durable pending retry"
                 )
+
+    async def _settle_pending_local_call(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+    ) -> tuple[bool, Finish | None]:
+        """Complete a policy-rejected pending call before opening a new session."""
+
+        invocation = self._pending_invocation(ctx)
+        if invocation is None:
+            return False, None
+        prepared = self._active_or_reconstructed_call(ctx, invocation)
+        if prepared.local_result is None:
+            return False, None
+        finish, retry = await self._execute_call(ctx, prepared)
+        if retry is not None and ctx.pending_retry is None:
+            raise HarnessInfrastructureError(
+                "retry directive was returned without a durable pending retry"
+            )
+        return True, finish
 
     async def _ensure_session(
         self,
@@ -844,6 +879,13 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         await self._checkpoint(ctx)
 
         if prepared.local_result is not None:
+            await self._stage_response_lineage(
+                ctx,
+                invocation=started,
+                prepared=prepared,
+                response=prepared.local_result,
+                is_remote=False,
+            )
             return await self._complete_response(
                 ctx,
                 prepared=prepared,
@@ -862,11 +904,12 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         except Exception as exc:
             return await self._complete_failure(ctx, prepared, started, fingerprint, exc)
 
-        await self._stage_remote_response(
+        await self._stage_response_lineage(
             ctx,
             invocation=started,
             prepared=prepared,
             response=raw_result,
+            is_remote=True,
         )
 
         return await self._complete_response(
@@ -1082,6 +1125,13 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 continue
             prepared = self._active_or_reconstructed_call(ctx, invocation)
             if prepared.local_result is not None:
+                await self._stage_response_lineage(
+                    ctx,
+                    invocation=invocation,
+                    prepared=prepared,
+                    response=prepared.local_result,
+                    is_remote=False,
+                )
                 finish, _retry = await self._complete_response(
                     ctx,
                     prepared=prepared,
@@ -1264,6 +1314,14 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                             status=ToolInvocationStatus.STARTED,
                             started_at=max(started_event.occurred_at, invocation.created_at),
                         )
+            if invocation.status == ToolInvocationStatus.PENDING and (
+                recovered is None
+                or (
+                    recovered.status == ToolInvocationStatus.STARTED
+                    and invocation.invocation_id not in ctx.remote_debited_invocations
+                )
+            ):
+                self._refresh_pending_call_policy(ctx, invocation)
             if recovered is None:
                 continue
             self._validate_recovered_invocation(invocation, recovered)
@@ -1271,6 +1329,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 invocation.status == ToolInvocationStatus.PENDING
                 and recovered.status == ToolInvocationStatus.STARTED
                 and invocation.invocation_id not in ctx.remote_debited_invocations
+                and not self._is_local_invocation(ctx, invocation)
             ):
                 raise HarnessInfrastructureError(
                     "durable STARTED invocation has no correlated remote tool debit"
@@ -1863,10 +1922,23 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         raise HarnessInfrastructureError(
                             "durable MCP prepared call does not match its decision"
                         )
-                    # prepare_call may update deterministic scenario state (for
-                    # example, an Archery query trace). Replay those effects
-                    # once, but retain the durable provider-native call context.
-                    self._prepare_call(ctx, action)
+                    # Reapply current Host policy while retaining durable
+                    # provider-native context such as response item IDs.
+                    current_prepared = self._prepare_call(ctx, action)
+                    durable_context_metadata = {
+                        key: deepcopy(prepared.metadata[key])
+                        for key in _DURABLE_CALL_CONTEXT_METADATA_KEYS
+                        if key in prepared.metadata
+                    }
+                    prepared = current_prepared.model_copy(
+                        update={
+                            "metadata": {
+                                **deepcopy(current_prepared.metadata),
+                                **durable_context_metadata,
+                            }
+                        },
+                        deep=True,
+                    )
             else:
                 if raw_prepared is not None:
                     raise HarnessInfrastructureError(
@@ -2074,28 +2146,30 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                 f"failed to persist artifact {invocation.artifact_ref.artifact_id}"
             ) from exc
 
-    async def _stage_remote_response(
+    async def _stage_response_lineage(
         self,
         ctx: _RunContext[StateT, ObservationT],
         *,
         invocation: ToolInvocation,
         prepared: PreparedCall,
         response: Any,
+        is_remote: bool,
     ) -> None:
         record = RemoteResponseRecord(
             invocation_id=invocation.invocation_id,
             tool_name=prepared.tool_name,
             arguments=deepcopy(prepared.effective_arguments),
             response=self._portable_remote_response(response),
+            is_remote=is_remote,
         )
         existing = ctx.remote_responses.get(invocation.invocation_id)
         if existing is not None and existing != record:
             raise HarnessInfrastructureError(
-                "checkpoint remote MCP response conflicts with the completed invocation"
+                "checkpoint response lineage conflicts with the completed invocation"
             )
         ctx.remote_responses[invocation.invocation_id] = record
-        # The raw response is checkpointed before scenario processing so a
-        # process restart can finish this read-only call without repeating it.
+        # Checkpoint before scenario processing so recovery can apply the same
+        # response without repeating either transport or local policy work.
         await self._checkpoint(ctx)
 
     async def _persist_deferred_remote_responses(
@@ -2106,7 +2180,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             return
         for invocation in ctx.invocations:
             record = ctx.remote_responses.get(invocation.invocation_id)
-            if record is None:
+            if record is None or not record.is_remote:
                 continue
             try:
                 await self.remote_response_store.save(
@@ -2131,7 +2205,9 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         staged = ctx.remote_responses.get(invocation.invocation_id)
         if staged is not None:
             if (
-                staged.tool_name != prepared.tool_name
+                not staged.is_remote
+                or prepared.local_result is not None
+                or staged.tool_name != prepared.tool_name
                 or staged.arguments != prepared.effective_arguments
             ):
                 raise HarnessInfrastructureError(
@@ -2220,6 +2296,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     tool_name=record.tool_name,
                     arguments=deepcopy(record.arguments),
                     response=deepcopy(record.response),
+                    is_remote=record.is_remote,
                 )
                 for record in (
                     ctx.remote_responses[invocation_id]
@@ -2331,6 +2408,75 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         return ToolInvocation.build_fingerprint(
             tool_name=call.tool_name,
             effective_arguments=call.effective_arguments,
+        )
+
+    def _is_local_invocation(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        invocation: ToolInvocation,
+    ) -> bool:
+        return self._active_or_reconstructed_call(ctx, invocation).local_result is not None
+
+    def _refresh_pending_call_policy(
+        self,
+        ctx: _RunContext[StateT, ObservationT],
+        invocation: ToolInvocation,
+    ) -> None:
+        """Apply current Host policy before a checkpointed call crosses transport."""
+
+        durable = self._active_or_reconstructed_call(ctx, invocation)
+        # A durable local decision is already the conservative side of the
+        # transport boundary. Policy upgrades may further restrict a pending
+        # remote call, but must never turn a checkpointed local rejection into
+        # a remote execution.
+        if durable.local_result is not None:
+            return
+        action = CallToolAction(
+            tool_name=invocation.tool_name,
+            objective=invocation.objective,
+            hypothesis_ids=list(invocation.hypothesis_ids),
+            arguments=deepcopy(invocation.model_arguments),
+        )
+        # The checkpoint already contains prepare_call's deterministic state
+        # effects. Re-evaluate policy against an isolated copy so recovery does
+        # not append duplicate traces or advance scenario state twice.
+        isolated_state = deepcopy(ctx.state)
+        restore_state = getattr(self.scenario, "restore_state", None)
+        try:
+            scenario_prepared = self.scenario.prepare_call(action, state=isolated_state)
+        finally:
+            # Stateful scenarios may retain the state object passed to
+            # prepare_call. Never leave that pointer on the isolated policy
+            # copy, including when policy evaluation raises.
+            if callable(restore_state):
+                restore_state(ctx.state)
+        current = scenario_prepared.model_copy(
+            update={
+                "tool_name": action.tool_name,
+                "objective": action.objective,
+                "hypothesis_ids": list(action.hypothesis_ids),
+                "model_arguments": deepcopy(action.arguments),
+                "effective_arguments": deepcopy(action.arguments),
+            },
+            deep=True,
+        )
+        if self._call_fingerprint(current) != invocation.fingerprint:
+            raise HarnessInfrastructureError(
+                "current Host policy changed a checkpointed invocation identity"
+            )
+        durable_context_metadata = {
+            key: deepcopy(durable.metadata[key])
+            for key in _DURABLE_CALL_CONTEXT_METADATA_KEYS
+            if key in durable.metadata
+        }
+        ctx.active_call = current.model_copy(
+            update={
+                "metadata": {
+                    **deepcopy(current.metadata),
+                    **durable_context_metadata,
+                }
+            },
+            deep=True,
         )
 
     def _active_or_reconstructed_call(

@@ -5,6 +5,7 @@ import json
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -489,7 +490,7 @@ class _CancelledBootstrapScenario(_Scenario):
         raise asyncio.CancelledError
 
 
-class _LocalResultScenario(_Scenario):
+class _LocalResultScenario(_NativePreparedScenario):
     def prepare_call(
         self,
         action: Any,
@@ -559,12 +560,20 @@ def _budget(**overrides: int | float) -> BudgetLedger:
 @pytest.mark.asyncio
 async def test_local_prepared_result_never_crosses_transport_or_remote_budget() -> None:
     session = _TrackingSession()
+    checkpoints: list[Any] = []
+    response_store = _RecordingRemoteResponseStore()
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
     result = await MCPAgentHarnessRuntime(
         connector=_SingleSessionConnector(session),
         planner=ScriptedPlanner([_call("locally-rejected"), _finish()]),
         scenario=_LocalResultScenario(),
         event_sink=InMemoryEventSink(),
         budget=_budget(),
+        checkpoint_hook=capture_checkpoint,
+        remote_response_store=response_store,
     ).run(run_id=uuid4())
 
     assert session.call_calls == 0
@@ -574,6 +583,557 @@ async def test_local_prepared_result_never_crosses_transport_or_remote_budget() 
         "query": "locally-rejected",
         "result": {"rejected": True, "reason": "unsafe"},
     }
+    assert len(result.remote_responses) == 1
+    assert result.remote_responses[0].is_remote is False
+    assert result.remote_responses[0].response == {
+        "rejected": True,
+        "reason": "unsafe",
+    }
+    assert any(
+        snapshot.remote_responses and not snapshot.observations
+        for snapshot in checkpoints
+    )
+    assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_completed_local_result_checkpoint_resumes_without_session_or_artifact() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    checkpoints: list[Any] = []
+    response_store = _RecordingRemoteResponseStore()
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    first = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(_TrackingSession()),
+        planner=ScriptedPlanner([_call("completed-local"), _finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        checkpoint_hook=capture_checkpoint,
+        remote_response_store=response_store,
+    ).run(run_id=run_id)
+
+    snapshot = checkpoints[-1]
+    assert snapshot.finish is not None
+    resume_connector = ReplayMCPConnector("fixture-mcp", [])
+    resumed = await MCPAgentHarnessRuntime(
+        connector=resume_connector,
+        planner=ScriptedPlanner([]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert resumed.finish == first.finish
+    assert resumed.state == first.state
+    assert resumed.observations == first.observations
+    assert resumed.invocations == first.invocations
+    assert resumed.budget == first.budget
+    assert resume_connector.opened_session_ids == []
+    assert resumed.remote_responses[0].is_remote is False
+    assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_staged_local_result_checkpoint_replays_without_transport_or_artifact() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    staged_checkpoints: list[Any] = []
+
+    async def interrupt_staged_local_result(snapshot: Any) -> None:
+        if (
+            snapshot.remote_responses
+            and snapshot.remote_responses[-1].is_remote is False
+            and not snapshot.observations
+        ):
+            staged_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("staged-local")]),
+            scenario=_LocalResultScenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_staged_local_result,
+        ).run(run_id=run_id)
+
+    snapshot = staged_checkpoints[-1]
+    assert snapshot.invocations[-1].status == ToolInvocationStatus.STARTED
+    second_session = _TrackingSession()
+    response_store = _RecordingRemoteResponseStore()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(second_session),
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert first_session.call_calls == second_session.call_calls == 0
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.state.successful_queries == ["staged-local"]
+    assert len(resumed.observations) == 1
+    assert resumed.remote_responses[0].is_remote is False
+    assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_local_result_adopts_durable_started_without_remote_debit() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+    invocation_store = _InterruptAfterStartedInvocationStore()
+
+    async def capture_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("pending-local")]),
+            scenario=_LocalResultScenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=capture_pending_checkpoint,
+            invocation_store=invocation_store,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    durable = await invocation_store.load(snapshot.invocations[-1].invocation_id)
+    assert durable is not None
+    assert durable.status == ToolInvocationStatus.STARTED
+    response_store = _RecordingRemoteResponseStore()
+    second_session = _TrackingSession()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(second_session),
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        invocation_store=invocation_store,
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert first_session.call_calls == second_session.call_calls == 0
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.state.successful_queries == ["pending-local"]
+    assert resumed.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert len(resumed.remote_responses) == 1
+    assert resumed.remote_responses[0].is_remote is False
+    assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_reapplies_current_local_policy_before_transport() -> None:
+    class _StateTrackingLocalResultScenario(_LocalResultScenario):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current_state: _ScenarioState | None = None
+            self.result_state_was_restored = False
+
+        def prepare_call(
+            self,
+            action: Any,
+            *,
+            state: _ScenarioState,
+        ) -> PreparedCall:
+            self.current_state = state
+            return super().prepare_call(action, state=state)
+
+        def restore_state(self, state: _ScenarioState) -> None:
+            self.current_state = state
+
+        def on_result(
+            self,
+            state: _ScenarioState,
+            call: PreparedCall,
+            result: Any,
+        ) -> ScenarioTransition[_ScenarioState, dict[str, Any]]:
+            self.result_state_was_restored = self.current_state is state
+            return super().on_result(state, call, result)
+
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+
+    async def interrupt_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("newly-rejected")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_pending_checkpoint,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    assert snapshot.active_call is not None
+    assert snapshot.active_call.local_result is None
+    second_session = _TrackingSession()
+    response_store = _RecordingRemoteResponseStore()
+    resumed_scenario = _StateTrackingLocalResultScenario()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(second_session),
+        planner=ScriptedPlanner([_finish()]),
+        scenario=resumed_scenario,
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert first_session.call_calls == second_session.call_calls == 0
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.state.successful_queries == ["newly-rejected"]
+    assert resumed.observations[0].payload == {
+        "query": "newly-rejected",
+        "result": {"rejected": True, "reason": "unsafe"},
+    }
+    assert resumed.remote_responses[0].is_remote is False
+    assert response_store.responses == []
+    assert resumed_scenario.result_state_was_restored is True
+
+
+@pytest.mark.asyncio
+async def test_refreshed_pending_local_policy_resumes_without_opening_session() -> None:
+    class _FailOnOpenConnector:
+        provider = "fixture-mcp"
+
+        def __init__(self) -> None:
+            self.open_calls = 0
+
+        async def open_session(self) -> Any:
+            self.open_calls += 1
+            raise AssertionError("local checkpoint recovery must not open an MCP session")
+
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+
+    async def interrupt_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("offline-local-rejection")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_pending_checkpoint,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    assert snapshot.active_call is not None
+    assert snapshot.active_call.local_result is None
+    connector = _FailOnOpenConnector()
+    artifact_store = _RecordingArtifactStore()
+    response_store = _RecordingRemoteResponseStore()
+
+    resumed = await MCPAgentHarnessRuntime(
+        connector=connector,
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        artifact_store=artifact_store,
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert connector.open_calls == 0
+    assert resumed.finish is not None
+    assert resumed.finish.reason == RuntimeStopReason.COMPLETED
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.state.successful_queries == ["offline-local-rejection"]
+    assert resumed.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert resumed.invocations[0].artifact_ref is None
+    assert resumed.observations[0].payload == {
+        "query": "offline-local-rejection",
+        "result": {"rejected": True, "reason": "unsafe"},
+    }
+    assert len(resumed.remote_responses) == 1
+    assert resumed.remote_responses[0].is_remote is False
+    assert resumed.remote_responses[0].response == {
+        "rejected": True,
+        "reason": "unsafe",
+    }
+    assert artifact_store.artifacts == []
+    assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_expired_checkpoint_settles_pending_local_policy_before_deadline() -> None:
+    class _FailOnOpenConnector:
+        provider = "fixture-mcp"
+
+        def __init__(self) -> None:
+            self.open_calls = 0
+
+        async def open_session(self) -> Any:
+            self.open_calls += 1
+            raise AssertionError("expired local recovery must not open an MCP session")
+
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+
+    async def interrupt_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("expired-local-rejection")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_pending_checkpoint,
+        ).run(run_id=run_id)
+
+    expired_at = datetime.now(UTC) - timedelta(seconds=1)
+    snapshot = replace(
+        pending_checkpoints[-1],
+        deadline=expired_at,
+        wall_time_deadline=expired_at,
+    )
+    connector = _FailOnOpenConnector()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=connector,
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert connector.open_calls == 0
+    assert first_session.call_calls == 0
+    assert resumed.finish is not None
+    assert resumed.finish.reason == RuntimeStopReason.DEADLINE_EXCEEDED
+    assert resumed.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert resumed.active_call is None
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.state.successful_queries == ["expired-local-rejection"]
+    assert len(resumed.observations) == 1
+    assert resumed.remote_responses[0].is_remote is False
+
+
+@pytest.mark.asyncio
+async def test_pending_policy_refresh_preserves_committed_remote_debit_reservation() -> None:
+    run_id = uuid4()
+    sink = _InterruptAfterCommittedEventSink(
+        AgentEventKind.BUDGET_DEBITED,
+        remote_debit_only=True,
+    )
+    invocation_store = _RecordingInvocationStore()
+    pending_checkpoints: list[Any] = []
+
+    async def capture_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("reserved-before-policy-upgrade")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=capture_pending_checkpoint,
+            invocation_store=invocation_store,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    second_connector = _SingleSessionConnector(_TrackingSession())
+    resumed = await MCPAgentHarnessRuntime(
+        connector=second_connector,
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_LocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+        invocation_store=invocation_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    remote_debits = [
+        event
+        for event in await sink.read(run_id)
+        if event.kind == AgentEventKind.BUDGET_DEBITED
+        and event.payload.get("amounts", {}).get("remote_tool_calls") == 1
+    ]
+    assert first_session.call_calls == second_connector.session.call_calls == 0
+    assert second_connector.open_calls == 0
+    assert resumed.invocations[0].status == ToolInvocationStatus.SUCCEEDED
+    assert resumed.remote_responses[0].is_remote is False
+    assert resumed.budget.consumed.remote_tool_calls == 1
+    assert len(remote_debits) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_policy_refresh_restores_scenario_state_when_prepare_fails() -> None:
+    class _FailingStateTrackingScenario(_Scenario):
+        def __init__(self) -> None:
+            self.policy_state: _ScenarioState | None = None
+            self.current_state: _ScenarioState | None = None
+
+        def prepare_call(
+            self,
+            action: Any,
+            *,
+            state: _ScenarioState,
+        ) -> PreparedCall:
+            del action
+            self.policy_state = state
+            self.current_state = state
+            raise RuntimeError("policy refresh failed")
+
+        def restore_state(self, state: _ScenarioState) -> None:
+            self.current_state = state
+
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+
+    async def interrupt_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(_TrackingSession()),
+            planner=ScriptedPlanner([_call("policy-error")]),
+            scenario=_Scenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_pending_checkpoint,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    resumed_scenario = _FailingStateTrackingScenario()
+    with pytest.raises(RuntimeError, match="policy refresh failed"):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(_TrackingSession()),
+            planner=ScriptedPlanner([_finish()]),
+            scenario=resumed_scenario,
+            event_sink=sink,
+            budget=_budget(),
+        ).resume(
+            snapshot,
+            restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+        )
+
+    assert resumed_scenario.policy_state is not None
+    assert resumed_scenario.current_state is not resumed_scenario.policy_state
+    assert resumed_scenario.current_state == snapshot.state
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_never_relaxes_durable_local_policy_to_transport() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    pending_checkpoints: list[Any] = []
+
+    async def interrupt_pending_checkpoint(snapshot: Any) -> None:
+        if (
+            snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending_checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    first_session = _TrackingSession()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(first_session),
+            planner=ScriptedPlanner([_call("durably-rejected")]),
+            scenario=_LocalResultScenario(),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=interrupt_pending_checkpoint,
+        ).run(run_id=run_id)
+
+    snapshot = pending_checkpoints[-1]
+    assert snapshot.active_call is not None
+    assert snapshot.active_call.local_result is not None
+    second_session = _TrackingSession()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(second_session),
+        planner=ScriptedPlanner([_finish()]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert first_session.call_calls == second_session.call_calls == 0
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.observations[0].payload == {
+        "query": "durably-rejected",
+        "result": {"rejected": True, "reason": "unsafe"},
+    }
+    assert resumed.remote_responses[0].is_remote is False
 
 
 @pytest.mark.asyncio
@@ -1915,6 +2475,119 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
     assert len(observation_traces) == 1
     assert all(event.payload["scope"] == "mcp_internal" for event in action_traces)
     assert observation_traces[0].payload["scope"] == "mcp_internal"
+
+
+@pytest.mark.asyncio
+async def test_resume_reapplies_current_local_policy_to_legacy_durable_decision() -> None:
+    class _LegacyDecisionSink(_InterruptAfterDecisionSink):
+        async def append(
+            self,
+            event: AgentEvent,
+            *,
+            expected_version: int | None = None,
+        ) -> AgentEvent:
+            prepared = event.payload.get("prepared_call")
+            if event.kind == AgentEventKind.MODEL_DECISION and isinstance(prepared, dict):
+                payload = deepcopy(event.payload)
+                payload["prepared_call"].pop("local_result", None)
+                event = event.model_copy(update={"payload": payload}, deep=True)
+            return await super().append(event, expected_version=expected_version)
+
+    class _InspectingLocalResultScenario(_LocalResultScenario):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_metadata: dict[str, Any] = {}
+
+        def on_result(
+            self,
+            state: _ScenarioState,
+            call: PreparedCall,
+            result: Any,
+        ) -> ScenarioTransition[_ScenarioState, dict[str, Any]]:
+            self.seen_metadata = deepcopy(call.metadata)
+            return super().on_result(state, call, result)
+
+    run_id = uuid4()
+    sink = _LegacyDecisionSink()
+    checkpoints: list[Any] = []
+    provider_output_items = [
+        {
+            "type": "reasoning",
+            "id": "legacy-reasoning-item",
+            "encrypted_content": "encrypted-legacy-reasoning",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "id": "legacy-function-item",
+            "call_id": "legacy-function-call",
+            "name": "fixture.query",
+            "arguments": json.dumps({"query": "legacy-policy"}),
+            "status": "completed",
+        },
+    ]
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=_SingleSessionConnector(_TrackingSession()),
+            planner=ScriptedPlanner([_call("legacy-policy")]),
+            scenario=_NativePreparedScenario(
+                {
+                    "call_id": "legacy-function-call",
+                    "local_rejection": {"reason": "stale-policy-result"},
+                    "request_id": "legacy-response",
+                    "provider_output_items": provider_output_items,
+                }
+            ),
+            event_sink=sink,
+            budget=_budget(),
+            checkpoint_hook=capture_checkpoint,
+        ).run(run_id=run_id)
+
+    durable_decision = next(
+        event
+        for event in await sink.read(run_id)
+        if event.kind == AgentEventKind.MODEL_DECISION
+    )
+    assert "local_result" not in durable_decision.payload["prepared_call"]
+    snapshot = checkpoints[-1]
+    resumed_session = _TrackingSession()
+    response_store = _RecordingRemoteResponseStore()
+    resumed_planner = ScriptedPlanner([_finish()])
+    resumed_scenario = _InspectingLocalResultScenario()
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(resumed_session),
+        planner=resumed_planner,
+        scenario=resumed_scenario,
+        event_sink=sink,
+        budget=_budget(),
+        remote_response_store=response_store,
+    ).resume(
+        snapshot,
+        restored_budget=BudgetLedger.from_snapshot(snapshot.budget),
+    )
+
+    assert resumed_session.call_calls == 0
+    assert resumed.budget.consumed.remote_tool_calls == 0
+    assert resumed.observations[0].payload == {
+        "query": "legacy-policy",
+        "result": {"rejected": True, "reason": "unsafe"},
+    }
+    assert resumed.remote_responses[0].is_remote is False
+    assert response_store.responses == []
+    assert "local_rejection" not in resumed_scenario.seen_metadata
+    assert resumed_scenario.seen_metadata["request_id"] == "legacy-response"
+    resumed_messages = resumed_planner.requests[0].messages
+    assert sum(item.get("id") == "legacy-reasoning-item" for item in resumed_messages) == 1
+    assert sum(item.get("id") == "legacy-function-item" for item in resumed_messages) == 1
+    assert sum(
+        item.get("type") == "function_call_output"
+        and item.get("call_id") == "legacy-function-call"
+        for item in resumed_messages
+    ) == 1
 
 
 @pytest.mark.asyncio

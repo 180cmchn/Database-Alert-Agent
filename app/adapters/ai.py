@@ -44,7 +44,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v22"
+PROMPT_VERSION = "database-alert-advisor-v23"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -722,8 +722,9 @@ artifact；evidence 中 Archery 最终 history 查询结果是程序仅按 colum
 history；其余 MCP 内容是程序确定性过滤、聚合和排序后的有界 observation；程序不判断因果。只有最终
 汇总阶段能结合不同证据判断根因，本轮不得替最终汇总输出根因。
 
-所有工具调用都必须保持只读。这是 Agent 行为要求；MCP Key 的权限由服务端配置，Host 不执行
-annotations、SQL、参数、工具白名单或权限审查。只返回 JSON，不要使用 Markdown 代码围栏。"""
+所有工具调用都必须保持只读。这是 Agent 行为要求；MCP Key 的权限由服务端配置。通用 Host 不包含
+provider 业务规则；专用 provider adapter 可以按自身契约在 transport 前拒绝不安全或未绑定的调用。
+只返回 JSON，不要使用 Markdown 代码围栏。"""
 
 
 def _extract_json(content: str) -> dict[str, Any]:

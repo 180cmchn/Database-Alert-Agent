@@ -223,8 +223,9 @@ mindmap
 2. 主 Agent 每轮至多选择一个外层 MCP 工具，Durable Dispatcher 先持久化 `PENDING / STARTED` 状态。
 3. MCP Adapter 接收权威告警详情、固定五分钟窗口和只读调查目标，建立会话并动态发现远端工具。
 4. MCP 内部调查 Agent 按远端真实 Schema 逐次调用工具，每次根据返回决定继续或结束。
-5. 完整远端响应和完整外层结果进入内部 Artifact；确定性投影器生成事实、异常、限制和 source paths。
-6. 有界 `EvidenceRecord` 作为 observation 返回主 Agent，供下一轮 ReAct 决策使用。
+5. 完整远端响应和完整外层结果进入内部 Artifact；确定性投影器按 provider 契约生成模型可见事实。
+6. `EvidenceRecord` 作为 observation 返回主 Agent，供下一轮 ReAct 决策使用；通用 provider 使用有界
+   投影，Archery 的最终 history 则按专用契约完整透传，并把 EXPLAIN、表结构和索引事实独立投影。
 
 关键边界如下：
 
@@ -232,7 +233,8 @@ mindmap
 - MCP 内部调查 Agent 只在被选中的 provider 会话中工作，可以根据上一步返回连续调用多个远端工具；这些内部调用不消耗主 Agent 的 ReAct 轮次。
 - 远端工具名、描述和 JSON Schema 来自运行时发现。Host 负责连接、超时、持久化和恢复，不替模型硬编码远端调用参数。
 - 完整原始响应保存在内部 artifact，供审计和恢复使用；它不会直接进入主 Agent 的根因分析上下文或用户轨迹。
-- 主 Agent 接收的是确定性投影，包括真实数值聚合、事实、异常、限制和 JSON source path。投影器不做因果判断。
+- 主 Agent 接收的是确定性投影，包括真实数值聚合、事实、异常、限制和 JSON source path。Archery
+  history 只做格式转换，补充分析与它相互独立；所有投影器都不做因果判断。
 
 ### 3.3 新增一个 MCP 的最小改动
 
@@ -328,7 +330,8 @@ mindmap
 
 - “什么时候可能有用”写在 `role/purpose`，不要在 Python 中新增告警类型到 MCP 的硬编码映射。
 - “选中后如何查”写在 `workflow`，只引用权威告警字段和远端动态发现的资源，不猜测实例、表、字段或指标。
-- `safety.md` 明确 `read_only: true`。这是 Agent 行为约束；真正的远端权限仍应由 MCP 服务端为 Key 配置。
+- `safety.md` 明确 `read_only: true`。这是 Agent 行为约束；真正的远端权限仍应由 MCP 服务端为 Key
+  配置。若 provider 需要更严格的 transport 前门禁，应保留在专用 adapter，不把业务规则写入通用 Host。
 - 提示词文件只写业务行为，不写 URL、Token、固定生产实例或其它秘密。
 - 修改后至少运行 Catalog、对应 provider、通用 MCP、工作流和 AI 提示词测试；发布时重启 API 与 Worker。
 - 主 Agent 提示词版本会进入运行 manifest。Provider 提示词正文依靠 Git 版本管理；若变更专用 provider 的行为契约，还应同步更新其代码中的 prompt/policy 版本常量和相关测试。

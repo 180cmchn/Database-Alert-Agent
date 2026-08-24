@@ -165,7 +165,8 @@ NEW_PROVIDER_MCP_API_KEY=replace-me
 ```
 
 `safety.md` 中声明 `read_only: true` 是给 Agent 的行为指令。远端工具权限由 MCP 服务为该 Key
-配置；不要把明文秘密或固定业务参数写入 JSON 和提示词。
+配置；专用 provider adapter 还可以在 transport 前执行更严格的确定性门禁。不要把明文秘密或固定
+业务参数写入 JSON 和提示词。
 
 通用 MCP 无需新增 provider 专用 Python 选择分支。其原始响应由确定性通用投影处理；当某类结构需要
 更精确的领域聚合时，在程序投影层新增结构化处理器和测试，结果处理阶段不调用模型。
@@ -177,9 +178,13 @@ Archery 的作用是查询慢查询日志，提示词位于 `config/mcp/prompts/
 `occurred_at`，通过真实元数据链定位 `mysql_slow_query_review_history`，查询
 `[occurred_at - 5 分钟, occurred_at]`。
 
-认证、实例枚举、`t_instance_member`、`sql_instance`、Schema 和索引响应仅保存为内部审计
-artifact。只有最终 `mysql_slow_query_review_history` 查询结果经过程序侧按 checksum、发生次数、
-耗时等事实聚合和异常排序后发送给主 Agent。
+认证、实例枚举、`t_instance_member` 和 `sql_instance` 等导航响应仅保存为内部审计 artifact。
+最终 `mysql_slow_query_review_history` 结果只做 JSON 格式转换后完整透传，不过滤、聚合、排序或
+截断。完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max`
+严格绑定；任何 sample 都不能直接执行，但与完整 sample 绑定的普通 `EXPLAIN` 可以包裹 SELECT、
+WITH 以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断 sample 前缀始终禁止。目标及实际执行 SQL
+核对成功的 EXPLAIN、表结构和索引结果通过独立 `slow_query_analysis` 投影发送给主 Agent；补充调查
+失败只形成证据缺口，不修改或降级 history。
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json

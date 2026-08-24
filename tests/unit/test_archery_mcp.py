@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,7 @@ ARCHERY_MCP_LOGIN_TOOL_NAME = "ensure_login_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME = "sql_query_gymJPA"
 TEST_INSTANCE_ID = 226
 TEST_RESOURCE_GROUP_ID = 10
-TEST_DB_NAME = "archery_data"
+TEST_DB_NAME = "archery"
 TEST_TIME_COLUMN = "f_insert_time"
 TEST_ALERT_OCCURRED_AT = datetime.fromisoformat("2026-07-23T16:00:00+08:00")
 TEST_WINDOW_START = datetime(2026, 7, 23, 7, 55, tzinfo=UTC)
@@ -76,7 +77,7 @@ TEST_ALTERNATE_SLOW_LOG_QUERY = (
     "ORDER BY f_start_time DESC LIMIT 5"
 )
 TEST_HISTORY_TIME_CLAUSE = (
-    "AND ts_min >= FROM_UNIXTIME(1784793300) AND ts_min <= FROM_UNIXTIME(1784793600) "
+    "AND ts_min >= FROM_UNIXTIME(1784793300) AND ts_min < FROM_UNIXTIME(1784793600) "
 )
 FINISH_TOOL_NAME = "finish_archery_investigation"
 
@@ -602,7 +603,7 @@ async def test_archery_mcp_returns_login_failure_as_observation_for_agent_decisi
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_treats_other_slow_log_tables_as_auxiliary_results() -> None:
+async def test_archery_mcp_rejects_other_slow_log_tables_before_transport() -> None:
     tool_calls: list[str] = []
     table_name = "mysql_slow_log"
     query_sql = (
@@ -639,7 +640,14 @@ async def test_archery_mcp_treats_other_slow_log_tables_as_auxiliary_results() -
     assert result.query_completed is False
     assert result.requested_sql == ""
     assert not hasattr(result, "raw_mcp_call_results")
-    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE)
+    assert tool_calls == list(DEFAULT_MODEL_TOOL_SEQUENCE[:-1])
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == len(DEFAULT_MODEL_TOOL_SEQUENCE) - 1
+    assert any(
+        entry.get("reason_code") == "history_recovery_query_forbidden"
+        and entry.get("sent_to_mcp") is False
+        for entry in result.diagnostics["query_trace"]
+    )
 
 
 
@@ -656,15 +664,14 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
     )
     instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
     timed_out_sql = (
-        "SELECT hostname_max, sample, ts_min, ts_max "
-        f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+        f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
         "WHERE hostname_max = 'db-1:3306' "
+        "AND ts_min >= FROM_UNIXTIME(1784789700) "
         "AND ts_min < FROM_UNIXTIME(1784793600) "
         "AND ts_max >= FROM_UNIXTIME(1784793300) LIMIT 20"
     )
     recovered_sql = (
-        "SELECT hostname_max, sample, ts_min, ts_max "
-        f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+        f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
         "WHERE hostname_max = 'db-1:3306' "
         "AND ts_min >= FROM_UNIXTIME(1784793300) "
         "AND ts_min < FROM_UNIXTIME(1784793600) "
@@ -805,7 +812,7 @@ def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> Non
     assert ArcheryMCPClient.is_history_id_retrieval_query(
         f"SELECT * FROM {history_table} WHERE id = 24413454"
     )
-    assert ArcheryMCPClient.is_history_id_retrieval_query(
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(
         f"SELECT id, hostname_max FROM {history_table} "
         "WHERE hostname_max = 'h:3306' AND id IN (24413454, 24413460)"
     )
@@ -821,12 +828,50 @@ def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> Non
     assert not ArcheryMCPClient.is_history_id_retrieval_query(
         f"SELECT * FROM {history_table} WHERE f_instance_id = 53"
     )
-    # Projection queries that clip oversized columns (LEFT/LENGTH aliases) are
-    # still per-id retrievals and must keep merging into the final payload.
+    projection_sql = ArcheryMCPClient.history_sample_projection_sql(24413640)
+    # The fixed projection that clips oversized sample text is still a per-id
+    # retrieval and must keep merging into the final payload.
     assert ArcheryMCPClient.is_history_id_retrieval_query(
-        "SELECT id, hostname_max, ts_cnt, LEFT(sample, '4000') AS sample, "
+        projection_sql
+    )
+    assert ArcheryMCPClient.is_history_id_retrieval_query(
+        projection_sql.lower()
+        .replace(", ", ",\n    ")
+        .replace(" from ", "\nfrom\n")
+        .replace(" where ", "\nwhere\n")
+    )
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(
+        f"SELECT SLEEP(10), * FROM {history_table} WHERE id = 24413640"
+    )
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(
+        "SELECT id, sample, LEFT(sample, '4000') AS sample, "
         f"LENGTH(sample) AS sample_full_length FROM {history_table} "
         "WHERE id = 24413640"
+    )
+    assert not ArcheryMCPClient.is_history_id_retrieval_query(
+        f"SELECT * FROM {history_table} WHERE id = 24413640 AND 1 = 1"
+    )
+
+
+def test_history_sample_projection_rejects_any_projection_drift() -> None:
+    projection_sql = ArcheryMCPClient.history_sample_projection_sql(24413640)
+
+    invalid = (
+        projection_sql.replace("SELECT id,", "SELECT id, secret_column,"),
+        projection_sql.replace(
+            "LEFT(sample, '4000') AS sample",
+            "sample",
+        ),
+        projection_sql.replace(
+            "SELECT id, hostname_max",
+            "SELECT hostname_max, id",
+        ),
+        projection_sql.replace("client_max, ", ""),
+        projection_sql.replace("id, hostname_max", "id, id, hostname_max"),
+    )
+
+    assert all(
+        not ArcheryMCPClient.is_history_id_retrieval_query(sql) for sql in invalid
     )
 
 
@@ -881,6 +926,134 @@ def test_accumulate_history_rows_merges_by_id_with_field_union() -> None:
         "SELECT * FROM mysql_slow_query_review_history "
         "WHERE id IN (24413458, 24413460)",
     ]
+
+
+def test_sample_prefix_merge_does_not_downgrade_complete_sample() -> None:
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    sources: list[dict[str, Any]] = []
+    complete_sample = "UPDATE orders SET note = 'complete statement' WHERE id = 7"
+
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {
+            "rows": [
+                {
+                    "id": 24413458,
+                    "sample": complete_sample,
+                    "ts_cnt": 6,
+                }
+            ]
+        },
+        sql="SELECT * FROM mysql_slow_query_review_history WHERE id = 24413458",
+        include_source=True,
+        projection="full",
+    )
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {
+            "rows": [
+                {
+                    "id": 24413458,
+                    "sample": "UPDATE orders SET note = 'complete",
+                    "sample_full_length": len(complete_sample.encode("utf-8")),
+                    "ts_cnt": 12,
+                }
+            ]
+        },
+        sql=ArcheryMCPClient.history_sample_projection_sql(24413458),
+        include_source=True,
+        projection="sample_prefix",
+    )
+
+    assert rows_by_id[24413458]["sample"] == complete_sample
+    assert rows_by_id[24413458]["ts_cnt"] == 12
+    assert "sample_full_length" not in rows_by_id[24413458]
+
+
+def test_full_row_merge_replaces_prefix_and_removes_stale_length() -> None:
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    sources: list[dict[str, Any]] = []
+    complete_sample = "DELETE FROM orders WHERE archived = 1"
+
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {
+            "rows": [
+                {
+                    "id": 24413458,
+                    "sample": "DELETE FROM orders WHERE arch",
+                    "sample_full_length": len(complete_sample.encode("utf-8")),
+                    "ts_cnt": 6,
+                }
+            ]
+        },
+        sql=ArcheryMCPClient.history_sample_projection_sql(24413458),
+        include_source=True,
+        projection="sample_prefix",
+    )
+    ArcheryMCPClient.accumulate_history_rows(
+        rows_by_id,
+        sources,
+        {
+            "rows": [
+                {
+                    "id": 24413458,
+                    "sample": complete_sample,
+                    "ts_cnt": 12,
+                }
+            ]
+        },
+        sql="SELECT * FROM mysql_slow_query_review_history WHERE id = 24413458",
+        include_source=True,
+        projection="full",
+    )
+
+    assert rows_by_id[24413458] == {
+        "id": 24413458,
+        "sample": complete_sample,
+        "ts_cnt": 12,
+    }
+
+
+def test_positional_merge_returns_each_unresolved_row_and_preserves_full_sample() -> None:
+    prefix_ids = {1}
+    trusted_full_ids = {4}
+    rows_by_id = {
+        1: {
+            "id": 1,
+            "sample": "SELECT * FROM orders WHERE note = 'prefix",
+            "sample_full_length": 99,
+            "ts_cnt": 7,
+        }
+    }
+    deferred: list[Any] = [
+        [1, "SELECT * FROM orders WHERE note = 'complete'", 3],
+        [2, "short"],
+        ["not-an-id", "SELECT 3", 1],
+        [3, "SELECT 3", 1],
+        [4],
+    ]
+
+    unresolved = ArcheryMCPClient.merge_positional_rows_with_reference(
+        rows_by_id,
+        deferred,
+        ["id", "sample", "ts_cnt"],
+        allowed_ids={1, 2, 4},
+        trusted_full_row_ids=trusted_full_ids,
+        sample_prefix_ids=prefix_ids,
+    )
+
+    assert rows_by_id[1] == {
+        "id": 1,
+        "sample": "SELECT * FROM orders WHERE note = 'complete'",
+        "ts_cnt": 7,
+    }
+    assert unresolved == deferred[1:4]
+    assert prefix_ids == set()
+    assert trusted_full_ids == {1, 4}
 
 
 @pytest.mark.asyncio
@@ -946,7 +1119,7 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
     )
     instance_sql = f"SELECT host, port FROM sql_instance WHERE id = {metadata_instance_id} LIMIT 1"
     history_sql = (
-        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         f"WHERE hostname_max = 'db-1:3306' {TEST_HISTORY_TIME_CLAUSE}LIMIT 1"
     )
 
@@ -994,11 +1167,19 @@ async def test_archery_mcp_returns_allowlist_error_to_model_for_retry() -> None:
                     "isError": False,
                 },
                 {
-                    "structuredContent": {"status": "ok", "rows": [[metadata_instance_id]]},
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["f_instance_id"],
+                        "rows": [[metadata_instance_id]],
+                    },
                     "isError": False,
                 },
                 {
-                    "structuredContent": {"status": "ok", "rows": [["db-1", 3306]]},
+                    "structuredContent": {
+                        "status": "ok",
+                        "columns": ["host", "port"],
+                        "rows": [["db-1", 3306]],
+                    },
                     "isError": False,
                 },
                 {
@@ -1037,7 +1218,7 @@ async def test_archery_mcp_forwards_history_without_flashduty_endpoint() -> None
     tool_calls: list[str] = []
     query_sql_calls: list[str] = []
     direct_history_sql = (
-        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         "WHERE hostname_max = '100.84.97.113:3306' "
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
@@ -1061,10 +1242,10 @@ async def test_archery_mcp_forwards_history_without_flashduty_endpoint() -> None
         TEST_ALERT_OCCURRED_AT,
         alert_context={"title": "MySQL/mysql_slow_query/100.84.97.113:3306"},
     )
-    assert result.query_completed is True
-    assert result.requested_sql == direct_history_sql
-    assert tool_calls == [ARCHERY_MCP_QUERY_TOOL_NAME]
-    assert query_sql_calls == [direct_history_sql]
+    assert result.query_completed is False
+    assert result.requested_sql == ""
+    assert tool_calls == []
+    assert query_sql_calls == []
     assert result.metadata_resolution_tables == ()
     assert result.diagnostics is not None
     assert result.diagnostics["alert_endpoint"] is None
@@ -1082,6 +1263,15 @@ def test_archery_mcp_recognizes_member_id_in_real_multicolumn_projection() -> No
     )
     assert not ArcheryMCPClient._member_query_selects_instance_id(
         "SELECT f_id, f_ip, f_port FROM t_instance_member WHERE f_id = 22 LIMIT 1",
+        set(),
+    )
+    assert not ArcheryMCPClient._member_query_selects_instance_id(
+        "SELECT f_id AS f_instance_id FROM t_instance_member "
+        "WHERE f_ip = '100.84.97.113' AND f_port = 3306 LIMIT 1",
+        set(),
+    )
+    assert not ArcheryMCPClient._sql_instance_query_selects_endpoint(
+        "SELECT id AS host, id AS port FROM sql_instance WHERE id = 53 LIMIT 1",
         set(),
     )
     assert ArcheryMCPClient._member_instance_ids_for_endpoint(
@@ -1102,7 +1292,7 @@ async def test_archery_mcp_does_not_parse_endpoint_from_title() -> None:
     query_sql_calls: list[str] = []
     title_endpoint = "100.84.97.113:3306"
     direct_history_sql = (
-        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         f"WHERE hostname_max = '{title_endpoint}' "
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
@@ -1127,19 +1317,19 @@ async def test_archery_mcp_does_not_parse_endpoint_from_title() -> None:
         alert_context={"title": f"MySQL/mysql_slow_query/{title_endpoint}"},
     )
 
-    assert result.query_completed is True
-    assert result.requested_sql == direct_history_sql
-    assert query_sql_calls == [direct_history_sql]
+    assert result.query_completed is False
+    assert result.requested_sql == ""
+    assert query_sql_calls == []
     assert result.diagnostics is not None
     assert result.diagnostics["alert_endpoint"] is None
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_does_not_host_reject_history_without_resolved_lineage() -> None:
+async def test_archery_mcp_rejects_history_without_resolved_lineage() -> None:
 
     query_sql_calls: list[str] = []
     direct_history_sql = (
-        "SELECT hostname_max FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         "WHERE hostname_max = '100.84.97.113:3306' "
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
@@ -1162,15 +1352,15 @@ async def test_archery_mcp_does_not_host_reject_history_without_resolved_lineage
         alert_context={"title": "MySQL/mysql_slow_query/100.84.97.113:3306"},
     )
 
-    assert query_sql_calls == [direct_history_sql]
-    assert result.query_completed is True
-    assert result.requested_sql == direct_history_sql
+    assert query_sql_calls == []
+    assert result.query_completed is False
+    assert result.requested_sql == ""
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_tool_call_count"] == 1
+    assert result.diagnostics["mcp_tool_call_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_forwards_unscoped_history_and_extra_arguments_unchanged() -> None:
+async def test_archery_mcp_rejects_unscoped_history_with_extra_arguments() -> None:
     history_sql = "SELECT hostname_max, sample FROM mysql_slow_query_review_history"
     forwarded_arguments = {
         "instance_id": TEST_INSTANCE_ID,
@@ -1221,13 +1411,13 @@ async def test_archery_mcp_forwards_unscoped_history_and_extra_arguments_unchang
 
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert argument_calls == [forwarded_arguments]
-    assert result.query_completed is True
-    assert result.requested_sql == history_sql
+    assert argument_calls == []
+    assert result.query_completed is False
+    assert result.requested_sql == ""
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_does_not_block_nonconforming_sql() -> None:
+async def test_archery_mcp_blocks_nonconforming_sql_before_transport() -> None:
     provider_specific_sql = "CALL provider_specific_diagnostic()"
     argument_calls: list[dict[str, Any]] = []
     client = _client(
@@ -1245,7 +1435,7 @@ async def test_archery_mcp_does_not_block_nonconforming_sql() -> None:
 
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
-    assert argument_calls[0]["sql_content"] == provider_specific_sql
+    assert argument_calls == []
     assert result.query_completed is False
 
 
@@ -1253,7 +1443,6 @@ async def test_archery_mcp_does_not_block_nonconforming_sql() -> None:
 async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -> None:
     """A successful LIMIT 1 sample must not replace alert-window evidence."""
 
-    arbitrary_endpoint = "10.126.106.205:3306"
     resolved_endpoint = "100.84.97.139:3306"
     member_sql = (
         "SELECT f_instance_id FROM t_instance_member "
@@ -1262,8 +1451,7 @@ async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -
     instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
     probe_sql = "SELECT hostname_max, ts_min, ts_max FROM mysql_slow_query_review_history LIMIT 1"
     final_sql = (
-        "SELECT hostname_max, ts_min, ts_max "
-        "FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         f"WHERE hostname_max = '{resolved_endpoint}' "
         f"{TEST_HISTORY_TIME_CLAUSE}ORDER BY ts_min LIMIT 20"
     )
@@ -1293,20 +1481,6 @@ async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -
                 {
                     "structuredContent": {
                         "columns": ["hostname_max", "ts_min", "ts_max"],
-                        "rows": [
-                            [
-                                arbitrary_endpoint,
-                                "2024-05-16T06:39:34",
-                                "2024-05-16T06:41:18",
-                            ]
-                        ],
-                        "rowCount": 1,
-                    },
-                    "isError": False,
-                },
-                {
-                    "structuredContent": {
-                        "columns": ["hostname_max", "ts_min", "ts_max"],
                         "rows": [],
                         "rowCount": 0,
                     },
@@ -1324,23 +1498,23 @@ async def test_archery_mcp_continues_after_successful_unscoped_history_probe() -
         alert_context={"alert_host": "100.84.97.135", "alert_port": 3306},
     )
 
-    assert query_sql_calls == [member_sql, instance_sql, probe_sql, final_sql]
+    assert query_sql_calls == [member_sql, instance_sql, final_sql]
     assert result.requested_sql == final_sql
     assert result.query_completed is True
     assert result.payload["rows"] == []
     assert result.query_time_column == "ts_min"
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_roundtrip_count"] == 4
+    assert result.diagnostics["mcp_roundtrip_count"] == 3
     assert "instance_identity_verification" not in result.diagnostics
-    assert result.diagnostics["query_trace"][2]["outcome"] == "ok"
+    assert result.diagnostics["query_trace"][2]["outcome"] == "rejected_locally"
 
 
 @pytest.mark.asyncio
-async def test_archery_mcp_forwards_history_with_model_selected_endpoint() -> None:
+async def test_archery_mcp_rejects_history_with_unresolved_model_selected_endpoint() -> None:
     alert_endpoint = "100.84.97.113:3306"
     slow_log_endpoint = "10.23.45.67:3306"
     history_sql = (
-        "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         f"WHERE hostname_max = '{slow_log_endpoint}' "
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
@@ -1372,12 +1546,11 @@ async def test_archery_mcp_forwards_history_with_model_selected_endpoint() -> No
         alert_context={"title": f"MySQL/mysql_slow_query/{alert_endpoint}"},
     )
 
-    assert query_sql_calls == [history_sql]
-    assert result.query_completed is True
-    assert result.payload["status"] == "ok"
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
+    assert query_sql_calls == []
+    assert result.query_completed is False
+    assert result.model_tool_calls == ()
     assert result.diagnostics is not None
-    assert result.diagnostics["mcp_roundtrip_count"] == 1
+    assert result.diagnostics["mcp_roundtrip_count"] == 0
     assert result.diagnostics["alert_endpoint"] is None
 
 
@@ -1571,6 +1744,72 @@ def test_archery_tabular_row_shapes_use_consistent_precedence(
     assert ArcheryMCPClient.payload_row_count(payload) == expected_count
 
 
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (
+            {"columns": ["id", "sample"], "rows": [[1]]},
+            "positional_row_width_mismatch",
+        ),
+        (
+            {"columns": ["id", "sample"], "rows": [{"id": 1}, [2, "SELECT 2"]]},
+            "mixed_tabular_row_shapes",
+        ),
+        (
+            {"column_list": ["id", "ID"], "rows": [[1, 1]]},
+            "duplicate_tabular_columns",
+        ),
+        (
+            {"column_list": ["id", 7], "rows": [[1, "SELECT 1"]]},
+            "invalid_tabular_columns",
+        ),
+        (
+            {"rows": [[1, "SELECT 1"]]},
+            "missing_tabular_columns",
+        ),
+    ],
+)
+def test_archery_tabular_shape_failures_never_partially_zip_rows(
+    payload: dict[str, Any],
+    reason: str,
+) -> None:
+    assert ArcheryMCPClient.tabular_shape_issue(payload) == reason
+    assert ArcheryMCPClient._tabular_rows(payload) == []
+    assert ArcheryMCPClient.is_result_incomplete(payload) is True
+
+
+def test_mapping_rows_do_not_depend_on_positional_column_metadata() -> None:
+    payload = {
+        "column_list": ["duplicate", "DUPLICATE"],
+        "rows": [{"id": 1, "sample": "SELECT 1"}],
+    }
+
+    assert ArcheryMCPClient.tabular_shape_issue(payload) is None
+    assert ArcheryMCPClient._tabular_rows(payload) == payload["rows"]
+    assert ArcheryMCPClient.is_result_incomplete(payload) is False
+
+
+def test_complete_json_reported_row_shortfall_gets_unified_incomplete_marker() -> None:
+    sql = "SELECT id, sample FROM mysql_slow_query_review_history WHERE id = 1"
+    embedded = json.dumps(
+        {
+            "full_sql": sql,
+            "columns": ["id", "sample"],
+            "rows": [[1, "SELECT 1"]],
+        }
+    )
+    wrapped = f"SQL 查询已执行。\n执行的SQL：{sql}\n返回 2 行。\n结果：\n{embedded}"
+
+    payload, _executed_sql, _verified = ArcheryMCPClient.normalize_query_payload(
+        {"result": wrapped},
+        requested_sql=sql,
+    )
+
+    assert payload["rows"] == [[1, "SELECT 1"]]
+    assert payload["result_incomplete"] is True
+    assert "row_count_shortfall" in payload["result_incomplete_reasons"]
+
+
 def test_archery_select_row_count_does_not_use_affected_rows_without_rows() -> None:
     payload = {"response": {"result": {"affected_rows": 0}}}
 
@@ -1661,7 +1900,7 @@ async def test_archery_mcp_preserves_all_rows_returned_by_remote_service() -> No
     )
     instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
     history_sql = (
-        "SELECT hostname_max, sample FROM mysql_slow_query_review_history "
+        "SELECT * FROM mysql_slow_query_review_history "
         f"WHERE hostname_max = '{slow_log_endpoint}' "
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
@@ -2376,6 +2615,47 @@ async def test_slow_log_evidence_keys_positional_rows_by_column_list() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "rows": [
+                {
+                    "hostname_max": "db-1:3306",
+                    "sample": "SELECT * FROM orders",
+                }
+            ],
+            "mcp_reported_row_count": 2,
+        },
+        {
+            "columns": ["hostname_max", "sample"],
+            "rows": [
+                ["db-1:3306", "SELECT * FROM orders"],
+                ["db-1:3306"],
+            ],
+        },
+    ],
+)
+async def test_incomplete_history_payload_is_no_data_and_preserves_raw_rows(
+    payload: dict[str, Any],
+) -> None:
+    raw_rows = deepcopy(payload["rows"])
+    outcome = await ArcherySlowLogEvidenceTool(  # type: ignore[arg-type]
+        RecordingArcheryClient(payload=payload)
+    ).execute(
+        ToolExecutionRequest(tool_name=ARCHERY_SLOW_LOG_TOOL_NAME),
+        _context("database_latency", title="MySQL/mysql_slow_query_400/db-1:3306"),
+    )
+
+    assert isinstance(outcome, ToolExecutionResult)
+    assert outcome.status == ToolStatus.NO_DATA
+    assert outcome.structured_data["partial"] is True
+    assert outcome.structured_data["root_cause_eligible"] is False
+    assert outcome.structured_data["root_cause_ineligible_reason"]
+    assert outcome.structured_data["final_result_payload"]["rows"] == raw_rows
+
+
+@pytest.mark.asyncio
 async def test_slow_log_evidence_keeps_raw_text_when_json_unparseable() -> None:
     raw_text = (
         "SQL 查询已执行。\n执行的SQL：SELECT id FROM mysql_slow_query_review_history\n\n"
@@ -2412,6 +2692,13 @@ def test_archery_mcp_accepts_supported_dml_as_plain_explain_inner_statement(
 ) -> None:
     assert ArcheryMCPClient.explainable_statement_type(sample) == statement_type
     assert ArcheryMCPClient.plain_explain_inner_sql(f"EXPLAIN {sample}") == sample
+
+
+def test_with_dml_table_references_include_cte_source_and_write_target() -> None:
+    assert ArcheryMCPClient.explainable_table_references(
+        "WITH selected AS (SELECT id FROM source_orders) "
+        "UPDATE orders SET status = 'done' WHERE id IN (SELECT id FROM selected)"
+    ) == {"source_orders", "orders"}
 
 
 @pytest.mark.parametrize(
@@ -2462,6 +2749,254 @@ def test_archery_mcp_selects_explainable_rows_by_query_time_id_and_checksum() ->
 
     assert [row["id"] for row in selected] == [9, 8]
     assert selected[0]["sample"].startswith("UPDATE")
+
+
+def test_archery_mcp_excludes_explicitly_truncated_samples_from_explain() -> None:
+    complete = "SELECT * FROM complete_orders"
+    truncated_prefix = "SELECT * FROM truncated_orders WHERE note = 'prefix'"
+    payload = {
+        "rows": [
+            {
+                "id": 12,
+                "checksum": "truncated",
+                "sample": truncated_prefix,
+                "sample_full_length": len(truncated_prefix.encode("utf-8")) + 100,
+                "Query_time_max": 99,
+            },
+            {
+                "id": 11,
+                "checksum": "complete",
+                "sample": complete,
+                "sample_full_length": len(complete.encode("utf-8")),
+                "Query_time_max": 1,
+            },
+        ]
+    }
+
+    selected = ArcheryMCPClient.select_explainable_history_rows(payload)
+
+    assert [row["id"] for row in selected] == [11]
+    assert ArcheryMCPClient.history_row_for_explain(
+        f"EXPLAIN {truncated_prefix}", payload
+    ) is None
+
+
+def test_archery_mcp_requires_exact_positive_sample_full_length_when_present() -> None:
+    sample = "SELECT * FROM multibyte_orders WHERE note = '慢查询'"
+    byte_length = len(sample.encode("utf-8"))
+    rows = [
+        {
+            "id": index,
+            "checksum": f"invalid-length-{index}",
+            "sample": sample,
+            "sample_full_length": marker,
+            "Query_time_max": 10,
+        }
+        for index, marker in enumerate(
+            (None, 0, -1, "invalid", byte_length - 1, byte_length + 1),
+            start=1,
+        )
+    ]
+    rows.append(
+        {
+            "id": 99,
+            "checksum": "exact-length",
+            "sample": sample,
+            "sample_full_length": str(byte_length),
+            "Query_time_max": 1,
+        }
+    )
+
+    selected = ArcheryMCPClient.select_explainable_history_rows({"rows": rows})
+
+    assert [row["id"] for row in selected] == [99]
+
+
+def test_sql_equivalence_preserves_physical_table_identity() -> None:
+    assert ArcheryMCPClient.sql_equivalent(
+        "SELECT LOW_PRIORITY * FROM orders",
+        "select low_priority * from orders",
+    )
+    assert not ArcheryMCPClient.sql_equivalent(
+        "SELECT * FROM Orders",
+        "select * from orders",
+    )
+    assert not ArcheryMCPClient.sql_equivalent(
+        "SELECT * FROM orders",
+        "SELECT * FROM other_prod.orders",
+    )
+    assert not ArcheryMCPClient.sql_equivalent(
+        "SELECT A.id FROM Orders A JOIN orders a ON A.id = a.id",
+        "select a.id from orders A join Orders a on a.id = A.id",
+    )
+    assert not ArcheryMCPClient.sql_equivalent(
+        "SELECT A.id FROM orders A JOIN audit a ON A.id = a.id",
+        "select a.id from orders A join audit a on a.id = A.id",
+    )
+
+
+def test_sql_equivalence_preserves_optimizer_hint_identity() -> None:
+    expected = "SELECT /*+ INDEX(orders PRIMARY) */ * FROM orders"
+
+    assert ArcheryMCPClient.sql_equivalent(
+        expected,
+        "select /*+ INDEX(orders PRIMARY) */ * from orders",
+    )
+    assert not ArcheryMCPClient.sql_equivalent(
+        expected,
+        "SELECT /*+ INDEX(orders idx_customer) */ * FROM orders",
+    )
+
+
+def test_normalized_query_rejects_echoed_physical_table_change() -> None:
+    requested = "EXPLAIN SELECT * FROM Orders WHERE id = 1"
+    actual = "explain select * from orders where id = 1"
+
+    _payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"full_sql": actual, "rows": [{"table": "orders"}]},
+        requested_sql=requested,
+    )
+
+    assert executed_sql == actual
+    assert actual_sql_verified is False
+
+
+def test_normalized_query_rejects_conflicting_nested_actual_sql_echoes() -> None:
+    requested = "SELECT id FROM sql_instance WHERE id = 53"
+    conflicting = "SELECT host FROM sql_instance WHERE id = 99"
+
+    _payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {
+            "full_sql": requested,
+            "execution": {"executed_sql": conflicting},
+            "rows": [{"id": 53}],
+        },
+        requested_sql=requested,
+    )
+
+    assert executed_sql == requested
+    assert actual_sql_verified is False
+
+
+def test_normalized_query_rejects_conflicting_raw_text_actual_sql_echo() -> None:
+    requested = "SELECT id FROM sql_instance WHERE id = 53"
+    conflicting = "SELECT host FROM sql_instance WHERE id = 99"
+
+    _payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"full_sql": requested, "rows": [{"id": 53}]},
+        requested_sql=requested,
+        supplemental_text=(
+            json.dumps({"response": {"full_sql": conflicting}}),
+        ),
+    )
+
+    assert executed_sql == requested
+    assert actual_sql_verified is False
+
+
+def test_normalized_query_rejects_conflicting_sql_echoes_in_one_text_block() -> None:
+    requested = "SELECT id FROM sql_instance WHERE id = 53"
+    conflicting = "SELECT host FROM sql_instance WHERE id = 99"
+
+    _payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        {"rows": [{"id": 53}]},
+        requested_sql=requested,
+        supplemental_text=(
+            "SQL 查询已执行。\n"
+            f"执行的SQL：{requested}\n\n"
+            f"执行的SQL：{conflicting}\n\n"
+            "返回 1 行。",
+        ),
+    )
+
+    assert executed_sql == requested
+    assert actual_sql_verified is False
+
+
+def test_normalized_query_keeps_first_embedded_result_when_it_equals_outer_payload() -> None:
+    requested = "SELECT id FROM sql_instance WHERE id = 53"
+    first = {"rows": [{"id": 53}]}
+    second = {"rows": [{"id": 99}]}
+
+    payload, _executed_sql, _actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        first,
+        requested_sql=requested,
+        supplemental_text=(
+            "结果：" + json.dumps(first),
+            "结果：" + json.dumps(second),
+        ),
+    )
+
+    assert payload == first
+
+
+def test_explain_sample_identity_preserves_string_literal_semantics() -> None:
+    payload = {
+        "rows": [
+            {
+                "id": 11,
+                "checksum": "literal-orders",
+                "sample": "SELECT * FROM orders WHERE note = 'A  B'",
+                "Query_time_max": 1,
+            }
+        ]
+    }
+
+    assert ArcheryMCPClient.history_row_for_explain(
+        " explain select * from orders where note='A  B'; ",
+        payload,
+    ) is not None
+    assert ArcheryMCPClient.history_row_for_explain(
+        "EXPLAIN SELECT * FROM orders WHERE note = 'a b'",
+        payload,
+    ) is None
+
+
+def test_information_schema_classifier_rejects_additional_physical_tables() -> None:
+    assert ArcheryMCPClient.is_information_schema_columns_query(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS"
+    )
+    assert not ArcheryMCPClient.is_information_schema_columns_query(
+        "SELECT c.COLUMN_NAME FROM information_schema.COLUMNS c "
+        "JOIN orders o ON o.name = c.COLUMN_NAME"
+    )
+    assert not ArcheryMCPClient.is_information_schema_columns_query(
+        "SELECT SLEEP(1) FROM information_schema.COLUMNS"
+    )
+    assert not ArcheryMCPClient.is_information_schema_columns_query(
+        "SELECT COLUMN_NAME INTO OUTFILE '/tmp/columns' "
+        "FROM information_schema.COLUMNS"
+    )
+    assert not ArcheryMCPClient.is_information_schema_columns_query(
+        "SELECT TABLE_NAME AS COLUMN_NAME FROM information_schema.COLUMNS"
+    )
+    exact = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    assert ArcheryMCPClient.has_exact_information_schema_target_filters(exact)
+    assert not ArcheryMCPClient.has_exact_information_schema_target_filters(
+        exact + " AND COLUMN_NAME = 'id'"
+    )
+
+
+def test_allowlist_discovery_extracts_only_explicit_row_local_targets() -> None:
+    payload = {
+        "rows": [
+            {"id": 3, "host": "orders-db.example", "port": 3306},
+            {"instance_id": 4, "endpoint": "report-db.example:3307"},
+            {"id": 5, "name": "looks-like-db.example:3308"},
+            {"f_instance_id": 6, "address": "ignored-db.example:3309"},
+        ]
+    }
+
+    assert ArcheryMCPClient.allowlisted_instance_endpoints(payload) == {
+        3: {"orders-db.example:3306"},
+        4: {"report-db.example:3307"},
+    }
+    assert ArcheryMCPClient.allowlisted_database_names(
+        {"rows": [{"name": "orders_prod"}, {"db_name": "reporting"}]}
+    ) == {"orders_prod", "reporting"}
 
 
 def test_slow_log_evidence_keeps_history_and_adds_independent_analysis() -> None:

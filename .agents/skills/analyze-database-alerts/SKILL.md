@@ -94,18 +94,32 @@ New MCPs are integrated declaratively:
    `config/mcp/prompts/<provider>/`;
 4. restart the API and Worker so the main Agent can discover the new role and purpose.
 
-Do not add a provider selection branch to this skill or application code.
+Keep provider-specific sequencing, SQL binding, and projection rules in each provider's workflow and
+adapter. Do not hard-code Archery or Prometheus business policy into the generic MCP Host/runtime.
 
 ## 5. Apply provider workflows faithfully
 
 Archery provides slow-query evidence. Use the FlashDuty detail endpoint and five-minute window,
 follow the configured metadata chain, and query `mysql_slow_query_review_history`. The complete
-history result is the independent base evidence. After history succeeds, continue with safe
-supplemental collection: resolve `hostname_max` to a real allowlisted business instance, use
-`db_max`, and attempt plain EXPLAIN, table structure, and index queries. A plain EXPLAIN may wrap a
-supported DML sample, but never execute the sample itself and never use EXPLAIN ANALYZE. Follow-up
-successes are supplemental live facts; follow-up failures are structured evidence gaps and never
-invalidate or replace history.
+history result is the independent base evidence. After history succeeds, bind each selected sample
+to its real history `id` and `checksum`, resolve `hostname_max` to an exact allowlisted business
+instance, and use that row's `db_max`. Read the sample's real table and columns before attempting a
+plain EXPLAIN; collect real index metadata as a separate fact. A plain EXPLAIN may wrap SELECT, WITH,
+or DML supported by the target engine, but never execute any history sample directly, including a
+SELECT, and never use EXPLAIN ANALYZE. A sample prefix recovered with `LEFT(sample, '4000')` remains
+valid history evidence but is not complete SQL and must never be explained. Per-id recovery is
+limited to ids returned by the bound window's id listing. Any explicit sample schema, including CTE
+physical sources and DML targets, must exactly match the row's `db_max`.
+
+From history recovery through supplemental collection, restrict Archery calls to history-recovery
+queries, strict target resolution, real table/column/index metadata queries, and plain EXPLAIN for a
+bound history sample. Do not issue arbitrary business SELECTs, management statements, or unrelated
+probes. If the MCP explicitly reports an executed SQL or target that differs from the request,
+bound sample, or resolved target, do not project that response as the sample's EXPLAIN, structure,
+or index fact. Record the mismatch as a structured evidence gap. All such sequencing, binding, and
+projection rules remain inside the Archery provider workflow and adapter rather than the generic MCP
+Host/runtime. Follow-up successes are supplemental live facts; follow-up failures never invalidate,
+replace, modify, or downgrade history.
 
 Prometheus provides database monitoring metrics. First discover which database targets and metrics
 are actually configured. If the alert database is covered, query relevant metrics for the exact
@@ -126,12 +140,13 @@ For Archery, the program passes the final `mysql_slow_query_review_history` quer
 merged result when content-length truncation forced per-id follow-up queries) through to the main
 Agent with a format conversion only: the JSON embedded in the `result` text becomes a JSON object
 and positional rows are labeled with `column_list`. It performs no filtering, aggregation,
-sorting, truncation, or size capping, and it never judges causality. Plain EXPLAIN, table-structure,
-and index results are exposed separately as deterministic `slow_query_analysis` facts; their
-failures expose only the missing stage and real error. They do not modify the history passthrough,
-its usability, or root-cause eligibility. When the history JSON cannot be parsed, the original text
-is passed through as-is and the record is marked `processing_status=unavailable`. Authentication
-and unrelated navigation responses stay internal.
+sorting, truncation, or size capping, and it never judges causality. Only target-matched, SQL-matched
+plain EXPLAIN, table-structure, and index results are exposed separately as deterministic
+`slow_query_analysis` facts. A supplemental failure or explicit executed-SQL/target mismatch exposes
+the missing stage and real error instead of an associated fact; it does not modify the history
+passthrough, its usability, or root-cause eligibility. When the history JSON cannot be parsed, the
+original text is passed through as-is and the record is marked `processing_status=unavailable`.
+Authentication and unrelated navigation responses stay internal.
 
 For every other provider, program-side processing may deterministically filter, aggregate, sort,
 calculate statistics, and select traceable snippets. Every projected fact or anomaly must

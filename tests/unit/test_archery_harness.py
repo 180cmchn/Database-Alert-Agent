@@ -74,8 +74,7 @@ TARGET_ARGUMENTS = {
     "limit_num": 20,
 }
 FINAL_SQL = (
-    "SELECT hostname_max, ts_min, ts_max, sql_text "
-    f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
     "WHERE hostname_max = 'db-1.example:3306' "
     "AND ts_min >= FROM_UNIXTIME(1784793300) "
     "AND ts_min < FROM_UNIXTIME(1784793600) "
@@ -142,6 +141,19 @@ def _call(call_id: str, sql: str) -> MCPModelToolCall:
     )
 
 
+def _named_call(
+    call_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> MCPModelToolCall:
+    return MCPModelToolCall(
+        call_id=call_id,
+        name=tool_name,
+        arguments=arguments,
+        request_id=f"request-{call_id}",
+    )
+
+
 def _target_call(
     call_id: str,
     sql: str,
@@ -202,10 +214,99 @@ def _tools() -> list[DiscoveredMCPTool]:
     ]
 
 
-def _success(sql: str, *, rows: list[dict[str, Any]] | None = None) -> ReplayCallFixture:
+def _analysis_tools() -> list[DiscoveredMCPTool]:
+    return [
+        *_tools(),
+        DiscoveredMCPTool(
+            name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            description="List allowlisted database instances",
+            input_schema={"type": "object", "properties": {}},
+            annotations={"readOnlyHint": True},
+        ),
+        DiscoveredMCPTool(
+            name=ARCHERY_MCP_DATABASES_TOOL_NAME,
+            description="List databases for one allowlisted instance",
+            input_schema={
+                "type": "object",
+                "properties": {"instance_id": {"type": "integer"}},
+                "required": ["instance_id"],
+            },
+            annotations={"readOnlyHint": True},
+        ),
+        DiscoveredMCPTool(
+            name=ARCHERY_MCP_COLUMNS_TOOL_NAME,
+            description="List real columns for one table",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "integer"},
+                    "db_name": {"type": "string"},
+                    "tb_name": {"type": "string"},
+                },
+                "required": ["instance_id", "db_name", "tb_name"],
+            },
+            annotations={"readOnlyHint": True},
+        ),
+    ]
+
+
+def _analysis_discovery_actions(
+    *,
+    instance_id: int = 3,
+) -> list[MCPModelToolCall]:
+    return [
+        _named_call("allowlist", ARCHERY_MCP_INSTANCES_TOOL_NAME, {}),
+        _named_call(
+            "databases",
+            ARCHERY_MCP_DATABASES_TOOL_NAME,
+            {"instance_id": instance_id},
+        ),
+    ]
+
+
+def _analysis_discovery_calls(
+    *,
+    instance_id: int = 3,
+    endpoint: str = "orders-db.example:3306",
+    db_name: str = "orders_prod",
+) -> list[ReplayCallFixture]:
+    host, port_text = endpoint.rsplit(":", 1)
+    return [
+        ReplayCallFixture(
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            expected_arguments={},
+            result={
+                "structuredContent": {
+                    "status": "success",
+                    "rows": [{"id": instance_id, "host": host, "port": int(port_text)}],
+                }
+            },
+        ),
+        ReplayCallFixture(
+            tool_name=ARCHERY_MCP_DATABASES_TOOL_NAME,
+            expected_arguments={"instance_id": instance_id},
+            result={
+                "structuredContent": {
+                    "status": "success",
+                    "rows": [{"name": db_name}],
+                }
+            },
+        ),
+    ]
+
+
+def _success(
+    sql: str,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+    max_result_chars: int | None = None,
+) -> ReplayCallFixture:
+    expected_arguments = {**TARGET_ARGUMENTS, "sql_content": sql}
+    if max_result_chars is not None:
+        expected_arguments["max_result_chars"] = max_result_chars
     return ReplayCallFixture(
         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
-        expected_arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        expected_arguments=expected_arguments,
         result={
             "structuredContent": {
                 "status": "success",
@@ -284,6 +385,33 @@ def _scenario() -> archery_harness_module.ArcheryHarnessScenario:
         state,
         archery_harness_module._PlannerCallRegistry(),
     )
+
+
+def _bound_history_scenario(
+    rows: list[dict[str, Any]],
+    *,
+    instance_id: int = 3,
+    endpoint: str = "orders-db.example:3306",
+    db_name: str = "orders_prod",
+) -> tuple[
+    archery_harness_module.ArcheryHarnessScenario,
+    archery_harness_module.ArcheryHarnessState,
+]:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.final_result = archery_harness_module.ArcherySlowLogQueryResult(
+        payload={"rows": rows},
+        requested_sql=FINAL_SQL,
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    state.history_result_target = (
+        TARGET_ARGUMENTS["instance_id"],
+        TARGET_ARGUMENTS["db_name"],
+    )
+    state.analysis_instance_endpoints = {instance_id: {endpoint}}
+    state.analysis_database_names = {instance_id: {db_name}}
+    return scenario, state
 
 
 async def _create_durable_run(
@@ -661,51 +789,49 @@ def test_archery_harness_exposes_unknown_dynamic_tool_with_original_contract() -
     assert specs[-1].input_schema == schema
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("deployment_specific_query", {"deployment_scope": "primary"}),
+        (ARCHERY_MCP_QUERY_TOOL_NAME, dict(TARGET_ARGUMENTS)),
+        (
+            ARCHERY_MCP_QUERY_TOOL_NAME,
+            {**TARGET_ARGUMENTS, "sql_content": {"statement": FINAL_SQL}},
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_unknown_dynamic_tool_can_return_final_history_by_actual_sql() -> None:
-    dynamic_tool_name = "deployment_specific_query"
-    dynamic_arguments = {"deployment_scope": "primary"}
+async def test_pre_history_tool_without_authorized_contract_is_rejected_before_mcp(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
     model = _ScriptedModel(
         [
             MCPModelToolCall(
-                call_id="dynamic-history",
-                name=dynamic_tool_name,
-                arguments=dynamic_arguments,
-                request_id="request-dynamic-history",
+                call_id="unauthorized-pre-history",
+                name=tool_name,
+                arguments=arguments,
+                request_id="request-unauthorized-pre-history",
             ),
             _finish(),
         ]
     )
+    tools = _tools()
+    if tool_name != ARCHERY_MCP_QUERY_TOOL_NAME:
+        tools.append(
+            DiscoveredMCPTool(
+                name=tool_name,
+                description="Deployment-specific capability",
+                input_schema={"type": "object", "additionalProperties": True},
+            )
+        )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
             ReplaySessionFixture(
-                session_id="archery-dynamic-history",
-                tools=[
-                    DiscoveredMCPTool(
-                        name=dynamic_tool_name,
-                        description="Deployment-specific query capability",
-                        input_schema={"type": "object", "additionalProperties": True},
-                    )
-                ],
-                calls=[
-                    ReplayCallFixture(
-                        tool_name=dynamic_tool_name,
-                        expected_arguments=dynamic_arguments,
-                        result={
-                            "structuredContent": {
-                                "status": "success",
-                                "full_sql": FINAL_SQL,
-                                "rows": [
-                                    {
-                                        "hostname_max": "db-1.example:3306",
-                                        "sample": "SELECT dynamic history",
-                                    }
-                                ],
-                            }
-                        },
-                    )
-                ],
+                session_id="archery-reject-unauthorized-pre-history",
+                tools=tools,
+                calls=[],
             )
         ],
     )
@@ -715,10 +841,146 @@ async def test_unknown_dynamic_tool_can_return_final_history_by_actual_sql() -> 
         alert_context=ALERT_CONTEXT,
     )
 
-    assert result.query_completed is True
-    assert result.requested_sql == FINAL_SQL
-    assert result.executed_sql == FINAL_SQL
-    assert result.model_tool_calls == (dynamic_tool_name,)
+    assert result.query_completed is False
+    assert result.requested_sql == ""
+    assert result.payload["status"] == "evidence_insufficient"
+    assert result.model_tool_calls == ()
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == 0
+    assert connector.opened_session_ids == ["archery-reject-unauthorized-pre-history"]
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {"readOnlyHint": True},
+        {"readOnlyHint": True, "destructiveHint": False},
+    ],
+)
+def test_pre_history_read_only_auth_tool_remains_allowed(
+    annotations: dict[str, Any],
+) -> None:
+    scenario = _scenario()
+    scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name=ARCHERY_MCP_LOGIN_TOOL_NAME,
+                description="Confirm the configured Archery identity",
+                input_schema={"type": "object", "properties": {}},
+                annotations=annotations,
+            )
+        ]
+    )
+    state = scenario.initial_state()
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_LOGIN_TOOL_NAME,
+            objective="Confirm the configured identity",
+            hypothesis_ids=[],
+            arguments={},
+        ),
+        state=state,
+    )
+
+    assert prepared.local_result is None
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {},
+        {"readOnlyHint": False},
+        {"readOnlyHint": True, "destructiveHint": True},
+    ],
+)
+@pytest.mark.asyncio
+async def test_pre_history_dynamic_auth_tool_requires_nondestructive_read_only_contract(
+    annotations: dict[str, Any],
+) -> None:
+    tool_name = "refresh_session_credentials_gymJPA"
+    model = _ScriptedModel(
+        [
+            _named_call("unsafe-dynamic-auth", tool_name, {}),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-unsafe-dynamic-auth",
+                tools=[
+                    *_tools(),
+                    DiscoveredMCPTool(
+                        name=tool_name,
+                        description="Refresh the current authentication session",
+                        input_schema={"type": "object", "properties": {}},
+                        annotations=annotations,
+                    ),
+                ],
+                calls=[],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.model_tool_calls == ()
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == 0
+    assert result.diagnostics["model_attempted_tool_calls"] == [
+        tool_name,
+        FINISH_TOOL_NAME,
+    ]
+
+
+def test_dynamic_auth_allowlist_is_rebuilt_after_annotation_change() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    tool_name = "refresh_session_credentials_gymJPA"
+
+    def discovered(annotations: dict[str, Any]) -> DiscoveredMCPTool:
+        return DiscoveredMCPTool(
+            name=tool_name,
+            input_schema={"type": "object", "properties": {}},
+            annotations=annotations,
+        )
+
+    scenario.build_tool_specs([discovered({"readOnlyHint": True})])
+    allowed = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=tool_name,
+            objective="Refresh authentication",
+            hypothesis_ids=[],
+            arguments={},
+        ),
+        state=state,
+    )
+    scenario.build_tool_specs(
+        [
+            discovered(
+                {"readOnlyHint": True, "destructiveHint": True},
+            )
+        ]
+    )
+    rejected = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=tool_name,
+            objective="Refresh authentication",
+            hypothesis_ids=[],
+            arguments={},
+        ),
+        state=state,
+    )
+
+    assert allowed.local_result is None
+    assert rejected.metadata["local_rejection"]["reason_code"] == (
+        "pre_history_tool_forbidden"
+    )
 
 
 @pytest.mark.asyncio
@@ -739,7 +1001,14 @@ async def test_harness_parses_structured_response_result_history_rows() -> None:
             ensure_ascii=False,
         )
     )
-    model = _ScriptedModel([_call("wrapped-history", FINAL_SQL), _finish()])
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("wrapped-history", FINAL_SQL),
+            _finish(),
+        ]
+    )
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
@@ -747,6 +1016,8 @@ async def test_harness_parses_structured_response_result_history_rows() -> None:
                 session_id="archery-response-result-history",
                 tools=_tools(),
                 calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
@@ -782,15 +1053,13 @@ async def test_harness_parses_structured_response_result_history_rows() -> None:
             "sql_text": "SELECT fixture two",
         },
     ]
-    assert len(model.requests) == 2
+    assert len(model.requests) == 4
 
 
 _MERGE_WINDOW_SQL = (
-    "SELECT id, hostname_max, db_max, user_max, checksum, sample, ts_min, ts_max, ts_cnt, "
-    "Query_time_sum, Query_time_max, Query_time_pct_95 "
-    f"FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
     "WHERE hostname_max = 'db-1.example:3306' "
-    "AND ts_min >= FROM_UNIXTIME(1784793300) "
+    "AND ts_min >= FROM_UNIXTIME(1784789700) "
     "AND ts_min < FROM_UNIXTIME(1784793600) "
     "AND ts_max >= FROM_UNIXTIME(1784793300) "
     "ORDER BY id DESC"
@@ -798,7 +1067,7 @@ _MERGE_WINDOW_SQL = (
 _MERGE_IDS_SQL = (
     f"SELECT id FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
     "WHERE hostname_max = 'db-1.example:3306' "
-    "AND ts_min >= FROM_UNIXTIME(1784793300) "
+    "AND ts_min >= FROM_UNIXTIME(1784789700) "
     "AND ts_min < FROM_UNIXTIME(1784793600) "
     "AND ts_max >= FROM_UNIXTIME(1784793300) "
     "ORDER BY id DESC"
@@ -859,10 +1128,8 @@ def _truncated_window_positional_fixture() -> ReplayCallFixture:
     """
     recovered = json.dumps(
         [
-            [24413648, "db-1.example:3306", "dpm"],
-            [24413647, "db-1.example:3306", "dpm"],
-            [24413646, "db-1.example:3306", "dpm"],
-            [24413645, "db-1.example:3306", "dpm"],
+            list({**_MERGE_RECOVERED_ROW, "id": row_id}.values())
+            for row_id in (24413648, 24413647, 24413646, 24413645)
         ]
     )
     truncated_result = (
@@ -967,6 +1234,123 @@ async def test_truncated_window_merges_per_id_retrieval_rows_into_final_result()
     assert payload["rows"][0] == _MERGE_RECOVERED_ROW
     assert payload["rows"][1] == row_60
     assert payload["rows"][2] == row_54
+
+
+@pytest.mark.asyncio
+async def test_truncated_history_blocks_supplemental_calls_before_transport() -> None:
+    explain_sql = f"EXPLAIN {_MERGE_RECOVERED_ROW['sample']}"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window", _MERGE_WINDOW_SQL),
+            _named_call("early-allowlist", ARCHERY_MCP_INSTANCES_TOOL_NAME, {}),
+            _target_call(
+                "early-explain",
+                explain_sql,
+                instance_id=3,
+                db_name="dpm",
+            ),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-truncated-blocks-supplemental",
+                tools=_analysis_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _merge_truncated_window_fixture(),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.payload["rows_recovered_from_truncated_json"] is True
+    assert result.payload["history_recovery_id_listing_complete"] is False
+    assert result.slow_query_analysis is not None
+    reason_codes = [
+        failure["reason_code"]
+        for failure in result.slow_query_analysis["failures"]
+    ]
+    assert reason_codes.count("history_recovery_pending") == 2
+    assert "history_recovery_incomplete" in reason_codes
+
+
+@pytest.mark.asyncio
+async def test_incomplete_per_id_recovery_keeps_merged_history_partial() -> None:
+    row_60 = {
+        **_MERGE_RECOVERED_ROW,
+        "id": 24413460,
+        "checksum": "b" * 32,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("window", _MERGE_WINDOW_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("id-60", _MERGE_ID_SQL_60),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-incomplete-per-id-recovery",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _merge_truncated_window_fixture(),
+                    _success(
+                        _MERGE_IDS_SQL,
+                        rows=[
+                            {"id": 24413460},
+                            {"id": 24413458},
+                            {"id": 24413454},
+                        ],
+                    ),
+                    _success(_MERGE_ID_SQL_60, rows=[row_60]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows_merged_from_per_id_queries"] is True
+    assert result.payload["rows_recovered_from_truncated_json"] is True
+    assert result.payload["history_recovery_complete"] is False
+    assert result.payload["history_recovery_missing_ids"] == [24413454]
+    assert [row["id"] for row in result.payload["rows"]] == [24413458, 24413460]
+    assert result.diagnostics is not None
+    assert result.diagnostics["history_recovery_complete"] is False
+    assert result.diagnostics["history_recovery_missing_ids"] == [24413454]
+    assert result.slow_query_analysis is not None
+    assert any(
+        failure["reason_code"] == "history_recovery_incomplete"
+        for failure in result.slow_query_analysis["failures"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1224,15 +1608,7 @@ _PROJECTION_SAMPLE_PREFIX = (
     "SELECT count(0) FROM t_device WHERE store_code IN "
     "('1000042256', '1000042257')"
 )
-_PROJECTION_ID_SQL_40 = (
-    "SELECT id, hostname_max, client_max, user_max, db_max, checksum, "
-    "ts_min, ts_max, ts_cnt, Query_time_sum, Query_time_max, "
-    "Query_time_pct_95, Query_time_median, Lock_time_sum, Lock_time_max, "
-    "Rows_sent_sum, Rows_examined_sum, Full_scan_cnt, Tmp_table_cnt, "
-    "Filesort_cnt, Bytes_sum, LEFT(sample, '4000') AS sample, "
-    f"LENGTH(sample) AS sample_full_length FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
-    "WHERE id = 24413640"
-)
+_PROJECTION_ID_SQL_40 = ArcheryMCPClient.history_sample_projection_sql(24413640)
 
 
 @pytest.mark.asyncio
@@ -1388,8 +1764,9 @@ async def test_history_followup_collects_dml_explain_structure_and_indexes() -> 
             _call("member", MEMBER_SQL),
             _call("instance", INSTANCE_SQL),
             _call("history", FINAL_SQL),
-            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            *_analysis_discovery_actions(),
             _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
             _target_call("indexes", indexes_sql, instance_id=3, db_name="orders_prod"),
             _finish(),
         ]
@@ -1399,20 +1776,10 @@ async def test_history_followup_collects_dml_explain_structure_and_indexes() -> 
         [
             ReplaySessionFixture(
                 session_id="archery-history-analysis",
-                tools=_tools(),
+                tools=_analysis_tools(),
                 calls=[
                     *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
-                    ReplayCallFixture(
-                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
-                        result={
-                            "structuredContent": {
-                                "status": "success",
-                                "full_sql": explain_sql,
-                                "rows": [{"table": "orders", "type": "range", "key": "PRIMARY"}],
-                            }
-                        },
-                    ),
+                    *_analysis_discovery_calls(),
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**analysis_arguments, "sql_content": columns_sql},
@@ -1424,6 +1791,17 @@ async def test_history_followup_collects_dml_explain_structure_and_indexes() -> 
                                     {"COLUMN_NAME": "id", "COLUMN_TYPE": "bigint"},
                                     {"COLUMN_NAME": "status", "COLUMN_TYPE": "varchar(20)"},
                                 ],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": explain_sql,
+                                "rows": [{"table": "orders", "type": "range", "key": "PRIMARY"}],
                             }
                         },
                     ),
@@ -1462,6 +1840,377 @@ async def test_history_followup_collects_dml_explain_structure_and_indexes() -> 
     assert analysis["index_results"][0]["result"]["row_count"] == 1
     assert analysis["missing_stages"] == []
     assert analysis["failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_table_columns_can_supply_bound_structure_before_explain() -> None:
+    sample = "SELECT * FROM orders WHERE customer_id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    indexes_sql = (
+        "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    history_rows = [
+        {
+            "id": 1011,
+            "checksum": "list-columns-orders",
+            "sample": sample,
+            "Query_time_max": 12.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    column_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "tb_name": "orders",
+    }
+    analysis_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "limit_num": 20,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            *_analysis_discovery_actions(),
+            _named_call("columns", ARCHERY_MCP_COLUMNS_TOOL_NAME, column_arguments),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("indexes", indexes_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-list-columns-analysis",
+                tools=_analysis_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    *_analysis_discovery_calls(),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_COLUMNS_TOOL_NAME,
+                        expected_arguments=column_arguments,
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "rows": [{"name": "id"}, {"name": "customer_id"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": explain_sql,
+                                "rows": [{"table": "orders", "key": "idx_customer"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": indexes_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": indexes_sql,
+                                "rows": [
+                                    {
+                                        "INDEX_NAME": "idx_customer",
+                                        "COLUMN_NAME": "customer_id",
+                                    }
+                                ],
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.slow_query_analysis is not None
+    analysis = result.slow_query_analysis
+    assert analysis["status"] == "succeeded"
+    assert analysis["table_structure_results"][0]["source"] == "list_table_columns"
+    assert analysis["table_structure_results"][0]["result"]["columns"] == [
+        "customer_id",
+        "id",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unsafe_sql", "arguments", "reason_code"),
+    [
+        (
+            "SELECT 1; DELETE FROM orders",
+            TARGET_ARGUMENTS,
+            "multi_statement_forbidden",
+        ),
+        ("DELETE FROM orders", TARGET_ARGUMENTS, "direct_statement_forbidden"),
+        (
+            "WITH selected AS (SELECT id FROM orders) DELETE FROM orders",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        ("EXPLAIN DELETE FROM orders", TARGET_ARGUMENTS, "unbound_explain_forbidden"),
+        (
+            "EXPLAIN ANALYZE DELETE FROM orders",
+            TARGET_ARGUMENTS,
+            "explain_analyze_forbidden",
+        ),
+        ("SELECT SLEEP(1) FROM sql_instance", TARGET_ARGUMENTS, "direct_statement_forbidden"),
+        (
+            "SELECT * FROM sql_instance FOR UPDATE",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        ("SELECT @row_id := id FROM sql_instance", TARGET_ARGUMENTS, "direct_statement_forbidden"),
+        (
+            "SELECT f_instance_id FROM t_instance_member LIMIT 1",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT f_instance_id FROM t_instance_member "
+            "WHERE f_ip = 'db-1.example' OR f_port = 3306 LIMIT 1",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT f_instance_id FROM t_instance_member "
+            "WHERE f_ip = 'attacker.example' AND f_port = 9999 "
+            "AND 'db-1.example' = 'db-1.example' AND 3306 = 3306 LIMIT 1",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT f_id AS f_instance_id FROM t_instance_member "
+            "WHERE f_ip = 'db-1.example' AND f_port = 3306 LIMIT 1",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT host, port FROM sql_instance LIMIT 1",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = 'archery'",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT id FROM sql_instance WHERE id = custom_lookup(53)",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT s.id FROM sql_instance s "
+            "JOIN t_instance_member m ON m.f_instance_id = s.id",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT id FROM sql_instance UNION "
+            "SELECT f_instance_id FROM t_instance_member",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT id FROM sql_instance WHERE id IN "
+            "(SELECT f_instance_id FROM t_instance_member)",
+            TARGET_ARGUMENTS,
+            "direct_statement_forbidden",
+        ),
+        (
+            "SELECT * FROM {OJ sql_instance LEFT JOIN t_instance_member ON 1 = 1}",
+            TARGET_ARGUMENTS,
+            "multi_statement_forbidden",
+        ),
+        (
+            r"SELECT id FROM sql_instance WHERE note = 'prefix\' OR id = 53'",
+            TARGET_ARGUMENTS,
+            "multi_statement_forbidden",
+        ),
+        (
+            "SELECT h.* FROM mysql_slow_query_review_history h "
+            "JOIN sql_instance s ON s.id = h.id",
+            TARGET_ARGUMENTS,
+            "history_recovery_query_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history "
+            "UNION SELECT * FROM sql_instance",
+            TARGET_ARGUMENTS,
+            "history_recovery_query_forbidden",
+        ),
+        (
+            "WITH history_rows AS ("
+            "SELECT * FROM mysql_slow_query_review_history"
+            ") SELECT * FROM history_rows JOIN sql_instance ON 1 = 1",
+            TARGET_ARGUMENTS,
+            "history_recovery_query_forbidden",
+        ),
+        (
+            "SELECT * FROM orders",
+            {"instance_id": 3, "db_name": "orders_prod", "limit_num": 20},
+            "direct_statement_forbidden",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unsafe_pre_history_sql_is_rejected_before_mcp(
+    unsafe_sql: str,
+    arguments: dict[str, Any],
+    reason_code: str,
+) -> None:
+    unsafe_call = MCPModelToolCall(
+        call_id="unsafe-pre-history",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={**arguments, "sql_content": unsafe_sql},
+        request_id="request-unsafe-pre-history",
+    )
+    model = _ScriptedModel([unsafe_call, *_lineage_actions()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-unsafe-pre-history",
+                tools=_tools(),
+                calls=_lineage_replay_calls(),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.diagnostics is not None
+    assert result.diagnostics["model_attempted_tool_calls"] == [
+        ARCHERY_MCP_QUERY_TOOL_NAME
+    ] * 4
+    assert result.diagnostics["mcp_roundtrip_count"] == 3
+    assert any(
+        entry.get("reason_code") == reason_code
+        and entry.get("sent_to_mcp") is False
+        for entry in result.diagnostics["query_trace"]
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_lookup",
+    [
+        "SELECT host, port FROM sql_instance WHERE id = 53 + 946 LIMIT 1",
+        "SELECT id AS host, id AS port FROM sql_instance WHERE id = 53 LIMIT 1",
+    ],
+)
+@pytest.mark.asyncio
+async def test_sql_instance_lookup_requires_exact_returned_member_id_predicate(
+    unsafe_lookup: str,
+) -> None:
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("unsafe-instance", unsafe_lookup),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-arithmetic-instance-id",
+                tools=_tools(),
+                calls=_lineage_replay_calls(),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == 3
+    assert any(
+        entry.get("reason_code") == "direct_statement_forbidden"
+        and entry.get("sent_to_mcp") is False
+        for entry in result.diagnostics["query_trace"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("unsafe_lookup", "columns", "member_ids"),
+    [
+        (
+            "SELECT f_instance_id FROM t_instance_member "
+            "WHERE attacker_host = 'db-1.example' AND attacker_port = 3306 LIMIT 1",
+            {
+                "attacker_host",
+                "attacker_port",
+                "f_instance_id",
+                "f_ip",
+                "f_port",
+            },
+            set(),
+        ),
+        (
+            "SELECT backup_host, backup_port FROM sql_instance "
+            "WHERE id = 53 LIMIT 1",
+            {"backup_host", "backup_port", "host", "id", "port"},
+            {53},
+        ),
+    ],
+)
+def test_discovered_lookalike_endpoint_columns_are_rejected_before_transport(
+    unsafe_lookup: str,
+    columns: set[str],
+    member_ids: set[int],
+) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    target = (17, "archery")
+    table_name = (
+        "t_instance_member" if "t_instance_member" in unsafe_lookup else "sql_instance"
+    )
+    state.table_columns = {target: {table_name: columns}}
+    if member_ids:
+        state.member_instance_ids = {target: member_ids}
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Reject lookalike endpoint columns",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": unsafe_lookup},
+        ),
+        state=state,
+    )
+
+    assert prepared.local_result is not None
+    assert prepared.metadata["local_rejection"]["reason_code"] == (
+        "direct_statement_forbidden"
+    )
 
 
 @pytest.mark.asyncio
@@ -1516,6 +2265,200 @@ async def test_explain_analyze_is_rejected_before_mcp_and_history_is_preserved()
     )
 
 
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "SELECT * FROM {OJ orders LEFT JOIN customers ON orders.customer_id = customers.id}",
+        r"SELECT * FROM orders WHERE note = 'prefix\' OR admin = 1'",
+    ],
+)
+@pytest.mark.asyncio
+async def test_lexically_ambiguous_explain_is_rejected_before_transport(
+    sample: str,
+) -> None:
+    history_rows = [
+        {
+            "id": 110,
+            "checksum": "ambiguous-explain",
+            "sample": sample,
+            "Query_time_max": 9.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+        {
+            "id": 109,
+            "checksum": "valid-control-for-ambiguous",
+            "sample": "SELECT * FROM safe_orders",
+            "Query_time_max": 1.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+    ]
+    explain_sql = f"EXPLAIN {sample}"
+    model = _ScriptedModel(
+        [
+            *_lineage_actions()[:-1],
+            _target_call(
+                "ambiguous-explain",
+                explain_sql,
+                instance_id=3,
+                db_name="orders_prod",
+            ),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-ambiguous-explain",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert len(model.requests) == 5
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.slow_query_analysis is not None
+    assert any(
+        failure.get("reason_code") == "multi_statement_forbidden"
+        for failure in result.slow_query_analysis["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    "length_marker",
+    [None, 0, -1, "invalid", 44, 46],
+)
+@pytest.mark.asyncio
+async def test_invalid_sample_full_length_cannot_authorize_explain_transport(
+    length_marker: Any,
+) -> None:
+    sample = "SELECT * FROM orders WHERE note = '慢查询'"
+    assert len(sample.encode("utf-8")) == 45
+    history_rows = [
+        {
+            "id": 111,
+            "checksum": "invalid-sample-length",
+            "sample": sample,
+            "sample_full_length": length_marker,
+            "Query_time_max": 9.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+        {
+            "id": 109,
+            "checksum": "valid-control-for-length",
+            "sample": "SELECT * FROM safe_orders",
+            "Query_time_max": 1.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+    ]
+    explain_sql = f"EXPLAIN {sample}"
+    model = _ScriptedModel(
+        [
+            *_lineage_actions()[:-1],
+            _target_call(
+                "invalid-length-explain",
+                explain_sql,
+                instance_id=3,
+                db_name="orders_prod",
+            ),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-invalid-sample-length",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.payload["rows"] == history_rows
+    assert len(model.requests) == 5
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.slow_query_analysis is not None
+    assert any(
+        failure.get("reason_code") == "explain_sample_not_in_history"
+        for failure in result.slow_query_analysis["failures"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_history_information_schema_union_udf_is_rejected_before_transport() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    history_rows = [
+        {
+            "id": 112,
+            "checksum": "orders-metadata-guard",
+            "sample": sample,
+            "Query_time_max": 9.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    unsafe_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "UNION SELECT mutate_state() FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    model = _ScriptedModel(
+        [
+            *_lineage_actions()[:-1],
+            _target_call(
+                "unsafe-information-schema",
+                unsafe_sql,
+                instance_id=3,
+                db_name="orders_prod",
+            ),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-information-schema-union-udf",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert len(model.requests) == 5
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.slow_query_analysis is not None
+    assert any(
+        failure.get("reason_code") == "direct_statement_forbidden"
+        for failure in result.slow_query_analysis["failures"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_direct_dml_sample_is_rejected_before_mcp_and_history_is_preserved() -> None:
     sample = "INSERT INTO order_archive SELECT * FROM orders WHERE id = 1"
@@ -1565,9 +2508,415 @@ async def test_direct_dml_sample_is_rejected_before_mcp_and_history_is_preserved
 
 
 @pytest.mark.asyncio
+async def test_direct_select_sample_formatting_variant_is_rejected_before_mcp() -> None:
+    sample = "SELECT * FROM orders WHERE id=1 AND note = 'A  B'"
+    direct_sql = " select * from orders where id = 1 and note='A  B'; "
+    history_rows = [
+        {
+            "id": 1031,
+            "checksum": "select-orders",
+            "sample": sample,
+            "Query_time_max": 8.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("direct-select", direct_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-direct-select",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["explain_results"] == []
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "sample_execution_forbidden"
+    )
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_post_history_business_select_is_rejected_before_mcp() -> None:
+    history_rows = [
+        {
+            "id": 1032,
+            "checksum": "select-orders",
+            "sample": "SELECT * FROM orders WHERE id = 1",
+            "Query_time_max": 8.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    arbitrary_sql = "SELECT * FROM customers WHERE id = 1"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _target_call("arbitrary", arbitrary_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-arbitrary-select",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "direct_statement_forbidden"
+    )
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+
+
+@pytest.mark.asyncio
+async def test_multi_id_history_recovery_is_rejected_before_mcp() -> None:
+    history_rows = [
+        {
+            "id": 1033,
+            "checksum": "history-in",
+            "sample": "SELECT 1",
+            "Query_time_max": 8.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    in_sql = (
+        f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+        "WHERE id IN (1033, 1034)"
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _call("multi-id", in_sql),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-multi-id",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "history_recovery_query_forbidden"
+    )
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+
+
+@pytest.mark.asyncio
+async def test_unscoped_history_id_listing_is_rejected_before_mcp() -> None:
+    history_rows = [
+        {
+            "id": 10331,
+            "checksum": "history-unscoped-ids",
+            "sample": "SELECT 1",
+            "Query_time_max": 8.0,
+            "hostname_max": "db-1.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    unscoped_sql = f"SELECT id FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE}"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _call("unscoped-ids", unscoped_sql),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-unscoped-ids",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "history_recovery_query_forbidden"
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_sql",
+    [
+        (
+            f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} h "
+            f"JOIN {ARCHERY_SLOW_QUERY_REVIEW_TABLE} h2 ON h2.id = h.id "
+            "WHERE h.hostname_max = 'db-1.example:3306' "
+            "AND h.ts_min >= FROM_UNIXTIME(1784793300) "
+            "AND h.ts_min < FROM_UNIXTIME(1784793600)"
+        ),
+        (
+            f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} h, "
+            f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} h2 "
+            "WHERE h.hostname_max = 'db-1.example:3306' "
+            "AND h.ts_min >= FROM_UNIXTIME(1784793300) "
+            "AND h.ts_min < FROM_UNIXTIME(1784793600)"
+        ),
+        (
+            f"WITH history_rows AS (SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE}) "
+            "SELECT * FROM history_rows "
+            "WHERE hostname_max = 'db-1.example:3306' "
+            "AND ts_min >= FROM_UNIXTIME(1784793300) "
+            "AND ts_min < FROM_UNIXTIME(1784793600)"
+        ),
+        (
+            f"SELECT * FROM (SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE}) h "
+            "WHERE hostname_max = 'db-1.example:3306' "
+            "AND ts_min >= FROM_UNIXTIME(1784793300) "
+            "AND ts_min < FROM_UNIXTIME(1784793600)"
+        ),
+        FINAL_SQL.replace("SELECT *", "SELECT id, sample"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_complex_or_partial_history_window_is_rejected_before_mcp(
+    unsafe_sql: str,
+) -> None:
+    model = _ScriptedModel([_call("unsafe-history-shape", unsafe_sql), *_lineage_actions()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-history-source-shape",
+                tools=_tools(),
+                calls=_lineage_replay_calls(),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is True
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.diagnostics is not None
+    assert any(
+        entry.get("reason_code") == "history_recovery_query_forbidden"
+        for entry in result.diagnostics["query_trace"]
+    )
+
+
+@pytest.mark.parametrize(
+    "wrong_target",
+    [
+        {"instance_id": 3, "db_name": "archery", "limit_num": 20},
+        {"instance_id": 17, "db_name": "orders_prod", "limit_num": 20},
+    ],
+)
+@pytest.mark.asyncio
+async def test_history_recovery_wrong_target_is_rejected_before_mcp(
+    wrong_target: dict[str, Any],
+) -> None:
+    history_rows = [
+        {
+            "id": 24413454,
+            "hostname_max": "db-1.example:3306",
+            "sample": "SELECT * FROM orders",
+        }
+    ]
+    wrong_target_call = MCPModelToolCall(
+        call_id="wrong-history-target",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={**wrong_target, "sql_content": _MERGE_IDS_SQL},
+        request_id="request-wrong-history-target",
+    )
+    model = _ScriptedModel(
+        [*_lineage_actions()[:-1], wrong_target_call, _finish()]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-wrong-history-target",
+                tools=_tools(),
+                calls=_lineage_replay_calls(rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.slow_query_analysis is not None
+    assert any(
+        failure["reason_code"] == "history_recovery_query_forbidden"
+        for failure in result.slow_query_analysis["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    "wrong_target",
+    [
+        {"instance_id": 3, "db_name": "archery", "limit_num": 20},
+        {"instance_id": 17, "db_name": "orders_prod", "limit_num": 20},
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_history_wrong_target_is_rejected_before_mcp(
+    wrong_target: dict[str, Any],
+) -> None:
+    history_call = MCPModelToolCall(
+        call_id="wrong-initial-history-target",
+        name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        arguments={**wrong_target, "sql_content": FINAL_SQL},
+        request_id="request-wrong-initial-history-target",
+    )
+    model = _ScriptedModel(
+        [_call("member", MEMBER_SQL), _call("instance", INSTANCE_SQL), history_call, _finish()]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-wrong-initial-history-target",
+                tools=_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.query_completed is False
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 2
+    assert result.slow_query_analysis is None
+    assert result.diagnostics is not None
+    assert any(
+        entry.get("reason_code") == "history_target_mismatch"
+        for entry in result.diagnostics["query_trace"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_non_sql_tool_is_rejected_after_history() -> None:
+    history_rows = [
+        {
+            "id": 1034,
+            "checksum": "unknown-tool",
+            "sample": "SELECT 1",
+            "Query_time_max": 8.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    tool_name = "run_custom_probe_gymJPA"
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            _named_call("custom-probe", tool_name, {"target": "orders"}),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-reject-custom-tool",
+                tools=[
+                    *_tools(),
+                    DiscoveredMCPTool(
+                        name=tool_name,
+                        input_schema={"type": "object", "additionalProperties": True},
+                    ),
+                ],
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "followup_tool_forbidden"
+    )
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+
+
+@pytest.mark.asyncio
 async def test_dml_plain_explain_target_syntax_failure_does_not_replace_history() -> None:
     sample = "DELETE FROM orders WHERE id = 1"
     explain_sql = f"EXPLAIN {sample}"
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
     history_rows = [
         {
             "id": 104,
@@ -1583,6 +2932,8 @@ async def test_dml_plain_explain_target_syntax_failure_does_not_replace_history(
             _call("member", MEMBER_SQL),
             _call("instance", INSTANCE_SQL),
             _call("history", FINAL_SQL),
+            *_analysis_discovery_actions(),
+            _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
             _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
             _finish(),
         ]
@@ -1592,9 +2943,26 @@ async def test_dml_plain_explain_target_syntax_failure_does_not_replace_history(
         [
             ReplaySessionFixture(
                 session_id="archery-explain-not-supported",
-                tools=_tools(),
+                tools=_analysis_tools(),
                 calls=[
                     *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    *_analysis_discovery_calls(),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={
+                            "instance_id": 3,
+                            "db_name": "orders_prod",
+                            "limit_num": 20,
+                            "sql_content": columns_sql,
+                        },
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": columns_sql,
+                                "rows": [{"COLUMN_NAME": "id"}],
+                            }
+                        },
+                    ),
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={
@@ -1626,10 +2994,1423 @@ async def test_dml_plain_explain_target_syntax_failure_does_not_replace_history(
     assert result.query_completed is True
     assert result.payload["rows"] == history_rows
     assert result.slow_query_analysis is not None
-    assert result.slow_query_analysis["status"] == "failed"
+    assert result.slow_query_analysis["status"] == "partial"
     assert result.slow_query_analysis["failures"][0]["reason_code"] == (
         "explain_not_supported_by_target"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instance_id", "db_name", "reason_code"),
+    [
+        (4, "orders_prod", "instance_target_mismatch"),
+        (3, "other_prod", "database_target_mismatch"),
+        (3, "ORDERS_PROD", "database_target_mismatch"),
+    ],
+)
+async def test_supplemental_metadata_requires_bound_instance_and_database(
+    instance_id: int,
+    db_name: str,
+    reason_code: str,
+) -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    history_rows = [
+        {
+            "id": 1041,
+            "checksum": "target-orders",
+            "sample": sample,
+            "Query_time_max": 7.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            *_analysis_discovery_actions(),
+            _target_call("wrong-target", columns_sql, instance_id=instance_id, db_name=db_name),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id=f"archery-target-mismatch-{reason_code}",
+                tools=_analysis_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    *_analysis_discovery_calls(),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["table_structure_results"] == []
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == reason_code
+
+
+@pytest.mark.asyncio
+async def test_plain_explain_requires_prior_structure_result_or_failure() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    history_rows = [
+        {
+            "id": 1045,
+            "checksum": "structure-first",
+            "sample": sample,
+            "Query_time_max": 7.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            *_analysis_discovery_actions(),
+            _target_call("early-explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-structure-first",
+                tools=_analysis_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    *_analysis_discovery_calls(),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "table_structure_required"
+    )
+
+
+@pytest.mark.asyncio
+async def test_supplemental_actual_sql_mismatch_is_not_projected_as_explain() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    actual_sql = "EXPLAIN SELECT * FROM unrelated WHERE id = 1"
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    history_rows = [
+        {
+            "id": 1042,
+            "checksum": "actual-sql-orders",
+            "sample": sample,
+            "Query_time_max": 7.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    analysis_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "limit_num": 20,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("history", FINAL_SQL),
+            *_analysis_discovery_actions(),
+            _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-actual-explain-mismatch",
+                tools=_analysis_tools(),
+                calls=[
+                    *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+                    *_analysis_discovery_calls(),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": columns_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": columns_sql,
+                                "rows": [{"COLUMN_NAME": "id"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": actual_sql,
+                                "rows": [{"table": "unrelated", "type": "ALL"}],
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["explain_results"] == []
+    assert any(
+        failure["reason_code"] == "actual_sql_mismatch"
+        for failure in result.slow_query_analysis["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("result", "reason_code"),
+    [
+        (
+            {
+                "structuredContent": {
+                    "status": "success",
+                    "full_sql": INSTANCE_SQL,
+                    "rows": [{"f_instance_id": 53}],
+                }
+            },
+            "actual_sql_mismatch",
+        ),
+        (
+            {
+                "structuredContent": {
+                    "status": "success",
+                    "full_sql": MEMBER_SQL,
+                    "instance_id": 99,
+                    "db_name": "archery",
+                    "rows": [{"f_instance_id": 53}],
+                }
+            },
+            "actual_target_mismatch",
+        ),
+        (
+            {
+                "structuredContent": {
+                    "status": "success",
+                    "full_sql": MEMBER_SQL,
+                    "instance_id": 17,
+                    "db_name": "Archery",
+                    "rows": [{"f_instance_id": 53}],
+                }
+            },
+            "actual_target_mismatch",
+        ),
+        (
+            {
+                "structuredContent": {
+                    "status": "success",
+                    "full_sql": MEMBER_SQL,
+                    "instance_id": 17,
+                    "db_name": "archery",
+                    "rows": [{"f_instance_id": 53}],
+                },
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "full_sql": MEMBER_SQL,
+                                "instance_id": 99,
+                                "db_name": "archery",
+                            }
+                        ),
+                    }
+                ],
+            },
+            "actual_target_mismatch",
+        ),
+    ],
+)
+def test_pre_history_response_mismatch_does_not_authorize_metadata_lineage(
+    result: dict[str, Any],
+    reason_code: str,
+) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Resolve the alert instance",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(state, prepared, result)
+
+    assert state.member_instance_ids == {}
+    assert state.resolved_endpoints == {}
+    assert state.history_result_target is None
+    assert state.slow_query_analysis_failures == []
+    assert state.query_trace[-1]["outcome"] == "result_mismatch"
+    assert state.query_trace[-1]["reason_code"] == reason_code
+
+
+def test_explicit_actual_target_mismatch_is_not_collected() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.final_result = archery_harness_module.ArcherySlowLogQueryResult(
+        payload={
+            "rows": [
+                {
+                    "id": 1043,
+                    "checksum": "actual-target-orders",
+                    "sample": sample,
+                    "Query_time_max": 7.0,
+                    "hostname_max": "orders-db.example:3306",
+                    "db_max": "orders_prod",
+                }
+            ]
+        },
+        requested_sql=FINAL_SQL,
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
+    state.analysis_database_names = {3: {"orders_prod"}}
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Collect bound columns",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": columns_sql,
+            },
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": columns_sql,
+                "instance_id": 99,
+                "db_name": "orders_prod",
+                "rows": [{"COLUMN_NAME": "id"}],
+            }
+        },
+    )
+
+    assert state.slow_query_table_structure_results == []
+    assert state.slow_query_analysis_failures[0]["reason_code"] == (
+        "actual_target_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_table", "result_row", "result_attribute", "mismatched_field"),
+    [
+        (
+            "COLUMNS",
+            {
+                "TABLE_SCHEMA": "other_prod",
+                "TABLE_NAME": "orders",
+                "COLUMN_NAME": "id",
+            },
+            "slow_query_table_structure_results",
+            "db_name",
+        ),
+        (
+            "STATISTICS",
+            {
+                "TABLE_SCHEMA": "orders_prod",
+                "TABLE_NAME": "Orders",
+                "INDEX_NAME": "PRIMARY",
+            },
+            "slow_query_index_results",
+            "table_name",
+        ),
+    ],
+)
+def test_information_schema_row_target_mismatch_is_not_collected(
+    metadata_table: str,
+    result_row: dict[str, Any],
+    result_attribute: str,
+    mismatched_field: str,
+) -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    selected_columns = (
+        "TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME"
+        if metadata_table == "COLUMNS"
+        else "TABLE_SCHEMA, TABLE_NAME, INDEX_NAME"
+    )
+    metadata_sql = (
+        f"SELECT {selected_columns} FROM information_schema.{metadata_table} "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.final_result = archery_harness_module.ArcherySlowLogQueryResult(
+        payload={
+            "rows": [
+                {
+                    "id": 1044,
+                    "checksum": "row-target-orders",
+                    "sample": sample,
+                    "Query_time_max": 7.0,
+                    "hostname_max": "orders-db.example:3306",
+                    "db_max": "orders_prod",
+                }
+            ]
+        },
+        requested_sql=FINAL_SQL,
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
+    state.analysis_database_names = {3: {"orders_prod"}}
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Collect bound metadata",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": metadata_sql,
+            },
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": metadata_sql,
+                "rows": [result_row],
+            }
+        },
+    )
+
+    assert getattr(state, result_attribute) == []
+    failure = state.slow_query_analysis_failures[0]
+    assert failure["reason_code"] == "actual_target_mismatch"
+    assert mismatched_field in failure["detail"]
+
+
+def test_incomplete_supplemental_results_are_recorded_only_as_evidence_gaps() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    columns_sql = (
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME "
+        "FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    explain_sql = f"EXPLAIN {sample}"
+    indexes_sql = (
+        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME "
+        "FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    scenario, state = _bound_history_scenario(
+        [
+            {
+                "id": 1045,
+                "checksum": "incomplete-supplemental-orders",
+                "sample": sample,
+                "Query_time_max": 7.0,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    )
+    calls = (
+        (
+            columns_sql,
+            {
+                "TABLE_SCHEMA": "orders_prod",
+                "TABLE_NAME": "orders",
+                "COLUMN_NAME": "id",
+            },
+        ),
+        (explain_sql, {"id": 1, "table": "orders", "type": "const"}),
+        (
+            indexes_sql,
+            {
+                "TABLE_SCHEMA": "orders_prod",
+                "TABLE_NAME": "orders",
+                "INDEX_NAME": "PRIMARY",
+            },
+        ),
+    )
+
+    for sql, row in calls:
+        prepared = scenario.prepare_call(
+            SimpleNamespace(
+                tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                objective="Collect bound supplemental evidence",
+                hypothesis_ids=(),
+                arguments={
+                    "instance_id": 3,
+                    "db_name": "orders_prod",
+                    "sql_content": sql,
+                },
+            ),
+            state=state,
+        )
+        assert "local_rejection" not in prepared.metadata
+        scenario.on_result(
+            state,
+            prepared,
+            {
+                "structuredContent": {
+                    "status": "success",
+                    "full_sql": sql,
+                    "mcp_reported_row_count": 2,
+                    "rows": [row],
+                }
+            },
+        )
+
+    assert state.slow_query_table_structure_results == []
+    assert state.slow_query_explain_results == []
+    assert state.slow_query_index_results == []
+    incomplete_failures = [
+        failure
+        for failure in state.slow_query_analysis_failures
+        if failure["reason_code"] == "supplemental_result_incomplete"
+    ]
+    assert [failure["stage"] for failure in incomplete_failures] == [
+        "table_structure",
+        "explain",
+        "indexes",
+    ]
+    assert all(failure["error_type"] == "incomplete_result" for failure in incomplete_failures)
+
+
+def test_database_discovery_actual_instance_mismatch_does_not_authorize_database() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.final_result = archery_harness_module.ArcherySlowLogQueryResult(
+        payload={
+            "rows": [
+                {
+                    "id": 1046,
+                    "checksum": "database-target",
+                    "sample": "SELECT * FROM orders",
+                    "Query_time_max": 7.0,
+                    "hostname_max": "orders-db.example:3306",
+                    "db_max": "orders_prod",
+                }
+            ]
+        },
+        requested_sql=FINAL_SQL,
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_DATABASES_TOOL_NAME,
+            objective="Discover bound databases",
+            hypothesis_ids=(),
+            arguments={"instance_id": 3},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "instance_id": 99,
+                "rows": [{"name": "orders_prod"}],
+            }
+        },
+    )
+
+    assert state.analysis_database_names == {}
+    assert state.slow_query_analysis_failures[0]["reason_code"] == (
+        "actual_target_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "authorized_ids"),
+    [
+        (
+            "SELECT SLEEP(10), * FROM mysql_slow_query_review_history "
+            "WHERE id = 24413454",
+            {24413454},
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 999",
+            {24413454},
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454",
+            set(),
+        ),
+    ],
+)
+def test_id_listing_context_rejects_unsafe_or_unauthorized_per_id_queries(
+    sql: str,
+    authorized_ids: set[int],
+) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_result_target = (17, "archery")
+    state.history_recovery_ids = authorized_ids
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover one listed history row",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+
+    assert prepared.metadata["local_rejection"]["reason_code"] == (
+        "history_recovery_query_forbidden"
+    )
+
+
+def test_malformed_nonempty_id_listing_does_not_complete_recovery() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.window_start, state.window_end = archery_harness_module.client_window(
+        scenario.client,
+        OCCURRED_AT,
+    )
+    state.resolved_endpoints = {(17, "archery"): {"db-1.example:3306"}}
+    listing = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="List history ids",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": _MERGE_IDS_SQL},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        listing,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": _MERGE_IDS_SQL,
+                "rows": [{"id": "not-an-integer"}],
+            }
+        },
+    )
+    followup = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            objective="Discover supplemental target",
+            hypothesis_ids=(),
+            arguments={},
+        ),
+        state=state,
+    )
+
+    assert state.history_recovery_required is True
+    assert state.history_recovery_listing_completed is False
+    assert state.history_recovery_ids == set()
+    assert followup.metadata["local_rejection"]["reason_code"] == (
+        "history_recovery_pending"
+    )
+
+
+def test_pending_recovery_diagnostic_distinguishes_unlisted_rows() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {24413458}
+    state.history_id_rows = {
+        24413458: dict(_MERGE_RECOVERED_ROW),
+        24413454: {**_MERGE_RECOVERED_ROW, "id": 24413454},
+    }
+    state.history_full_row_ids = {24413458, 24413454}
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            objective="Discover supplemental target",
+            hypothesis_ids=(),
+            arguments={},
+        ),
+        state=state,
+    )
+
+    rejection = prepared.metadata["local_rejection"]
+    assert rejection["reason_code"] == "history_recovery_pending"
+    assert "未出现在完整 id 清单" in rejection["detail"]
+    assert "24413454" in rejection["detail"]
+
+
+def test_unverified_full_per_id_result_cannot_decode_positional_rows() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {24413454, 24413458}
+    state.history_positional_rows = [
+        [24413458, "db-1.example:3306", "dpm"]
+    ]
+    sql = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413454"
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover one listed history row",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                # Deliberately omit full_sql: the returned field order is not
+                # trustworthy enough to decode another query's positional rows.
+                "rows": [
+                    {
+                        "id": 24413454,
+                        "hostname_max": "db-1.example:3306",
+                        "db_max": "dpm",
+                        "sample": "SELECT 1",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert state.history_positional_reference_columns == []
+    assert state.history_positional_rows == [
+        [24413458, "db-1.example:3306", "dpm"]
+    ]
+    assert set(state.history_id_rows) == {24413454}
+
+
+@pytest.mark.parametrize(
+    ("include_marker", "marker"),
+    [(False, None), (True, 0), (True, "invalid"), (True, "exact")],
+)
+def test_sample_prefix_provenance_blocks_explain_even_without_valid_length_marker(
+    include_marker: bool,
+    marker: Any,
+) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    row_id = 24413640
+    sample = "SELECT * FROM orders WHERE id = 1"
+    sql = scenario.client.history_sample_projection_sql(row_id)
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {row_id}
+    row: dict[str, Any] = {
+        "id": row_id,
+        "hostname_max": "orders-db.example:3306",
+        "db_max": "orders_prod",
+        "checksum": "prefix-provenance",
+        "sample": sample,
+        "Query_time_max": 9,
+    }
+    if include_marker:
+        row["sample_full_length"] = (
+            len(sample.encode("utf-8")) if marker == "exact" else marker
+        )
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover sample prefix",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rows": [row],
+            }
+        },
+    )
+    state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
+    state.analysis_database_names = {3: {"orders_prod"}}
+    explain = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Explain recovered sample",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": f"EXPLAIN {sample}",
+            },
+        ),
+        state=state,
+    )
+
+    assert state.history_id_rows[row_id]["sample"] == sample
+    assert row_id in state.history_sample_prefix_ids
+    assert explain.metadata["local_rejection"]["reason_code"] == (
+        "explain_sample_not_in_history"
+    )
+
+
+def test_only_verified_complete_full_per_id_sample_clears_prefix_provenance() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    row_id = 24413454
+    prefix = "SELECT * FROM orders WHERE note = 'prefix"
+    complete = "SELECT * FROM orders WHERE note = 'complete'"
+    sql = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {row_id}
+    state.history_sample_prefix_ids = {row_id}
+    state.history_id_rows = {
+        row_id: {
+            "id": row_id,
+            "sample": prefix,
+            "sample_full_length": len(complete.encode("utf-8")),
+        }
+    }
+    state.history_merge_sources = [
+        {"full_sql": scenario.client.history_sample_projection_sql(row_id), "row_count": 1}
+    ]
+
+    missing_sample = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover full row without sample",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+    scenario.on_result(
+        state,
+        missing_sample,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rows": [{"id": row_id, "hostname_max": "db-1.example:3306"}],
+            }
+        },
+    )
+
+    assert state.history_id_rows[row_id]["sample"] == prefix
+    assert state.history_id_rows[row_id]["sample_full_length"] == len(
+        complete.encode("utf-8")
+    )
+    assert state.history_sample_prefix_ids == {row_id}
+    assert state.history_full_row_ids == set()
+
+    shortfall = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Reject incomplete full sample provenance",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+    scenario.on_result(
+        state,
+        shortfall,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rowCount": 2,
+                "rows": [{"id": row_id, "sample": complete}],
+            }
+        },
+    )
+
+    assert state.history_id_rows[row_id]["sample"] == prefix
+    assert state.history_sample_prefix_ids == {row_id}
+    assert state.history_full_row_ids == set()
+
+    complete_sample = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover verified full sample",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+    scenario.on_result(
+        state,
+        complete_sample,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rows": [
+                    {
+                        "id": row_id,
+                        "hostname_max": "db-1.example:3306",
+                        "sample": complete,
+                    }
+                ],
+            }
+        },
+    )
+
+    assert state.history_id_rows[row_id]["sample"] == complete
+    assert "sample_full_length" not in state.history_id_rows[row_id]
+    assert state.history_sample_prefix_ids == set()
+    assert state.history_full_row_ids == {row_id}
+
+
+@pytest.mark.parametrize("projection", ["full", "sample_prefix"])
+def test_per_id_row_without_sample_does_not_complete_history_recovery(
+    projection: str,
+) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    row_id = 24413454
+    sql = (
+        f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
+        if projection == "full"
+        else scenario.client.history_sample_projection_sql(row_id)
+    )
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {row_id}
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover one history row",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rows": [{"id": row_id}],
+            }
+        },
+    )
+
+    assert state.history_id_rows == {row_id: {"id": row_id}}
+    assert state.history_full_row_ids == set()
+    assert state.history_sample_prefix_ids == set()
+    assert archery_harness_module._history_recovery_missing_ids(state) == {row_id}
+    assert archery_harness_module._history_recovery_complete(state) is False
+
+
+def test_complete_json_row_shortfall_starts_history_recovery() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.window_start, state.window_end = archery_harness_module.client_window(
+        scenario.client,
+        OCCURRED_AT,
+    )
+    state.resolved_endpoints = {(17, "archery"): {"db-1.example:3306"}}
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Read alert-window history",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": FINAL_SQL},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": FINAL_SQL,
+                "rows": [{**_MERGE_RECOVERED_ROW, "id": 24413458}],
+                "mcp_reported_row_count": 2,
+            }
+        },
+    )
+
+    assert state.history_recovery_required is True
+    assert state.history_recovery_listing_completed is False
+    assert state.final_result is not None
+    assert state.final_result.payload["result_incomplete"] is True
+    assert "row_count_shortfall" in state.final_result.payload[
+        "result_incomplete_reasons"
+    ]
+
+
+def test_decoded_full_positional_sample_survives_later_prefix_projection() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    row_id = 24413640
+    full_sample = "SELECT * FROM orders WHERE id = 4001"
+    prefix_sample = "SELECT * FROM orders WHERE id = 4"
+    state.history_result_target = (17, "archery")
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {row_id}
+    state.history_sample_prefix_ids = {row_id}
+    state.history_id_rows = {
+        row_id: {
+            "id": row_id,
+            "sample": prefix_sample,
+            "sample_full_length": len(full_sample.encode("utf-8")),
+        }
+    }
+    state.history_positional_reference_columns = ["id", "sample", "ts_cnt"]
+    state.history_positional_rows = [[row_id, full_sample, 7]]
+
+    scenario._resolve_deferred_positional_rows(state)
+
+    assert state.history_positional_rows == []
+    assert state.history_id_rows[row_id]["sample"] == full_sample
+    assert "sample_full_length" not in state.history_id_rows[row_id]
+    assert state.history_sample_prefix_ids == set()
+    assert state.history_full_row_ids == {row_id}
+
+    sql = scenario.client.history_sample_projection_sql(row_id)
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Recover redundant sample prefix",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": sql,
+                "rows": [
+                    {
+                        "id": row_id,
+                        "sample": prefix_sample,
+                        "sample_full_length": len(full_sample.encode("utf-8")),
+                    }
+                ],
+            }
+        },
+    )
+
+    assert state.history_id_rows[row_id]["sample"] == full_sample
+    assert "sample_full_length" not in state.history_id_rows[row_id]
+    assert state.history_sample_prefix_ids == set()
+    assert state.history_full_row_ids == {row_id}
+
+
+def test_unresolved_positional_rows_keep_recovery_incomplete_until_same_id_full() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_recovery_required = True
+    state.history_recovery_listing_completed = True
+    state.history_recovery_ids = {1, 2}
+    state.history_positional_reference_columns = ["id", "sample"]
+    state.history_positional_rows = [
+        [1],
+        [2, "SELECT 2"],
+        [3, "SELECT 3"],
+        ["invalid", "SELECT invalid"],
+    ]
+
+    scenario._resolve_deferred_positional_rows(state)
+
+    assert state.history_id_rows == {2: {"id": 2, "sample": "SELECT 2"}}
+    assert state.history_positional_rows == [
+        [1],
+        [3, "SELECT 3"],
+        ["invalid", "SELECT invalid"],
+    ]
+    assert archery_harness_module._history_recovery_complete(state) is False
+
+    state.history_full_row_ids.add(1)
+    state.history_id_rows[1] = {"id": 1, "sample": "SELECT 1"}
+    scenario._resolve_deferred_positional_rows(state)
+
+    assert state.history_positional_rows == [
+        [3, "SELECT 3"],
+        ["invalid", "SELECT invalid"],
+    ]
+    assert archery_harness_module._history_recovery_complete(state) is False
+
+
+def test_unscoped_id_listing_is_rejected_before_any_history_result() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.resolved_endpoints = {(17, "archery"): {"db-1.example:3306"}}
+    sql = f"SELECT id FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE}"
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="List history ids",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": sql},
+        ),
+        state=state,
+    )
+
+    assert prepared.metadata["local_rejection"]["reason_code"] == (
+        "history_recovery_query_forbidden"
+    )
+
+
+def test_unknown_dynamic_sql_tool_is_rejected_even_for_valid_explain_shape() -> None:
+    sample = "SELECT * FROM orders WHERE id = 1"
+    scenario, state = _bound_history_scenario(
+        [
+            {
+                "id": 1050,
+                "checksum": "unknown-sql-tool",
+                "sample": sample,
+                "Query_time_max": 1,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    )
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name="custom_sql_probe_gymJPA",
+            objective="Explain the selected sample",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": f"EXPLAIN {sample}",
+            },
+        ),
+        state=state,
+    )
+
+    assert prepared.metadata["local_rejection"]["reason_code"] == "sql_tool_forbidden"
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "SELECT * FROM other_prod.orders",
+        "UPDATE LOW_PRIORITY other_prod.orders SET status = 1",
+        "UPDATE /*+ NO_MERGE(orders) */ other_prod.orders SET status = 1",
+        "INSERT /*+ SET_VAR(foreign_key_checks=OFF) */ "
+        "INTO other_prod.archive VALUES (1)",
+        "DELETE FROM orders USING other_prod.orders WHERE orders.id = 1",
+        "INSERT INTO archive TABLE other_prod.source_rows",
+        "REPLACE INTO archive TABLE other_prod.source_rows",
+        "WITH recent AS (SELECT * FROM other_prod.orders) SELECT * FROM recent",
+        "WITH recent AS (TABLE other_prod.orders) SELECT * FROM recent",
+        "SELECT * FROM (TABLE other_prod.orders) recent",
+        "SELECT * FROM orders UNION ALL TABLE other_prod.archive",
+        'SELECT * FROM "other_prod"."orders"',
+        "SELECT * FROM (other_prod.secret)",
+        "SELECT * FROM (other_prod.a JOIN orders b ON a.id = b.id)",
+        "SELECT * FROM (orders a, other_prod.secret s)",
+        "DELETE other_prod.orders FROM orders JOIN audit a ON orders.id = a.id",
+        "DELETE /*+ NO_MERGE(orders) */ other_prod.orders.* "
+        "FROM orders JOIN audit a ON orders.id = a.id",
+    ],
+)
+def test_explicit_sample_schema_mismatch_is_rejected_for_supported_statements(
+    sample: str,
+) -> None:
+    scenario, state = _bound_history_scenario(
+        [
+            {
+                "id": 1051,
+                "checksum": "schema-mismatch",
+                "sample": sample,
+                "Query_time_max": 2,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    )
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Explain the selected sample",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": f"EXPLAIN {sample}",
+            },
+        ),
+        state=state,
+    )
+
+    assert prepared.metadata["local_rejection"]["reason_code"] == (
+        "sample_schema_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "SELECT 'FROM other_prod.decoy' FROM orders",
+        "SELECT * FROM orders_prod.Orders",
+    ],
+)
+def test_table_parser_does_not_invent_schema_mismatch(sample: str) -> None:
+    scenario, state = _bound_history_scenario(
+        [
+            {
+                "id": 1052,
+                "checksum": "schema-match",
+                "sample": sample,
+                "Query_time_max": 2,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    )
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Explain the selected sample",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": f"EXPLAIN {sample}",
+            },
+        ),
+        state=state,
+    )
+
+    assert prepared.metadata["local_rejection"]["reason_code"] == (
+        "table_structure_required"
+    )
+
+
+def test_list_tables_actual_target_mismatch_does_not_mutate_discovery_state() -> None:
+    scenario, state = _bound_history_scenario(
+        [
+            {
+                "id": 1053,
+                "checksum": "table-discovery-target",
+                "sample": "SELECT * FROM orders",
+                "Query_time_max": 2,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    )
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_TABLES_TOOL_NAME,
+            objective="List bound tables",
+            hypothesis_ids=(),
+            arguments={"instance_id": 3, "db_name": "orders_prod"},
+        ),
+        state=state,
+    )
+
+    scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "instance_id": 99,
+                "db_name": "orders_prod",
+                "rows": [{"name": "mysql_slow_query_log"}],
+            }
+        },
+    )
+
+    assert state.slow_log_tables == {}
+    assert state.slow_query_analysis_failures[0]["reason_code"] == (
+        "actual_target_mismatch"
+    )
+
+
+def test_structure_and_indexes_are_reused_for_same_physical_table() -> None:
+    rows = [
+        {
+            "id": 1061,
+            "checksum": "orders-a",
+            "sample": "SELECT * FROM orders WHERE id = 1",
+            "Query_time_max": 3,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+        {
+            "id": 1062,
+            "checksum": "orders-b",
+            "sample": "SELECT * FROM orders WHERE id = 2",
+            "Query_time_max": 2,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        },
+    ]
+    scenario, state = _bound_history_scenario(rows)
+    source_a = scenario.client.slow_query_source_row(rows[0])
+    source_b = scenario.client.slow_query_source_row(rows[1])
+    target = {"instance_id": 3, "db_name": "orders_prod", "table_name": "orders"}
+    shared_structure = {
+        "stage": "table_structure",
+        "source_history_row": source_a,
+        "target": target,
+        "result": {"rows": [{"COLUMN_NAME": "id"}], "row_count": 1},
+    }
+    state.slow_query_table_structure_results = [shared_structure]
+    state.slow_query_index_results = [
+        {
+            "stage": "indexes",
+            "source_history_row": source_a,
+            "target": target,
+            "result": {"rows": [{"INDEX_NAME": "PRIMARY"}], "row_count": 1},
+        }
+    ]
+    explain_results = [
+        {
+            "stage": "explain",
+            "source_history_row": source,
+            "target": {"instance_id": 3, "db_name": "orders_prod"},
+            "result": {"rows": [{"table": "orders"}], "row_count": 1},
+        }
+        for source in (source_a, source_b)
+    ]
+    state.slow_query_explain_results = explain_results[:1]
+
+    incomplete = archery_harness_module._build_slow_query_analysis(
+        scenario.client,
+        state,
+        state.final_result.payload,
+    )
+    state.slow_query_explain_results.append(explain_results[1])
+
+    prepared = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Explain the second checksum",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": f"EXPLAIN {rows[1]['sample']}",
+            },
+        ),
+        state=state,
+    )
+    analysis = archery_harness_module._build_slow_query_analysis(
+        scenario.client,
+        state,
+        state.final_result.payload,
+    )
+
+    assert incomplete["status"] == "partial"
+    assert incomplete["missing_stages"] == ["explain"]
+    assert "local_rejection" not in prepared.metadata
+    assert analysis["status"] == "succeeded"
+    assert analysis["missing_stages"] == []
+
+
+def test_all_truncated_samples_record_no_safe_explainable_sample() -> None:
+    sample = "SELECT * FROM orders"
+    rows = [
+        {
+            "id": 1070,
+            "checksum": "truncated-only",
+            "sample": sample,
+            "sample_full_length": len(sample.encode("utf-8")) + 1,
+            "Query_time_max": 5,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    scenario, state = _bound_history_scenario(rows)
+
+    analysis = archery_harness_module._build_slow_query_analysis(
+        scenario.client,
+        state,
+        state.final_result.payload,
+    )
+
+    assert analysis["status"] == "not_applicable"
+    assert analysis["failures"][0]["reason_code"] == "no_safe_explainable_sample"
 
 
 def test_archery_restore_state_backfills_slow_query_fields_from_old_checkpoint() -> None:
@@ -1643,10 +4424,133 @@ def test_archery_restore_state_backfills_slow_query_fields_from_old_checkpoint()
     )
     for field_name in new_fields:
         delattr(state, field_name)
+    for field_name in ("analysis_instance_endpoints", "analysis_database_names"):
+        delattr(state, field_name)
+    delattr(state, "history_result_target")
+    delattr(state, "history_recovery_ids")
+    delattr(state, "supplemental_analysis_started")
 
     scenario.restore_state(state)
 
     assert all(getattr(state, field_name) == [] for field_name in new_fields)
+    assert state.analysis_instance_endpoints == {}
+    assert state.analysis_database_names == {}
+    assert state.history_result_target is None
+    assert state.history_recovery_ids == set()
+    assert state.history_recovery_required is False
+    assert state.history_recovery_listing_completed is False
+    assert state.supplemental_analysis_started is False
+
+
+def test_legacy_checkpoint_accumulator_restores_conservative_recovery_provenance() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_id_rows = {
+        41: {"id": 41, "sample": "SELECT * FROM legacy_orders"}
+    }
+    state.history_merge_sources = [
+        {
+            "full_sql": (
+                "SELECT * FROM mysql_slow_query_review_history WHERE id = 41"
+            ),
+            "row_count": 1,
+        }
+    ]
+    for field_name in (
+        "history_recovery_ids",
+        "history_recovery_required",
+        "history_recovery_listing_completed",
+        "history_sample_prefix_ids",
+        "history_full_row_ids",
+    ):
+        delattr(state, field_name)
+
+    scenario.restore_state(state)
+
+    assert state.history_recovery_required is True
+    assert state.history_recovery_listing_completed is False
+    assert state.history_sample_prefix_ids == {41}
+    assert state.history_full_row_ids == set()
+    assert archery_harness_module._history_recovery_complete(state) is False
+
+
+def test_restore_state_fails_closed_for_inconsistent_current_accumulator() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    state.history_id_rows = {42: {"id": 42, "sample": "SELECT 42"}}
+    state.history_merge_sources = [
+        {
+            "full_sql": (
+                "SELECT * FROM mysql_slow_query_review_history WHERE id = 42"
+            ),
+            "row_count": 1,
+        }
+    ]
+    state.history_recovery_required = False
+    state.history_recovery_ids = {42}
+    state.history_recovery_listing_completed = True
+
+    scenario.restore_state(state)
+
+    assert state.history_recovery_required is True
+    assert state.history_recovery_listing_completed is False
+    assert archery_harness_module._history_recovery_complete(state) is False
+
+
+def test_analysis_success_requires_same_source_target_and_table() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    history_payload = {
+        "rows": [
+            {
+                "id": 1044,
+                "checksum": "coherent-orders",
+                "sample": "SELECT * FROM orders WHERE id = 1",
+                "Query_time_max": 7.0,
+                "hostname_max": "orders-db.example:3306",
+                "db_max": "orders_prod",
+            }
+        ]
+    }
+    source = scenario.client.slow_query_source_row(history_payload["rows"][0])
+    correct_target = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "endpoint": "orders-db.example:3306",
+        "table_name": "orders",
+    }
+    state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
+    state.analysis_database_names = {3: {"orders_prod"}}
+    state.slow_query_explain_results = [
+        {
+            "source_history_row": source,
+            "target": correct_target,
+            "result": {"row_count": 1, "rows": [{"table": "orders"}]},
+        }
+    ]
+    state.slow_query_table_structure_results = [
+        {
+            "source_history_row": source,
+            "target": {**correct_target, "instance_id": 99},
+            "result": {"row_count": 1, "rows": [{"COLUMN_NAME": "id"}]},
+        }
+    ]
+    state.slow_query_index_results = [
+        {
+            "source_history_row": source,
+            "target": correct_target,
+            "result": {"row_count": 1, "rows": [{"INDEX_NAME": "PRIMARY"}]},
+        }
+    ]
+
+    analysis = archery_harness_module._build_slow_query_analysis(
+        scenario.client,
+        state,
+        history_payload,
+    )
+
+    assert analysis["status"] == "partial"
+    assert analysis["missing_stages"] == ["table_structure"]
 
 
 @pytest.mark.asyncio
@@ -1691,7 +4595,44 @@ async def test_history_without_explainable_sample_marks_analysis_not_applicable(
     assert result.slow_query_analysis["status"] == "not_applicable"
     assert result.slow_query_analysis["source_history_row"] is None
     assert result.slow_query_analysis["failures"][0]["reason_code"] == (
-        "no_explainable_sample"
+        "no_safe_explainable_sample"
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_direct_finish_records_supplemental_analysis_not_attempted() -> None:
+    history_rows = [
+        {
+            "id": 1051,
+            "checksum": "finish-orders",
+            "sample": "SELECT * FROM orders WHERE id = 1",
+            "Query_time_max": 20.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+    model = _ScriptedModel([*_lineage_actions(FINAL_SQL)[:-1], _finish()])
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-analysis-not-attempted",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == history_rows
+    assert result.slow_query_analysis is not None
+    assert result.slow_query_analysis["status"] == "failed"
+    assert result.slow_query_analysis["failures"][0]["reason_code"] == (
+        "slow_query_analysis_not_attempted"
     )
 
 
@@ -1722,8 +4663,9 @@ async def test_followup_allowlist_failure_preserves_history_and_remaining_facts(
             _call("member", MEMBER_SQL),
             _call("instance", INSTANCE_SQL),
             _call("history", FINAL_SQL),
-            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            *_analysis_discovery_actions(),
             _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
             _target_call("indexes", indexes_sql, instance_id=3, db_name="orders_prod"),
             _finish(),
         ]
@@ -1738,19 +4680,10 @@ async def test_followup_allowlist_failure_preserves_history_and_remaining_facts(
         [
             ReplaySessionFixture(
                 session_id="archery-followup-allowlist-failure",
-                tools=_tools(),
+                tools=_analysis_tools(),
                 calls=[
                     *_lineage_replay_calls(FINAL_SQL, rows=history_rows),
-                    ReplayCallFixture(
-                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
-                        result={
-                            "structuredContent": {
-                                "status": "failed",
-                                "message": "实例不在白名单中，已拒绝执行（allowlist）",
-                            }
-                        },
-                    ),
+                    *_analysis_discovery_calls(),
                     ReplayCallFixture(
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**analysis_arguments, "sql_content": columns_sql},
@@ -1758,7 +4691,19 @@ async def test_followup_allowlist_failure_preserves_history_and_remaining_facts(
                             "structuredContent": {
                                 "status": "success",
                                 "full_sql": columns_sql,
-                                "rows": [{"COLUMN_NAME": "customer_id", "COLUMN_TYPE": "bigint"}],
+                                "rows": [
+                                    {"COLUMN_NAME": "customer_id", "COLUMN_TYPE": "bigint"}
+                                ],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "failed",
+                                "message": "实例不在白名单中，已拒绝执行（allowlist）",
                             }
                         },
                     ),
@@ -1787,7 +4732,16 @@ async def test_followup_allowlist_failure_preserves_history_and_remaining_facts(
 
     assert result.query_completed is True
     assert result.payload["rows"] == history_rows
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 6
+    assert result.model_tool_calls == (
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        ARCHERY_MCP_DATABASES_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
     assert result.slow_query_analysis is not None
     analysis = result.slow_query_analysis
     assert analysis["status"] == "partial"
@@ -1813,6 +4767,7 @@ async def test_complete_window_query_resets_per_id_accumulation() -> None:
             _call("member", MEMBER_SQL),
             _call("instance", INSTANCE_SQL),
             _call("window-truncated", _MERGE_WINDOW_SQL),
+            _call("ids", _MERGE_IDS_SQL),
             _call("id-60", _MERGE_ID_SQL_60),
             _call("window-requery", _MERGE_WINDOW_SQL),
             _finish(),
@@ -1830,6 +4785,7 @@ async def test_complete_window_query_resets_per_id_accumulation() -> None:
                         INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]
                     ),
                     _merge_truncated_window_fixture(),
+                    _success(_MERGE_IDS_SQL, rows=[{"id": 24413460}]),
                     _success(_MERGE_ID_SQL_60, rows=[dict(_MERGE_RECOVERED_ROW)]),
                     _success(_MERGE_WINDOW_SQL, rows=[row_a, row_c]),
                 ],
@@ -1846,6 +4802,101 @@ async def test_complete_window_query_resets_per_id_accumulation() -> None:
     assert "rows_merged_from_per_id_queries" not in result.payload
     assert result.payload["rows"] == [row_a, row_c]
     assert "rows_recovered_from_truncated_json" not in result.payload
+
+
+@pytest.mark.asyncio
+async def test_per_id_only_history_keeps_supplemental_success_and_failure() -> None:
+    per_id_sql = (
+        f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413454"
+    )
+    sample = "DELETE FROM orders WHERE id = 1"
+    explain_sql = f"EXPLAIN {sample}"
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    history_row = {
+        "id": 24413454,
+        "checksum": "per-id-orders",
+        "sample": sample,
+        "Query_time_max": 6.0,
+        "hostname_max": "orders-db.example:3306",
+        "db_max": "orders_prod",
+    }
+    analysis_arguments = {
+        "instance_id": 3,
+        "db_name": "orders_prod",
+        "limit_num": 20,
+    }
+    model = _ScriptedModel(
+        [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
+            _call("ids", _MERGE_IDS_SQL),
+            _call("per-id", per_id_sql),
+            *_analysis_discovery_actions(),
+            _target_call("columns", columns_sql, instance_id=3, db_name="orders_prod"),
+            _target_call("explain", explain_sql, instance_id=3, db_name="orders_prod"),
+            _finish(),
+        ]
+    )
+    connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-per-id-analysis",
+                tools=_analysis_tools(),
+                calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _success(_MERGE_IDS_SQL, rows=[{"id": 24413454}]),
+                    _success(per_id_sql, rows=[history_row]),
+                    *_analysis_discovery_calls(),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": columns_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "success",
+                                "full_sql": columns_sql,
+                                "rows": [{"COLUMN_NAME": "id"}],
+                            }
+                        },
+                    ),
+                    ReplayCallFixture(
+                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                        expected_arguments={**analysis_arguments, "sql_content": explain_sql},
+                        result={
+                            "structuredContent": {
+                                "status": "failed",
+                                "message": "permission denied for EXPLAIN",
+                            }
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result = await _client(model, connector).execute_slow_log_query(
+        OCCURRED_AT,
+        alert_context=ALERT_CONTEXT,
+    )
+
+    assert result.payload["rows"] == [history_row]
+    assert result.instance_id == TARGET_ARGUMENTS["instance_id"]
+    assert result.db_name == TARGET_ARGUMENTS["db_name"]
+    assert result.slow_query_analysis is not None
+    analysis = result.slow_query_analysis
+    assert analysis["status"] == "partial"
+    assert analysis["table_structure_results"][0]["result"]["row_count"] == 1
+    assert any(
+        failure["reason_code"] == "permission_denied"
+        for failure in analysis["failures"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2214,7 +5265,7 @@ async def test_archery_planner_forwards_provider_reasoning_deltas() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_preserves_schema_and_sends_remote_character_limit() -> None:
+async def test_shared_harness_preserves_schema_valid_window_character_limit() -> None:
     final_arguments = {
         **TARGET_ARGUMENTS,
         "sql_content": FINAL_SQL,
@@ -2222,6 +5273,8 @@ async def test_shared_harness_preserves_schema_and_sends_remote_character_limit(
     }
     model = _ScriptedModel(
         [
+            _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
             MCPModelToolCall(
                 call_id="final-with-limit",
                 name=ARCHERY_MCP_QUERY_TOOL_NAME,
@@ -2238,21 +5291,17 @@ async def test_shared_harness_preserves_schema_and_sends_remote_character_limit(
                 session_id="archery-no-character-limit",
                 tools=_tools(),
                 calls=[
-                    ReplayCallFixture(
-                        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
-                        expected_arguments=final_arguments,
-                        result={
-                            "structuredContent": {
-                                "status": "success",
-                                "full_sql": FINAL_SQL,
-                                "rows": [
-                                    {
-                                        "hostname_max": "db-1.example:3306",
-                                        "sql_text": "SELECT 1",
-                                    }
-                                ],
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
+                    _success(
+                        FINAL_SQL,
+                        rows=[
+                            {
+                                "hostname_max": "db-1.example:3306",
+                                "sql_text": "SELECT 1",
                             }
-                        },
+                        ],
+                        max_result_chars=123_456,
                     ),
                 ],
             )
@@ -2271,8 +5320,14 @@ async def test_shared_harness_preserves_schema_and_sends_remote_character_limit(
         if item["function"]["name"] == ARCHERY_MCP_QUERY_TOOL_NAME
     )
     assert "max_result_chars" in query_tool["function"]["parameters"]["properties"]
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
-    assert len(model.requests) == 2
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert len(model.requests) == 4
+    assert result.diagnostics is not None
+    assert result.diagnostics["mcp_roundtrip_count"] == 3
+    assert all(
+        entry.get("reason_code") != "max_result_chars_forbidden"
+        for entry in result.diagnostics["query_trace"]
+    )
     assert connector.opened_session_ids == ["archery-no-character-limit"]
 
 
@@ -2291,6 +5346,7 @@ async def test_auxiliary_raw_payload_is_replayed_to_internal_model() -> None:
     model = _ScriptedModel(
         [
             _call("member", MEMBER_SQL),
+            _call("instance", INSTANCE_SQL),
             _call("final", FINAL_SQL),
             _finish(),
         ]
@@ -2306,8 +5362,12 @@ async def test_auxiliary_raw_payload_is_replayed_to_internal_model() -> None:
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
                         result=raw_member_result,
-                    ),
-                    _success(
+                        ),
+                        _success(
+                            INSTANCE_SQL,
+                            rows=[{"host": "db-1.example", "port": 3306}],
+                        ),
+                        _success(
                         FINAL_SQL,
                         rows=[
                             {
@@ -3031,6 +6091,161 @@ async def test_archery_resume_replays_prepared_state_and_responses_items() -> No
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("unsafe_sql", "reason_code"),
+    [
+        ("DELETE FROM orders WHERE id = 1", "sample_execution_forbidden"),
+        (
+            "EXPLAIN ANALYZE DELETE FROM orders WHERE id = 1",
+            "explain_analyze_forbidden",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_archery_pending_checkpoint_reapplies_current_sql_policy_before_transport(
+    unsafe_sql: str,
+    reason_code: str,
+) -> None:
+    sample = "DELETE FROM orders WHERE id = 1"
+    history_rows = [
+        {
+            "id": 104,
+            "checksum": "delete-orders-resume",
+            "sample": sample,
+            "Query_time_max": 9.0,
+            "hostname_max": "orders-db.example:3306",
+            "db_max": "orders_prod",
+        }
+    ]
+
+    class LegacyPermissiveScenario(archery_harness_module.ArcheryHarnessScenario):
+        def prepare_call(self, action: Any, *, state: Any) -> Any:
+            prepared = super().prepare_call(action, state=state)
+            if action.arguments.get("sql_content") != unsafe_sql:
+                return prepared
+            metadata = deepcopy(prepared.metadata)
+            metadata.pop("local_rejection", None)
+            return prepared.model_copy(
+                update={"metadata": metadata, "local_result": None},
+                deep=True,
+            )
+
+    first_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-before-pending-policy-upgrade",
+                tools=_tools(),
+                calls=_lineage_replay_calls(FINAL_SQL, rows=history_rows),
+            )
+        ],
+    )
+    first_model = _ScriptedModel(
+        [
+            _call("member-before-upgrade", MEMBER_SQL),
+            _call("instance-before-upgrade", INSTANCE_SQL),
+            _call("history-before-upgrade", FINAL_SQL),
+            _target_call(
+                "unsafe-before-upgrade",
+                unsafe_sql,
+                instance_id=3,
+                db_name="orders_prod",
+            ),
+        ]
+    )
+    first_client = _client(first_model, first_connector)
+    window_start, window_end = archery_harness_module.client_window(
+        first_client,
+        OCCURRED_AT,
+    )
+    first_state = archery_harness_module.ArcheryHarnessState(
+        window_start=window_start,
+        window_end=window_end,
+        occurred_at=OCCURRED_AT,
+        alert_context=dict(ALERT_CONTEXT),
+        alert_endpoint=ALERT_CONTEXT["alert_endpoint"],
+    )
+    first_registry = archery_harness_module._PlannerCallRegistry()
+    first_scenario = LegacyPermissiveScenario(
+        first_client,
+        first_state,
+        first_registry,
+    )
+    checkpoints: list[Any] = []
+
+    async def interrupt_unsafe_pending(snapshot: Any) -> None:
+        if (
+            len(snapshot.invocations) == 4
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            checkpoints.append(snapshot)
+            raise asyncio.CancelledError
+
+    sink = InMemoryEventSink()
+    with pytest.raises(asyncio.CancelledError):
+        await MCPAgentHarnessRuntime(
+            connector=first_connector,
+            planner=archery_harness_module.ArcheryHarnessPlanner(
+                first_client,
+                first_scenario,
+                first_registry,
+            ),
+            scenario=first_scenario,
+            event_sink=sink,
+            budget=BudgetLedger(BudgetLimits()),
+            checkpoint_hook=interrupt_unsafe_pending,
+        ).run(run_id=uuid4(), initial_state=first_state)
+
+    stale_checkpoint = checkpoints[-1]
+    assert stale_checkpoint.active_call is not None
+    assert stale_checkpoint.active_call.local_result is None
+    second_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="archery-after-pending-policy-upgrade",
+                tools=_tools(),
+                calls=[],
+            )
+        ],
+    )
+    resumed_model = _ScriptedModel([_finish("finish-after-local-policy-refresh")])
+    resumed_client = _client(resumed_model, second_connector)
+    resumed_registry = archery_harness_module._PlannerCallRegistry()
+    resumed_scenario = archery_harness_module.ArcheryHarnessScenario(
+        resumed_client,
+        deepcopy(stale_checkpoint.state),
+        resumed_registry,
+    )
+    result = await MCPAgentHarnessRuntime(
+        connector=second_connector,
+        planner=archery_harness_module.ArcheryHarnessPlanner(
+            resumed_client,
+            resumed_scenario,
+            resumed_registry,
+        ),
+        scenario=resumed_scenario,
+        event_sink=sink,
+        budget=BudgetLedger(BudgetLimits()),
+    ).resume(
+        stale_checkpoint,
+        restored_budget=BudgetLedger.from_snapshot(stale_checkpoint.budget),
+    )
+
+    assert result.budget.consumed.remote_tool_calls == 3
+    assert result.state.executed_model_calls == [ARCHERY_MCP_QUERY_TOOL_NAME] * 3
+    assert len(result.state.query_trace) == len(stale_checkpoint.state.query_trace) == 4
+    assert result.state.query_trace[-1]["sql_summary"] == unsafe_sql
+    assert result.state.query_trace[-1]["outcome"] == "rejected_locally"
+    assert result.state.query_trace[-1]["reason_code"] == reason_code
+    local_record = next(
+        record
+        for record in result.remote_responses
+        if record.invocation_id == result.invocations[-1].invocation_id
+    )
+    assert local_record.is_remote is False
+
+
 @pytest.mark.asyncio
 async def test_shared_archery_harness_executes_text_agent_action_history_query() -> None:
     action = {
@@ -3048,7 +6263,7 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
         async def create(self, **kwargs: object) -> SimpleNamespace:
             del kwargs
             self.request_count += 1
-            if self.request_count == 2:
+            if self.request_count == 4:
                 return SimpleNamespace(
                     id="archery-text-finish-request",
                     choices=[
@@ -3071,13 +6286,22 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
                         )
                     ],
                 )
+            sql = {
+                1: MEMBER_SQL,
+                2: INSTANCE_SQL,
+                3: FINAL_SQL,
+            }[self.request_count]
+            selected_action = {
+                **action,
+                "arguments": {**TARGET_ARGUMENTS, "sql_content": sql},
+            }
             return SimpleNamespace(
-                id="archery-text-action-request",
+                id=f"archery-text-action-request-{self.request_count}",
                 choices=[
                     SimpleNamespace(
                         finish_reason="stop",
                         message=SimpleNamespace(
-                            content=json.dumps(action),
+                                content=json.dumps(selected_action),
                             tool_calls=[],
                         ),
                     )
@@ -3099,6 +6323,8 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
                 session_id="archery-text-action",
                 tools=_tools(),
                 calls=[
+                    _success(MEMBER_SQL, rows=[{"f_instance_id": 53}]),
+                    _success(INSTANCE_SQL, rows=[{"host": "db-1.example", "port": 3306}]),
                     _success(
                         FINAL_SQL,
                         rows=[
@@ -3120,9 +6346,13 @@ async def test_shared_archery_harness_executes_text_agent_action_history_query()
 
     assert result.query_completed is True
     assert result.requested_sql == FINAL_SQL
-    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,)
-    assert result.model_request_ids == ("archery-text-action-request",)
-    assert completions.request_count == 2
+    assert result.model_tool_calls == (ARCHERY_MCP_QUERY_TOOL_NAME,) * 3
+    assert result.model_request_ids == (
+        "archery-text-action-request-1",
+        "archery-text-action-request-2",
+        "archery-text-action-request-3",
+    )
+    assert completions.request_count == 4
     assert connector.opened_session_ids == ["archery-text-action"]
 
 
@@ -3254,9 +6484,10 @@ async def test_shared_harness_resume_keeps_repairing_until_explicit_finish(
 async def test_shared_harness_reconnects_without_losing_prior_observations() -> None:
     auxiliary_sql = (
         "SELECT index_name, column_name FROM information_schema.statistics "
-        "WHERE table_schema = 'archery' LIMIT 20"
+        "WHERE table_schema = 'archery' "
+        "AND table_name = 'mysql_slow_query_review_history' LIMIT 20"
     )
-    interrupted_sql = FINAL_SQL.replace("ORDER BY", "AND ts_max >= ts_min ORDER BY")
+    interrupted_sql = FINAL_SQL.replace("LIMIT 20", "LIMIT 10")
     model = _ScriptedModel(
         [
             _call("auxiliary", auxiliary_sql),
@@ -3367,10 +6598,7 @@ async def test_shared_harness_allows_more_than_two_session_attempts() -> None:
 
 @pytest.mark.asyncio
 async def test_shared_harness_reconnects_and_continues_after_tool_timeout() -> None:
-    broad_sql = FINAL_SQL.replace(
-        "AND ts_min >= FROM_UNIXTIME(1784793300) ",
-        "AND ts_max >= FROM_UNIXTIME(1784793300) ",
-    )
+    broad_sql = FINAL_SQL.replace("LIMIT 20", "LIMIT 10")
     model = _ScriptedModel(
         [
             *_lineage_actions()[:2],

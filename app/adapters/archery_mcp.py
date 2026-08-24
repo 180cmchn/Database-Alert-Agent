@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
@@ -19,6 +19,15 @@ from uuid import UUID
 
 import httpx
 
+from app.adapters.archery_sql import (
+    SQLTableReference,
+    canonical_sql,
+    is_simple_single_table_select,
+    mysql_identifier_paths,
+    mysql_table_references,
+    strip_mysql_comments,
+    unquoted_words,
+)
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.models import (
@@ -45,6 +54,7 @@ ARCHERY_MCP_INSTANCES_TOOL_NAME: Final = "list_instances_gymJPA"
 ARCHERY_MCP_DATABASES_TOOL_NAME: Final = "list_instance_databases_gymJPA"
 ARCHERY_MCP_TABLES_TOOL_NAME: Final = "list_db_tables_gymJPA"
 ARCHERY_MCP_COLUMNS_TOOL_NAME: Final = "list_table_columns_gymJPA"
+ARCHERY_MCP_QUERY_TOOL_NAME: Final = "sql_query_gymJPA"
 # Compatibility hint only; dynamic probes use the discovered table's real columns.
 ARCHERY_SLOW_LOG_TIME_COLUMN: Final = "f_insert_time"
 ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
@@ -52,8 +62,9 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v27"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v2"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v28"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v3"
+_MISSING: Final = object()
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
     "hostname_max",
@@ -79,10 +90,40 @@ _SLOW_QUERY_NUMERIC_PREFIXES: Final = (
     "filesort_",
     "bytes_",
 )
+_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS: Final = (
+    "id",
+    "hostname_max",
+    "client_max",
+    "user_max",
+    "db_max",
+    "checksum",
+    "ts_min",
+    "ts_max",
+    "ts_cnt",
+    "Query_time_sum",
+    "Query_time_min",
+    "Query_time_max",
+    "Query_time_pct_95",
+    "Query_time_median",
+    "Lock_time_sum",
+    "Lock_time_max",
+    "Rows_sent_sum",
+    "Rows_examined_sum",
+    "Full_scan_cnt",
+    "Tmp_table_cnt",
+    "Filesort_cnt",
+    "Bytes_sum",
+    "LEFT(sample, '4000') AS sample",
+    "LENGTH(sample) AS sample_full_length",
+)
 
 _ARCHERY_TRACE_SELECTED_ROWS: Final = 3
 _ARCHERY_TRACE_TEXT_CHARS: Final = 400
 _ARCHERY_TABULAR_ROW_KEYS: Final = ("rows", "result", "results", "data")
+_ENDPOINT_HOST_COLUMN_NAMES: Final = frozenset(
+    {"fip", "host", "hostip", "hostname", "ip"}
+)
+_ENDPOINT_PORT_COLUMN_NAMES: Final = frozenset({"fport", "hostport", "port"})
 
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _QUERY_TIMEOUT_TEXT: Final = re.compile(
@@ -132,11 +173,48 @@ _SLOW_LOG_TABLE_TEXT: Final = re.compile(
     r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?(?:[_$-]*log|[_$-]*review[_$-]*history)[A-Za-z0-9_$-]*)"
     r"(?![A-Za-z0-9_$])"
 )
-_SQL_IDENTIFIER_PART: Final = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
-_SQL_TABLE_REFERENCE: Final = re.compile(
-    rf"(?is)\b(?:from|join)\s+"
-    rf"(?P<table>{_SQL_IDENTIFIER_PART}(?:\s*\.\s*{_SQL_IDENTIFIER_PART})?)"
-)
+_INFORMATION_SCHEMA_PROJECTION_FIELDS: Final = {
+    "columns": {
+        "character_maximum_length",
+        "column_comment",
+        "column_default",
+        "column_key",
+        "column_name",
+        "column_type",
+        "data_type",
+        "extra",
+        "generation_expression",
+        "is_nullable",
+        "numeric_precision",
+        "numeric_scale",
+        "ordinal_position",
+        "privileges",
+        "srs_id",
+        "table_name",
+        "table_schema",
+    },
+    "statistics": {
+        "cardinality",
+        "collation",
+        "column_name",
+        "comment",
+        "expression",
+        "index_comment",
+        "index_name",
+        "index_schema",
+        "index_type",
+        "is_visible",
+        "non_unique",
+        "nullable",
+        "packed",
+        "seq_in_index",
+        "sub_part",
+        "table_name",
+        "table_schema",
+    },
+}
+
+
 class ArcheryMCPError(RuntimeError):
     """Base error for the Archery MCP integration."""
 
@@ -421,52 +499,7 @@ class ArcheryMCPClient:
     def _sql_without_comments(sql: str) -> str | None:
         """Remove SQL comments while retaining literals used by completion checks."""
 
-        if re.search(r"/\*(?:!|m!)", sql, re.IGNORECASE) is not None:
-            return None
-        output: list[str] = []
-        index = 0
-        while index < len(sql):
-            character = sql[index]
-            if character in {"'", '"', "`"}:
-                quote = character
-                output.append(character)
-                index += 1
-                while index < len(sql):
-                    output.append(sql[index])
-                    if sql[index] == "\\":
-                        index += 1
-                        if index < len(sql):
-                            output.append(sql[index])
-                            index += 1
-                        continue
-                    if sql[index] == quote:
-                        if index + 1 < len(sql) and sql[index + 1] == quote:
-                            output.append(sql[index + 1])
-                            index += 2
-                            continue
-                        index += 1
-                        break
-                    index += 1
-                else:
-                    return None
-                continue
-            if sql.startswith("--", index) or character == "#":
-                newline = sql.find("\n", index)
-                if newline < 0:
-                    break
-                output.append("\n")
-                index = newline + 1
-                continue
-            if sql.startswith("/*", index):
-                comment_end = sql.find("*/", index + 2)
-                if comment_end < 0:
-                    return None
-                output.append(" ")
-                index = comment_end + 2
-                continue
-            output.append(character)
-            index += 1
-        return "".join(output)
+        return strip_mysql_comments(sql)
 
     @classmethod
     def is_slow_log_select(cls, sql: str) -> bool:
@@ -474,7 +507,17 @@ class ArcheryMCPClient:
         if re.match(r"(?is)^(?:select|with)\b", statement) is None:
             return False
         return any(
-            cls._is_slow_log_table_name(name) for name in cls.sql_table_references(statement)
+            cls._is_slow_log_table_name(reference.table)
+            for reference in cls.explainable_physical_table_references(statement)
+        )
+
+    @classmethod
+    def has_slow_log_reference(cls, sql: str) -> bool:
+        """Return whether a lexically valid statement names a slow-log source."""
+
+        references = cls.explainable_physical_table_reference_sequence(sql)
+        return references is not None and any(
+            cls._is_slow_log_table_name(reference.table) for reference in references
         )
 
     @classmethod
@@ -485,7 +528,8 @@ class ArcheryMCPClient:
         if re.match(r"(?is)^(?:select|with)\b", statement) is None:
             return False
         return ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold() in {
-            cls.clean_table_name(name).casefold() for name in cls.sql_table_references(statement)
+            reference.table.casefold()
+            for reference in cls.explainable_physical_table_references(statement)
         }
 
     @classmethod
@@ -500,6 +544,19 @@ class ArcheryMCPClient:
         return cls._is_slow_query_review_history_select(sql)
 
     @classmethod
+    def is_history_recovery_query(cls, sql: str) -> bool:
+        """Allow only a single SELECT whose physical source is the history table."""
+
+        statement = cls._single_sql_statement(sql)
+        if statement is None or re.match(r"(?is)^\s*(?:select|with)\b", statement) is None:
+            return False
+        references = cls.explainable_physical_table_references(statement)
+        return bool(references) and all(
+            reference.table.casefold() == ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
+            for reference in references
+        )
+
+    @classmethod
     def is_history_id_only_projection(cls, sql: str) -> bool:
         """Classify id-only listing queries issued after result truncation.
 
@@ -512,19 +569,135 @@ class ArcheryMCPClient:
         return cls._simple_select_columns(sql) == ("id",)
 
     @classmethod
-    def is_history_id_retrieval_query(cls, sql: str) -> bool:
-        """Classify per-id history retrieval queries (id equality or id IN)."""
+    def has_safe_direct_select_projection(cls, sql: str) -> bool:
+        """Accept only ``*`` or direct column references in a SELECT list."""
 
-        uncommented = cls._sql_without_comments(sql)
-        if not uncommented:
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
             return False
-        identifier = r"(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?`?id`?"
-        # The identifier must start after whitespace, "(", ",", or a qualified
-        # prefix so column names such as ``f_instance_id`` never match.
-        boundary = r"(?:^|[\s(,])"
-        return bool(
-            re.search(rf"(?is){boundary}{identifier}\s*=\s*\d", uncommented)
-            or re.search(rf"(?is){boundary}{identifier}\s+in\s*\(", uncommented)
+        select = re.match(r"(?is)^\s*select\s+(?P<body>.*?)\s+from\s+", statement)
+        if select is None:
+            return False
+        expressions = cls._split_top_level_expressions(select.group("body"))
+        if expressions == ("*",):
+            return True
+        return bool(expressions) and all(
+            re.fullmatch(
+                r"(?is)\s*(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                r"`?[A-Za-z_][A-Za-z0-9_$]*`?"
+                r"(?:\s+(?:as\s+)?`?[A-Za-z_][A-Za-z0-9_$]*`?)?\s*",
+                expression,
+            )
+            is not None
+            for expression in expressions
+        )
+
+    @classmethod
+    def is_simple_metadata_select(cls, sql: str) -> bool:
+        """Recognize the closed, expression-free pre-history SELECT shape."""
+
+        return is_simple_single_table_select(sql) and cls.has_safe_direct_select_projection(
+            sql
+        )
+
+    @classmethod
+    def is_history_id_retrieval_query(cls, sql: str) -> bool:
+        """Classify one of the two closed per-id recovery projections."""
+
+        return cls.history_id_retrieval(sql) is not None
+
+    @classmethod
+    def history_id_retrieval(cls, sql: str) -> tuple[int, str] | None:
+        """Return ``(id, projection)`` for an exact safe recovery query.
+
+        The provider allows only ``SELECT *`` and the fixed sample-prefix
+        projection suggested after MCP truncation. Generating the accepted SQL
+        here keeps validation and the model hint on one canonical definition.
+        """
+
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return None
+        match = re.fullmatch(
+            rf"(?is)\s*select\s+(?P<projection>.*?)\s+from\s+"
+            rf"`?{re.escape(ARCHERY_SLOW_QUERY_REVIEW_TABLE)}`?\s+"
+            r"where\s+`?id`?\s*=\s*(?P<id>\d+)\s*",
+            statement,
+        )
+        if match is None:
+            return None
+        row_id = cls._coerce_positive_integer(match.group("id"))
+        if row_id is None:
+            return None
+        projection = match.group("projection").strip()
+        if projection == "*":
+            return row_id, "full"
+        if cls._is_history_sample_prefix_projection(projection):
+            return row_id, "sample_prefix"
+        return None
+
+    @classmethod
+    def _is_history_sample_prefix_projection(cls, projection: str) -> bool:
+        expressions = cls._split_top_level_expressions(projection)
+        return len(expressions) == len(_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS) and all(
+            canonical_sql(actual) == canonical_sql(expected)
+            for actual, expected in zip(
+                expressions,
+                _HISTORY_SAMPLE_PROJECTION_EXPRESSIONS,
+                strict=True,
+            )
+        )
+
+    @staticmethod
+    def _split_top_level_expressions(sql: str) -> tuple[str, ...]:
+        expressions: list[str] = []
+        start = 0
+        depth = 0
+        quote: str | None = None
+        index = 0
+        while index < len(sql):
+            character = sql[index]
+            if quote is not None:
+                if character == "\\" and quote != "`":
+                    index += 2
+                    continue
+                if character == quote:
+                    if index + 1 < len(sql) and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth < 0:
+                    return ()
+            elif character == "," and depth == 0:
+                expression = sql[start:index].strip()
+                if not expression:
+                    return ()
+                expressions.append(expression)
+                start = index + 1
+            index += 1
+        if quote is not None or depth != 0:
+            return ()
+        expression = sql[start:].strip()
+        if not expression:
+            return ()
+        expressions.append(expression)
+        return tuple(expressions)
+
+    @staticmethod
+    def history_sample_projection_sql(row_id: int) -> str:
+        """Build the only field-level recovery projection accepted by policy."""
+
+        return (
+            f"SELECT {', '.join(_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS)} FROM "
+            f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
         )
 
     @classmethod
@@ -618,13 +791,22 @@ class ArcheryMCPClient:
     def select_explainable_history_rows(
         cls,
         payload: Mapping[str, Any],
+        *,
+        sample_prefix_ids: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Select one explainable row per checksum in deterministic priority order."""
 
+        blocked_ids = sample_prefix_ids or set()
         candidates: list[dict[str, Any]] = []
         for source_index, row in enumerate(cls._tabular_rows(payload)):
             sample = cls._casefolded_value(row, "sample")
-            if not isinstance(sample, str) or cls.classify_explainable_statement(sample) is None:
+            row_id = cls._coerce_positive_integer(cls._casefolded_value(row, "id"))
+            if (
+                not isinstance(sample, str)
+                or row_id in blocked_ids
+                or not cls._history_sample_is_complete(row, sample)
+                or cls.classify_explainable_statement(sample) is None
+            ):
                 continue
             candidate = dict(row)
             candidate["__source_index"] = source_index
@@ -660,10 +842,33 @@ class ArcheryMCPClient:
         return selected
 
     @classmethod
+    def _history_sample_is_complete(
+        cls,
+        row: Mapping[str, Any],
+        sample: str,
+    ) -> bool:
+        """Accept an absent length marker or one exact positive byte length."""
+
+        marker = next(
+            (
+                value
+                for key, value in row.items()
+                if str(key).casefold() == "sample_full_length"
+            ),
+            _MISSING,
+        )
+        if marker is _MISSING:
+            return True
+        full_length = cls._coerce_positive_integer(marker)
+        return full_length is not None and full_length == len(sample.encode("utf-8"))
+
+    @classmethod
     def history_row_for_explain(
         cls,
         explain_sql: str,
         history_payload: Mapping[str, Any],
+        *,
+        sample_prefix_ids: set[int] | None = None,
     ) -> dict[str, Any] | None:
         inner_sql = cls.classify_plain_explain(explain_sql)
         if inner_sql is None:
@@ -672,9 +877,17 @@ class ArcheryMCPClient:
         return next(
             (
                 row
-                for row in cls.select_explainable_history_rows(history_payload)
-                if cls._canonical_sql(str(cls._casefolded_value(row, "sample") or ""))
+                for row in cls.select_explainable_history_rows(
+                    history_payload,
+                    sample_prefix_ids=sample_prefix_ids,
+                )
+                if cls._canonical_sql(
+                    str(cls._casefolded_value(row, "sample") or "")
+                )
                 == canonical_inner
+                and cls.sql_equivalent(
+                    str(cls._casefolded_value(row, "sample") or ""), inner_sql
+                )
             ),
             None,
         )
@@ -727,22 +940,162 @@ class ArcheryMCPClient:
         return target
 
     @classmethod
+    def has_exact_information_schema_target_filters(cls, sql: str) -> bool:
+        """Require exactly one schema equality and one table equality predicate."""
+
+        where_body = cls._where_body(sql)
+        if where_body is None:
+            return False
+        remainder = where_body
+        for field in ("table_schema", "table_name"):
+            pattern = re.compile(
+                rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                rf"`?{field}`?\s*=\s*'(?:''|[^'])*'"
+            )
+            matches = list(pattern.finditer(remainder))
+            if len(matches) != 1:
+                return False
+            match = matches[0]
+            remainder = remainder[: match.start()] + " " + remainder[match.end() :]
+        remainder = re.sub(r"(?is)\band\b", " ", remainder)
+        remainder = re.sub(r"[\s()]+", "", remainder)
+        return not remainder
+
+    @classmethod
     def explainable_table_references(cls, sql: str) -> set[str]:
         """Return traceable table references, including DML target tables."""
 
-        references = set(cls.sql_table_references(sql))
+        return {
+            reference.table for reference in cls.explainable_physical_table_references(sql)
+        }
+
+    @classmethod
+    def explainable_qualified_table_references(cls, sql: str) -> set[str]:
+        """Return physical table references while retaining explicit schemas."""
+
+        return {
+            (
+                f"{reference.schema}.{reference.table}"
+                if reference.schema is not None
+                else reference.table
+            ).casefold()
+            for reference in cls.explainable_physical_table_references(sql)
+        }
+
+    @classmethod
+    def explainable_physical_table_references(
+        cls,
+        sql: str,
+    ) -> set[SQLTableReference]:
+        """Return non-CTE physical references with identifier case preserved."""
+
+        return set(cls.explainable_physical_table_reference_sequence(sql) or ())
+
+    @classmethod
+    def explainable_physical_table_reference_sequence(
+        cls,
+        sql: str,
+    ) -> tuple[SQLTableReference, ...] | None:
+        """Return ordered non-CTE references for SQL identity checks."""
+
+        references = mysql_table_references(sql)
+        if references is None:
+            return None
+        cte_names = cls._with_cte_names(sql)
+        return tuple(
+            reference
+            for reference in references
+            if reference.schema is not None
+            or reference.table.casefold() not in cte_names
+        )
+
+    @classmethod
+    def _with_cte_names(cls, sql: str) -> set[str]:
         statement = cls._single_sql_statement(sql)
         if statement is None:
-            return references
-        target = re.match(
-            r"(?is)^\s*(?:update\s+|(?:insert|replace)\s+(?:ignore\s+)?into\s+)"
-            r"(?P<table>(?:`[^`]+`|[a-zA-Z_][\w$]*)(?:\s*\.\s*"
-            r"(?:`[^`]+`|[a-zA-Z_][\w$]*))?)",
-            statement,
+            return set()
+        with_match = re.match(r"(?is)^\s*with\b(?:\s+recursive\b)?", statement)
+        terminal = cls._with_terminal_statement(statement)
+        if with_match is None or terminal is None:
+            return set()
+        names: set[str] = set()
+        index = with_match.end()
+        terminal_offset = terminal[1]
+        while index < terminal_offset:
+            while index < terminal_offset and statement[index].isspace():
+                index += 1
+            name_match = re.match(
+                r"(?:`(?P<quoted>(?:``|[^`])+)`|"
+                r'"(?P<double>(?:""|[^"])+)"|'
+                r"(?P<bare>[A-Za-z_][A-Za-z0-9_$]*))",
+                statement[index:terminal_offset],
+            )
+            if name_match is None:
+                return set()
+            name = (
+                name_match.group("quoted")
+                or name_match.group("double")
+                or name_match.group("bare")
+            )
+            name = (
+                name.replace('""', '"')
+                if name_match.group("double")
+                else name.replace("``", "`")
+            )
+            names.add(name.casefold())
+            index += name_match.end()
+            body_start = cls._cte_body_start(statement, index, terminal_offset)
+            if body_start is None:
+                return set()
+            body_end = cls._matching_parenthesis_end(statement, body_start)
+            if body_end is None or body_end > terminal_offset:
+                return set()
+            index = body_end + 1
+            while index < terminal_offset and statement[index].isspace():
+                index += 1
+            if index < terminal_offset and statement[index] == ",":
+                index += 1
+                continue
+            break
+        return names
+
+    @staticmethod
+    def _cte_body_start(sql: str, start: int, limit: int) -> int | None:
+        prefix = sql[start:limit]
+        match = re.match(
+            r"(?is)\s*(?:\([^)]*\)\s*)?as\s*(?P<body>\()",
+            prefix,
         )
-        if target is not None:
-            references.add(cls.clean_table_name(target.group("table")))
-        return references
+        return start + match.start("body") if match is not None else None
+
+    @staticmethod
+    def _matching_parenthesis_end(sql: str, start: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        index = start
+        while index < len(sql):
+            character = sql[index]
+            if quote is not None:
+                if character == "\\" and quote != "`":
+                    index += 2
+                    continue
+                if character == quote:
+                    if index + 1 < len(sql) and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    return index
+            index += 1
+        return None
 
     @staticmethod
     def _casefolded_value(row: Mapping[str, Any], field: str) -> Any:
@@ -752,14 +1105,43 @@ class ArcheryMCPClient:
     @classmethod
     def _is_information_schema_query(cls, sql: str, table: str) -> bool:
         statement = cls._single_sql_statement(sql)
-        if statement is None or re.match(r"(?is)^\s*(?:select|with)\b", statement) is None:
+        if statement is None or re.match(r"(?is)^\s*select\b", statement) is None:
             return False
-        return bool(
-            re.search(
-                rf"(?is)\binformation_schema\s*\.\s*`?{re.escape(table)}`?\b",
-                statement,
-            )
+        if not cls.is_simple_metadata_select(statement):
+            return False
+        if cls.sql_qualified_table_references(statement) != {
+            f"information_schema.{table.casefold()}"
+        }:
+            return False
+        words = unquoted_words(statement)
+        if words is None or {
+            "benchmark",
+            "get_lock",
+            "into",
+            "procedure",
+            "release_lock",
+            "sleep",
+        }.intersection(words):
+            return False
+        projection = re.match(
+            r"(?is)^\s*select\s+(?P<body>.*?)\s+from\s+",
+            statement,
         )
+        if projection is None:
+            return False
+        allowed = _INFORMATION_SCHEMA_PROJECTION_FIELDS[table.casefold()]
+        for expression in projection.group("body").split(","):
+            match = re.fullmatch(
+                r"(?is)\s*(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                r"(?P<source>\*|`?[A-Za-z_][A-Za-z0-9_$]*`?)\s*",
+                expression,
+            )
+            if match is None:
+                return False
+            source = match.group("source").strip("`").casefold()
+            if source != "*" and source not in allowed:
+                return False
+        return True
 
     @classmethod
     def _single_sql_statement(cls, sql: str) -> str | None:
@@ -801,6 +1183,13 @@ class ArcheryMCPClient:
     def _with_terminal_statement_type(sql: str) -> str | None:
         """Find the first top-level DML keyword after one or more CTE bodies."""
 
+        terminal = ArcheryMCPClient._with_terminal_statement(sql)
+        return terminal[0] if terminal is not None else None
+
+    @staticmethod
+    def _with_terminal_statement(sql: str) -> tuple[str, int] | None:
+        """Return the first top-level DML keyword and its offset after CTE bodies."""
+
         depth = 0
         quote: str | None = None
         index = 0
@@ -831,7 +1220,7 @@ class ArcheryMCPClient:
                     end += 1
                 keyword = sql[index:end].casefold()
                 if keyword in {"select", "insert", "update", "delete", "replace"}:
-                    return keyword
+                    return keyword, index
                 index = end
                 continue
             index += 1
@@ -850,24 +1239,91 @@ class ArcheryMCPClient:
         any parsable rows (``row_count_source == "archery_text"``).
         """
 
-        rows = payload.get("rows")
-        recovered = len(rows) if isinstance(rows, list) else None
+        containers = cls._metadata_containers(payload)
+        rows = next(
+            (
+                candidate
+                for container in containers
+                if (candidate := cls._tabular_row_list(container)) is not None
+            ),
+            None,
+        )
+        recovered = len(rows) if rows is not None else None
         declared: int | None = None
-        if isinstance(payload.get("mcp_reported_row_count"), int):
-            declared = payload["mcp_reported_row_count"]
-        elif (
-            payload.get("row_count_source") == "archery_text"
-            and isinstance(payload.get("rowCount"), int)
-            and payload["rowCount"] > 0
-        ):
-            declared = payload["rowCount"]
+        reported = next(
+            (
+                value
+                for container in containers
+                if type(value := container.get("mcp_reported_row_count")) is int
+            ),
+            None,
+        )
+        if reported is not None:
+            declared = reported
+        else:
+            declared = next(
+                (
+                    value
+                    for container in containers
+                    for key in ("rowCount", "row_count", "total")
+                    if type(value := container.get(key)) is int and value >= 0
+                ),
+                None,
+            )
         if declared is None:
             return None
         if recovered is None:
-            return declared, 0
+            return (declared, 0) if declared > 0 else None
         if declared > recovered:
             return declared, recovered
         return None
+
+    @classmethod
+    def result_incomplete_reasons(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Return deterministic reasons why a query payload is not complete."""
+
+        reasons: list[str] = []
+        if payload.get("rows_recovered_from_truncated_json") is True:
+            reasons.append("character_truncated")
+        if cls.truncation_row_shortfall(payload) is not None:
+            reasons.append("row_count_shortfall")
+        if shape_issue := cls.tabular_shape_issue(payload):
+            reasons.append(shape_issue)
+        if payload.get("history_recovery_complete") is False:
+            reasons.append("history_recovery_incomplete")
+        declared_reasons = payload.get("result_incomplete_reasons")
+        if isinstance(declared_reasons, list):
+            reasons.extend(
+                str(reason)
+                for reason in declared_reasons
+                if isinstance(reason, str) and reason
+            )
+        return tuple(dict.fromkeys(reasons))
+
+    @classmethod
+    def is_result_incomplete(cls, payload: Mapping[str, Any]) -> bool:
+        """Use one fail-closed completeness decision across harness and evidence."""
+
+        return payload.get("result_incomplete") is True or bool(
+            cls.result_incomplete_reasons(payload)
+        )
+
+    @classmethod
+    def with_result_completeness(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Annotate an incomplete result without modifying its original rows."""
+
+        projected = dict(payload)
+        reasons = cls.result_incomplete_reasons(projected)
+        if reasons:
+            projected["result_incomplete"] = True
+            projected["result_incomplete_reasons"] = list(reasons)
+        return projected
 
     @classmethod
     def accumulate_history_rows(
@@ -878,12 +1334,16 @@ class ArcheryMCPClient:
         *,
         sql: str,
         include_source: bool,
+        projection: str | None = None,
     ) -> None:
-        """Accumulate history rows keyed by id; later fields overwrite earlier.
+        """Accumulate history rows keyed by id with projection-aware precedence.
 
         Mechanical union only: rows without a usable id stay in their own
         query result but cannot join the merge, no row is invented, reordered,
-        or filtered, and per-query source metadata is recorded for tracing.
+        or filtered, and per-query source metadata is recorded for tracing. A
+        sample-prefix recovery may add missing fields but cannot replace an
+        already complete sample. A later full-row recovery replaces the prefix
+        and removes its stale ``sample_full_length`` marker.
         """
 
         rows = cls._tabular_rows(payload)
@@ -892,7 +1352,30 @@ class ArcheryMCPClient:
             if row_id is None:
                 continue
             merged = dict(rows_by_id.get(row_id) or {})
-            merged.update(row)
+            if projection in {"sample_prefix", "unverified_full"}:
+                incoming = dict(row)
+                existing_sample = cls._casefolded_value(merged, "sample")
+                if (
+                    isinstance(existing_sample, str)
+                    and (
+                        projection == "unverified_full"
+                        or cls._history_sample_is_complete(merged, existing_sample)
+                    )
+                ):
+                    incoming = {
+                        key: value
+                        for key, value in incoming.items()
+                        if key.casefold() not in {"sample", "sample_full_length"}
+                    }
+                merged.update(incoming)
+            else:
+                if projection == "full":
+                    merged = {
+                        key: value
+                        for key, value in merged.items()
+                        if key.casefold() != "sample_full_length"
+                    }
+                merged.update(row)
             rows_by_id[row_id] = merged
         if include_source:
             merge_sources.append({"full_sql": sql, "row_count": len(rows)})
@@ -921,30 +1404,58 @@ class ArcheryMCPClient:
     def merge_positional_rows_with_reference(
         cls,
         rows_by_id: dict[int, dict[str, Any]],
-        positional_rows: list[list[Any]],
-        reference_row: Mapping[str, Any],
-    ) -> int:
-        """Decode deferred positional rows using a structured row's column order.
+        positional_rows: Sequence[Any],
+        reference_columns: Sequence[str],
+        *,
+        allowed_ids: set[int],
+        trusted_full_row_ids: set[int],
+        sample_prefix_ids: set[int],
+    ) -> list[Any]:
+        """Decode deferred positional rows using a verified ``SELECT *`` order.
 
-        Deferred rows come from a truncated window query whose column list sat
-        behind the truncation point. Fields already present on the structured
-        rows win the union, so a later per-id row still takes precedence.
+        Each row is decoded only when its width exactly matches the trusted
+        column order and its id belongs to the complete window id listing.
+        Unresolved rows are returned verbatim. A row may be discarded without
+        decoding only after the same id was recovered by a trusted full per-id
+        response.
         """
-        columns = [str(column) for column in reference_row.keys()]
-        decoded_count = 0
+
+        columns = [str(column) for column in reference_columns]
+        normalized_columns = [column.casefold() for column in columns]
+        columns_are_usable = bool(columns) and len(set(normalized_columns)) == len(
+            normalized_columns
+        )
+        unresolved: list[Any] = []
         for row in positional_rows:
-            if not isinstance(row, (list, tuple)) or not row:
+            row_id: int | None = None
+            if isinstance(row, Mapping):
+                row_id = cls._coerce_positive_integer(cls._casefolded_value(row, "id"))
+            elif isinstance(row, (list, tuple)) and row:
+                row_id = cls._coerce_positive_integer(row[0])
+            if row_id is not None and row_id in trusted_full_row_ids:
                 continue
-            row_id = cls._coerce_positive_integer(row[0])
-            if row_id is None:
+            if (
+                not columns_are_usable
+                or not isinstance(row, (list, tuple))
+                or len(row) != len(columns)
+                or row_id is None
+                or row_id not in allowed_ids
+            ):
+                unresolved.append(row)
                 continue
-            decoded = {
-                column: value for column, value in zip(columns, row, strict=False)
-            }
+            decoded = dict(zip(columns, row, strict=True))
             merged = dict(rows_by_id.get(row_id) or {})
+            decoded_sample = cls._casefolded_value(decoded, "sample")
+            if isinstance(decoded_sample, str):
+                merged = {
+                    key: value
+                    for key, value in merged.items()
+                    if str(key).casefold() not in {"sample", "sample_full_length"}
+                }
+                sample_prefix_ids.discard(row_id)
+                trusted_full_row_ids.add(row_id)
             rows_by_id[row_id] = {**decoded, **merged}
-            decoded_count += 1
-        return decoded_count
+        return unresolved
 
     @classmethod
     def merged_history_payload(
@@ -984,13 +1495,51 @@ class ArcheryMCPClient:
 
     @classmethod
     def sql_table_references(cls, sql: str) -> set[str]:
-        uncommented = cls._sql_without_comments(sql)
-        if uncommented is None:
+        references = mysql_table_references(sql)
+        if references is None:
+            return set()
+        return {reference.table for reference in references}
+
+    @classmethod
+    def sql_qualified_table_references(cls, sql: str) -> set[str]:
+        """Return normalized physical table references, retaining a schema prefix."""
+
+        references = mysql_table_references(sql)
+        if references is None:
             return set()
         return {
-            cls.clean_table_name(match.group("table"))
-            for match in _SQL_TABLE_REFERENCE.finditer(uncommented)
+            (
+                f"{reference.schema}.{reference.table}"
+                if reference.schema is not None
+                else reference.table
+            ).casefold()
+            for reference in references
         }
+
+    @classmethod
+    def sql_equivalent(cls, expected: str, actual: str) -> bool:
+        """Compare SQL formatting while preserving physical table identity."""
+
+        expected_identity = canonical_sql(expected)
+        actual_identity = canonical_sql(actual)
+        expected_paths = mysql_identifier_paths(expected)
+        actual_paths = mysql_identifier_paths(actual)
+        expected_tables = cls.explainable_physical_table_reference_sequence(expected)
+        actual_tables = cls.explainable_physical_table_reference_sequence(actual)
+        if (
+            expected_identity is None
+            or actual_identity is None
+            or expected_paths is None
+            or actual_paths is None
+            or expected_tables is None
+            or actual_tables is None
+        ):
+            return False
+        return (
+            expected_identity == actual_identity
+            and expected_tables == actual_tables
+            and expected_paths == actual_paths
+        )
 
     @classmethod
     def matching_discovered_table(
@@ -1070,6 +1619,193 @@ class ArcheryMCPClient:
         return instance_id, db_name.strip().casefold()
 
     @classmethod
+    def allowlisted_instance_endpoints(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> dict[int, set[str]]:
+        """Extract only row-local explicit allowlist instance/endpoint pairs."""
+
+        discovered: dict[int, set[str]] = {}
+        for row in cls._tabular_rows(payload):
+            normalized = {
+                cls._normalized_column_name(str(key)): value for key, value in row.items()
+            }
+            instance_id = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("id", "instanceid")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            if instance_id is None:
+                continue
+            endpoints: set[str] = set()
+            host = next(
+                (
+                    normalized[key]
+                    for key in ("host", "hostname", "hostip", "ip")
+                    if isinstance(normalized.get(key), str) and normalized[key].strip()
+                ),
+                None,
+            )
+            port = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("port", "mysqlport")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            if isinstance(host, str) and port is not None and port <= 65_535:
+                endpoint = cls._normalize_endpoint(f"{host.strip()}:{port}")
+                if endpoint is not None:
+                    endpoints.add(endpoint.casefold())
+            for key in ("endpoint", "address", "instanceref"):
+                endpoint = cls._normalize_endpoint(normalized.get(key))
+                if endpoint is not None:
+                    endpoints.add(endpoint.casefold())
+            if endpoints:
+                discovered.setdefault(instance_id, set()).update(endpoints)
+        return discovered
+
+    @classmethod
+    def allowlisted_database_names(cls, payload: Mapping[str, Any]) -> set[str]:
+        """Extract database names only from explicit tabular name fields."""
+
+        names: set[str] = set()
+        for row in cls._tabular_rows(payload):
+            normalized = {
+                cls._normalized_column_name(str(key)): value for key, value in row.items()
+            }
+            for key in ("name", "dbname", "database", "schema"):
+                value = normalized.get(key)
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+        return names
+
+    @classmethod
+    def reported_execution_target_values(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        supplemental_text: Sequence[str] = (),
+    ) -> dict[str, set[Any]]:
+        """Collect every explicit execution-target echo outside tabular rows."""
+
+        values: dict[str, set[Any]] = {
+            "instance_id": set(),
+            "db_name": set(),
+            "table_name": set(),
+            "endpoint": set(),
+        }
+        payloads = [payload, *cls._mapping_payloads_from_text(supplemental_text)]
+        for candidate in payloads:
+            for container in cls._metadata_containers(candidate):
+                normalized_items = [
+                    (cls._normalized_column_name(str(key)), value)
+                    for key, value in container.items()
+                    if key not in _ARCHERY_TABULAR_ROW_KEYS
+                ]
+                for key, value in normalized_items:
+                    if key == "instanceid":
+                        instance_id = cls._coerce_positive_integer(value)
+                        if instance_id is not None:
+                            values["instance_id"].add(instance_id)
+                    elif key in {"dbname", "database", "schema"}:
+                        if isinstance(value, str) and value.strip():
+                            values["db_name"].add(value.strip())
+                    elif key in {"tablename", "tbname", "targettable"}:
+                        if isinstance(value, str) and value.strip():
+                            values["table_name"].add(value.strip().strip("`"))
+                    elif key in {"endpoint", "address", "instanceref"}:
+                        endpoint = cls._normalize_endpoint(value)
+                        if endpoint is not None:
+                            values["endpoint"].add(endpoint.casefold())
+                hosts = {
+                    value.strip()
+                    for key, value in normalized_items
+                    if key in {"host", "hostname", "hostip", "ip"}
+                    and isinstance(value, str)
+                    and value.strip()
+                }
+                ports = {
+                    port
+                    for key, value in normalized_items
+                    if key in {"port", "mysqlport"}
+                    and (port := cls._coerce_positive_integer(value)) is not None
+                    and port <= 65_535
+                }
+                for host in hosts:
+                    for port in ports:
+                        endpoint = cls._normalize_endpoint(f"{host}:{port}")
+                        if endpoint is not None:
+                            values["endpoint"].add(endpoint.casefold())
+        return {key: found for key, found in values.items() if found}
+
+    @classmethod
+    def reported_metadata_row_target_values(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        supplemental_text: Sequence[str] = (),
+    ) -> dict[str, set[str]]:
+        """Collect physical targets explicitly returned by information_schema rows."""
+
+        values: dict[str, set[str]] = {
+            "db_name": set(),
+            "table_name": set(),
+        }
+        payloads = [payload, *cls._mapping_payloads_from_text(supplemental_text)]
+        for candidate in payloads:
+            for row in cls._tabular_rows(candidate):
+                normalized = {
+                    cls._normalized_column_name(str(key)): value
+                    for key, value in row.items()
+                }
+                schema = normalized.get("tableschema")
+                if isinstance(schema, str) and schema.strip():
+                    values["db_name"].add(schema.strip().strip("`\""))
+                table = normalized.get("tablename")
+                if isinstance(table, str) and table.strip():
+                    values["table_name"].add(cls.clean_table_name(table))
+        return {key: found for key, found in values.items() if found}
+
+    @staticmethod
+    def _mapping_payloads_from_text(
+        text_blocks: Sequence[str],
+    ) -> list[Mapping[str, Any]]:
+        """Decode mapping payloads even when MCP wraps JSON in explanatory text."""
+
+        decoder = json.JSONDecoder()
+        payloads: list[Mapping[str, Any]] = []
+        for text in text_blocks:
+            cursor = 0
+            while (start := text.find("{", cursor)) >= 0:
+                try:
+                    decoded, consumed = decoder.raw_decode(text[start:])
+                except json.JSONDecodeError:
+                    cursor = start + 1
+                    continue
+                if isinstance(decoded, Mapping):
+                    payloads.append(decoded)
+                cursor = start + max(consumed, 1)
+        return payloads
+
+    @classmethod
+    def reported_execution_target(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return only unambiguous execution-target echoes for compatibility."""
+
+        return {
+            key: next(iter(values))
+            for key, values in cls.reported_execution_target_values(payload).items()
+            if len(values) == 1
+        }
+
+    @classmethod
     def _metadata_resolution_step_from_sql(cls, sql: str) -> str | None:
         """Return a single prescribed relational hop, never infer host values."""
 
@@ -1098,22 +1834,16 @@ class ArcheryMCPClient:
         step = cls._metadata_resolution_step_from_sql(sql)
         if step == "t_instance_member":
             columns = table_columns.get(target, {}).get(step, set())
-            if not cls._member_query_selects_instance_id(sql, columns):
-                return
-            if alert_endpoint is None:
-                instance_ids = cls._member_instance_ids_from_payload(payload)
-            elif cls._member_query_matches_alert_endpoint(sql, alert_endpoint):
-                instance_ids = cls._member_instance_ids_from_payload(payload)
-            elif cls._member_query_matches_alert_host(sql, alert_endpoint):
-                # Archery's member table can have several ports for one host.
-                # A host-scoped lookup is sufficient only when its returned row
-                # itself supplies the exact alert host:port and its paired ID.
-                instance_ids = cls._member_instance_ids_for_endpoint(
-                    payload,
-                    alert_endpoint,
+            if (
+                not cls._member_query_selects_instance_id(sql, columns)
+                or not cls.is_exact_member_endpoint_lookup(
+                    sql,
+                    alert_endpoint=alert_endpoint,
+                    discovered_columns=columns,
                 )
-            else:
+            ):
                 return
+            instance_ids = cls._member_instance_ids_from_payload(payload)
             if instance_ids:
                 member_instance_ids.setdefault(target, set()).update(instance_ids)
                 resolution_steps.setdefault(target, []).append(step)
@@ -1124,7 +1854,11 @@ class ArcheryMCPClient:
         known_ids = member_instance_ids.get(target, set())
         if (
             not known_ids
-            or not cls._sql_instance_query_uses_id(sql, known_ids)
+            or not cls.is_exact_sql_instance_lookup(
+                sql,
+                known_ids=known_ids,
+                discovered_columns=columns,
+            )
             or not cls._sql_instance_query_selects_endpoint(sql, columns)
         ):
             return
@@ -1457,6 +2191,141 @@ class ArcheryMCPClient:
         )
         return port_match is not None
 
+    @classmethod
+    def is_exact_member_endpoint_lookup(
+        cls,
+        sql: str,
+        *,
+        alert_endpoint: str | None,
+        discovered_columns: set[str],
+    ) -> bool:
+        """Bind the member hop to exactly the alert host and port predicates."""
+
+        if not alert_endpoint or ":" not in alert_endpoint:
+            return False
+        host, port_text = alert_endpoint.rsplit(":", 1)
+        if not host or not port_text.isdecimal():
+            return False
+        predicates = cls._exact_simple_equality_predicates(sql)
+        if predicates is None or len(predicates) != 2:
+            return False
+        host_columns, port_columns = cls._endpoint_lookup_columns(
+            discovered_columns,
+            default_host={"f_ip", "host", "host_ip", "hostname", "ip"},
+            default_port={"f_port", "host_port", "port"},
+        )
+        host_matches = [
+            value
+            for column, kind, value in predicates
+            if column in host_columns and kind == "literal"
+        ]
+        port_matches = [
+            value
+            for column, kind, value in predicates
+            if column in port_columns and kind in {"literal", "number"}
+        ]
+        return bool(
+            len(host_matches) == 1
+            and host_matches[0].casefold() == host.casefold()
+            and len(port_matches) == 1
+            and port_matches[0].isdecimal()
+            and int(port_matches[0]) == int(port_text)
+        )
+
+    @classmethod
+    def is_exact_sql_instance_lookup(
+        cls,
+        sql: str,
+        *,
+        known_ids: set[int],
+        discovered_columns: set[str],
+    ) -> bool:
+        """Bind the endpoint hop to one exact returned member-id equality."""
+
+        predicates = cls._exact_simple_equality_predicates(sql)
+        if predicates is None or len(predicates) != 1:
+            return False
+        id_columns = {
+            column.casefold()
+            for column in discovered_columns
+            if cls._normalized_column_name(column) == "id"
+        } or {"id"}
+        column, kind, value = predicates[0]
+        instance_id = cls._coerce_positive_integer(value)
+        return bool(
+            column in id_columns
+            and kind in {"literal", "number"}
+            and instance_id in known_ids
+        )
+
+    @classmethod
+    def _endpoint_lookup_columns(
+        cls,
+        discovered_columns: set[str],
+        *,
+        default_host: set[str],
+        default_port: set[str],
+    ) -> tuple[set[str], set[str]]:
+        if not discovered_columns:
+            return default_host, default_port
+        return (
+            {
+                column.casefold()
+                for column in discovered_columns
+                if cls._normalized_column_name(column) in _ENDPOINT_HOST_COLUMN_NAMES
+            },
+            {
+                column.casefold()
+                for column in discovered_columns
+                if cls._normalized_column_name(column) in _ENDPOINT_PORT_COLUMN_NAMES
+            },
+        )
+
+    @classmethod
+    def _exact_simple_equality_predicates(
+        cls,
+        sql: str,
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        """Parse the tiny WHERE grammar used by the two metadata lineage hops."""
+
+        statement = cls._single_sql_statement(sql)
+        if statement is None:
+            return None
+        where = re.search(r"(?is)\bwhere\b(?P<body>.*)$", statement)
+        if where is None:
+            return None
+        body = where.group("body").strip()
+        limit = re.search(r"(?is)\s+limit\s+(?P<count>\d+)\s*$", body)
+        if limit is not None:
+            if cls._coerce_positive_integer(limit.group("count")) != 1:
+                return None
+            body = body[: limit.start()].strip()
+        elif re.search(r"(?i)\blimit\b", body):
+            return None
+        parts = re.split(r"(?i)\s+and\s+", body)
+        predicates: list[tuple[str, str, str]] = []
+        comparison = re.compile(
+            r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+            r"`?(?P<column>[A-Za-z_][A-Za-z0-9_$]*)`?\s*=\s*"
+            r"(?:'(?P<literal>(?:''|[^'])*)'|(?P<number>\d+))"
+        )
+        for part in parts:
+            candidate = part.strip()
+            while candidate.startswith("(") and candidate.endswith(")"):
+                candidate = candidate[1:-1].strip()
+            match = comparison.fullmatch(candidate)
+            if match is None:
+                return None
+            literal = match.group("literal")
+            predicates.append(
+                (
+                    match.group("column").casefold(),
+                    "literal" if literal is not None else "number",
+                    literal.replace("''", "'") if literal is not None else match.group("number"),
+                )
+            )
+        return tuple(predicates) if predicates else None
+
     @staticmethod
     def _member_query_matches_alert_host(
         sql: str,
@@ -1482,27 +2351,17 @@ class ArcheryMCPClient:
         sql: str,
         discovered_columns: set[str],
     ) -> bool:
-        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
-        if select is None:
-            return False
-        selected = cls._normalized_column_name(select.group("body"))
+        selected = {
+            cls._normalized_column_name(column)
+            for column in cls._simple_select_source_columns(sql)
+        }
         if discovered_columns:
             return any(
                 cls._normalized_column_name(column) in {"finstanceid", "instanceid"}
                 and cls._normalized_column_name(column) in selected
                 for column in discovered_columns
             )
-        # list_table_columns is preferred, but a completed read-only query can
-        # independently confirm an explicitly selected conventional ID column.
-        # Do not accept SELECT * here: the query must expose its lineage.
-        return (
-            re.search(
-                r"(?i)(?<![A-Za-z0-9_$])`?(?:f_instance_id|instance_id)`?"
-                r"(?![A-Za-z0-9_$])",
-                select.group("body"),
-            )
-            is not None
-        )
+        return bool(selected.intersection({"finstanceid", "instanceid"}))
 
     @classmethod
     def _sql_instance_query_selects_endpoint(
@@ -1510,19 +2369,16 @@ class ArcheryMCPClient:
         sql: str,
         discovered_columns: set[str],
     ) -> bool:
-        select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
-        if select is None:
-            return False
-        selected = cls._normalized_column_name(select.group("body"))
+        selected = {
+            cls._normalized_column_name(column)
+            for column in cls._simple_select_source_columns(sql)
+        }
         normalized_columns = {cls._normalized_column_name(column) for column in discovered_columns}
         if normalized_columns:
-            return any(
-                ("host" in column or column.endswith("ip")) and column in selected
-                for column in normalized_columns
-            ) and any("port" in column and column in selected for column in normalized_columns)
-        # As above, permit a result-backed explicit projection when schema
-        # discovery is unavailable, without relying on SELECT * or prose.
-        return bool(re.search(r"(?i)(?:host|hostname|hostip|ip)", selected)) and "port" in selected
+            selected = selected.intersection(normalized_columns)
+        return bool(selected.intersection(_ENDPOINT_HOST_COLUMN_NAMES)) and bool(
+            selected.intersection(_ENDPOINT_PORT_COLUMN_NAMES)
+        )
 
     @staticmethod
     def _tabular_row_list(container: Mapping[str, Any]) -> list[Any] | None:
@@ -1530,6 +2386,57 @@ class ArcheryMCPClient:
             value = container.get(key)
             if isinstance(value, list):
                 return value
+        return None
+
+    @classmethod
+    def tabular_shape_issue(cls, payload: Mapping[str, Any]) -> str | None:
+        """Validate the first concrete tabular row set without coercing it.
+
+        Mapping rows do not require column metadata. Positional rows do: mixed
+        row representations, ambiguous/invalid columns, and any width mismatch
+        fail closed so callers retain the raw rows instead of inventing a
+        partial field mapping.
+        """
+
+        for container in cls._metadata_containers(payload):
+            rows = cls._tabular_row_list(container)
+            if rows is None:
+                continue
+            if not rows or all(isinstance(row, Mapping) for row in rows):
+                return None
+            positional = [isinstance(row, (list, tuple)) for row in rows]
+            if any(isinstance(row, Mapping) for row in rows) and any(positional):
+                return "mixed_tabular_row_shapes"
+            if not all(positional):
+                return "invalid_tabular_row_shape"
+
+            declared_columns = [
+                container[key]
+                for key in ("columns", "column_list")
+                if key in container and container[key] is not None
+            ]
+            if not declared_columns:
+                return "missing_tabular_columns"
+            if any(
+                not isinstance(columns, list)
+                or not columns
+                or not all(isinstance(column, str) and column for column in columns)
+                for columns in declared_columns
+            ):
+                return "invalid_tabular_columns"
+            canonical_column_sets = [
+                tuple(column.casefold() for column in columns)
+                for columns in declared_columns
+            ]
+            if len(set(canonical_column_sets)) != 1:
+                return "ambiguous_tabular_columns"
+            columns = declared_columns[0]
+            canonical_columns = canonical_column_sets[0]
+            if len(set(canonical_columns)) != len(canonical_columns):
+                return "duplicate_tabular_columns"
+            if any(len(row) != len(columns) for row in rows):
+                return "positional_row_width_mismatch"
+            return None
         return None
 
     @classmethod
@@ -1543,9 +2450,11 @@ class ArcheryMCPClient:
                 continue
             if all(isinstance(row, Mapping) for row in rows):
                 return [dict(row) for row in rows if isinstance(row, Mapping)]
+            if cls.tabular_shape_issue(container) is not None:
+                return []
             if isinstance(columns, list) and all(isinstance(column, str) for column in columns):
                 return [
-                    {column: value for column, value in zip(columns, row, strict=False)}
+                    dict(zip(columns, row, strict=True))
                     for row in rows
                     if isinstance(row, (list, tuple))
                 ]
@@ -1565,16 +2474,8 @@ class ArcheryMCPClient:
 
     @staticmethod
     def _without_leading_sql_comments(sql: str) -> str:
-        statement = sql.lstrip()
-        while True:
-            comment = re.match(
-                r"(?is)^(?:--[^\r\n]*(?:\r?\n|$)|\#[^\r\n]*(?:\r?\n|$)|"
-                r"/\*.*?\*/)\s*",
-                statement,
-            )
-            if comment is None:
-                return statement
-            statement = statement[comment.end() :]
+        uncommented = strip_mysql_comments(sql)
+        return uncommented.lstrip() if uncommented is not None else ""
 
     @staticmethod
     def _coerce_positive_integer(value: Any) -> int | None:
@@ -1722,20 +2623,26 @@ class ArcheryMCPClient:
         payload: Mapping[str, Any],
         *,
         requested_sql: str,
+        supplemental_text: Sequence[str] = (),
     ) -> tuple[dict[str, Any], str | None, bool]:
         """Extract Archery's text-wrapped SQL result without constraining the Agent."""
 
         normalized_payload = dict(payload)
-        echoed_sql: str | None = None
+        embedded_payload_selected = False
         reported_row_count: int | None = None
-        for text in cls._metadata_text(payload):
-            echoed_sql = echoed_sql or cls._executed_sql_from_text(text)
+        texts = [*cls._metadata_text(payload), *supplemental_text]
+        embedded_payloads: list[Mapping[str, Any]] = []
+        for text in texts:
             if reported_row_count is None:
                 reported_row_count = cls._reported_row_count_from_text(text)
             embedded_result = cls._embedded_result_object(text)
             if embedded_result is not None:
-                normalized_payload = embedded_result
-                break
+                embedded_payloads.append(embedded_result)
+                if not embedded_payload_selected:
+                    normalized_payload = embedded_result
+                    embedded_payload_selected = True
+
+        text_payloads = cls._mapping_payloads_from_text(texts)
 
         parsed_row_count = cls.payload_row_count(normalized_payload)
         if reported_row_count is not None:
@@ -1746,23 +2653,43 @@ class ArcheryMCPClient:
                 normalized_payload["mcp_reported_row_count"] = reported_row_count
                 normalized_payload["parsed_row_count"] = parsed_row_count
 
-        executed_sql = next(
-            (
-                value.strip()
-                for container in cls._metadata_containers(normalized_payload)
-                for key in ("full_sql", "executed_sql", "sql_content")
-                if isinstance((value := container.get(key)), str) and value.strip()
-            ),
-            echoed_sql,
-        )
-        actual_sql_verified = bool(
-            executed_sql and cls._canonical_sql(executed_sql) == cls._canonical_sql(requested_sql)
+        declared_sqls: list[str] = []
+
+        def record_sql(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                sql = value.strip()
+                if sql not in declared_sqls:
+                    declared_sqls.append(sql)
+
+        for candidate in [
+            payload,
+            normalized_payload,
+            *embedded_payloads,
+            *text_payloads,
+        ]:
+            for container in cls._metadata_containers(candidate):
+                for key, value in container.items():
+                    if str(key).casefold() in {
+                        "full_sql",
+                        "executed_sql",
+                        "sql_content",
+                    }:
+                        record_sql(value)
+        for text in texts:
+            for declared_sql in cls._executed_sqls_from_text(text):
+                record_sql(declared_sql)
+
+        executed_sql = declared_sqls[0] if declared_sqls else None
+        actual_sql_verified = bool(declared_sqls) and all(
+            cls.sql_equivalent(requested_sql, actual_sql)
+            for actual_sql in declared_sqls
         )
         if actual_sql_verified:
             normalized_payload = cls._with_inferred_query_columns(
                 normalized_payload,
                 sql=requested_sql,
             )
+        normalized_payload = cls.with_result_completeness(normalized_payload)
         return normalized_payload, executed_sql, actual_sql_verified
 
     @staticmethod
@@ -1806,10 +2733,24 @@ class ArcheryMCPClient:
 
     @staticmethod
     def _simple_select_columns(sql: str) -> tuple[str, ...]:
+        return tuple(
+            alias or source
+            for source, alias in ArcheryMCPClient._simple_select_projection(sql)
+        )
+
+    @staticmethod
+    def _simple_select_source_columns(sql: str) -> tuple[str, ...]:
+        return tuple(
+            source
+            for source, _alias in ArcheryMCPClient._simple_select_projection(sql)
+        )
+
+    @staticmethod
+    def _simple_select_projection(sql: str) -> tuple[tuple[str, str | None], ...]:
         select = re.search(r"(?is)\bselect\b(?P<body>.*?)\bfrom\b", sql)
         if select is None:
             return ()
-        columns: list[str] = []
+        columns: list[tuple[str, str | None]] = []
         for expression in select.group("body").split(","):
             match = re.fullmatch(
                 r"(?is)\s*(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
@@ -1819,7 +2760,7 @@ class ArcheryMCPClient:
             )
             if match is None:
                 return ()
-            columns.append(match.group("alias") or match.group("source"))
+            columns.append((match.group("source"), match.group("alias")))
         return tuple(columns)
 
     @classmethod
@@ -1940,24 +2881,25 @@ class ArcheryMCPClient:
         return items, False
 
     @staticmethod
-    def _executed_sql_from_text(text: str) -> str | None:
-        match = re.search(
+    def _executed_sqls_from_text(text: str) -> tuple[str, ...]:
+        matches = re.finditer(
             r"(?is)执行的SQL\s*[：:]\s*(?P<sql>.*?)"
             r"(?:\r?\n\s*\r?\n|\r?\n\s*返回\s*\d+\s*行|"
             r"\r?\n\s*结果\s*[：:]|$)",
             text,
         )
-        if match is None:
-            return None
-        sql = match.group("sql").strip()
-        return sql or None
+        return tuple(
+            sql
+            for match in matches
+            if (sql := match.group("sql").strip())
+        )
 
     @staticmethod
     def _canonical_sql(sql: str) -> str:
-        candidate = sql.strip()
-        while candidate.endswith(";"):
-            candidate = candidate[:-1].rstrip()
-        return re.sub(r"\s+", " ", candidate).casefold()
+        identity = canonical_sql(sql)
+        if identity is not None:
+            return identity
+        return "invalid:" + sha256(sql.encode("utf-8", errors="replace")).hexdigest()
 
     @staticmethod
     def _where_body(sql: str) -> str | None:
@@ -2190,9 +3132,7 @@ class ArcherySlowLogEvidenceTool:
         parsed_rows = ArcheryMCPClient._tabular_rows(result.payload)
         row_count = self._reported_row_count(result.payload)
         has_log_content = any(self._semantic_slow_query_row(row) for row in parsed_rows)
-        remote_result_partial = (
-            result.payload.get("rows_recovered_from_truncated_json") is True
-        )
+        remote_result_partial = ArcheryMCPClient.is_result_incomplete(result.payload)
         if has_log_content and row_count is not None:
             row_summary = f"返回 {row_count} 行"
         elif row_count is not None and row_count > 0:
@@ -2241,16 +3181,28 @@ class ArcherySlowLogEvidenceTool:
             parsed_rows=parsed_rows,
             root_cause_ineligible_reason=(
                 "remote_result_character_truncated"
-                if remote_result_partial
+                if result.payload.get("rows_recovered_from_truncated_json") is True
+                else "remote_result_incomplete"
+                if remote_result_partial and has_log_content
                 else ineligible_reason
             ),
         )
         if remote_result_partial:
+            partial_summary = (
+                "Archery MCP 返回发生字符截断"
+                if result.payload.get("rows_recovered_from_truncated_json") is True
+                else "Archery MCP 返回不完整"
+            )
             return ToolExecutionResult(
                 status=ToolStatus.NO_DATA,
                 summary=(
-                    "Archery MCP 返回发生字符截断；已保留完整收到的原始信封和可解析行，"
-                    "但部分结果不能用于支持根因。"
+                    summary
+                    if not has_log_content
+                    else (
+                        partial_summary
+                        + "；已保留完整收到的原始信封和可解析行，"
+                        "但部分结果不能用于支持根因。"
+                    )
                 ),
                 structured_data=structured_data,
             )
@@ -2309,7 +3261,7 @@ class ArcherySlowLogEvidenceTool:
         semantic_rows = [row for row in semantic_rows if row]
         reported_row_count = self._reported_row_count(result.payload)
         total_row_count = max(reported_row_count or 0, len(source_rows))
-        partial = result.payload.get("rows_recovered_from_truncated_json") is True
+        partial = ArcheryMCPClient.is_result_incomplete(result.payload)
         final_result_payload, final_result_text = self._final_result_passthrough(
             result.payload
         )

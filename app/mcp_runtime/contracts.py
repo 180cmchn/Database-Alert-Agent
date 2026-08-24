@@ -124,12 +124,16 @@ class HarnessObservation[ObservationT]:
 
 @dataclass(frozen=True, slots=True)
 class RemoteResponseRecord:
-    """A complete MCP transport response retained until the investigation ends."""
+    """A complete response retained for replay until the investigation ends."""
 
     invocation_id: UUID
     tool_name: str
     arguments: dict[str, Any]
     response: Any
+    # Local deterministic responses share the checkpoint lineage contract but
+    # must never be persisted as remote MCP response artifacts. Defaulting to
+    # remote keeps records decoded from older checkpoints compatible.
+    is_remote: bool = True
 
 
 @dataclass(frozen=True, slots=True)
