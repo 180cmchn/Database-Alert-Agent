@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -58,6 +58,70 @@ class ToolStatus(StrEnum):
     TIMEOUT = "TIMEOUT"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+
+
+EVIDENCE_RECORD_V1 = "evidence-record/v1"
+EVIDENCE_RECORD_V2 = "evidence-record/v2"
+EVIDENCE_UNIT_V2 = "evidence-unit/v2"
+
+
+class EvidenceUnitKind(StrEnum):
+    HISTORY = "HISTORY"
+    SUPPLEMENTAL = "SUPPLEMENTAL"
+
+
+class EvidenceUnitStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    NO_DATA = "NO_DATA"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class EvidenceUnit(BaseModel):
+    """One independently qualified fact unit backed by a parent raw artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: Literal["evidence-unit/v2"] = EVIDENCE_UNIT_V2
+    id: UUID
+    parent_evidence_id: UUID
+    unit_key: str = Field(min_length=1, max_length=256)
+    kind: EvidenceUnitKind
+    stage: str = Field(min_length=1, max_length=128)
+    result_index: int | None = Field(default=None, ge=0)
+    status: EvidenceUnitStatus
+    summary: str = Field(min_length=1, max_length=4000)
+    data: dict[str, Any] = Field(default_factory=dict)
+    root_cause_eligible: bool = False
+    root_cause_ineligible_reason: str | None = Field(default=None, max_length=256)
+    source_artifact_id: UUID
+    source_paths: list[str] = Field(min_length=1, max_length=50)
+
+    @classmethod
+    def build_id(cls, parent_evidence_id: UUID, unit_key: str) -> UUID:
+        return uuid5(parent_evidence_id, f"{EVIDENCE_UNIT_V2}:{unit_key}")
+
+    @field_validator("source_paths")
+    @classmethod
+    def validate_source_paths(cls, value: list[str]) -> list[str]:
+        if any(not item.startswith("/") for item in value):
+            raise ValueError("evidence unit source paths must be JSON Pointers")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity_and_eligibility(self) -> EvidenceUnit:
+        if self.id != self.build_id(self.parent_evidence_id, self.unit_key):
+            raise ValueError("evidence unit id must be the stable UUID5 for its unit key")
+        if self.root_cause_eligible and self.status != EvidenceUnitStatus.SUCCESS:
+            raise ValueError("only a SUCCESS evidence unit may be root-cause eligible")
+        if self.root_cause_eligible and self.root_cause_ineligible_reason is not None:
+            raise ValueError("eligible evidence unit cannot have an ineligibility reason")
+        if not self.root_cause_eligible and not self.root_cause_ineligible_reason:
+            raise ValueError("ineligible evidence unit requires an ineligibility reason")
+        return self
+
+    def is_root_cause_support_eligible(self) -> bool:
+        return self.status == EvidenceUnitStatus.SUCCESS and self.root_cause_eligible
 
 
 class ToolResultSourceSpan(BaseModel):
@@ -299,6 +363,9 @@ class InvestigationContext(BaseModel):
 
 class EvidenceRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)
+    contract_version: Literal["evidence-record/v1", "evidence-record/v2"] = (
+        EVIDENCE_RECORD_V1
+    )
     run_id: UUID
     tool_name: str
     source_system: str
@@ -311,6 +378,37 @@ class EvidenceRecord(BaseModel):
     collected_at: datetime = Field(default_factory=utc_now)
     duration_ms: int = Field(default=0, ge=0)
     truncated: bool = False
+    source_artifact_id: UUID | None = None
+    evidence_units: list[EvidenceUnit] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_evidence_units(self) -> EvidenceRecord:
+        if self.contract_version == EVIDENCE_RECORD_V1 and self.evidence_units:
+            raise ValueError("v1 evidence records cannot contain v2 evidence units")
+        if self.contract_version == EVIDENCE_RECORD_V2 and not self.evidence_units:
+            raise ValueError("v2 evidence records require at least one evidence unit")
+        if self.contract_version == EVIDENCE_RECORD_V2 and self.source_artifact_id is None:
+            raise ValueError("v2 evidence records require a source artifact id")
+        unit_ids = [item.id for item in self.evidence_units]
+        unit_keys = [item.unit_key for item in self.evidence_units]
+        if len(unit_ids) != len(set(unit_ids)) or len(unit_keys) != len(set(unit_keys)):
+            raise ValueError("evidence unit identities must be unique within the parent")
+        if any(item.parent_evidence_id != self.id for item in self.evidence_units):
+            raise ValueError("evidence unit parent id must match its evidence record")
+        if any(
+            item.source_artifact_id != self.source_artifact_id
+            for item in self.evidence_units
+        ):
+            raise ValueError("evidence unit source artifact must match its parent record")
+        if any(item.root_cause_eligible for item in self.evidence_units) and (
+            self.status != ToolStatus.SUCCESS
+            or self.source_system.casefold() == "alert_platform"
+            or self.is_context_only()
+        ):
+            raise ValueError(
+                "eligible evidence units require a successful non-context parent record"
+            )
+        return self
 
     def is_root_cause_support_eligible(self) -> bool:
         """Return whether this usable live record may decide a root cause.
@@ -320,12 +418,52 @@ class EvidenceRecord(BaseModel):
         ``partial=true`` or ``root_cause_eligible=false``.
         """
 
+        if self.contract_version == EVIDENCE_RECORD_V2:
+            return False
         return (
             self.status == ToolStatus.SUCCESS
-            and self.source_system != "alert_platform"
+            and self.source_system.casefold() != "alert_platform"
+            and not self.is_context_only()
             and self.structured_data.get("partial") is not True
             and (not self.truncated or self.structured_data.get("root_cause_eligible") is True)
             and self.structured_data.get("root_cause_eligible") is not False
+        )
+
+    def is_context_only(self) -> bool:
+        normalized_source = self.source_system.casefold()
+        return normalized_source == "flashduty_similar" or (
+            normalized_source
+            in {
+                "alert_platform",
+                "flashduty",
+                "flashduty_api",
+                "flashduty_alert",
+                "flashduty_alert_detail",
+                "flashduty_monitors",
+            }
+            and self.tool_name.casefold()
+            in {
+                "query_similar_incidents",
+                "flashduty_similar",
+            }
+        )
+
+    def is_evidence_unit_root_cause_support_eligible(
+        self,
+        unit: EvidenceUnit,
+    ) -> bool:
+        """Qualify a v2 child together with its parent execution provenance."""
+
+        return (
+            self.contract_version == EVIDENCE_RECORD_V2
+            and self.status == ToolStatus.SUCCESS
+            and self.source_system.casefold() != "alert_platform"
+            and not self.is_context_only()
+            and unit.parent_evidence_id == self.id
+            and self.source_artifact_id is not None
+            and unit.source_artifact_id == self.source_artifact_id
+            and any(item.id == unit.id for item in self.evidence_units)
+            and unit.is_root_cause_support_eligible()
         )
 
 

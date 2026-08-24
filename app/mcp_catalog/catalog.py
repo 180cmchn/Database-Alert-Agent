@@ -11,7 +11,8 @@ import json
 import re
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -40,6 +41,10 @@ _SENSITIVE_OPTION_TOKENS = {
 _CONNECTION_VALUE = re.compile(
     r"(?i)(?:[a-z][a-z0-9+.-]*://|\bbearer\s+|\bbasic\s+[A-Za-z0-9+/=]+)"
 )
+_DIRECTIVE_START = re.compile(
+    r"^<!--\s*directive:id=(?P<id>[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*)\s*-->$"
+)
+_DIRECTIVE_END = "<!-- /directive -->"
 
 
 class MCPCatalogConfigurationError(ValueError):
@@ -54,6 +59,8 @@ class MCPPromptBundle:
     purpose: str
     workflow: str
     safety: str
+    workflow_directives: Mapping[str, str] = field(default_factory=dict)
+    workflow_revision: str = ""
 
     @property
     def execution_instructions(self) -> str:
@@ -565,7 +572,75 @@ def _load_prompts(
                 f"MCP server {name!r} {prompt_name} prompt must not be empty"
             )
         contents[prompt_name] = content
-    return MCPPromptBundle(**contents)
+    authored_workflow = contents["workflow"]
+    workflow, directives = _parse_workflow_directives(
+        authored_workflow,
+        server_name=name,
+    )
+    contents["workflow"] = workflow
+    return MCPPromptBundle(
+        **contents,
+        workflow_directives=MappingProxyType(directives),
+        workflow_revision=(
+            sha256(authored_workflow.encode("utf-8")).hexdigest()
+            if directives
+            else ""
+        ),
+    )
+
+
+def _parse_workflow_directives(
+    workflow: str,
+    *,
+    server_name: str,
+) -> tuple[str, dict[str, str]]:
+    """Extract trusted runtime prompt fragments while preserving the workflow text."""
+
+    rendered: list[str] = []
+    directives: dict[str, str] = {}
+    active_id: str | None = None
+    active_lines: list[str] = []
+    for raw_line in workflow.splitlines():
+        line = raw_line.strip()
+        marker = _DIRECTIVE_START.fullmatch(line)
+        if marker is not None:
+            if active_id is not None:
+                raise MCPCatalogConfigurationError(
+                    f"MCP server {server_name!r} workflow directives cannot be nested"
+                )
+            active_id = marker.group("id")
+            if active_id in directives:
+                raise MCPCatalogConfigurationError(
+                    f"MCP server {server_name!r} workflow directive {active_id!r} is duplicated"
+                )
+            active_lines = []
+            continue
+        if line == _DIRECTIVE_END:
+            if active_id is None:
+                raise MCPCatalogConfigurationError(
+                    f"MCP server {server_name!r} workflow has an unmatched directive end"
+                )
+            instruction = "\n".join(active_lines).strip()
+            if not instruction:
+                raise MCPCatalogConfigurationError(
+                    f"MCP server {server_name!r} workflow directive {active_id!r} is empty"
+                )
+            directives[active_id] = instruction
+            active_id = None
+            active_lines = []
+            continue
+        if line.casefold().startswith(("<!-- directive", "<!-- /directive")):
+            raise MCPCatalogConfigurationError(
+                f"MCP server {server_name!r} workflow has a malformed directive marker"
+            )
+        rendered.append(raw_line)
+        if active_id is not None:
+            active_lines.append(raw_line)
+    if active_id is not None:
+        raise MCPCatalogConfigurationError(
+            f"MCP server {server_name!r} workflow directive {active_id!r} is not closed"
+        )
+    return "\n".join(rendered).strip(), directives
 
 
 def _resolve_prompt_path(

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Sequence
+import json
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any, Protocol
 from uuid import UUID, uuid5
+
+from jsonpointer import JsonPointerException, resolve_pointer
 
 from app.agent_runtime.contracts import (
     ArtifactRef,
@@ -19,9 +23,14 @@ from app.agent_runtime.contracts import (
 )
 from app.application.sanitization import sanitize, sanitize_text
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitKind,
+    EvidenceUnitStatus,
     InvestigationContext,
     ToolExecutionRequest,
+    ToolResultAnalysis,
     ToolStatus,
 )
 from app.domain.ports import (
@@ -329,7 +338,9 @@ class DurableOuterToolDispatcher:
                 fencing_token=fencing_token,
             )
         except ToolInvocationConflict:
-            current = await self.repository.get_tool_invocation(str(invocation.invocation_id))
+            current = await self.repository.get_tool_invocation(
+                str(invocation.invocation_id)
+            )
             if current is None:
                 raise
             return await self._resolve_attempt(
@@ -444,9 +455,7 @@ class DurableOuterToolDispatcher:
                 fencing_token=fencing_token,
             )
         except ToolInvocationConflict:
-            current = await self.repository.get_tool_invocation(
-                str(invocation.invocation_id)
-            )
+            current = await self.repository.get_tool_invocation(str(invocation.invocation_id))
             if current is None:
                 raise
             return await self._resolve_attempt(
@@ -678,6 +687,35 @@ class DurableOuterToolDispatcher:
                     raise OuterDispatchError(
                         "terminal evidence artifact provenance does not match invocation"
                     )
+            if (
+                evidence.contract_version == EVIDENCE_RECORD_V2
+                and evidence.source_artifact_id != invocation.artifact_ref.artifact_id
+            ):
+                raise OuterDispatchError(
+                    "terminal evidence source artifact does not match invocation"
+                )
+            if any(
+                unit.source_artifact_id != invocation.artifact_ref.artifact_id
+                for unit in evidence.evidence_units
+            ):
+                raise OuterDispatchError(
+                    "terminal evidence-unit artifact provenance does not match invocation"
+                )
+            if evidence.evidence_units:
+                raw_result = stored[1]
+                if not isinstance(raw_result, Mapping):
+                    raise OuterDispatchError(
+                        "terminal evidence-unit raw-result artifact is not a JSON object"
+                    )
+                self._validate_evidence_unit_sources(
+                    raw_result,
+                    evidence.evidence_units,
+                    artifact_id=invocation.artifact_ref.artifact_id,
+                )
+        elif evidence.evidence_units or evidence.source_artifact_id is not None:
+            raise OuterDispatchError(
+                "terminal evidence provenance requires a raw-result artifact"
+            )
         return evidence
 
     async def _persist_raw_result(
@@ -776,46 +814,71 @@ class DurableOuterToolDispatcher:
                 and analysis.analysis_usable
                 and analysis.source_coverage_complete
             )
+            context_only_similar_incidents = evidence.is_context_only()
+            evidence_units = self._archery_evidence_units(
+                evidence,
+                analysis=analysis,
+            )
+            if evidence_units:
+                self._validate_evidence_unit_sources(
+                    raw_result,
+                    evidence_units,
+                    artifact_id=artifact_ref.artifact_id,
+                )
+            parent_root_cause_eligible = (
+                result_usable_by_main_agent
+                and evidence.source_system.casefold() != "alert_platform"
+                and not context_only_similar_incidents
+                and not evidence_units
+            )
             # A passthrough provider whose final-result JSON could not be parsed
             # still reaches the main Agent verbatim, but stays mechanically
             # unavailable so it can never support a root cause.
-            passthrough_parse_failed = bool(
-                getattr(analysis, "passthrough_parse_failed", False)
-            )
+            passthrough_parse_failed = bool(getattr(analysis, "passthrough_parse_failed", False))
             projected_data: dict[str, Any] = {
                 **self._status_metadata(evidence),
-                "processing_status": (
-                    "unavailable" if passthrough_parse_failed else "completed"
-                ),
+                "processing_status": ("unavailable" if passthrough_parse_failed else "completed"),
                 "tool_result_analysis": analysis.model_dump(
                     mode="json",
                     exclude={"source_artifact_id", "source_sha256"},
                 ),
                 # Mechanical completeness gate only. The main Agent alone decides
                 # whether these facts, combined with other evidence, imply a cause.
-                "root_cause_eligible": result_usable_by_main_agent,
+                "root_cause_eligible": parent_root_cause_eligible,
             }
             if passthrough_parse_failed:
+                projected_data["root_cause_ineligible_reason"] = "final_result_json_unparseable"
+            elif context_only_similar_incidents:
                 projected_data["root_cause_ineligible_reason"] = (
-                    "final_result_json_unparseable"
+                    "similar_incidents_are_context_only"
                 )
+            elif evidence_units:
+                projected_data["root_cause_ineligible_reason"] = "reference_eligible_evidence_unit"
+            elif evidence.source_system.casefold() == "alert_platform":
+                projected_data["root_cause_ineligible_reason"] = "alert_platform_context_only"
             elif not analysis.analysis_usable:
-                projected_data["root_cause_ineligible_reason"] = (
-                    "program_fact_projection_unusable"
-                )
+                projected_data["root_cause_ineligible_reason"] = "program_fact_projection_unusable"
             elif not result_usable_by_main_agent and not projected_data.get(
                 "root_cause_ineligible_reason"
             ):
                 projected_data["root_cause_ineligible_reason"] = (
                     "tool_result_incomplete_or_unusable"
                 )
-            return evidence.model_copy(
+            projected = evidence.model_copy(
                 update={
                     "summary": analysis.summary,
                     "structured_data": projected_data,
                     "truncated": False,
+                    "contract_version": (
+                        EVIDENCE_RECORD_V2 if evidence_units else evidence.contract_version
+                    ),
+                    "source_artifact_id": (
+                        artifact_ref.artifact_id if evidence_units else None
+                    ),
+                    "evidence_units": evidence_units,
                 }
             )
+            return EvidenceRecord.model_validate(projected.model_dump(mode="python"))
         except Exception as exc:
             request_id = getattr(exc, "request_id", None)
             error_data: dict[str, Any] = {
@@ -839,6 +902,303 @@ class DurableOuterToolDispatcher:
                     "truncated": False,
                 }
             )
+
+    @staticmethod
+    def _archery_evidence_units(
+        evidence: EvidenceRecord,
+        *,
+        analysis: ToolResultAnalysis,
+    ) -> list[EvidenceUnit]:
+        """Split Archery history and supplemental results into qualified v2 units."""
+
+        if evidence.source_system.casefold() not in {"archery", "archery_mcp"}:
+            return []
+        payload = analysis.passthrough_payload
+        supplemental = analysis.slow_query_analysis
+        full_sql = str(payload.get("full_sql") or "") if isinstance(payload, Mapping) else ""
+        raw_text = (
+            str(payload.get("final_result_text") or "") if isinstance(payload, Mapping) else ""
+        )
+        if not isinstance(supplemental, Mapping) and (
+            "mysql_slow_query_review_history" not in full_sql.casefold()
+            and "mysql_slow_query_review_history" not in raw_text.casefold()
+        ):
+            return []
+
+        artifact_id = analysis.source_artifact_id
+        units: list[EvidenceUnit] = []
+        unit_keys: set[str] = set()
+
+        def stable_unit_key(
+            *,
+            stage: str,
+            outcome: str,
+            data: Mapping[str, Any],
+        ) -> str:
+            canonical = json.dumps(
+                sanitize(dict(data)),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            digest = sha256(canonical.encode()).hexdigest()[:24]
+            return f"supplemental:{stage}:{outcome}:{digest}"
+
+        def append_unit(
+            *,
+            unit_key: str,
+            kind: EvidenceUnitKind,
+            stage: str,
+            status: EvidenceUnitStatus,
+            summary: str,
+            data: Mapping[str, Any] | None,
+            source_paths: list[str],
+            eligible: bool,
+            ineligible_reason: str | None = None,
+            result_index: int | None = None,
+        ) -> None:
+            if unit_key in unit_keys:
+                return
+            unit_keys.add(unit_key)
+            units.append(
+                EvidenceUnit(
+                    id=EvidenceUnit.build_id(evidence.id, unit_key),
+                    parent_evidence_id=evidence.id,
+                    unit_key=unit_key,
+                    kind=kind,
+                    stage=stage,
+                    result_index=result_index,
+                    status=status,
+                    summary=summary,
+                    data=dict(data or {}),
+                    root_cause_eligible=eligible,
+                    root_cause_ineligible_reason=(
+                        None if eligible else ineligible_reason or "evidence_unit_unusable"
+                    ),
+                    source_artifact_id=artifact_id,
+                    source_paths=source_paths,
+                )
+            )
+
+        history_path = "/structured_data/final_result_payload"
+        raw_structured_data = evidence.structured_data
+        history_data = payload if isinstance(payload, Mapping) else None
+        rows = history_data.get("rows") if history_data is not None else None
+        history_incomplete = bool(
+            history_data is not None
+            and (
+                history_data.get("result_incomplete") is True
+                or history_data.get("history_recovery_complete") is False
+            )
+        )
+        if analysis.passthrough_parse_failed:
+            parse_failure_path = (
+                "/structured_data/final_result_text"
+                if "final_result_text" in raw_structured_data
+                else "/structured_data/final_result_parse_failed"
+                if "final_result_parse_failed" in raw_structured_data
+                else "/structured_data"
+            )
+            append_unit(
+                unit_key="history",
+                kind=EvidenceUnitKind.HISTORY,
+                stage="history",
+                status=EvidenceUnitStatus.FAILED,
+                summary="Archery history 返回内容无法解析。",
+                data=history_data,
+                source_paths=[parse_failure_path],
+                eligible=False,
+                ineligible_reason="history_result_unparseable",
+            )
+        elif isinstance(rows, list) and rows and history_incomplete:
+            append_unit(
+                unit_key="history",
+                kind=EvidenceUnitKind.HISTORY,
+                stage="history",
+                status=EvidenceUnitStatus.FAILED,
+                summary=(f"Archery history 仅恢复 {len(rows)} 行，仍有未完整恢复的内容。"),
+                data=history_data,
+                source_paths=[history_path],
+                eligible=False,
+                ineligible_reason="history_recovery_incomplete",
+            )
+        elif isinstance(rows, list) and rows:
+            history_eligible = (
+                evidence.status == ToolStatus.SUCCESS and analysis.source_coverage_complete
+            )
+            append_unit(
+                unit_key="history",
+                kind=EvidenceUnitKind.HISTORY,
+                stage="history",
+                status=EvidenceUnitStatus.SUCCESS,
+                summary=f"Archery history 已完整恢复 {len(rows)} 行。",
+                data=history_data,
+                source_paths=[history_path],
+                eligible=history_eligible,
+                ineligible_reason="history_source_coverage_incomplete",
+            )
+        elif isinstance(rows, list):
+            append_unit(
+                unit_key="history",
+                kind=EvidenceUnitKind.HISTORY,
+                stage="history",
+                status=EvidenceUnitStatus.NO_DATA,
+                summary="Archery history 查询没有返回数据行。",
+                data=history_data,
+                source_paths=[history_path],
+                eligible=False,
+                ineligible_reason="history_no_data",
+            )
+        else:
+            append_unit(
+                unit_key="history",
+                kind=EvidenceUnitKind.HISTORY,
+                stage="history",
+                status=EvidenceUnitStatus.FAILED,
+                summary="Archery history 结果缺少可验证的 rows。",
+                data=history_data,
+                source_paths=["/structured_data"],
+                eligible=False,
+                ineligible_reason="history_rows_missing",
+            )
+
+        if not isinstance(supplemental, Mapping):
+            return units
+
+        result_fields = {
+            "explain_results": "explain",
+            "table_structure_results": "table_structure",
+            "index_results": "indexes",
+        }
+        supplemental_eligible = (
+            evidence.status == ToolStatus.SUCCESS and analysis.source_coverage_complete
+        )
+        for field_name, stage in result_fields.items():
+            results = supplemental.get(field_name)
+            if not isinstance(results, list):
+                continue
+            for index, result in enumerate(results):
+                if not isinstance(result, Mapping):
+                    continue
+                append_unit(
+                    unit_key=stable_unit_key(
+                        stage=stage,
+                        outcome="result",
+                        data=result,
+                    ),
+                    kind=EvidenceUnitKind.SUPPLEMENTAL,
+                    stage=stage,
+                    result_index=index,
+                    status=EvidenceUnitStatus.SUCCESS,
+                    summary=f"Archery supplemental {stage} 第 {index + 1} 项已完成。",
+                    data=result,
+                    source_paths=[f"/structured_data/slow_query_analysis/{field_name}/{index}"],
+                    eligible=supplemental_eligible,
+                    ineligible_reason="supplemental_source_coverage_incomplete",
+                )
+
+        overall_status = str(supplemental.get("status") or "").casefold()
+        failure_stages: set[str] = set()
+        failures = supplemental.get("failures")
+        if isinstance(failures, list):
+            for index, failure in enumerate(failures):
+                if not isinstance(failure, Mapping):
+                    continue
+                stage = str(failure.get("stage") or "supplemental")
+                failure_stages.add(stage)
+                not_applicable = (
+                    str(failure.get("reason_code") or "").casefold()
+                    == "no_safe_explainable_sample"
+                )
+                append_unit(
+                    unit_key=stable_unit_key(
+                        stage=stage,
+                        outcome="failure",
+                        data=failure,
+                    ),
+                    kind=EvidenceUnitKind.SUPPLEMENTAL,
+                    stage=stage,
+                    result_index=index,
+                    status=(
+                        EvidenceUnitStatus.NOT_APPLICABLE
+                        if not_applicable
+                        else EvidenceUnitStatus.FAILED
+                    ),
+                    summary=f"Archery supplemental {stage} 第 {index + 1} 项未成功。",
+                    data=failure,
+                    source_paths=[f"/structured_data/slow_query_analysis/failures/{index}"],
+                    eligible=False,
+                    ineligible_reason=(
+                        "supplemental_not_applicable" if not_applicable else "supplemental_failed"
+                    ),
+                )
+
+        missing_stages = supplemental.get("missing_stages")
+        if isinstance(missing_stages, list):
+            for index, raw_stage in enumerate(missing_stages):
+                stage = str(raw_stage or "supplemental")
+                if stage in failure_stages:
+                    continue
+                append_unit(
+                    unit_key=f"supplemental:{stage}:missing",
+                    kind=EvidenceUnitKind.SUPPLEMENTAL,
+                    stage=stage,
+                    status=EvidenceUnitStatus.NO_DATA,
+                    summary=f"Archery supplemental {stage} 没有取得结果。",
+                    data={"stage": stage, "overall_status": overall_status},
+                    source_paths=[f"/structured_data/slow_query_analysis/missing_stages/{index}"],
+                    eligible=False,
+                    ineligible_reason="supplemental_result_missing",
+                )
+        return units
+
+    @classmethod
+    def _validate_evidence_unit_sources(
+        cls,
+        raw_result: Mapping[str, Any],
+        units: Sequence[EvidenceUnit],
+        *,
+        artifact_id: UUID,
+    ) -> None:
+        """Require every unit path to resolve inside its bound raw artifact."""
+
+        for unit in units:
+            if unit.source_artifact_id != artifact_id:
+                raise OuterDispatchError(
+                    "evidence-unit source artifact does not match the raw artifact"
+                )
+            resolved_values: list[Any] = []
+            for source_path in unit.source_paths:
+                try:
+                    resolved_values.append(resolve_pointer(raw_result, source_path))
+                except (JsonPointerException, TypeError, ValueError) as exc:
+                    raise OuterDispatchError(
+                        f"evidence-unit source path does not resolve: {source_path}"
+                    ) from exc
+            if unit.status == EvidenceUnitStatus.SUCCESS and not any(
+                cls._projected_value_matches_source(unit.data, source)
+                for source in resolved_values
+            ):
+                raise OuterDispatchError(
+                    "successful evidence-unit data does not match its raw source path"
+                )
+
+    @classmethod
+    def _projected_value_matches_source(cls, projected: Any, source: Any) -> bool:
+        """Match a bounded projection against the corresponding raw source value."""
+
+        if isinstance(projected, Mapping):
+            return isinstance(source, Mapping) and all(
+                key in source and cls._projected_value_matches_source(value, source[key])
+                for key, value in projected.items()
+            )
+        if isinstance(projected, list):
+            return isinstance(source, list) and len(projected) == len(source) and all(
+                cls._projected_value_matches_source(item, raw_item)
+                for item, raw_item in zip(projected, source, strict=True)
+            )
+        return projected == source
 
     @staticmethod
     def _status_metadata(evidence: EvidenceRecord) -> dict[str, Any]:

@@ -34,6 +34,67 @@ async def test_fresh_database_is_created_with_current_revision(tmp_path: Path) -
     await repository.close()
 
 
+def test_0015_to_0016_keeps_legacy_evidence_as_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "evidence-unit-migration.db"
+    database_url = sqlite_url(database)
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+    now = "2026-08-24 00:00:00"
+
+    try:
+        command.upgrade(config, "0015")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO evidence_records "
+                "(id, alert_id, run_id, tool_name, source_system, status, request_json, "
+                "summary, data_json, started_at, collected_at, duration_ms, truncated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-evidence",
+                    "legacy-alert",
+                    "legacy-run",
+                    "legacy-tool",
+                    "database_diagnostics",
+                    "SUCCESS",
+                    "{}",
+                    "legacy evidence",
+                    "{}",
+                    now,
+                    now,
+                    1,
+                    0,
+                ),
+            )
+            connection.commit()
+
+        command.upgrade(config, "0016")
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT contract_version, source_artifact_id, evidence_units_json "
+                "FROM evidence_records WHERE id = 'legacy-evidence'"
+            ).fetchone()
+            assert row == ("evidence-record/v1", None, "[]")
+
+        command.downgrade(config, "0015")
+        with sqlite3.connect(database) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info('evidence_records')")
+            }
+            assert "contract_version" not in columns
+            assert "source_artifact_id" not in columns
+            assert "evidence_units_json" not in columns
+            assert connection.execute(
+                "SELECT summary FROM evidence_records WHERE id = 'legacy-evidence'"
+            ).fetchone() == ("legacy evidence",)
+    finally:
+        get_settings.cache_clear()
+
+
 def test_fresh_0015_database_can_downgrade_and_upgrade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -49,6 +49,7 @@ import { buildKnowledgeCardModel } from "../lib/knowledgeMatchModel";
 import type {
   AnalysisBasis,
   AlertStatus,
+  EvidenceUnit,
   InvestigationRun,
   StoredAlert,
 } from "../types/api";
@@ -70,6 +71,16 @@ function basisLabel(source: AnalysisBasis["source"]): string {
 function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | null {
   if (!reference) return null;
   return `${reference.title} · ${reference.source}`;
+}
+
+function evidenceUnitQualification(
+  unit: Pick<EvidenceUnit, "root_cause_eligible" | "status">,
+): string {
+  if (unit.root_cause_eligible) return "根因可用";
+  if (unit.status === "FAILED") return "不可用";
+  if (unit.status === "NO_DATA") return "无数据";
+  if (unit.status === "NOT_APPLICABLE") return "不适用";
+  return "根因不可用";
 }
 
 export function AlertDetailPage() {
@@ -384,6 +395,22 @@ export function AlertDetailPage() {
                 </div>
                 <p>{evidence.summary}</p>
                 {evidence.error && <div className="tool-error">{evidence.error}</div>}
+                {(evidence.evidence_units?.length ?? 0) > 0 && (
+                  <div className="evidence-unit-list">
+                    {evidence.evidence_units?.map((unit) => (
+                      <div className="evidence-unit-row" key={unit.id}>
+                        <div>
+                          <strong>{unit.kind === "HISTORY" ? "History" : unit.stage}</strong>
+                          <span>{unit.summary}</span>
+                        </div>
+                        <span className={`evidence-unit-status unit-${unit.status.toLowerCase()}`}>
+                          {unit.status} · {evidenceUnitQualification(unit)}
+                        </span>
+                        <small>单元 {compactId(unit.id)} · 父证据 {compactId(unit.parent_evidence_id)}</small>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {(Object.keys(evidence.structured_data).length > 0 || Object.keys(evidence.request).length > 0) && (
                   <details className="json-details">
                     <summary>查看请求与结构化数据</summary>

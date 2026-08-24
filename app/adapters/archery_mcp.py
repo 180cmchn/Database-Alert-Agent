@@ -18,6 +18,9 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
+from sqlglot import Dialect, exp, parse
+from sqlglot.errors import ParseError, TokenError
+from sqlglot.tokens import Token, TokenType
 
 from app.adapters.archery_sql import (
     SQLTableReference,
@@ -49,6 +52,7 @@ ARCHERY_SLOW_LOG_TABLE: Final = "t_slowlog_info"
 ARCHERY_SLOW_QUERY_REVIEW_TABLE: Final = "mysql_slow_query_review_history"
 ARCHERY_SLOW_LOG_TABLE_SEARCH_KEYWORD: Final = "slow"
 ARCHERY_SLOW_LOG_TOOL_NAME: Final = "query_archery_slow_logs"
+ARCHERY_SLOW_LOG_CAPABILITY: Final = "database.slow_query"
 ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME: Final = "list_resource_groups_gymJPA"
 ARCHERY_MCP_INSTANCES_TOOL_NAME: Final = "list_instances_gymJPA"
 ARCHERY_MCP_DATABASES_TOOL_NAME: Final = "list_instance_databases_gymJPA"
@@ -62,8 +66,8 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v28"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v3"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v29"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v4"
 _MISSING: Final = object()
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -608,45 +612,276 @@ class ArcheryMCPClient:
 
     @classmethod
     def history_id_retrieval(cls, sql: str) -> tuple[int, str] | None:
-        """Return ``(id, projection)`` for an exact safe recovery query.
+        """Return ``(id, projection)`` for one semantically safe recovery query."""
 
-        The provider allows only ``SELECT *`` and the fixed sample-prefix
-        projection suggested after MCP truncation. Generating the accepted SQL
-        here keeps validation and the model hint on one canonical definition.
-        """
-
-        statement = cls._single_sql_statement(sql)
-        if statement is None:
-            return None
-        match = re.fullmatch(
-            rf"(?is)\s*select\s+(?P<projection>.*?)\s+from\s+"
-            rf"`?{re.escape(ARCHERY_SLOW_QUERY_REVIEW_TABLE)}`?\s+"
-            r"where\s+`?id`?\s*=\s*(?P<id>\d+)\s*",
-            statement,
-        )
-        if match is None:
-            return None
-        row_id = cls._coerce_positive_integer(match.group("id"))
-        if row_id is None:
-            return None
-        projection = match.group("projection").strip()
-        if projection == "*":
-            return row_id, "full"
-        if cls._is_history_sample_prefix_projection(projection):
-            return row_id, "sample_prefix"
-        return None
+        retrieval, _reason_code = cls.history_id_retrieval_validation(sql)
+        return retrieval
 
     @classmethod
-    def _is_history_sample_prefix_projection(cls, projection: str) -> bool:
-        expressions = cls._split_top_level_expressions(projection)
-        return len(expressions) == len(_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS) and all(
-            canonical_sql(actual) == canonical_sql(expected)
-            for actual, expected in zip(
-                expressions,
-                _HISTORY_SAMPLE_PROJECTION_EXPRESSIONS,
+    def history_id_retrieval_validation(
+        cls,
+        sql: str,
+    ) -> tuple[tuple[int, str] | None, str | None]:
+        """Validate a bounded per-id query through sqlglot's MySQL AST.
+
+        Formatting, quoting, aliases, an id-only ORDER BY, and LIMIT 1 are
+        immaterial. Additional data sources, predicates, projections, or query
+        operators fail closed before transport.
+        """
+
+        parser_input = cls._sql_without_comments(sql)
+        if parser_input is None:
+            return None, "history_recovery_sql_parse_failed"
+        try:
+            statements = parse(parser_input, read="mysql")
+        except (ParseError, TokenError):
+            return None, "history_recovery_sql_parse_failed"
+        if len(statements) != 1 or statements[0] is None:
+            return None, "history_recovery_not_single_statement"
+        tree = statements[0]
+        if not isinstance(tree, exp.Select) or len(list(tree.find_all(exp.Select))) != 1:
+            return None, "history_recovery_not_single_select"
+        allowed_args = {
+            "distinct",
+            "exclude",
+            "expressions",
+            "from_",
+            "hint",
+            "kind",
+            "limit",
+            "offset",
+            "operation_modifiers",
+            "order",
+            "where",
+        }
+        if any(
+            value not in (None, False, (), [])
+            for key, value in tree.args.items()
+            if key not in allowed_args
+        ) or any(
+            tree.args.get(key) not in (None, False, (), [])
+            for key in ("distinct", "exclude", "hint", "operation_modifiers")
+        ):
+            return None, "history_recovery_query_shape_forbidden"
+
+        tables = list(tree.find_all(exp.Table))
+        from_clause = tree.args.get("from_")
+        if (
+            len(tables) != 1
+            or not isinstance(from_clause, exp.From)
+            or from_clause.this is not tables[0]
+        ):
+            return None, "history_recovery_data_source_forbidden"
+        table = tables[0]
+        table_name = cls._ascii_identifier(table.name)
+        schema_name = cls._ascii_identifier(table.db) if table.db else None
+        if (
+            table_name != ARCHERY_SLOW_QUERY_REVIEW_TABLE
+            or bool(table.catalog)
+            or (table.db and schema_name != "archery")
+        ):
+            return None, "history_recovery_target_forbidden"
+        if any(
+            value not in (None, False, (), [])
+            for key, value in table.args.items()
+            if key not in {"alias", "catalog", "db", "this"}
+        ):
+            return None, "history_recovery_query_shape_forbidden"
+        table_alias = table.args.get("alias")
+        if isinstance(table_alias, exp.TableAlias) and table_alias.columns:
+            return None, "history_recovery_query_shape_forbidden"
+        qualifier = cls._ascii_identifier(table.alias or table.name)
+        if qualifier is None:
+            return None, "history_recovery_query_shape_forbidden"
+
+        def is_column(value: exp.Expression, name: str) -> bool:
+            column_name = (
+                cls._ascii_identifier(value.name) if isinstance(value, exp.Column) else None
+            )
+            column_table = (
+                cls._ascii_identifier(value.table)
+                if isinstance(value, exp.Column) and value.table
+                else None
+            )
+            return bool(
+                isinstance(value, exp.Column)
+                and not isinstance(value.this, exp.Star)
+                and column_name == name.lower()
+                and not value.db
+                and not value.catalog
+                and (not value.table or column_table == qualifier)
+            )
+
+        def is_id_column(value: exp.Expression) -> bool:
+            return is_column(value, "id")
+
+        projections = list(tree.expressions)
+        projection_kind: str | None = None
+        if len(projections) == 1 and (
+            isinstance(projections[0], exp.Star)
+            or (
+                isinstance(projections[0], exp.Column)
+                and isinstance(projections[0].this, exp.Star)
+                and not projections[0].db
+                and not projections[0].catalog
+                and (
+                    not projections[0].table
+                    or cls._ascii_identifier(projections[0].table) == qualifier
+                )
+            )
+        ):
+            projection_kind = "full"
+        elif cls._is_history_sample_prefix_projection(
+            projections,
+            qualifier=qualifier,
+        ):
+            projection_kind = "sample_prefix"
+        if projection_kind is None:
+            return None, "history_recovery_projection_forbidden"
+
+        where = tree.args.get("where")
+        condition = where.this if isinstance(where, exp.Where) else None
+        while isinstance(condition, exp.Paren):
+            condition = condition.this
+        if not isinstance(condition, exp.EQ):
+            return None, "history_recovery_id_predicate_required"
+        operands = ((condition.this, condition.expression), (condition.expression, condition.this))
+        literal = next(
+            (
+                candidate
+                for column, candidate in operands
+                if is_id_column(column)
+                and isinstance(candidate, exp.Literal)
+                and candidate.is_int
+            ),
+            None,
+        )
+        row_id = (
+            cls._coerce_positive_integer(literal.this)
+            if isinstance(literal, exp.Literal)
+            else None
+        )
+        if row_id is None:
+            return None, "history_recovery_id_predicate_required"
+
+        order = tree.args.get("order")
+        if order is not None:
+            ordered = list(order.expressions) if isinstance(order, exp.Order) else []
+            try:
+                order_tokens = Dialect.get_or_raise("mysql").tokenize(parser_input)
+            except TokenError:
+                return None, "history_recovery_sql_parse_failed"
+            if (
+                len(ordered) != 1
+                or not isinstance(ordered[0], exp.Ordered)
+                or not is_id_column(ordered[0].this)
+                or ordered[0].args.get("with_fill") not in (None, False)
+                or cls._has_explicit_order_nulls_modifier(order_tokens)
+            ):
+                return None, "history_recovery_order_forbidden"
+
+        if tree.args.get("offset") is not None:
+            return None, "history_recovery_limit_forbidden"
+
+        limit = tree.args.get("limit")
+        if limit is not None:
+            limit_value = limit.expression if isinstance(limit, exp.Limit) else None
+            if (
+                not isinstance(limit_value, exp.Literal)
+                or not limit_value.is_int
+                or int(limit_value.this) != 1
+            ):
+                return None, "history_recovery_limit_forbidden"
+        return (row_id, projection_kind), None
+
+    @staticmethod
+    def _has_explicit_order_nulls_modifier(tokens: Sequence[Token]) -> bool:
+        """Reject non-MySQL NULLS FIRST/LAST syntax retained by sqlglot."""
+
+        order_seen = False
+        for index, token in enumerate(tokens[:-1]):
+            if token.token_type is TokenType.ORDER_BY:
+                order_seen = True
+                continue
+            if (
+                order_seen
+                and token.text.casefold() == "nulls"
+                and tokens[index + 1].text.casefold() in {"first", "last"}
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _is_history_sample_prefix_projection(
+        cls,
+        projections: Sequence[exp.Expression],
+        *,
+        qualifier: str,
+    ) -> bool:
+        """Match the fixed truncation projection by AST, including table aliases."""
+
+        if len(projections) != len(_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS):
+            return False
+
+        def column_matches(value: exp.Expression, expected_name: str) -> bool:
+            if isinstance(value, exp.Alias):
+                if cls._ascii_identifier(value.alias) != expected_name.lower():
+                    return False
+                value = value.this
+            column_name = (
+                cls._ascii_identifier(value.name) if isinstance(value, exp.Column) else None
+            )
+            column_table = (
+                cls._ascii_identifier(value.table)
+                if isinstance(value, exp.Column) and value.table
+                else None
+            )
+            return bool(
+                isinstance(value, exp.Column)
+                and not isinstance(value.this, exp.Star)
+                and column_name == expected_name.lower()
+                and not value.db
+                and not value.catalog
+                and (not value.table or column_table == qualifier)
+            )
+
+        direct_names = _HISTORY_SAMPLE_PROJECTION_EXPRESSIONS[:-2]
+        if any(
+            not column_matches(expression, expected_name)
+            for expression, expected_name in zip(
+                projections[:-2],
+                direct_names,
                 strict=True,
             )
+        ):
+            return False
+
+        sample_prefix = projections[-2]
+        if (
+            not isinstance(sample_prefix, exp.Alias)
+            or cls._ascii_identifier(sample_prefix.alias) != "sample"
+            or not isinstance(sample_prefix.this, exp.Left)
+            or not column_matches(sample_prefix.this.this, "sample")
+            or not isinstance(sample_prefix.this.expression, exp.Literal)
+            or not sample_prefix.this.expression.is_string
+            or sample_prefix.this.expression.this != "4000"
+        ):
+            return False
+
+        sample_length = projections[-1]
+        return bool(
+            isinstance(sample_length, exp.Alias)
+            and cls._ascii_identifier(sample_length.alias) == "sample_full_length"
+            and isinstance(sample_length.this, exp.Length)
+            and sample_length.this.args.get("binary") is True
+            and column_matches(sample_length.this.this, "sample")
         )
+
+    @staticmethod
+    def _ascii_identifier(value: str) -> str | None:
+        """Canonicalize only the ASCII identifiers used by the closed query shape."""
+
+        return value.lower() if value and value.isascii() else None
 
     @staticmethod
     def _split_top_level_expressions(sql: str) -> tuple[str, ...]:
@@ -1285,6 +1520,8 @@ class ArcheryMCPClient:
     ) -> tuple[str, ...]:
         """Return deterministic reasons why a query payload is not complete."""
 
+        if payload.get("result_completeness_assessment") == "complete":
+            return ()
         reasons: list[str] = []
         if payload.get("rows_recovered_from_truncated_json") is True:
             reasons.append("character_truncated")
@@ -3051,6 +3288,7 @@ class ArcherySlowLogEvidenceTool:
 
     name = ARCHERY_SLOW_LOG_TOOL_NAME
     source_system = "archery_mcp"
+    capability = ARCHERY_SLOW_LOG_CAPABILITY
     input_schema = {
         "type": "object",
         "properties": {},
@@ -3066,7 +3304,6 @@ class ArcherySlowLogEvidenceTool:
         self.client = client
         self.default_timeout_seconds = default_timeout_seconds
         self.role = client.prompts.role
-        self.capability = client.prompts.purpose
         self.workflow = client.prompts.workflow
         self.safety = client.prompts.safety
 

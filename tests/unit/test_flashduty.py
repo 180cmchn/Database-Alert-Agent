@@ -944,6 +944,56 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     }
     assert not hasattr(visible_specs["query_metrics"], "read_only")
     assert not hasattr(visible_specs["query_changes"], "read_only")
+    alert_spec = visible_specs["alert_context"]
+    similar_spec = visible_specs["query_similar_incidents"]
+    assert alert_spec.capability == "flashduty.alert_context"
+    assert similar_spec.capability == "flashduty.similar_incidents"
+    assert alert_spec.policy_version == "flashduty-read-only-api-v1"
+    assert similar_spec.policy_version == "flashduty-read-only-api-v1"
+    assert alert_spec.schema_version == "flashduty-alert-context-api-v1"
+    assert similar_spec.schema_version == "flashduty-similar-incidents-api-v1"
+    expected_api_contracts = {
+        "query_changes": (
+            "flashduty.changes",
+            "flashduty-read-only-api-v1",
+            "flashduty-changes-api-v1",
+        ),
+        "query_metrics": (
+            "flashduty.monitors.metrics",
+            "flashduty-monitors-read-only-api-v1",
+            "flashduty-metrics-api-v1",
+        ),
+        "query_logs": (
+            "flashduty.monitors.logs",
+            "flashduty-monitors-read-only-api-v1",
+            "flashduty-logs-api-v1",
+        ),
+        "query_trace": (
+            "flashduty.monitors.trace",
+            "flashduty-monitors-read-only-api-v1",
+            "flashduty-trace-api-v1",
+        ),
+        "query_endpoint_errors": (
+            "flashduty.monitors.endpoint_errors",
+            "flashduty-monitors-read-only-api-v1",
+            "flashduty-endpoint-errors-api-v1",
+        ),
+        "query_database_diagnostics": (
+            "flashduty.monitors.database_diagnostics",
+            "flashduty-monitors-read-only-api-v1",
+            "flashduty-database-diagnostics-api-v1",
+        ),
+    }
+    for tool_name, expected in expected_api_contracts.items():
+        spec = visible_specs[tool_name]
+        assert (spec.capability, spec.policy_version, spec.schema_version) == expected
+    for spec in (
+        alert_spec,
+        similar_spec,
+        *(visible_specs[name] for name in expected_api_contracts),
+    ):
+        assert "mcp" not in spec.policy_version.casefold()
+        assert "mcp" not in spec.schema_version.casefold()
 
 
 def test_factory_disables_unaudited_flashduty_capabilities_by_default(

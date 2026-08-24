@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from jsonpointer import JsonPointerException, resolve_pointer
 from sqlalchemy import (
     JSON,
     Column,
@@ -290,7 +291,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0015"
+DATABASE_SCHEMA_REVISION = "0016"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -392,6 +393,9 @@ class EvidenceRow(Base):
     __tablename__ = "evidence_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    contract_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="evidence-record/v1"
+    )
     alert_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("alerts.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -404,6 +408,8 @@ class EvidenceRow(Base):
     request_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     data_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    source_artifact_id: Mapped[str | None] = mapped_column(String(36))
+    evidence_units_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     collected_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
@@ -2546,6 +2552,11 @@ class SQLAlchemyAlertRepository:
             if run_row.alert_id != alert_id:
                 raise RunLeaseConflict(run_id, "run does not belong to the requested alert")
             evidence_id = str(evidence.id)
+            await self._require_evidence_artifact_ownership(
+                session,
+                evidence,
+                error_factory=lambda detail: EvidenceRecordConflict(evidence_id, detail),
+            )
             existing = await session.get(EvidenceRow, evidence_id)
             if existing is not None:
                 if self._evidence_record(existing) == evidence:
@@ -2557,6 +2568,7 @@ class SQLAlchemyAlertRepository:
             session.add(
                 EvidenceRow(
                     id=evidence_id,
+                    contract_version=evidence.contract_version,
                     alert_id=alert_id,
                     run_id=run_id,
                     tool_name=evidence.tool_name,
@@ -2565,6 +2577,14 @@ class SQLAlchemyAlertRepository:
                     request_json=evidence.request,
                     summary=evidence.summary,
                     data_json=evidence.structured_data,
+                    source_artifact_id=(
+                        str(evidence.source_artifact_id)
+                        if evidence.source_artifact_id is not None
+                        else None
+                    ),
+                    evidence_units_json=[
+                        item.model_dump(mode="json") for item in evidence.evidence_units
+                    ],
                     error=evidence.error,
                     started_at=evidence.started_at,
                     collected_at=evidence.collected_at,
@@ -2578,6 +2598,7 @@ class SQLAlchemyAlertRepository:
     def _evidence_record(row: EvidenceRow) -> EvidenceRecord:
         return EvidenceRecord(
             id=row.id,
+            contract_version=row.contract_version,
             run_id=row.run_id,
             tool_name=row.tool_name,
             source_system=row.source_system,
@@ -2585,12 +2606,126 @@ class SQLAlchemyAlertRepository:
             request=row.request_json,
             summary=row.summary,
             structured_data=row.data_json,
+            source_artifact_id=row.source_artifact_id,
+            evidence_units=row.evidence_units_json or [],
             error=row.error,
             started_at=row.started_at,
             collected_at=row.collected_at,
             duration_ms=row.duration_ms,
             truncated=bool(row.truncated),
         )
+
+    @classmethod
+    async def _require_evidence_artifact_ownership(
+        cls,
+        session: AsyncSession,
+        evidence: EvidenceRecord,
+        *,
+        error_factory: Any = RuntimeError,
+    ) -> None:
+        if evidence.contract_version != "evidence-record/v2":
+            return
+        artifact_id = str(evidence.source_artifact_id)
+        artifact = await session.get(AgentArtifactRow, artifact_id)
+        if artifact is None:
+            raise error_factory("v2 source artifact does not exist")
+        if artifact.run_id != str(evidence.run_id):
+            raise error_factory("v2 source artifact belongs to a different run")
+        metadata = artifact.metadata_json or {}
+        if (
+            artifact.kind != "raw_tool_result"
+            or metadata.get("tool_name") != evidence.tool_name
+            or metadata.get("source_system") != evidence.source_system
+        ):
+            raise error_factory("v2 source artifact provenance does not match evidence")
+        if artifact.invocation_id is None:
+            raise error_factory("v2 source artifact is not bound to an invocation")
+        invocation = await session.get(ToolInvocationRow, artifact.invocation_id)
+        try:
+            stored_invocation = (
+                cls._validated_tool_invocation_row(invocation)
+                if invocation is not None
+                else None
+            )
+        except (ToolInvocationConflict, TypeError, ValueError) as exc:
+            raise error_factory("v2 source artifact invocation binding is invalid") from exc
+        stored_result = invocation.result_json if invocation is not None else None
+        stored_evidence = (
+            stored_result.get("evidence_record")
+            if isinstance(stored_result, Mapping)
+            and stored_result.get("contract") == "outer-evidence-record/v1"
+            else None
+        )
+        if (
+            stored_invocation is None
+            or str(stored_invocation.run_id) != str(evidence.run_id)
+            or stored_invocation.tool_name != evidence.tool_name
+            or stored_invocation.provider != evidence.source_system
+            or stored_invocation.effective_arguments != evidence.request
+            or stored_invocation.artifact_ref is None
+            or str(stored_invocation.artifact_ref.artifact_id) != artifact_id
+            or not isinstance(stored_evidence, Mapping)
+            or _canonical_json_hash(stored_evidence)
+            != _canonical_json_hash(evidence.model_dump(mode="json"))
+        ):
+            raise error_factory("v2 source artifact invocation binding is invalid")
+
+        artifact_payload = {
+            "artifact_id": artifact.id,
+            "kind": artifact.kind,
+            "media_type": artifact.media_type,
+            "uri": artifact.uri,
+            "sha256": artifact.sha256,
+            "size_bytes": artifact.size_bytes,
+            "metadata": artifact.metadata_json or {},
+        }
+        if _canonical_json_hash(artifact_payload) != _canonical_json_hash(
+            stored_invocation.artifact_ref.model_dump(mode="json")
+        ):
+            raise error_factory("v2 source artifact reference is invalid")
+        try:
+            raw_result = _decoded_artifact_content(artifact)
+            _stored, _encoding, content_bytes = _artifact_content(raw_result)
+        except Exception as exc:
+            raise error_factory("v2 source artifact content is invalid") from exc
+        if (
+            len(content_bytes) != artifact.size_bytes
+            or sha256(content_bytes).hexdigest() != artifact.sha256
+        ):
+            raise error_factory("v2 source artifact content hash is invalid")
+        if not isinstance(raw_result, Mapping):
+            raise error_factory("v2 source artifact is not a JSON object")
+
+        for unit in evidence.evidence_units:
+            resolved_values: list[Any] = []
+            for source_path in unit.source_paths:
+                try:
+                    resolved_values.append(resolve_pointer(raw_result, source_path))
+                except (JsonPointerException, TypeError, ValueError) as exc:
+                    raise error_factory(
+                        f"v2 evidence-unit source path does not resolve: {source_path}"
+                    ) from exc
+            if unit.status.value == "SUCCESS" and not any(
+                cls._projected_value_matches_source(unit.data, source)
+                for source in resolved_values
+            ):
+                raise error_factory(
+                    "v2 successful evidence-unit data does not match its raw source path"
+                )
+
+    @classmethod
+    def _projected_value_matches_source(cls, projected: Any, source: Any) -> bool:
+        if isinstance(projected, Mapping):
+            return isinstance(source, Mapping) and all(
+                key in source and cls._projected_value_matches_source(value, source[key])
+                for key, value in projected.items()
+            )
+        if isinstance(projected, list):
+            return isinstance(source, list) and len(projected) == len(source) and all(
+                cls._projected_value_matches_source(item, raw_item)
+                for item, raw_item in zip(projected, source, strict=True)
+            )
+        return projected == source
 
     async def save_validation(
         self,
@@ -2759,6 +2894,7 @@ class SQLAlchemyAlertRepository:
             evidence_records = [
                 EvidenceRecord(
                     id=item.id,
+                    contract_version=item.contract_version,
                     run_id=item.run_id,
                     tool_name=item.tool_name,
                     source_system=item.source_system,
@@ -2766,6 +2902,8 @@ class SQLAlchemyAlertRepository:
                     request=item.request_json,
                     summary=item.summary,
                     structured_data=item.data_json,
+                    source_artifact_id=item.source_artifact_id,
+                    evidence_units=item.evidence_units_json or [],
                     error=item.error,
                     started_at=item.started_at,
                     collected_at=item.collected_at,
@@ -2774,6 +2912,8 @@ class SQLAlchemyAlertRepository:
                 )
                 for item in evidence_rows
             ]
+            for evidence in evidence_records:
+                await self._require_evidence_artifact_ownership(session, evidence)
             validation_rows = (
                 (
                     await session.execute(

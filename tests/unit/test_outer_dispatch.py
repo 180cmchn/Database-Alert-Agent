@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.persistence import (
+    AgentArtifactRow,
     EvidenceRow,
     InvestigationRunRow,
     SQLAlchemyAlertRepository,
@@ -30,14 +31,17 @@ from app.agent_runtime.outer_dispatch import (
     OuterDispatchFaultPoint,
 )
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitStatus,
     InvestigationContext,
     ToolExecutionRequest,
     ToolResultAnalysis,
     ToolResultObservation,
     ToolStatus,
 )
-from app.domain.ports import ToolInvocationConflict
+from app.domain.ports import EvidenceRecordConflict, ToolInvocationConflict
 
 
 def _sqlite_url(path: Path) -> str:
@@ -106,6 +110,33 @@ class RecordingResultProcessor:
             provider="fake",
             model="tool-result-test",
             prompt_version="tool-result-analysis-test-v1",
+        )
+
+
+class ArcheryUnitResultProcessor(RecordingResultProcessor):
+    async def analyze(self, **payload):  # type: ignore[no-untyped-def]
+        artifact = payload["artifact"]
+        assert artifact.sha256 is not None
+        raw_data = payload["raw_result"]["structured_data"]
+        history = dict(raw_data["final_result_payload"])
+        slow_query_analysis = dict(raw_data["slow_query_analysis"])
+        return ToolResultAnalysis(
+            summary="Archery history and supplemental results projected.",
+            observations=[
+                ToolResultObservation(
+                    statement="Archery history returned one row.",
+                    source_paths=["/structured_data/final_result_payload"],
+                )
+            ],
+            analysis_usable=True,
+            source_coverage_complete=True,
+            source_artifact_id=artifact.artifact_id,
+            source_sha256=artifact.sha256,
+            provider="deterministic_host",
+            model="none",
+            prompt_version="tool-result-analysis-test-v1",
+            passthrough_payload=history,
+            slow_query_analysis=slow_query_analysis,
         )
 
 
@@ -1087,6 +1118,492 @@ async def test_dispatcher_keeps_complete_raw_generic_result_out_of_main_context(
     stored_text = str(stored[1])
     assert raw_text not in stored_text
     assert "result" not in stored[1]["structured_data"]["observations"][0]
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_archery_projection_persists_independent_v2_evidence_units(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "evidence-units.db"))
+    await repository.initialize()
+    alert_id, context = await _context(repository, external_id="outer-evidence-units")
+    executor = RecordingExecutor(
+        [
+            {
+                "final_result_payload": {
+                    "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+                    "rows": [{"id": 41}],
+                },
+                "slow_query_analysis": {
+                    "status": "partial",
+                    "explain_results": [{"result": {"row_count": 1}}],
+                    "table_structure_results": [],
+                    "index_results": [],
+                    "missing_stages": ["indexes"],
+                    "failures": [
+                        {"stage": "indexes", "reason_code": "permission_denied"}
+                    ],
+                },
+            }
+        ],
+        source_system="archery_mcp",
+    )
+    request = ToolExecutionRequest(
+        tool_name="query_mcp_archery",
+        parameters={"scope": "alert_window"},
+        objective="collect slow-query history",
+    )
+    spec = ToolSpec(
+        name=request.tool_name,
+        provider="archery_mcp",
+        capability="database.slow_query",
+        input_schema={"type": "object", "additionalProperties": True},
+        policy_version="test-policy-v1",
+        schema_version="test-schema-v1",
+    )
+
+    dispatcher = DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=ArcheryUnitResultProcessor(),
+    )
+    evidence = await dispatcher.execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=spec,
+    )
+
+    assert evidence.contract_version == EVIDENCE_RECORD_V2
+    assert evidence.source_artifact_id is not None
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.is_root_cause_support_eligible() is False
+    assert len(evidence.evidence_units) == 3
+    history = next(unit for unit in evidence.evidence_units if unit.unit_key == "history")
+    explain = next(
+        unit
+        for unit in evidence.evidence_units
+        if unit.stage == "explain" and unit.status == EvidenceUnitStatus.SUCCESS
+    )
+    indexes = next(
+        unit
+        for unit in evidence.evidence_units
+        if unit.stage == "indexes" and unit.status == EvidenceUnitStatus.FAILED
+    )
+    assert history.id == EvidenceUnit.build_id(evidence.id, "history")
+    assert history.source_artifact_id == evidence.source_artifact_id
+    assert history.status == EvidenceUnitStatus.SUCCESS
+    assert history.root_cause_eligible is True
+    assert history.source_paths == ["/structured_data/final_result_payload"]
+    assert explain.status == EvidenceUnitStatus.SUCCESS
+    assert explain.root_cause_eligible is True
+    assert explain.source_paths == [
+        "/structured_data/slow_query_analysis/explain_results/0"
+    ]
+    assert indexes.status == EvidenceUnitStatus.FAILED
+    assert indexes.root_cause_eligible is False
+    assert indexes.source_paths == [
+        "/structured_data/slow_query_analysis/failures/0"
+    ]
+    stored_artifact = await repository.get_agent_artifact(str(history.source_artifact_id))
+    assert stored_artifact is not None
+    artifact_payload = stored_artifact[1]
+    assert isinstance(artifact_payload, dict)
+    assert artifact_payload["structured_data"]["final_result_payload"]["rows"] == [
+        {"id": 41}
+    ]
+    assert artifact_payload["structured_data"]["slow_query_analysis"]["failures"][
+        0
+    ]["stage"] == "indexes"
+
+    assert context.lease_owner is not None and context.fencing_token is not None
+    with pytest.raises(EvidenceRecordConflict, match="invocation binding is invalid"):
+        await repository.save_evidence(
+            alert_id,
+            evidence.model_copy(update={"summary": "tampered projected evidence"}),
+            lease_owner=context.lease_owner,
+            fencing_token=context.fencing_token,
+        )
+    await repository.save_evidence(
+        alert_id,
+        evidence,
+        lease_owner=context.lease_owner,
+        fencing_token=context.fencing_token,
+    )
+    stored = await repository.get(alert_id, run_id=str(context.run_id))
+    assert stored is not None
+    assert stored.evidence_records == [evidence]
+    replayed = await dispatcher.execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=spec,
+    )
+    assert replayed == evidence
+    assert len(executor.calls) == 1
+
+    invocation_rows = await _invocation_rows(repository, str(context.run_id))
+    async with repository.session_factory() as session:
+        artifact_row = await session.get(AgentArtifactRow, str(history.source_artifact_id))
+        assert artifact_row is not None
+        original_content = artifact_row.sanitized_content
+        artifact_row.sanitized_content = original_content.replace('"id":41', '"id":42')
+        assert artifact_row.sanitized_content != original_content
+        await session.commit()
+
+    with pytest.raises(RuntimeError, match="artifact content hash is invalid"):
+        await repository.get(alert_id, run_id=str(context.run_id))
+
+    async with repository.session_factory() as session:
+        artifact_row = await session.get(AgentArtifactRow, str(history.source_artifact_id))
+        assert artifact_row is not None
+        artifact_row.sanitized_content = original_content
+        await session.commit()
+
+    history_index = next(
+        index
+        for index, unit in enumerate(evidence.evidence_units)
+        if unit.unit_key == "history"
+    )
+    async with repository.session_factory() as session:
+        evidence_row = await session.get(EvidenceRow, str(evidence.id))
+        invocation_row = await session.get(ToolInvocationRow, invocation_rows[0].id)
+        assert evidence_row is not None and invocation_row is not None
+        tampered_units = [item.model_dump(mode="json") for item in evidence.evidence_units]
+        tampered_units[history_index]["data"] = {"full_sql": "SELECT 1"}
+        evidence_row.evidence_units_json = tampered_units
+        result_payload = dict(invocation_row.result_json)
+        evidence_payload = dict(result_payload["evidence_record"])
+        evidence_payload["evidence_units"] = tampered_units
+        result_payload["evidence_record"] = evidence_payload
+        invocation_row.result_json = result_payload
+        await session.commit()
+
+    with pytest.raises(RuntimeError, match="data does not match its raw source path"):
+        await repository.get(alert_id, run_id=str(context.run_id))
+
+    async with repository.session_factory() as session:
+        evidence_row = await session.get(EvidenceRow, str(evidence.id))
+        invocation_row = await session.get(ToolInvocationRow, invocation_rows[0].id)
+        assert evidence_row is not None and invocation_row is not None
+        original_units = [item.model_dump(mode="json") for item in evidence.evidence_units]
+        evidence_row.evidence_units_json = original_units
+        result_payload = dict(invocation_row.result_json)
+        evidence_payload = dict(result_payload["evidence_record"])
+        evidence_payload["evidence_units"] = original_units
+        result_payload["evidence_record"] = evidence_payload
+        invocation_row.result_json = result_payload
+        await session.commit()
+
+    async with repository.session_factory() as session:
+        invocation_row = await session.get(ToolInvocationRow, invocation_rows[0].id)
+        assert invocation_row is not None
+        result_payload = dict(invocation_row.result_json)
+        evidence_payload = dict(result_payload["evidence_record"])
+        evidence_units = [dict(item) for item in evidence_payload["evidence_units"]]
+        evidence_units[0]["source_paths"] = ["/structured_data/does_not_exist"]
+        evidence_payload["evidence_units"] = evidence_units
+        result_payload["evidence_record"] = evidence_payload
+        invocation_row.result_json = result_payload
+        await session.commit()
+
+    with pytest.raises(OuterDispatchError, match="source path does not resolve"):
+        await dispatcher.execute(
+            alert_id=alert_id,
+            request=request,
+            context=context,
+            tool_spec=spec,
+        )
+    await repository.close()
+
+
+def test_not_applicable_status_is_derived_from_each_supplemental_failure() -> None:
+    artifact_id = uuid4()
+    history = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 41}],
+    }
+    supplemental = {
+        "status": "not_applicable",
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": [],
+        "failures": [
+            {"stage": "indexes", "reason_code": "permission_denied"},
+            {"stage": "explain", "reason_code": "no_safe_explainable_sample"},
+        ],
+    }
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+        structured_data={
+            "final_result_payload": history,
+            "slow_query_analysis": supplemental,
+        },
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery result",
+        analysis_usable=False,
+        source_coverage_complete=True,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        passthrough_payload=history,
+        slow_query_analysis=supplemental,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
+    by_reason = {
+        unit.data.get("reason_code"): unit.status
+        for unit in units
+        if unit.kind.value == "SUPPLEMENTAL"
+    }
+
+    assert by_reason == {
+        "permission_denied": EvidenceUnitStatus.FAILED,
+        "no_safe_explainable_sample": EvidenceUnitStatus.NOT_APPLICABLE,
+    }
+    DurableOuterToolDispatcher._validate_evidence_unit_sources(
+        parent.model_dump(mode="json"),
+        units,
+        artifact_id=artifact_id,
+    )
+
+
+def test_missing_history_payload_uses_an_existing_raw_source_path() -> None:
+    artifact_id = uuid4()
+    supplemental = {
+        "status": "failed",
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": [],
+        "failures": [{"stage": "explain", "reason_code": "query_failed"}],
+    }
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+        structured_data={"slow_query_analysis": supplemental},
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery result",
+        analysis_usable=False,
+        source_coverage_complete=True,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        slow_query_analysis=supplemental,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
+    history = next(unit for unit in units if unit.unit_key == "history")
+
+    assert history.status == EvidenceUnitStatus.FAILED
+    assert history.source_paths == ["/structured_data"]
+    DurableOuterToolDispatcher._validate_evidence_unit_sources(
+        parent.model_dump(mode="json"),
+        units,
+        artifact_id=artifact_id,
+    )
+
+
+def test_supplemental_unit_ids_do_not_depend_on_result_order() -> None:
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+    )
+    history = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 41}],
+    }
+    first = {"marker": "first", "result": {"type": "range"}}
+    second = {"marker": "second", "result": {"type": "ref"}}
+
+    def project(results: list[dict[str, object]]) -> list[EvidenceUnit]:
+        analysis = ToolResultAnalysis(
+            summary="Archery result",
+            observations=[
+                ToolResultObservation(
+                    statement="History returned one row.",
+                    source_paths=["/structured_data/final_result_payload"],
+                )
+            ],
+            analysis_usable=True,
+            source_coverage_complete=True,
+            source_artifact_id=uuid4(),
+            source_sha256="a" * 64,
+            provider="deterministic_host",
+            model="none",
+            prompt_version="test-v1",
+            passthrough_payload=history,
+            slow_query_analysis={
+                "status": "completed",
+                "explain_results": results,
+                "table_structure_results": [],
+                "index_results": [],
+                "missing_stages": [],
+                "failures": [],
+            },
+        )
+        return DurableOuterToolDispatcher._archery_evidence_units(
+            parent,
+            analysis=analysis,
+        )
+
+    forward = {
+        unit.data["marker"]: unit.id
+        for unit in project([first, second, first])
+        if unit.stage == "explain"
+    }
+    reversed_order = {
+        unit.data["marker"]: unit.id
+        for unit in project([second, first])
+        if unit.stage == "explain"
+    }
+
+    assert forward == reversed_order
+    assert set(forward) == {"first", "second"}
+
+
+@pytest.mark.asyncio
+async def test_incomplete_history_unit_is_ineligible_without_downgrading_supplemental(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "incomplete-history-unit.db"))
+    await repository.initialize()
+    alert_id, context = await _context(
+        repository,
+        external_id="outer-incomplete-history-unit",
+    )
+    executor = RecordingExecutor(
+        [
+            {
+                "final_result_payload": {
+                    "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+                    "rows": [{"id": 41}],
+                    "result_incomplete": True,
+                    "history_recovery_complete": False,
+                    "history_recovery_missing_ids": [42],
+                },
+                "slow_query_analysis": {
+                    "status": "partial",
+                    "explain_results": [{"result": {"row_count": 1}}],
+                    "table_structure_results": [],
+                    "index_results": [],
+                    "missing_stages": [],
+                    "failures": [],
+                },
+            }
+        ],
+        source_system="archery_mcp",
+    )
+    request = ToolExecutionRequest(
+        tool_name="query_mcp_archery",
+        parameters={"scope": "alert_window"},
+        objective="collect slow-query history",
+    )
+    spec = ToolSpec(
+        name=request.tool_name,
+        provider="archery_mcp",
+        capability="database.slow_query",
+        input_schema={"type": "object", "additionalProperties": True},
+        policy_version="test-policy-v1",
+        schema_version="test-schema-v1",
+    )
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=ArcheryUnitResultProcessor(),
+    ).execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=spec,
+    )
+
+    history = next(unit for unit in evidence.evidence_units if unit.unit_key == "history")
+    explain = next(
+        unit
+        for unit in evidence.evidence_units
+        if unit.stage == "explain" and unit.status == EvidenceUnitStatus.SUCCESS
+    )
+    assert history.status == EvidenceUnitStatus.FAILED
+    assert history.root_cause_eligible is False
+    assert history.root_cause_ineligible_reason == "history_recovery_incomplete"
+    assert explain.status == EvidenceUnitStatus.SUCCESS
+    assert explain.root_cause_eligible is True
+    await repository.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_system",
+    ["alert_platform", "flashduty_api", "flashduty_similar"],
+)
+async def test_similar_incidents_stays_usable_context_but_never_root_cause_evidence(
+    tmp_path: Path,
+    source_system: str,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        _sqlite_url(tmp_path / f"similar-context-{source_system}.db")
+    )
+    await repository.initialize()
+    alert_id, context = await _context(
+        repository, external_id=f"outer-similar-context-{source_system}"
+    )
+    executor = RecordingExecutor(
+        [{"observations": [{"incident_id": "similar-1"}]}],
+        source_system=source_system,
+    )
+    request = ToolExecutionRequest(
+        tool_name="query_similar_incidents",
+        parameters={"incident_id": "current-1"},
+        objective="collect similar incident context",
+    )
+    spec = ToolSpec(
+        name=request.tool_name,
+        provider=source_system,
+        capability="flashduty.similar_incidents",
+        input_schema={"type": "object", "additionalProperties": True},
+        policy_version="test-policy-v1",
+        schema_version="test-schema-v1",
+    )
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        executor,
+        result_analyzer=RecordingResultProcessor(),
+    ).execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=spec,
+    )
+
+    analysis = evidence.structured_data["tool_result_analysis"]
+    assert analysis["analysis_usable"] is True
+    assert evidence.structured_data["root_cause_eligible"] is False
+    assert evidence.structured_data["root_cause_ineligible_reason"] == (
+        "similar_incidents_are_context_only"
+    )
+    assert evidence.evidence_units == []
+    assert evidence.is_root_cause_support_eligible() is False
     await repository.close()
 
 

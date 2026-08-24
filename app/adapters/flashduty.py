@@ -719,6 +719,9 @@ def _flashduty_identifier(alert: NormalizedAlert, name: str) -> str | None:
 class FlashDutyAlertContextTool:
     name = "alert_context"
     source_system = "alert_platform"
+    capability = "flashduty.alert_context"
+    policy_version = "flashduty-read-only-api-v1"
+    schema_version = "flashduty-alert-context-api-v1"
     read_only = True
 
     def __init__(self, client: FlashDutyClient, *, item_limit: int = 20) -> None:
@@ -800,6 +803,9 @@ class FlashDutyAlertContextTool:
 class FlashDutySimilarIncidentsTool:
     name = "query_similar_incidents"
     source_system = "alert_platform"
+    capability = "flashduty.similar_incidents"
+    policy_version = "flashduty-read-only-api-v1"
+    schema_version = "flashduty-similar-incidents-api-v1"
     read_only = True
 
     def __init__(self, client: FlashDutyClient) -> None:
@@ -835,6 +841,9 @@ class FlashDutySimilarIncidentsTool:
 class FlashDutyChangesTool:
     name = "query_changes"
     source_system = "alert_platform"
+    capability = "flashduty.changes"
+    policy_version = "flashduty-read-only-api-v1"
+    schema_version = "flashduty-changes-api-v1"
     read_only = True
 
     def __init__(
@@ -915,6 +924,7 @@ def _merged_query_config(
 
 class FlashDutyDataSourceTool:
     source_system = "flashduty_monitors"
+    policy_version = "flashduty-monitors-read-only-api-v1"
     read_only = True
 
     def __init__(
@@ -925,6 +935,15 @@ class FlashDutyDataSourceTool:
         defaults: Mapping[str, Any] | None = None,
     ) -> None:
         self.name = name
+        capability_suffix = {
+            "query_metrics": "metrics",
+            "query_logs": "logs",
+            "query_trace": "trace",
+            "query_endpoint_errors": "endpoint_errors",
+        }[name]
+        schema_suffix = capability_suffix.replace("_", "-")
+        self.capability = f"flashduty.monitors.{capability_suffix}"
+        self.schema_version = f"flashduty-{schema_suffix}-api-v1"
         self.client = client
         self.defaults = dict(defaults or {})
 
@@ -1048,6 +1067,9 @@ _TARGET_LOCATOR = re.compile(r"^(?!.*\|)[\x21-\x7e]{1,256}$")
 class FlashDutyDatabaseDiagnosticsTool:
     name = "query_database_diagnostics"
     source_system = "flashduty_monitors"
+    capability = "flashduty.monitors.database_diagnostics"
+    policy_version = "flashduty-monitors-read-only-api-v1"
+    schema_version = "flashduty-database-diagnostics-api-v1"
     read_only = True
 
     def __init__(self, client: FlashDutyClient) -> None:

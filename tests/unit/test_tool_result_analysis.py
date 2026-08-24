@@ -6,8 +6,12 @@ from uuid import uuid4
 
 import pytest
 
-from app.adapters.tool_result_analysis import DeterministicToolResultProcessor
+from app.adapters.tool_result_analysis import (
+    DeterministicToolResultProcessor,
+    is_context_only_tool_result,
+)
 from app.agent_runtime.contracts import ArtifactRef
+from app.domain.errors import AdvisorError
 
 
 def _artifact() -> ArtifactRef:
@@ -294,6 +298,240 @@ async def test_archery_without_final_result_is_unusable() -> None:
     assert result.passthrough_parse_failed is False
     assert result.observations == []
     assert result.limitations
+
+
+@pytest.mark.asyncio
+async def test_flashduty_alert_context_uses_api_projection_without_mcp_wording() -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="alert_context",
+        source_system="alert_platform",
+        request={},
+        raw_result={
+            "status": "SUCCESS",
+            "structured_data": {
+                "local": {
+                    "severity": "WARNING",
+                    "database": {"host": "mysql-01", "port": 3306},
+                },
+                "flashduty": {
+                    "request_ids": {"alert_info": "must-not-enter-model"},
+                    "partial_errors": {"alert_feed": "FlashDutyAPIError"},
+                    "alert": {"title": "MySQL slow query", "event_cnt": 3},
+                    "events": [{"type": "triggered"}],
+                    "feed": None,
+                    "incident": {"info": {"progress": "Triggered"}},
+                },
+            },
+        },
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [result.summary, *(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is True
+    assert result.prompt_version == "program-fact-projection-v7"
+    assert "FlashDuty API" in projected
+    assert "MCP" not in projected
+    assert "must-not-enter-model" not in projected
+    assert "FlashDutyAPIError" in projected
+    assert [item.source_paths for item in result.observations] == [
+        ["/structured_data/local"],
+        ["/structured_data/flashduty/alert"],
+        ["/structured_data/flashduty/events"],
+        ["/structured_data/flashduty/incident"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_flashduty_similar_is_visible_context_only_api_projection() -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_similar_incidents",
+        source_system="alert_platform",
+        request={},
+        raw_result={
+            "status": "SUCCESS",
+            "structured_data": {
+                "request_id": "must-not-enter-model",
+                "items": [
+                    {"incident_id": "incident-1", "title": "Past connection spike"},
+                    {"incident_id": "incident-2", "title": "Past disk pressure"},
+                ],
+            },
+        },
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [result.summary, *(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is True
+    assert len(result.observations) == 2
+    assert "FlashDuty API" in projected
+    assert "MCP" not in projected
+    assert "仅作为调查上下文" in projected
+    assert "不能作为当前告警的根因证据" in projected
+    assert "must-not-enter-model" not in projected
+    assert result.observations[0].source_paths == ["/structured_data/items/0"]
+    assert is_context_only_tool_result(
+        tool_name="query_similar_incidents",
+        source_system="alert_platform",
+    )
+    assert not is_context_only_tool_result(
+        tool_name="alert_context",
+        source_system="alert_platform",
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "source_system", "structured_data", "context_only"),
+    (
+        (
+            "flashduty_alert",
+            "flashduty",
+            {"flashduty": {"alert": {"title": "MySQL slow query"}}},
+            False,
+        ),
+        (
+            "flashduty_similar",
+            "flashduty",
+            {"items": [{"incident_id": "incident-1", "title": "Past incident"}]},
+            True,
+        ),
+        (
+            "flashduty_alert",
+            "flashduty_alert",
+            {"flashduty": {"alert": {"title": "MySQL slow query"}}},
+            False,
+        ),
+        (
+            "flashduty_similar",
+            "flashduty_similar",
+            {"items": [{"incident_id": "incident-1", "title": "Past incident"}]},
+            True,
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_flashduty_compatibility_aliases_route_as_api_not_mcp(
+    tool_name: str,
+    source_system: str,
+    structured_data: dict[str, object],
+    context_only: bool,
+) -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name=tool_name,
+        source_system=source_system,
+        request={},
+        raw_result={"status": "SUCCESS", "structured_data": structured_data},
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [result.summary, *(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is True
+    assert "FlashDuty API" in projected
+    assert "MCP" not in projected
+    assert is_context_only_tool_result(
+        tool_name=tool_name,
+        source_system=source_system,
+    ) is context_only
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "source_system", "structured_data"),
+    (
+        (
+            "query_changes",
+            "alert_platform",
+            {
+                "request_id": "req-changes",
+                "query_window": {"start_time": 1, "end_time": 2},
+                "items": [{"title": "deployment", "start_time": 1}],
+            },
+        ),
+        (
+            "query_metrics",
+            "flashduty_monitors",
+            {
+                "request_id": "req-metrics",
+                "operation": "metric_trends",
+                "data": {"results": [{"metric": "connections", "value": 9}]},
+            },
+        ),
+        (
+            "query_logs",
+            "flashduty_monitors",
+            {
+                "request_id": "req-logs",
+                "operation": "log_patterns",
+                "data": {"results": [{"pattern": "timeout", "count": 4}]},
+            },
+        ),
+        (
+            "query_trace",
+            "flashduty_monitors",
+            {"request_id": "req-trace", "rows": [{"trace_id": "trace-1"}]},
+        ),
+        (
+            "query_endpoint_errors",
+            "flashduty_monitors",
+            {"request_id": "req-errors", "rows": [{"status": 500, "count": 3}]},
+        ),
+        (
+            "query_database_diagnostics",
+            "flashduty_monitors",
+            {
+                "catalog_request_id": "req-catalog",
+                "target_request_ids": ["req-target"],
+                "invoke_request_id": "req-invoke",
+                "target": {"locator": "db-prod-01", "kind": "mysql"},
+                "selected_tools": ["mysql.connection_overview"],
+                "results": [{"data": {"connections": 95}}],
+            },
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_all_flashduty_native_tools_use_bounded_api_projection(
+    tool_name: str,
+    source_system: str,
+    structured_data: dict[str, object],
+) -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name=tool_name,
+        source_system=source_system,
+        request={},
+        raw_result={"status": "SUCCESS", "structured_data": structured_data},
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(
+        [result.summary, *(item.statement for item in result.observations), *result.limitations]
+    )
+    assert result.analysis_usable is True
+    assert "FlashDuty API" in projected
+    assert "MCP" not in projected
+    assert "req-" not in projected
+    assert all(len(item.statement) <= 1000 for item in result.observations)
+    assert all(
+        path.startswith("/structured_data/")
+        for item in result.observations
+        for path in item.source_paths
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_non_mcp_projection_source_fails_closed() -> None:
+    with pytest.raises(AdvisorError, match="unsupported tool-result projection route"):
+        await DeterministicToolResultProcessor().analyze(
+            tool_name="query_unknown",
+            source_system="unknown_native_provider",
+            request={},
+            raw_result={"status": "SUCCESS", "structured_data": {}},
+            artifact=_artifact(),
+        )
 
 
 @pytest.mark.asyncio
@@ -891,6 +1129,8 @@ async def test_generic_processor_selects_successful_data_calls_conservatively() 
     )
 
     projected = "\n".join(item.statement for item in result.observations)
+    assert "MCP provider=custom_mcp" in projected
+    assert "通用 MCP" not in projected
     assert "选择 1 次" in projected
     assert "read_logs" in projected
     assert len(projected) < 5_000

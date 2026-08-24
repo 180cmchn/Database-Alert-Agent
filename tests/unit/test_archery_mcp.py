@@ -80,6 +80,7 @@ TEST_HISTORY_TIME_CLAUSE = (
     "AND ts_min >= FROM_UNIXTIME(1784793300) AND ts_min < FROM_UNIXTIME(1784793600) "
 )
 FINISH_TOOL_NAME = "finish_archery_investigation"
+RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
 
 
 def _write_prompt_files(
@@ -212,12 +213,18 @@ class PromptFollowingMCPModel:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> MCPModelToolCall:
-        name = (
-            self.sequence[len(self.calls)]
-            if len(self.calls) < len(self.sequence)
-            else FINISH_TOOL_NAME
-        )
         available_names = {item["function"]["name"] for item in tools}
+        if available_names == {RESULT_ASSESSMENT_TOOL_NAME}:
+            name = RESULT_ASSESSMENT_TOOL_NAME
+        else:
+            scripted_call_count = sum(
+                item["name"] != RESULT_ASSESSMENT_TOOL_NAME for item in self.calls
+            )
+            name = (
+                self.sequence[scripted_call_count]
+                if scripted_call_count < len(self.sequence)
+                else FINISH_TOOL_NAME
+            )
         assert name in available_names
         query_index = sum(item["name"] == ARCHERY_MCP_QUERY_TOOL_NAME for item in self.calls)
         query_sql = self.query_sqls[min(query_index, len(self.query_sqls) - 1)]
@@ -257,7 +264,21 @@ class PromptFollowingMCPModel:
                 "reason": "Archery evidence collection is complete",
             },
         }
-        arguments = arguments_by_tool[name]
+        if name == RESULT_ASSESSMENT_TOOL_NAME:
+            properties = tools[0]["function"]["parameters"]["properties"]
+            arguments = {
+                key: schema["const"]
+                for key, schema in properties.items()
+                if "const" in schema
+            }
+            arguments.update(
+                {
+                    "content_state": "complete",
+                    "basis": "appears_complete",
+                }
+            )
+        else:
+            arguments = arguments_by_tool[name]
         self.calls.append(
             {
                 "name": name,
@@ -351,7 +372,11 @@ def test_project_mcp_settings_resolve_environment_without_persisting_token(
 
     assert server.url == "https://archery.example.test/mcp"
     assert server.headers == {"X-Archery-Token": "runtime-only-token"}
-    assert server.prompts == ARCHERY_PROMPTS
+    assert server.prompts.execution_instructions == ARCHERY_PROMPTS.execution_instructions
+    assert server.prompts.workflow_revision == ""
+    # The helper writes the already-rendered workflow, so the synthetic catalog
+    # intentionally has no source markers from which to reconstruct directives.
+    assert server.prompts.workflow_directives == {}
     assert "runtime-only-token" not in settings_path.read_text(encoding="utf-8")
 
 
@@ -390,8 +415,7 @@ def test_archery_settings_accept_catalog_selected_authentication_header(
     assert client.headers == {"Authorization": "Bearer runtime-token"}
 
 
-@pytest.mark.asyncio
-async def test_archery_prompt_file_update_changes_actual_model_messages(
+def test_archery_prompt_file_update_changes_actual_model_messages(
     tmp_path: Path,
 ) -> None:
     settings_path = tmp_path / "settings.json"
@@ -427,13 +451,10 @@ async def test_archery_prompt_file_update_changes_actual_model_messages(
         "ARCHERY_MCP_TOKEN": "test-archery-token",
     }
 
-    async def capture_system_message() -> str:
-        model = PromptFollowingMCPModel(
-            sequence=(ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,)
-        )
+    def capture_system_message() -> str:
         client = ArcheryMCPClient.from_settings(
             settings_path,
-            model,
+            PromptFollowingMCPModel(),
             environment=environment,
             transport=_archery_call_handler(
                 login_result={
@@ -447,13 +468,18 @@ async def test_archery_prompt_file_update_changes_actual_model_messages(
                 tool_calls=[],
             ),
         )
-        await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
-        return str(model.calls[0]["messages"][0]["content"])
+        messages = client.agent_messages(
+            occurred_at=TEST_ALERT_OCCURRED_AT,
+            window_start=TEST_ALERT_OCCURRED_AT - timedelta(seconds=300),
+            window_end=TEST_ALERT_OCCURRED_AT,
+            alert_context={"alarm_host": "db.example.test", "alarm_port": 3306},
+        )
+        return str(messages[0]["content"])
 
-    first_message = await capture_system_message()
+    first_message = capture_system_message()
     workflow_path = tmp_path / prompt_references["workflow"]
     workflow_path.write_text("archery-workflow-v2-from-file", encoding="utf-8")
-    second_message = await capture_system_message()
+    second_message = capture_system_message()
 
     assert "[role]\narchery-role-from-file" in second_message
     assert "[purpose]\narchery-purpose-from-file" in second_message
@@ -593,7 +619,12 @@ async def test_archery_mcp_returns_login_failure_as_observation_for_agent_decisi
     assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
     assert result.query_completed is False
     assert len(model.calls) == 2
-    raw_feedback = model.calls[1]["messages"][-1]["content"]
+    raw_feedback = next(
+        message["content"]
+        for message in model.calls[1]["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "model-call-1"
+    )
     assert isinstance(raw_feedback, str)
     decoded_feedback = json.loads(raw_feedback)
     assert decoded_feedback["isError"] is True
@@ -731,8 +762,13 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
     assert result.query_completed is True
     assert result.requested_sql == recovered_sql
     assert query_sql_calls == [member_sql, instance_sql, timed_out_sql, recovered_sql]
-    timeout_feedback = model.calls[-2]["messages"][-1]["content"]
-    assert "查询超时被KILL，请优化SQL后执行" in timeout_feedback
+    assert any(
+        "查询超时被KILL，请优化SQL后执行" in message.get("content", "")
+        for call in model.calls
+        for message in call["messages"]
+        if message.get("role") == "tool"
+        and isinstance(message.get("content"), str)
+    )
 
 
 def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> None:
@@ -851,6 +887,177 @@ def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> Non
     assert not ArcheryMCPClient.is_history_id_retrieval_query(
         f"SELECT * FROM {history_table} WHERE id = 24413640 AND 1 = 1"
     )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+        "ORDER BY id DESC",
+        "select * from `mysql_slow_query_review_history` where `id`=24413454 "
+        "order by `id` asc limit 1",
+        "SELECT h.* FROM archery.mysql_slow_query_review_history AS h "
+        "WHERE h.id = 24413454 ORDER BY h.id DESC LIMIT 1",
+        "SELECT * FROM mysql_slow_query_review_history h WHERE 24413454 = h.id",
+        "SELECT * FROM `archery`.`mysql_slow_query_review_history` AS `H` "
+        "WHERE (`H`.`ID` = 24413454);",
+        "/* formatting comment */ SELECT * "
+        "FROM mysql_slow_query_review_history WHERE id = 24413454",
+    ),
+)
+def test_history_id_retrieval_accepts_safe_mysql_ast_equivalents(sql: str) -> None:
+    assert ArcheryMCPClient.history_id_retrieval(sql) == (24413454, "full")
+
+
+def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None:
+    sql = (
+        "SELECT h.id, h.hostname_max, h.client_max, h.user_max, h.db_max, "
+        "h.checksum, h.ts_min, h.ts_max, h.ts_cnt, h.Query_time_sum, "
+        "h.Query_time_min, h.Query_time_max, h.Query_time_pct_95, "
+        "h.Query_time_median, h.Lock_time_sum, h.Lock_time_max, "
+        "h.Rows_sent_sum, h.Rows_examined_sum, h.Full_scan_cnt, "
+        "h.Tmp_table_cnt, h.Filesort_cnt, h.Bytes_sum, "
+        "LEFT(h.sample, '4000') AS sample, "
+        "LENGTH(h.sample) AS sample_full_length "
+        "FROM `archery`.`mysql_slow_query_review_history` AS h "
+        "WHERE h.id = 24413640 ORDER BY h.id DESC LIMIT 1"
+    )
+
+    assert ArcheryMCPClient.history_id_retrieval(sql) == (
+        24413640,
+        "sample_prefix",
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "reason_code"),
+    (
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "AND checksum = 'x'",
+            "history_recovery_id_predicate_required",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history h "
+            "JOIN other_table o ON o.id = h.id WHERE h.id = 24413454",
+            "history_recovery_query_shape_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history h, other_table o "
+            "WHERE h.id = 24413454",
+            "history_recovery_query_shape_forbidden",
+        ),
+        (
+            "SELECT * INTO OUTFILE '/tmp/history.txt' "
+            "FROM mysql_slow_query_review_history WHERE id = 24413454",
+            "history_recovery_sql_parse_failed",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history "
+            "WHERE id IN (24413454, 24413455)",
+            "history_recovery_id_predicate_required",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "ORDER BY checksum DESC",
+            "history_recovery_order_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 2",
+            "history_recovery_limit_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "OFFSET 1",
+            "history_recovery_limit_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "LIMIT 1 OFFSET 0",
+            "history_recovery_limit_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = "
+            "(SELECT max(id) FROM mysql_slow_query_review_history)",
+            "history_recovery_not_single_select",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "UNION SELECT * FROM mysql_slow_query_review_history WHERE id = 24413455",
+            "history_recovery_not_single_select",
+        ),
+        (
+            "SELECT * FROM (SELECT * FROM mysql_slow_query_review_history "
+            "WHERE id = 24413454) AS h",
+            "history_recovery_not_single_select",
+        ),
+        (
+            "SELECT * FROM another_table WHERE id = 24413454",
+            "history_recovery_target_forbidden",
+        ),
+        (
+            "SELECT * FROM other_schema.mysql_slow_query_review_history "
+            "WHERE id = 24413454",
+            "history_recovery_target_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_ſlow_query_review_history WHERE id = 24413454",
+            "history_recovery_target_forbidden",
+        ),
+        (
+            "SELECT * FROM `mysql_ſlow_query_review_history` WHERE id = 24413454",
+            "history_recovery_target_forbidden",
+        ),
+        (
+            "SELECT evil.h.* FROM mysql_slow_query_review_history AS h "
+            "WHERE h.id = 24413454",
+            "history_recovery_projection_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "FOR UPDATE",
+            "history_recovery_query_shape_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "LOCK IN SHARE MODE",
+            "history_recovery_query_shape_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "ORDER BY id NULLS FIRST",
+            "history_recovery_order_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "ORDER BY id DESC NULLS LAST",
+            "history_recovery_order_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history USE INDEX (PRIMARY) "
+            "WHERE id = 24413454",
+            "history_recovery_query_shape_forbidden",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
+            "/*!50000 FOR UPDATE */",
+            "history_recovery_sql_parse_failed",
+        ),
+        (
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454; "
+            "SELECT 1",
+            "history_recovery_not_single_statement",
+        ),
+    ),
+)
+def test_history_id_retrieval_rejects_ast_scope_expansion(
+    sql: str,
+    reason_code: str,
+) -> None:
+    retrieval, actual_reason = ArcheryMCPClient.history_id_retrieval_validation(sql)
+
+    assert retrieval is None
+    assert actual_reason == reason_code
 
 
 def test_history_sample_projection_rejects_any_projection_drift() -> None:
@@ -1420,15 +1627,22 @@ async def test_archery_mcp_rejects_unscoped_history_with_extra_arguments() -> No
 async def test_archery_mcp_blocks_nonconforming_sql_before_transport() -> None:
     provider_specific_sql = "CALL provider_specific_diagnostic()"
     argument_calls: list[dict[str, Any]] = []
+    tool_calls: list[str] = []
     client = _client(
         _archery_call_handler(
-            login_result={"structuredContent": {"status": "ok"}, "isError": False},
+            login_result={
+                "structuredContent": {
+                    "status": "failed",
+                    "message": "authentication rejected",
+                },
+                "isError": True,
+            },
             query_result={"structuredContent": {"status": "ok"}, "isError": False},
-            tool_calls=[],
+            tool_calls=tool_calls,
             query_argument_calls=argument_calls,
         ),
         model=PromptFollowingMCPModel(
-            sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,),
+            sequence=(ARCHERY_MCP_QUERY_TOOL_NAME, ARCHERY_MCP_LOGIN_TOOL_NAME),
             query_sqls=(provider_specific_sql,),
         ),
     )
@@ -1436,6 +1650,7 @@ async def test_archery_mcp_blocks_nonconforming_sql_before_transport() -> None:
     result = await client.execute_slow_log_query(TEST_ALERT_OCCURRED_AT)
 
     assert argument_calls == []
+    assert tool_calls == [ARCHERY_MCP_LOGIN_TOOL_NAME]
     assert result.query_completed is False
 
 
@@ -2463,6 +2678,7 @@ async def test_factory_registers_only_model_capable_archery_tool(tmp_path: Path)
 
     assert isinstance(tool, ArcherySlowLogEvidenceTool)
     assert tool.client.window_seconds == 300
+    assert tool.capability == "database.slow_query"
 
     apply_runtime_settings(
         runtime,

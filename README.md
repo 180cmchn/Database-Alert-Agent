@@ -171,6 +171,11 @@ NEW_PROVIDER_MCP_API_KEY=replace-me
 通用 MCP 无需新增 provider 专用 Python 选择分支。其原始响应由确定性通用投影处理；当某类结构需要
 更精确的领域聚合时，在程序投影层新增结构化处理器和测试，结果处理阶段不调用模型。
 
+FlashDuty 告警详情与相似告警都属于 `FLASHDUTY_API`，不是 MCP。相似告警查询随 FlashDuty API
+正常注册，不增加独立的默认关闭开关；它可进入主 Agent 上下文，但只提供历史线索，机械上没有本次
+告警的根因证据资格。只有按明确 MCP provider 契约识别的响应才会进入 generic MCP 投影，未知原生
+工具不会再被兜底描述成“通用 MCP”。
+
 ## Archery MCP
 
 Archery 的作用是查询慢查询日志，提示词位于 `config/mcp/prompts/archery/`。主 Agent 只有在当前
@@ -180,11 +185,23 @@ Archery 的作用是查询慢查询日志，提示词位于 `config/mcp/prompts/
 
 认证、实例枚举、`t_instance_member` 和 `sql_instance` 等导航响应仅保存为内部审计 artifact。
 最终 `mysql_slow_query_review_history` 结果只做 JSON 格式转换后完整透传，不过滤、聚合、排序或
-截断。完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max`
-严格绑定；任何 sample 都不能直接执行，但与完整 sample 绑定的普通 `EXPLAIN` 可以包裹 SELECT、
-WITH 以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断 sample 前缀始终禁止。目标及实际执行 SQL
-核对成功的 EXPLAIN、表结构和索引结果通过独立 `slow_query_analysis` 投影发送给主 Agent；补充调查
-失败只形成证据缺口，不修改或降级 history。
+截断。上游 MCP 目前只返回文本，Archery 内部模型必须通过本地结果评估动作，根据原始响应显式报告
+`complete`、`content_too_long` 或 `uncertain`；Host 不猜测或伪造上游截断字段。命中恢复状态后，
+Host 按稳定 directive ID 将 `workflow.md` 中对应的原文片段追加到下一轮上下文：先查完整 id 清单，
+再逐 id 查询，提高单条结果上限后仍不完整时，最后使用带 `sample_full_length` 的 sample 前缀投影。
+
+动态 MCP Schema 负责普通 required、类型和额外参数校验；专用 Host 只保留只读边界、单语句和数据
+范围等安全门禁。单 id history 恢复使用 MySQL AST 做语义校验，允许大小写、空白、反引号、别名、
+`ORDER BY id ASC|DESC` 和 `LIMIT 1` 等安全等价写法，但仍在 transport 前拒绝 JOIN、子查询、额外
+谓词、错误目标表及未授权 id。所有本地拒绝都会把结构化 reason code、详情和下一步动作返回模型。
+
+完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max` 严格
+绑定；任何 sample 都不能直接执行，但与完整 sample 绑定的普通 `EXPLAIN` 可以包裹 SELECT、WITH
+以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断 sample 前缀始终禁止。目标及实际执行 SQL 核对
+成功的 EXPLAIN、表结构和索引结果分别形成独立 supplemental 证据单元；失败单元只形成证据缺口，
+不修改或降级完整 history 单元。只要仍有 history id 或适用的 supplemental 阶段处于 `PENDING`，
+内部 `finish` 就会被拒绝；全部工作项进入成功、失败、不适用或不可用等终态后即可结束，不要求全部
+成功。新 Archery 父 evidence 只关联调用和原始 artifact，根因必须引用具备资格的具体子单元 ID。
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json

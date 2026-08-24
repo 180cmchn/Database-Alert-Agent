@@ -155,8 +155,7 @@ class RepositoryInvocationStore:
             )
         allowed = {
             ToolInvocationStatus.PENDING: {ToolInvocationStatus.STARTED},
-            ToolInvocationStatus.STARTED: _TERMINAL_INVOCATION_STATUSES
-            - {ToolInvocationStatus.SKIPPED},
+            ToolInvocationStatus.STARTED: _TERMINAL_INVOCATION_STATUSES,
         }
         if proposed.status not in allowed.get(existing.status, set()):
             raise RuntimeError(

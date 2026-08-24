@@ -5,9 +5,12 @@ from app.domain.alert_preprocessing import (
     is_management_platform_collection_sql_cause,
 )
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasisSource,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitStatus,
     InvestigationRun,
     NormalizedAlert,
     Recommendation,
@@ -17,6 +20,16 @@ from app.domain.models import (
     ValidationKind,
     ValidationRecord,
 )
+
+
+def _evidence_units_by_id(
+    evidence: list[EvidenceRecord],
+) -> dict[str, tuple[EvidenceRecord, EvidenceUnit]]:
+    return {
+        str(unit.id): (record, unit)
+        for record in evidence
+        for unit in record.evidence_units
+    }
 
 
 def enforce_post_evidence_root_cause_policy(
@@ -32,6 +45,7 @@ def enforce_post_evidence_root_cause_policy(
     """
 
     evidence_by_id = {str(item.id): item for item in evidence}
+    evidence_units_by_id = _evidence_units_by_id(evidence)
     supported_causes: list[RootCauseAssessment] = []
     management_sql_already_filtered = bool(
         alert and has_management_platform_sql_filter_note(alert.raw_payload)
@@ -47,12 +61,21 @@ def enforce_post_evidence_root_cause_policy(
             continue
         if alert_reason and root_cause.cause.strip().casefold() == alert_reason:
             continue
-        qualified_refs = [
-            evidence_ref
-            for evidence_ref in dict.fromkeys(root_cause.evidence_refs)
-            if (record := evidence_by_id.get(evidence_ref)) is not None
-            and record.is_root_cause_support_eligible()
-        ]
+        qualified_refs: list[str] = []
+        for evidence_ref in dict.fromkeys(root_cause.evidence_refs):
+            unit_entry = evidence_units_by_id.get(evidence_ref)
+            if unit_entry is not None:
+                parent, unit = unit_entry
+                if parent.is_evidence_unit_root_cause_support_eligible(unit):
+                    qualified_refs.append(evidence_ref)
+                    continue
+            record = evidence_by_id.get(evidence_ref)
+            if (
+                record is not None
+                and record.contract_version != EVIDENCE_RECORD_V2
+                and record.is_root_cause_support_eligible()
+            ):
+                qualified_refs.append(evidence_ref)
         if not qualified_refs:
             continue
         supported_causes.append(
@@ -98,6 +121,7 @@ class RuleConclusionValidator:
         issues: list[str] = []
         knowledge_warnings: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
+        evidence_units_by_id = _evidence_units_by_id(evidence)
         has_supported_cause = bool(recommendation.root_causes)
 
         if not recommendation.root_causes:
@@ -123,10 +147,33 @@ class RuleConclusionValidator:
                 issues.append(f"根因 #{index}（{cause_label}）不得绑定采证前假设")
 
             for evidence_ref in dict.fromkeys(root_cause.evidence_refs):
+                unit_entry = evidence_units_by_id.get(evidence_ref)
+                if unit_entry is not None:
+                    parent, unit = unit_entry
+                    if unit.status != EvidenceUnitStatus.SUCCESS:
+                        issues.append(
+                            f"根因 #{index}（{cause_label}）引用的证据单元不是 SUCCESS："
+                            f"{evidence_ref}（{unit.status.value}）"
+                        )
+                        continue
+                    if parent.is_evidence_unit_root_cause_support_eligible(unit):
+                        live_successful_refs.add(evidence_ref)
+                    else:
+                        issues.append(
+                            f"根因 #{index}（{cause_label}）引用了不具备根因资格的"
+                            f"证据单元：{evidence_ref}"
+                        )
+                    continue
                 record = evidence_by_id.get(evidence_ref)
                 if record is None:
                     issues.append(
                         f"根因 #{index}（{cause_label}）引用了不存在的证据：{evidence_ref}"
+                    )
+                    continue
+                if record.contract_version == EVIDENCE_RECORD_V2:
+                    issues.append(
+                        f"根因 #{index}（{cause_label}）引用了 v2 父证据：{evidence_ref}；"
+                        "必须引用其合格 SUCCESS 子证据单元"
                     )
                     continue
                 if record.status != ToolStatus.SUCCESS:
@@ -245,6 +292,7 @@ class RuleConclusionValidator:
                 "checked_root_causes": len(recommendation.root_causes),
                 "checked_steps": len(recommendation.steps),
                 "evidence_count": len(evidence),
+                "evidence_unit_count": len(evidence_units_by_id),
                 "knowledge_count": len(knowledge_matches),
                 "knowledge_warnings": knowledge_warnings,
             },

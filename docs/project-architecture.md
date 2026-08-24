@@ -332,6 +332,13 @@ mindmap
 - “选中后如何查”写在 `workflow`，只引用权威告警字段和远端动态发现的资源，不猜测实例、表、字段或指标。
 - `safety.md` 明确 `read_only: true`。这是 Agent 行为约束；真正的远端权限仍应由 MCP 服务端为 Key
   配置。若 provider 需要更严格的 transport 前门禁，应保留在专用 adapter，不把业务规则写入通用 Host。
+- 需要由运行状态再次提示的 workflow 原文使用稳定 directive ID 标记。Catalog 加载时校验 marker、
+  保存正文 hash 并移除 marker；专用 Harness 只能按结构化状态注入对应原文，不能在代码里维护另一份
+  易漂移的提示词。Archery 的非结构化返回完整性由内部模型通过本地 assessment 动作显式报告，Host
+  不把文本启发式判断伪装成上游结构化字段。
+- 动态 Schema 和 MCP 服务端负责普通 required、类型及额外参数错误；Host 的 transport 前拒绝仅用于
+  真实安全与数据范围边界，并向模型返回 reason code 和明确详情。Archery 单 id history 恢复是特殊的
+  数据范围边界，使用 MySQL AST 接受安全等价 SQL，同时拒绝 JOIN、子查询、额外谓词及清单外 id。
 - 提示词文件只写业务行为，不写 URL、Token、固定生产实例或其它秘密。
 - 修改后至少运行 Catalog、对应 provider、通用 MCP、工作流和 AI 提示词测试；发布时重启 API 与 Worker。
 - 主 Agent 提示词版本会进入运行 manifest。Provider 提示词正文依靠 Git 版本管理；若变更专用 provider 的行为契约，还应同步更新其代码中的 prompt/policy 版本常量和相关测试。
@@ -356,6 +363,11 @@ mindmap
       标记事实 异常和限制
       保留 source paths
       不提出或判断根因
+    分层证据单元
+      父 Evidence 关联调用与 Artifact
+      History 独立资格
+      Supplemental 逐结果独立资格
+      失败单元不降级成功单元
     主 Agent 上下文
       权威告警详情
       命中的参考知识
@@ -392,6 +404,10 @@ mindmap
 - **LangGraph checkpoint**：进程恢复时从持久化状态继续，并校验 manifest digest。
 - **Durable outer dispatch**：外层工具调用先落库再越过远端边界；中断后不盲目重放未知结果。
 - **MCP checkpoint 与 artifact**：远端响应先形成可恢复状态，再进入下一步模型决策；完整结果独立留存。
+- **Provider 终态门禁**：内部 `finish` 只在必要 history id 和适用 supplemental 阶段均离开 `PENDING`
+  后接受；终态可以是成功、失败、不适用或不可用，结束调查不等于所有阶段成功。
+- **证据版本兼容**：`evidence-record/v2` 父记录不可直接支持根因，必须引用 eligible `SUCCESS` 子单元；
+  历史 `evidence-record/v1` 继续按父 ID 校验。
 - **实时轨迹**：事件按 sequence 幂等追加，前端通过增量接口合并 `main_agent` 与 `mcp_internal` 两个 scope。
 - **降级策略**：主模型无法返回合规结果时，固定降级为 `INCONCLUSIVE`，不会猜测根因。
 

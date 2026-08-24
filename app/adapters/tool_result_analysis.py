@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from app.agent_runtime.contracts import ArtifactRef
@@ -14,7 +15,7 @@ from app.application.sanitization import sanitize
 from app.domain.errors import AdvisorError
 from app.domain.models import ToolResultAnalysis, ToolResultObservation
 
-TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v5"
+TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v7"
 _MAX_SNIPPET_CHARS = 800
 _MAX_SELECTED_ITEMS = 20
 _PROMETHEUS_WINDOW_SECONDS = 300
@@ -34,6 +35,52 @@ _ENGINE_ALIASES = {
     "postgresql": ("postgres", "postgresql"),
     "tidb": ("tidb", "tikv", "tiflash"),
 }
+
+
+class ToolResultTransportCategory(StrEnum):
+    """Explicit transport/provider family used to select a projection contract."""
+
+    ARCHERY_MCP = "ARCHERY_MCP"
+    PROMETHEUS_MCP = "PROMETHEUS_MCP"
+    GENERIC_MCP = "GENERIC_MCP"
+    FLASHDUTY_API = "FLASHDUTY_API"
+    ALERT_CONTEXT = "ALERT_CONTEXT"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultProjectionRoute:
+    transport_category: ToolResultTransportCategory
+    subtype: str
+
+
+_FLASHDUTY_ALERT_SOURCES = frozenset({"flashduty_alert", "flashduty_alert_detail"})
+_FLASHDUTY_SIMILAR_SOURCES = frozenset({"flashduty_similar"})
+_FLASHDUTY_API_SOURCES = frozenset(
+    {
+        "alert_platform",
+        "flashduty",
+        "flashduty_api",
+        "flashduty_monitors",
+        *_FLASHDUTY_ALERT_SOURCES,
+        *_FLASHDUTY_SIMILAR_SOURCES,
+    }
+)
+_FLASHDUTY_ALERT_TOOLS = frozenset(
+    {"alert_context", "flashduty_alert", "flashduty_alert_info"}
+)
+_FLASHDUTY_SIMILAR_TOOLS = frozenset(
+    {"flashduty_similar", "query_similar_incidents"}
+)
+
+
+def is_context_only_tool_result(*, tool_name: str, source_system: str) -> bool:
+    """Return whether a known API result may be shown but never support a root cause."""
+
+    normalized_source = source_system.strip().casefold()
+    return normalized_source in _FLASHDUTY_SIMILAR_SOURCES or (
+        normalized_source in _FLASHDUTY_API_SOURCES
+        and tool_name.strip().casefold() in _FLASHDUTY_SIMILAR_TOOLS
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +121,7 @@ _INTERNAL_PROVENANCE_KEYS = frozenset(
         "digest",
         "hash",
         "request_id",
+        "request_ids",
         "sha256",
         "source_artifact",
         "source_artifact_id",
@@ -92,7 +140,12 @@ def _model_visible_projection(value: Any) -> Any:
         for raw_key, child in value.items():
             key = str(raw_key)
             normalized = key.strip().casefold()
-            if normalized.startswith("raw_") or normalized in _INTERNAL_PROVENANCE_KEYS:
+            if (
+                normalized.startswith("raw_")
+                or normalized in _INTERNAL_PROVENANCE_KEYS
+                or normalized.endswith("_request_id")
+                or normalized.endswith("_request_ids")
+            ):
                 continue
             projected = _model_visible_projection(child)
             if projected is not None:
@@ -157,7 +210,7 @@ def _analysis(
 
 
 class DeterministicToolResultProcessor:
-    """Project complete MCP results into bounded, traceable facts in program code.
+    """Project complete tool results into bounded, traceable facts in program code.
 
     The raw EvidenceRecord is retained in its immutable artifact. This program fact
     projection applies provider-specific extraction rules and never makes a causal
@@ -173,15 +226,113 @@ class DeterministicToolResultProcessor:
         raw_result: dict[str, Any],
         artifact: ArtifactRef,
     ) -> ToolResultAnalysis:
-        del tool_name, request
+        del request
         if not isinstance(raw_result, dict):
             raise AdvisorError("complete tool result must be a JSON object")
-        normalized_source = source_system.casefold()
-        if normalized_source in {"archery", "archery_mcp"}:
+        route = self._projection_route(
+            tool_name=tool_name,
+            source_system=source_system,
+            raw_result=raw_result,
+        )
+        if route.transport_category == ToolResultTransportCategory.ARCHERY_MCP:
             return self._process_archery(raw_result, artifact)
-        if normalized_source in {"prometheus", "prometheus_mcp"}:
+        if route.transport_category == ToolResultTransportCategory.PROMETHEUS_MCP:
             return self._process_prometheus(raw_result, artifact)
-        return self._process_generic(raw_result, artifact)
+        if route.transport_category == ToolResultTransportCategory.FLASHDUTY_API:
+            if route.subtype == "alert":
+                return self._process_flashduty_alert(raw_result, artifact)
+            if route.subtype == "similar":
+                return self._process_flashduty_similar(raw_result, artifact)
+            return self._process_flashduty_api(
+                raw_result,
+                artifact,
+                tool_name=route.subtype,
+            )
+        if route.transport_category == ToolResultTransportCategory.ALERT_CONTEXT:
+            return self._process_local_alert_context(raw_result, artifact)
+        return self._process_generic_mcp(
+            raw_result,
+            artifact,
+            source_system=source_system,
+        )
+
+    @classmethod
+    def _projection_route(
+        cls,
+        *,
+        tool_name: str,
+        source_system: str,
+        raw_result: dict[str, Any],
+    ) -> ToolResultProjectionRoute:
+        normalized_tool = tool_name.strip().casefold()
+        normalized_source = source_system.strip().casefold()
+        if normalized_source in {"archery", "archery_mcp"}:
+            return ToolResultProjectionRoute(
+                ToolResultTransportCategory.ARCHERY_MCP,
+                "query",
+            )
+        if normalized_source in {"prometheus", "prometheus_mcp"}:
+            return ToolResultProjectionRoute(
+                ToolResultTransportCategory.PROMETHEUS_MCP,
+                "query",
+            )
+        if normalized_source in _FLASHDUTY_API_SOURCES:
+            if (
+                normalized_source in _FLASHDUTY_SIMILAR_SOURCES
+                or normalized_tool in _FLASHDUTY_SIMILAR_TOOLS
+            ):
+                return ToolResultProjectionRoute(
+                    ToolResultTransportCategory.FLASHDUTY_API,
+                    "similar",
+                )
+            if (
+                normalized_source in _FLASHDUTY_ALERT_SOURCES
+                or normalized_tool in _FLASHDUTY_ALERT_TOOLS
+            ):
+                data = cls._structured_data(raw_result)
+                if (
+                    normalized_source == "alert_platform"
+                    and normalized_tool == "alert_context"
+                    and "flashduty" not in data
+                ):
+                    return ToolResultProjectionRoute(
+                        ToolResultTransportCategory.ALERT_CONTEXT,
+                        "local",
+                    )
+                return ToolResultProjectionRoute(
+                    ToolResultTransportCategory.FLASHDUTY_API,
+                    "alert",
+                )
+            return ToolResultProjectionRoute(
+                ToolResultTransportCategory.FLASHDUTY_API,
+                normalized_tool or "unknown",
+            )
+        if normalized_source.endswith("_mcp") or cls._has_generic_mcp_contract(raw_result):
+            return ToolResultProjectionRoute(
+                ToolResultTransportCategory.GENERIC_MCP,
+                "generic",
+            )
+        safe_source = str(sanitize(source_system))[:128]
+        safe_tool = str(sanitize(tool_name))[:128]
+        raise AdvisorError(
+            "unsupported tool-result projection route: "
+            f"source_system={safe_source!r}, tool_name={safe_tool!r}"
+        )
+
+    @classmethod
+    def _has_generic_mcp_contract(cls, raw_result: dict[str, Any]) -> bool:
+        observations = cls._structured_data(raw_result).get("observations")
+        if not isinstance(observations, list) or not observations:
+            return False
+        return all(
+            isinstance(item, Mapping)
+            and isinstance(item.get("projection"), Mapping)
+            and item["projection"].get("projection_type")
+            == "deterministic_fact_projection"
+            and isinstance(item.get("has_data"), bool)
+            and isinstance(item.get("is_error"), bool)
+            for item in observations
+        )
 
     @staticmethod
     def _structured_data(raw_result: dict[str, Any]) -> dict[str, Any]:
@@ -962,10 +1113,212 @@ class DeterministicToolResultProcessor:
                 )
         return result
 
-    def _process_generic(
+    @staticmethod
+    def _visible_fact(value: Any) -> Any | None:
+        projected = _model_visible_projection(value)
+        if projected in (None, "", [], {}):
+            return None
+        return projected
+
+    def _process_local_alert_context(
         self,
         raw_result: dict[str, Any],
         artifact: ArtifactRef,
+    ) -> ToolResultAnalysis:
+        data = self._structured_data(raw_result)
+        visible = self._visible_fact(data)
+        observations = (
+            [
+                ToolResultObservation(
+                    statement=(
+                        "告警事件随附的本地上下文="
+                        f"{_bounded_json(visible)}"
+                    ),
+                    source_paths=["/structured_data"],
+                )
+            ]
+            if visible is not None
+            else []
+        )
+        return _analysis(
+            artifact=artifact,
+            summary=(
+                "已确定性处理告警事件随附的本地上下文。"
+                if observations
+                else "告警事件没有可投影的本地上下文。"
+            ),
+            observations=observations,
+            limitations=([] if observations else ["告警事件没有可投影的本地上下文。"]),
+            analysis_usable=bool(observations),
+        )
+
+    def _process_flashduty_alert(
+        self,
+        raw_result: dict[str, Any],
+        artifact: ArtifactRef,
+    ) -> ToolResultAnalysis:
+        data = self._structured_data(raw_result)
+        observations: list[ToolResultObservation] = []
+
+        def append_fact(*, label: str, value: Any, path: str) -> None:
+            visible = self._visible_fact(value)
+            if visible is None:
+                return
+            observations.append(
+                ToolResultObservation(
+                    statement=f"FlashDuty API {label}={_bounded_json(visible)}",
+                    source_paths=[path],
+                )
+            )
+
+        append_fact(
+            label="告警的标准化本地上下文",
+            value=data.get("local"),
+            path="/structured_data/local",
+        )
+        flashduty = data.get("flashduty")
+        partial_errors: Mapping[str, Any] | None = None
+        if isinstance(flashduty, Mapping):
+            for field, label in (
+                ("alert", "告警详情"),
+                ("events", "告警事件"),
+                ("feed", "告警动态"),
+                ("incident", "关联故障上下文"),
+            ):
+                append_fact(
+                    label=label,
+                    value=flashduty.get(field),
+                    path=f"/structured_data/flashduty/{field}",
+                )
+            raw_partial_errors = flashduty.get("partial_errors")
+            if isinstance(raw_partial_errors, Mapping) and raw_partial_errors:
+                partial_errors = raw_partial_errors
+
+        for field, label in (
+            ("flashduty_alert_info", "权威告警详情"),
+            ("alert_detail", "标准化告警详情"),
+        ):
+            append_fact(
+                label=label,
+                value=data.get(field),
+                path=f"/structured_data/{field}",
+            )
+
+        limitations: list[str] = []
+        if partial_errors is not None:
+            limitations.append(
+                "FlashDuty API 部分辅助查询不可用="
+                f"{_bounded_json(partial_errors)}"
+            )
+        if not observations:
+            limitations.append("FlashDuty API 没有返回可投影的告警上下文。")
+        return _analysis(
+            artifact=artifact,
+            summary=(
+                f"已确定性处理 FlashDuty API 告警上下文：{len(observations)} 个事实单元进入投影。"
+            ),
+            observations=observations,
+            limitations=limitations,
+            analysis_usable=bool(observations),
+        )
+
+    def _process_flashduty_similar(
+        self,
+        raw_result: dict[str, Any],
+        artifact: ArtifactRef,
+    ) -> ToolResultAnalysis:
+        data = self._structured_data(raw_result)
+        raw_items = data.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        observations: list[ToolResultObservation] = []
+        for index, item in enumerate(items[:_MAX_SELECTED_ITEMS]):
+            visible = self._visible_fact(item)
+            if visible is None:
+                continue
+            observations.append(
+                ToolResultObservation(
+                    statement=(
+                        "FlashDuty API 历史相似告警上下文="
+                        f"{_bounded_json(visible)}"
+                    ),
+                    source_paths=[f"/structured_data/items/{index}"],
+                )
+            )
+
+        limitations = [
+            "FlashDuty API 历史相似告警仅作为调查上下文，不能作为当前告警的根因证据。"
+        ]
+        if len(items) > _MAX_SELECTED_ITEMS:
+            limitations.append(
+                f"主 Agent 仅展示前 {_MAX_SELECTED_ITEMS} 条历史相似告警；"
+                "完整响应保留在审计工件中。"
+            )
+        if not observations:
+            limitations.append("FlashDuty API 没有返回可投影的历史相似告警。")
+        return _analysis(
+            artifact=artifact,
+            summary=(
+                "已确定性处理 FlashDuty API 历史相似告警："
+                f"{len(observations)}/{len(items)} 条进入上下文投影。"
+            ),
+            observations=observations,
+            limitations=limitations,
+            analysis_usable=bool(observations),
+        )
+
+    def _process_flashduty_api(
+        self,
+        raw_result: dict[str, Any],
+        artifact: ArtifactRef,
+        *,
+        tool_name: str,
+    ) -> ToolResultAnalysis:
+        """Project a native FlashDuty API result without MCP-specific assumptions."""
+
+        visible_data = self._visible_fact(self._structured_data(raw_result))
+        fields = (
+            sorted(visible_data.items(), key=lambda item: str(item[0]).casefold())
+            if isinstance(visible_data, Mapping)
+            else []
+        )
+        selected = fields[:_MAX_SELECTED_ITEMS]
+        observations = [
+            ToolResultObservation(
+                statement=(
+                    f"FlashDuty API tool_name={tool_name} 字段 {field}="
+                    f"{_bounded_json(value)}"
+                ),
+                source_paths=[f"/structured_data/{_pointer_token(str(field))}"],
+            )
+            for field, value in selected
+        ]
+        limitations: list[str] = []
+        if len(fields) > _MAX_SELECTED_ITEMS:
+            limitations.append(
+                f"主 Agent 仅展示前 {_MAX_SELECTED_ITEMS} 个 FlashDuty API 事实字段；"
+                "完整响应保留在审计工件中。"
+            )
+        if not observations:
+            limitations.append(
+                f"FlashDuty API 工具 {tool_name} 没有返回可投影的事实字段。"
+            )
+        return _analysis(
+            artifact=artifact,
+            summary=(
+                f"已确定性处理 FlashDuty API 工具 {tool_name}："
+                f"{len(observations)}/{len(fields)} 个事实字段进入投影。"
+            ),
+            observations=observations,
+            limitations=limitations,
+            analysis_usable=bool(observations),
+        )
+
+    def _process_generic_mcp(
+        self,
+        raw_result: dict[str, Any],
+        artifact: ArtifactRef,
+        *,
+        source_system: str,
     ) -> ToolResultAnalysis:
         data = self._structured_data(raw_result)
         raw_observations = data.get("observations")
@@ -1004,7 +1357,8 @@ class DeterministicToolResultProcessor:
             observations.append(
                 ToolResultObservation(
                     statement=(
-                        f"通用 MCP 返回 {len(raw_observations)} 次调用，选择 {len(selected)} 次；"
+                        f"MCP provider={source_system!s} 返回 {len(raw_observations)} 次调用，"
+                        f"选择 {len(selected)} 次；"
                         "保守选择规则：仅 has_data=true 且 is_error!=true 的调用进入主 Agent 投影。"
                     ),
                     source_paths=["/structured_data/observations"],
@@ -1015,7 +1369,8 @@ class DeterministicToolResultProcessor:
             observations.append(
                 ToolResultObservation(
                     statement=(
-                        f"通用 MCP 成功调用 tool_name={item.get('tool_name')!s}；"
+                        f"MCP provider={source_system!s} 成功调用 "
+                        f"tool_name={item.get('tool_name')!s}；"
                         f"程序过滤、聚合和排序后的可追溯事实={_bounded_json(projection)}"
                     ),
                     source_paths=[f"/structured_data/observations/{index}/projection"],
@@ -1028,11 +1383,14 @@ class DeterministicToolResultProcessor:
                 "远端原始响应不进入主 Agent 上下文。"
             )
         if not selected:
-            limitations.append("通用 MCP 没有满足保守选择规则的成功数据调用。")
+            limitations.append(
+                f"MCP provider={source_system!s} 没有满足保守选择规则的成功数据调用。"
+            )
         return _analysis(
             artifact=artifact,
             summary=(
-                f"已确定性处理通用 MCP 返回：{len(selected)}/{len(raw_observations)} "
+                f"已确定性处理 MCP provider={source_system!s} 返回："
+                f"{len(selected)}/{len(raw_observations)} "
                 "次调用进入投影。"
             ),
             observations=observations,

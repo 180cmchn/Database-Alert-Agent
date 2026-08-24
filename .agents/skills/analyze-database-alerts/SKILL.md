@@ -81,7 +81,11 @@ Every MCP is optional. Do not call a server merely because it is configured, do 
 alert-type strategy branch, and do not require every configured MCP to succeed.
 
 For a selected MCP, follow its workflow and use its dynamically discovered tool descriptions and
-Schemas. Pass model-produced arguments through without application-side business rewriting.
+Schemas. Pass model-produced arguments through without application-side business rewriting. Let the
+dynamic Schema and MCP server report ordinary missing-required, type, and extra-argument errors.
+Provider adapters may reject only real read-only, transport-safety, and authorized-data-scope
+violations before transport, and every local rejection must return a structured reason and useful
+next action to the internal model.
 Preserve success, no-data, timeout, cancellation, and failure outcomes honestly. A database outside
 an MCP's configured coverage means that MCP is not applicable; it is not a global investigation
 failure.
@@ -108,8 +112,21 @@ plain EXPLAIN; collect real index metadata as a separate fact. A plain EXPLAIN m
 or DML supported by the target engine, but never execute any history sample directly, including a
 SELECT, and never use EXPLAIN ANALYZE. A sample prefix recovered with `LEFT(sample, '4000')` remains
 valid history evidence but is not complete SQL and must never be explained. Per-id recovery is
-limited to ids returned by the bound window's id listing. Any explicit sample schema, including CTE
+limited to ids returned by the bound window's id listing. Validate these recovery queries with a
+MySQL parser and AST: require one SELECT from the exact history table, one authorized id equality
+predicate, no join, subquery, or extra predicate, and only the full or fixed sample-prefix
+projection. Accept semantically equivalent casing, whitespace, quoting, aliases, optional id
+ordering, and `LIMIT 1`. Any explicit sample schema, including CTE
 physical sources and DML targets, must exactly match the row's `db_max`.
+
+The upstream Archery MCP currently returns unstructured result text. After each history window or
+per-id response, use the local result-assessment action to explicitly classify that raw response as
+`complete`, `content_too_long`, or `uncertain`; never invent an upstream truncation field. The Host
+maps that assessment and other structured runtime states to stable directive IDs and appends the
+exact corresponding fragments extracted from `workflow.md`. For an incomplete window, list ids;
+then fetch each authorized id separately. For an incomplete single-id response, retry once with
+`max_result_chars=24000`; if it is still incomplete, use the program-supplied regular-field
+projection with `LEFT(sample, '4000') AS sample` and `LENGTH(sample) AS sample_full_length`.
 
 From history recovery through supplemental collection, restrict Archery calls to history-recovery
 queries, strict target resolution, real table/column/index metadata queries, and plain EXPLAIN for a
@@ -120,6 +137,12 @@ or index fact. Record the mismatch as a structured evidence gap. All such sequen
 projection rules remain inside the Archery provider workflow and adapter rather than the generic MCP
 Host/runtime. Follow-up successes are supplemental live facts; follow-up failures never invalidate,
 replace, modify, or downgrade history.
+
+Treat unfinished work and failed work differently. `PENDING` means a required history id or an
+applicable supplemental stage has not reached any terminal outcome yet; reject an internal `finish`
+while any such item remains pending and return the missing items and next action. Success, terminal
+failure, unavailable, and not-applicable are all terminal for workflow completion, so finish does
+not claim that every stage succeeded.
 
 Prometheus provides database monitoring metrics. First discover which database targets and metrics
 are actually configured. If the alert database is covered, query relevant metrics for the exact
@@ -148,6 +171,13 @@ passthrough, its usability, or root-cause eligibility. When the history JSON can
 original text is passed through as-is and the record is marked `processing_status=unavailable`.
 Authentication and unrelated navigation responses stay internal.
 
+New Archery results use `evidence-record/v2`. The parent evidence record carries invocation and raw
+artifact provenance only and cannot itself support a root cause. Its stable UUID5 child units qualify
+history and each successful or failed supplemental result independently. Only a `SUCCESS` child with
+`root_cause_eligible=true` may be cited; a failed supplemental child cannot be cited and never
+downgrades an otherwise eligible history child. Historical `evidence-record/v1` records retain their
+parent-id compatibility behavior.
+
 For every other provider, program-side processing may deterministically filter, aggregate, sort,
 calculate statistics, and select traceable snippets. Every projected fact or anomaly must
 reference a real source JSON Pointer. Artifact URIs, IDs, hashes, and complete raw content stay
@@ -170,6 +200,10 @@ A supported root cause must describe a causal mechanism rather than repeat the a
 must cite relevant, successful, target-matched live evidence from the affected system. Knowledge
 alone, an alert threshold, a correlated metric, an MCP catalog response, or an auxiliary lookup does
 not establish a root cause.
+
+FlashDuty alert detail and similar-incident lookup are API tools, not MCP providers. Similar
+incidents remain model-visible historical context but never have root-cause evidence eligibility;
+do not cite them and do not add a dedicated default-off feature switch for them.
 
 Use only this result contract:
 

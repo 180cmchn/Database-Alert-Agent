@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 import pytest
 
@@ -8,10 +8,14 @@ from app.application.validation import (
     enforce_post_evidence_root_cause_policy,
 )
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitKind,
+    EvidenceUnitStatus,
     InvestigationRun,
     KnowledgeExcerpt,
     KnowledgeReference,
@@ -21,6 +25,31 @@ from app.domain.models import (
     RootCauseStatus,
     ToolStatus,
 )
+
+
+def make_evidence_unit(
+    parent: EvidenceRecord,
+    *,
+    unit_key: str,
+    status: EvidenceUnitStatus,
+    eligible: bool,
+) -> EvidenceUnit:
+    return EvidenceUnit(
+        id=EvidenceUnit.build_id(parent.id, unit_key),
+        parent_evidence_id=parent.id,
+        unit_key=unit_key,
+        kind=(EvidenceUnitKind.HISTORY if unit_key == "history" else EvidenceUnitKind.SUPPLEMENTAL),
+        stage=unit_key,
+        status=status,
+        summary=f"{unit_key} result",
+        data={"unit": unit_key},
+        root_cause_eligible=eligible,
+        root_cause_ineligible_reason=None if eligible else "unit_unusable",
+        source_artifact_id=(
+            parent.source_artifact_id or uuid5(parent.id, "test-source-artifact")
+        ),
+        source_paths=[f"/structured_data/{unit_key}"],
+    )
 
 
 def make_alert():  # type: ignore[no-untyped-def]
@@ -75,6 +104,28 @@ def make_live_evidence(
         structured_data=structured_data or {},
         truncated=truncated,
     )
+
+
+def test_similar_incident_context_requires_flashduty_api_identity() -> None:
+    flashduty = make_live_evidence(source_system="flashduty_api").model_copy(
+        update={"tool_name": "flashduty_similar"}
+    )
+    unrelated = make_live_evidence(source_system="other_mcp").model_copy(
+        update={"tool_name": "flashduty_similar"}
+    )
+
+    assert flashduty.is_context_only() is True
+    assert flashduty.is_root_cause_support_eligible() is False
+    assert unrelated.is_context_only() is False
+
+
+def test_direct_flashduty_similar_source_is_always_context_only() -> None:
+    evidence = make_live_evidence(source_system="flashduty_similar").model_copy(
+        update={"tool_name": "legacy_similar_lookup"}
+    )
+
+    assert evidence.is_context_only() is True
+    assert evidence.is_root_cause_support_eligible() is False
 
 
 def test_post_evidence_policy_keeps_only_supported_with_eligible_live_evidence() -> None:
@@ -195,7 +246,10 @@ def test_post_evidence_policy_returns_fixed_no_cause_for_ineligible_evidence(
 def test_post_evidence_policy_accepts_truncated_record_after_complete_fact_projection() -> None:
     evidence = make_live_evidence(
         truncated=True,
-        structured_data={"root_cause_eligible": True, "analyzed_from_complete_raw": True},
+        structured_data={
+            "root_cause_eligible": True,
+            "analyzed_from_complete_raw": True,
+        },
     )
     recommendation = make_recommendation(
         summary="完整分析结果表明长事务导致连接耗尽。",
@@ -215,9 +269,156 @@ def test_post_evidence_policy_accepts_truncated_record_after_complete_fact_proje
     assert result.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY
 
 
+def test_v2_history_and_failed_supplemental_have_independent_eligibility() -> None:
+    parent = make_live_evidence(structured_data={"root_cause_eligible": False})
+    history = make_evidence_unit(
+        parent,
+        unit_key="history",
+        status=EvidenceUnitStatus.SUCCESS,
+        eligible=True,
+    )
+    supplemental = make_evidence_unit(
+        parent,
+        unit_key="indexes",
+        status=EvidenceUnitStatus.FAILED,
+        eligible=False,
+    )
+    parent = parent.model_copy(
+        update={
+            "contract_version": EVIDENCE_RECORD_V2,
+            "source_artifact_id": history.source_artifact_id,
+            "evidence_units": [history, supplemental],
+        }
+    )
+    recommendation = make_recommendation(
+        summary="History facts establish the cause.",
+        root_causes=[
+            RootCauseAssessment(
+                cause="长事务持续占用连接槽位，导致可用连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(history.id), str(supplemental.id), str(parent.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = enforce_post_evidence_root_cause_policy(recommendation, [parent])
+
+    assert result.root_causes[0].evidence_refs == [str(history.id)]
+
+
+def test_v2_rejects_child_bound_to_a_different_artifact() -> None:
+    parent = make_live_evidence(structured_data={"root_cause_eligible": False})
+    history = make_evidence_unit(
+        parent,
+        unit_key="history",
+        status=EvidenceUnitStatus.SUCCESS,
+        eligible=True,
+    )
+
+    with pytest.raises(ValueError, match="source artifact must match"):
+        EvidenceRecord.model_validate(
+            {
+                **parent.model_dump(mode="python"),
+                "contract_version": EVIDENCE_RECORD_V2,
+                "source_artifact_id": uuid4(),
+                "evidence_units": [history],
+            }
+        )
+
+
+def test_v2_eligible_unit_requires_successful_parent_and_policy_checks_parent() -> None:
+    parent = make_live_evidence(
+        status=ToolStatus.FAILED,
+        structured_data={"root_cause_eligible": False},
+    )
+    history = make_evidence_unit(
+        parent,
+        unit_key="history",
+        status=EvidenceUnitStatus.SUCCESS,
+        eligible=True,
+    )
+    invalid_payload = {
+        **parent.model_dump(mode="python"),
+        "contract_version": EVIDENCE_RECORD_V2,
+        "source_artifact_id": history.source_artifact_id,
+        "evidence_units": [history],
+    }
+
+    with pytest.raises(ValueError, match="successful non-context parent"):
+        EvidenceRecord.model_validate(invalid_payload)
+
+    # model_copy deliberately skips validation; the policy must still fail closed
+    # if an in-memory or historical object bypasses model construction validation.
+    invalid_parent = parent.model_copy(
+        update={
+            "contract_version": EVIDENCE_RECORD_V2,
+            "source_artifact_id": history.source_artifact_id,
+            "evidence_units": [history],
+        }
+    )
+    recommendation = make_recommendation(
+        summary="Invalid child qualification.",
+        root_causes=[
+            RootCauseAssessment(
+                cause="无效子单元不应支持根因。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(history.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = enforce_post_evidence_root_cause_policy(recommendation, [invalid_parent])
+
+    assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.root_causes == []
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_rejects_v2_parent_and_failed_unit_references() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent = make_live_evidence(structured_data={"root_cause_eligible": False})
+    failed = make_evidence_unit(
+        parent,
+        unit_key="indexes",
+        status=EvidenceUnitStatus.FAILED,
+        eligible=False,
+    )
+    parent = parent.model_copy(
+        update={
+            "contract_version": EVIDENCE_RECORD_V2,
+            "source_artifact_id": failed.source_artifact_id,
+            "evidence_units": [failed],
+        }
+    )
+    recommendation = make_recommendation(
+        summary="Invalid v2 references.",
+        root_causes=[
+            RootCauseAssessment(
+                cause="索引缺失导致查询变慢。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(parent.id), str(failed.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [parent])
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("v2 父证据" in issue for issue in result.issues)
+    assert any("证据单元不是 SUCCESS" in issue for issue in result.issues)
+
+
 def test_program_projection_usability_does_not_create_a_root_cause() -> None:
     evidence = make_live_evidence(
-        structured_data={"root_cause_eligible": True, "analyzed_from_complete_raw": True}
+        structured_data={
+            "root_cause_eligible": True,
+            "analyzed_from_complete_raw": True,
+        }
     )
     recommendation = make_recommendation(summary="程序事实投影仅返回结构化事实。")
 
@@ -270,8 +471,7 @@ def test_post_evidence_policy_drops_filtered_management_sql_cause() -> None:
         update={
             "raw_payload": {
                 "description": (
-                    "五分钟内慢查询触发值为646个"
-                    "（已排除640个数据库管理平台采集数据用sql）"
+                    "五分钟内慢查询触发值为646个（已排除640个数据库管理平台采集数据用sql）"
                 )
             }
         }

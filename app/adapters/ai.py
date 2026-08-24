@@ -25,11 +25,13 @@ from app.domain.alert_preprocessing import (
 )
 from app.domain.errors import AdvisorError
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AdvisorMetadata,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
+    EvidenceUnit,
     InvestigationDecision,
     InvestigationDecisionResult,
     KnowledgeExcerpt,
@@ -44,7 +46,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v23"
+PROMPT_VERSION = "database-alert-advisor-v24"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -291,6 +293,19 @@ _MODEL_EVIDENCE_FIELDS = (
     "duration_ms",
     "truncated",
 )
+_MODEL_EVIDENCE_UNIT_FIELDS = (
+    "id",
+    "parent_evidence_id",
+    "kind",
+    "stage",
+    "result_index",
+    "status",
+    "summary",
+    "data",
+    "root_cause_eligible",
+    "root_cause_ineligible_reason",
+    "source_paths",
+)
 _MODEL_STATUS_FIELDS = (
     "partial",
     "query_completed",
@@ -528,8 +543,38 @@ def _model_evidence_payload(evidence: EvidenceRecord) -> dict[str, Any]:
         projected = _clean_model_value(serialized[field_name])
         if projected is not _OMIT_MODEL_VALUE:
             payload[field_name] = projected
-    payload["structured_data"] = _model_structured_data_payload(evidence)
+    structured_data = _model_structured_data_payload(evidence)
+    if evidence.contract_version == EVIDENCE_RECORD_V2:
+        payload["contract_version"] = evidence.contract_version
+        tool_analysis = structured_data.get("tool_result_analysis")
+        if isinstance(tool_analysis, dict):
+            tool_analysis.pop("passthrough_payload", None)
+            tool_analysis.pop("slow_query_analysis", None)
+    payload["structured_data"] = structured_data
+    if evidence.evidence_units:
+        payload["evidence_units"] = [
+            _model_evidence_unit_payload(item) for item in evidence.evidence_units
+        ]
     return preprocess_alert_data(payload)
+
+
+def _model_evidence_unit_payload(unit: EvidenceUnit) -> dict[str, Any]:
+    """Expose unit facts and raw JSON paths without internal artifact identity."""
+
+    serialized = unit.model_dump(mode="json")
+    payload: dict[str, Any] = {}
+    for field_name in _MODEL_EVIDENCE_UNIT_FIELDS:
+        if field_name == "source_paths":
+            payload[field_name] = [
+                path
+                for item in serialized[field_name]
+                if (path := _model_source_path(item)) is not None
+            ]
+            continue
+        projected = _clean_model_value(serialized[field_name])
+        if projected is not _OMIT_MODEL_VALUE:
+            payload[field_name] = projected
+    return payload
 
 
 def _accepts_keyword_argument(callable_obj: Any, argument: str) -> bool:
@@ -681,6 +726,13 @@ source_system 不是 alert_platform、结果可用且来源可追溯，并由你
 程序输出只是证据缺失。structured_data.root_cause_eligible 若存在，只表示程序输出是否可供主 Agent
 审阅，不是因果结论，也不表示该记录单独支持任何根因。不得根据 MCP 原始响应中的自报状态或策略
 标记替代事实分析。
+
+contract_version=evidence-record/v2 的父 evidence 只承担工具调用与原始 artifact 的审计关联，不能
+作为根因引用。它的 evidence_units 将 history 与每个 supplemental 结果或失败分别列出；只有
+status=SUCCESS 且 root_cause_eligible=true 的 evidence unit id 可以写入 evidence_refs。某个
+supplemental 单元失败不影响已成功 history 单元的资格。evidence-record/v1 是历史兼容记录，仍按其
+父 evidence id 和原有资格字段处理。query_similar_incidents 返回的相似告警只作为上下文，无论其
+投影是否可用都不能写入 evidence_refs。
 
 证据与告警实例的归属已由程序保障，你不需要也不得自行核验：实时证据的采集目标由程序在采集前
 确定，主机与端口一律取自告警详情的 alarm_host/alarm_port（唯一权威 host/port），不从告警标题

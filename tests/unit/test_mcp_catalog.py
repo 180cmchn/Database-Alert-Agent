@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,41 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert "慢查询日志" in archery.prompts.purpose
     assert "t_instance_member" in archery.prompts.workflow
     assert "mysql_slow_query_review_history" in archery.prompts.workflow
+    assert "<!-- directive:" not in archery.prompts.workflow
+    assert "<!-- /directive -->" not in archery.prompts.workflow
+    authored_archery_workflow = (
+        PROJECT_ROOT / "config/mcp/prompts/archery/workflow.md"
+    ).read_text(encoding="utf-8").strip()
+    assert archery.prompts.workflow_revision == sha256(
+        authored_archery_workflow.encode("utf-8")
+    ).hexdigest()
+    assert archery.prompts.workflow_directives[
+        "archery.history.truncation.fetch_single_id"
+    ].startswith("取得完整 id 清单后")
+    assert archery.prompts.workflow_directives[
+        "archery.history.truncation.project_sample_prefix"
+    ].endswith("绝不能进入 EXPLAIN。")
+    assert set(archery.prompts.workflow_directives) == {
+        "archery.alert.scope",
+        "archery.tools.dynamic_contract",
+        "archery.metadata.archery_target",
+        "archery.metadata.alert_endpoint_mapping",
+        "archery.history.window_query",
+        "archery.history.truncation.list_ids",
+        "archery.history.truncation.fetch_single_id",
+        "archery.history.truncation.retry_high_limit",
+        "archery.history.truncation.project_sample_prefix",
+        "archery.history.complete_before_supplemental",
+        "archery.history.time_bounds",
+        "archery.supplemental.sample_selection",
+        "archery.supplemental.target_binding",
+        "archery.supplemental.table_structure",
+        "archery.supplemental.explain",
+        "archery.supplemental.indexes_and_scope",
+        "archery.supplemental.response_binding",
+        "archery.supplemental.failure_isolation",
+        "archery.history.error_or_empty_completion",
+    }
     assert "read_only: true" in archery.prompts.safety
     assert not hasattr(archery, "read_only")
 
@@ -440,6 +476,117 @@ def test_each_prompt_requires_a_distinct_non_empty_file(tmp_path: Path) -> None:
     )
 
     with pytest.raises(MCPCatalogConfigurationError, match="separate file"):
+        load_mcp_catalog(path)
+
+
+def test_workflow_directives_are_extracted_without_changing_rendered_text(
+    tmp_path: Path,
+) -> None:
+    prompts = _write_prompts(tmp_path)
+    workflow_path = tmp_path / prompts["workflow"]
+    authored_workflow = (
+        "Before.\n"
+        "<!-- directive:id=example.history.list_ids -->\n"
+        "List ids first.\n"
+        "Keep the bounded window.\n"
+        "<!-- /directive -->\n"
+        "After."
+    )
+    workflow_path.write_text(authored_workflow + "\n", encoding="utf-8")
+    path = _write_settings(
+        tmp_path,
+        {
+            "example": {
+                "url": "${EXAMPLE_MCP_URL}",
+                "headers": {"Authorization": "${EXAMPLE_MCP_API_KEY}"},
+                "prompts": prompts,
+            }
+        },
+    )
+
+    bundle = load_mcp_catalog(path).require("example").prompts
+
+    assert bundle.workflow == (
+        "Before.\nList ids first.\nKeep the bounded window.\nAfter."
+    )
+    assert bundle.workflow_directives == {
+        "example.history.list_ids": "List ids first.\nKeep the bounded window."
+    }
+    assert "<!-- directive:" not in bundle.workflow
+    assert "<!-- /directive -->" not in bundle.workflow
+    assert bundle.workflow_revision == sha256(
+        authored_workflow.encode("utf-8")
+    ).hexdigest()
+
+    renamed_workflow = authored_workflow.replace(
+        "example.history.list_ids",
+        "example.history.enumerate_ids",
+    )
+    workflow_path.write_text(renamed_workflow + "\n", encoding="utf-8")
+    renamed_bundle = load_mcp_catalog(path).require("example").prompts
+
+    assert renamed_bundle.workflow == bundle.workflow
+    assert renamed_bundle.workflow_revision != bundle.workflow_revision
+    assert tuple(renamed_bundle.workflow_directives) == (
+        "example.history.enumerate_ids",
+    )
+
+
+@pytest.mark.parametrize(
+    ("workflow", "expected_message"),
+    (
+        (
+            "<!-- directive:id=example.one -->\nOne.\n<!-- /directive -->\n"
+            "<!-- directive:id=example.one -->\nAgain.\n<!-- /directive -->",
+            "directive 'example.one' is duplicated",
+        ),
+        (
+            "<!-- directive:id=example.one -->\n"
+            "<!-- directive:id=example.two -->\nTwo.\n<!-- /directive -->\n"
+            "<!-- /directive -->",
+            "directives cannot be nested",
+        ),
+        (
+            "<!-- directive:id=example.one -->\n \n<!-- /directive -->",
+            "directive 'example.one' is empty",
+        ),
+        (
+            "<!-- directive:id=example.one -->\nOne.",
+            "directive 'example.one' is not closed",
+        ),
+        (
+            "Before.\n<!-- /directive -->",
+            "unmatched directive end",
+        ),
+        (
+            "<!-- directive:id=Example.Invalid -->\nOne.\n<!-- /directive -->",
+            "malformed directive marker",
+        ),
+        (
+            "<!-- directive:id=example.one -->\nOne.\n<!-- /directive-->",
+            "malformed directive marker",
+        ),
+    ),
+)
+def test_catalog_rejects_malformed_workflow_directives(
+    tmp_path: Path,
+    workflow: str,
+    expected_message: str,
+) -> None:
+    prompts = _write_prompts(tmp_path)
+    (tmp_path / prompts["workflow"]).write_text(workflow, encoding="utf-8")
+    path = _write_settings(
+        tmp_path,
+        {
+            "example": {
+                "url": "${EXAMPLE_MCP_URL}",
+                "headers": {"Authorization": "${EXAMPLE_MCP_API_KEY}"},
+                "prompts": prompts,
+            }
+        },
+    )
+
+    with pytest.raises(MCPCatalogConfigurationError, match=expected_message):
         load_mcp_catalog(path)
 
 

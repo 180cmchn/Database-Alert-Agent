@@ -15,16 +15,78 @@ from app.adapters.ai import (
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.domain.errors import AdvisorError
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitKind,
+    EvidenceUnitStatus,
     KnowledgeExcerpt,
     KnowledgeReference,
     Recommendation,
     RecommendationStep,
     ToolStatus,
 )
+
+
+def test_v2_model_evidence_dto_exposes_units_without_internal_artifact_identity() -> None:
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery projection",
+        structured_data={
+            "root_cause_eligible": False,
+            "tool_result_analysis": {
+                "summary": "Projection",
+                "observations": [],
+                "anomalies": [],
+                "limitations": [],
+                "analysis_usable": True,
+                "source_coverage_complete": True,
+                "provider": "deterministic_host",
+                "model": "none",
+                "prompt_version": "test-v1",
+                "passthrough_payload": {"rows": [{"id": 41}]},
+                "slow_query_analysis": {"status": "failed"},
+            },
+        },
+    )
+    artifact_id = uuid4()
+    history = EvidenceUnit(
+        id=EvidenceUnit.build_id(parent.id, "history"),
+        parent_evidence_id=parent.id,
+        unit_key="history",
+        kind=EvidenceUnitKind.HISTORY,
+        stage="history",
+        status=EvidenceUnitStatus.SUCCESS,
+        summary="History complete",
+        data={"rows": [{"id": 41}]},
+        root_cause_eligible=True,
+        source_artifact_id=artifact_id,
+        source_paths=["/structured_data/final_result_payload"],
+    )
+    parent = parent.model_copy(
+        update={
+            "contract_version": EVIDENCE_RECORD_V2,
+            "source_artifact_id": artifact_id,
+            "evidence_units": [history],
+        }
+    )
+
+    payload = ai_module._model_evidence_payload(parent)
+
+    assert payload["contract_version"] == EVIDENCE_RECORD_V2
+    assert payload["evidence_units"][0]["id"] == str(history.id)
+    assert payload["evidence_units"][0]["parent_evidence_id"] == str(parent.id)
+    assert payload["evidence_units"][0]["data"] == {"rows": [{"id": 41}]}
+    analysis = payload["structured_data"]["tool_result_analysis"]
+    assert "passthrough_payload" not in analysis
+    assert "slow_query_analysis" not in analysis
+    assert str(artifact_id) not in json.dumps(payload)
 
 
 def make_alert():

@@ -504,6 +504,17 @@ class _LocalResultScenario(_NativePreparedScenario):
         )
 
 
+class _SkippedLocalResultScenario(_LocalResultScenario):
+    def on_result(
+        self,
+        state: _ScenarioState,
+        call: PreparedCall,
+        result: Any,
+    ) -> ScenarioTransition[_ScenarioState, dict[str, Any]]:
+        transition = super().on_result(state, call, result)
+        return replace(transition, status=ToolInvocationStatus.SKIPPED)
+
+
 def _tool(
     *,
     input_schema: dict[str, Any] | None = None,
@@ -594,6 +605,28 @@ async def test_local_prepared_result_never_crosses_transport_or_remote_budget() 
         for snapshot in checkpoints
     )
     assert response_store.responses == []
+
+
+@pytest.mark.asyncio
+async def test_skipped_scenario_transition_emits_skipped_terminal_event() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    session = _TrackingSession()
+
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("locally-skipped"), _finish()]),
+        scenario=_SkippedLocalResultScenario(),
+        event_sink=sink,
+        budget=_budget(),
+    ).run(run_id=run_id)
+
+    assert session.call_calls == 0
+    assert result.invocations[0].status == ToolInvocationStatus.SKIPPED
+    assert result.observations[0].status == ToolInvocationStatus.SKIPPED
+    assert AgentEventKind.TOOL_INVOCATION_SKIPPED in {
+        event.kind for event in await sink.read(run_id)
+    }
 
 
 @pytest.mark.asyncio

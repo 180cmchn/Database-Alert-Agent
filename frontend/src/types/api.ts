@@ -161,8 +161,28 @@ export interface ProgressRecord {
 
 export type ToolStatus = "SUCCESS" | "NO_DATA" | "TIMEOUT" | "FAILED" | "SKIPPED";
 
+export type EvidenceUnitStatus = "SUCCESS" | "FAILED" | "NO_DATA" | "NOT_APPLICABLE";
+
+export interface EvidenceUnit {
+  contract_version: "evidence-unit/v2";
+  id: string;
+  parent_evidence_id: string;
+  unit_key: string;
+  kind: "HISTORY" | "SUPPLEMENTAL";
+  stage: string;
+  result_index?: number | null;
+  status: EvidenceUnitStatus;
+  summary: string;
+  data: Record<string, unknown>;
+  root_cause_eligible: boolean;
+  root_cause_ineligible_reason?: string | null;
+  source_artifact_id: string;
+  source_paths: string[];
+}
+
 export interface EvidenceRecord {
   id: string;
+  contract_version: "evidence-record/v1" | "evidence-record/v2";
   run_id: string;
   tool_name: string;
   source_system: string;
@@ -175,6 +195,8 @@ export interface EvidenceRecord {
   collected_at: string;
   duration_ms: number;
   truncated: boolean;
+  source_artifact_id?: string | null;
+  evidence_units: EvidenceUnit[];
 }
 
 export interface ValidationRecord {

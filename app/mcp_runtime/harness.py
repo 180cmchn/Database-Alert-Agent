@@ -938,8 +938,11 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if transition.status not in {
                 ToolInvocationStatus.SUCCEEDED,
                 ToolInvocationStatus.NO_DATA,
+                ToolInvocationStatus.SKIPPED,
             }:
-                raise ValueError("successful scenario transition must be SUCCEEDED or NO_DATA")
+                raise ValueError(
+                    "successful scenario transition must be SUCCEEDED, NO_DATA, or SKIPPED"
+                )
         except Exception as exc:
             try:
                 result_error_directive = self.scenario.result_error_directive(
@@ -1017,6 +1020,8 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         kind = (
             AgentEventKind.TOOL_INVOCATION_NO_DATA
             if completed.status == ToolInvocationStatus.NO_DATA
+            else AgentEventKind.TOOL_INVOCATION_SKIPPED
+            if completed.status == ToolInvocationStatus.SKIPPED
             else AgentEventKind.TOOL_INVOCATION_SUCCEEDED
         )
         await self._emit_invocation(ctx, completed, kind)
