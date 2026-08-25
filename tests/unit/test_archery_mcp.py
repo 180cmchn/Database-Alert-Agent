@@ -2416,7 +2416,7 @@ async def test_archery_evidence_tool_ignores_parameters_and_uses_alert_detail_co
     assert "返回 0 行" in summary
     assert f"实例 ID {TEST_INSTANCE_ID}" in summary
     assert f"慢日志表 {ARCHERY_SLOW_LOG_TABLE}" in summary
-    assert "实际执行 SQL 已由 Archery 回显并与模型提交一致" in summary
+    assert "实际执行 SQL 已由 Archery 回显并通过 provider 执行契约核验" in summary
     assert "可能被截断" not in summary
     assert data["schema_version"] == ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION
     assert data["query_completed"] is True
@@ -3061,6 +3061,93 @@ def test_sql_equivalence_preserves_optimizer_hint_identity() -> None:
     assert not ArcheryMCPClient.sql_equivalent(
         expected,
         "SELECT /*+ INDEX(orders idx_customer) */ * FROM orders",
+    )
+
+
+def test_normalized_query_accepts_provider_appended_declared_limit() -> None:
+    requested = (
+        "SELECT f_instance_id FROM t_instance_member "
+        "WHERE f_ip = '100.84.97.117' AND f_port = '3306'"
+    )
+    actual = requested + " LIMIT 100"
+    embedded = {
+        "full_sql": actual.lower().replace("select", "SELECT", 1) + ";",
+        "rows": [[3]],
+        "column_list": ["f_instance_id"],
+    }
+    wrapped = (
+        "SQL query executed.\n"
+        f"Executed SQL: {actual}\n\n"
+        "Result:\n" + json.dumps(embedded)
+    )
+    response = {
+        "response": {
+            "result": wrapped.replace("Executed SQL:", "执行的SQL：").replace(
+                "Result:", "结果："
+            )
+        }
+    }
+
+    payload, executed_sql, actual_sql_verified = (
+        ArcheryMCPClient.normalize_query_payload(
+            response,
+            requested_sql=requested,
+            provider_limit_num=100,
+        )
+    )
+    _payload_without_contract, _executed_without_contract, verified_without_contract = (
+        ArcheryMCPClient.normalize_query_payload(
+            response,
+            requested_sql=requested,
+        )
+    )
+
+    assert payload["rows"] == [[3]]
+    assert payload["column_list"] == ["f_instance_id"]
+    assert executed_sql == embedded["full_sql"]
+    assert actual_sql_verified is True
+    assert verified_without_contract is False
+
+
+@pytest.mark.parametrize(
+    ("requested", "actual", "provider_limit_num"),
+    [
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3",
+            "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 100",
+            20,
+        ),
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3",
+            "SELECT host, port FROM sql_instance WHERE id = 4 LIMIT 100",
+            100,
+        ),
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3",
+            "SELECT id, host, port FROM sql_instance WHERE id = 3 LIMIT 100",
+            100,
+        ),
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 1",
+            "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 100",
+            100,
+        ),
+        (
+            "EXPLAIN SELECT * FROM orders WHERE id = 3",
+            "EXPLAIN SELECT * FROM orders WHERE id = 3 LIMIT 100",
+            100,
+        ),
+    ],
+)
+def test_execution_sql_equivalence_rejects_unbound_provider_rewrites(
+    requested: str,
+    actual: str,
+    provider_limit_num: int,
+) -> None:
+    assert not ArcheryMCPClient.execution_sql_equivalent(
+        requested,
+        actual,
+        provider_limit_num=provider_limit_num,
     )
 
 

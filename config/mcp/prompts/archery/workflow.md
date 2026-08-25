@@ -47,7 +47,7 @@
 13. 索引优先查询 `information_schema.STATISTICS`，避免 `SHOW INDEX` 被 MCP 自动追加 LIMIT 后产生语法错误。结构和索引条件必须使用第 10、11 条得到的真实数据库及表名。从 history 恢复开始到补充阶段结束，调用范围只允许：history 恢复查询、严格目标解析、真实表字段/索引元数据查询，以及已绑定 sample 的普通 EXPLAIN。不得直接执行 sample，也不得调用任意业务 SELECT、其它管理语句或与本次调查无关的探测。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.response_binding -->
-14. 收集补充结果时，必须使用 MCP 返回中的实际执行 SQL 和实际目标与请求、绑定 sample 及第 10 条目标进行核对。若返回明确回显的 SQL、物理 schema/表名、`instance_id`、host:port 或数据库与绑定内容不一致，不得将该结果投影为该 history sample 的 EXPLAIN、表结构或索引事实；将不一致记录为对应补充阶段的证据缺口。
+14. 收集补充结果时，必须使用 MCP 返回中的实际执行 SQL 和实际目标与请求、绑定 sample 及第 10 条目标进行核对。对于原请求不含顶层 `LIMIT` 的单一 `SELECT`，若唯一差异是 MCP 在语句末尾自动追加 `LIMIT N`，且 `N` 与该次调用显式提交的 `limit_num` 精确一致，这是已声明的 provider 结果限流，不视为 SQL 不一致；该例外不适用于已有顶层 `LIMIT` 的请求、`EXPLAIN` 或任何其它改写。若返回明确回显的 SQL、物理 schema/表名、`instance_id`、host:port 或数据库存在其它不一致，不得将该结果投影为该 history sample 的 EXPLAIN、表结构或索引事实；将不一致记录为对应补充阶段的证据缺口。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.failure_isolation -->
 15. EXPLAIN、目标解析、表结构、索引或第 14 条核对失败时，不要丢弃、替换、修改或降级已经取得的 history。继续尝试其它仍安全且有价值的允许阶段，并保留真实 `stage`、`target`、错误类型、reason code 和错误详情。权限、allowlist、表不存在、目标版本不支持 EXPLAIN、sample 解析失败或结果核对失败都只是补充分析缺口，不得改变 history 的状态、内容、可用性或根因资格。

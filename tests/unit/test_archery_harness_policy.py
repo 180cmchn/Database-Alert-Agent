@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -60,6 +61,93 @@ def _terminal_query_failure(sql: str) -> ReplayCallFixture:
             }
         },
     )
+
+
+def test_provider_appended_limit_preserves_metadata_resolution_lineage() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    target = (17, "archery")
+    member_sql = (
+        "SELECT f_instance_id FROM t_instance_member "
+        "WHERE f_ip = 'db-1.example' AND f_port = 3306"
+    )
+    instance_sql = "SELECT host, port FROM sql_instance WHERE id = 3"
+    arguments = {**TARGET_ARGUMENTS, "limit_num": 100}
+    state.table_columns = {
+        target: {
+            "t_instance_member": {"f_instance_id", "f_ip", "f_port"},
+            "sql_instance": {"id", "host", "port"},
+        }
+    }
+
+    def prepare(sql: str, call_id: str) -> Any:
+        return scenario.prepare_call(
+            SimpleNamespace(
+                tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+                objective="Resolve the alert endpoint through Archery metadata",
+                hypothesis_ids=(),
+                arguments={**arguments, "sql_content": sql},
+                call_id=call_id,
+                request_id=f"request-{call_id}",
+                provider_output_items=(),
+            ),
+            state=state,
+        )
+
+    def provider_result(
+        sql: str,
+        *,
+        columns: list[str],
+        rows: list[list[Any]],
+    ) -> dict[str, Any]:
+        actual_sql = f"{sql} LIMIT 100"
+        embedded = {
+            "full_sql": actual_sql.lower().replace("select", "SELECT", 1) + ";",
+            "rows": rows,
+            "column_list": columns,
+            "status": None,
+        }
+        result_text = (
+            "SQL 查询已执行。\n已优化：已自动添加 LIMIT 100\n\n"
+            f"执行的SQL：{actual_sql}\n\n"
+            f"返回 {len(rows)} 行。\n结果：\n"
+            + json.dumps(embedded, ensure_ascii=False)
+        )
+        return {"structuredContent": {"response": {"result": result_text}}}
+
+    member = prepare(member_sql, "provider-limited-member")
+    assert member.local_result is None
+    scenario.on_result(
+        state,
+        member,
+        provider_result(
+            member_sql,
+            columns=["f_instance_id"],
+            rows=[[3]],
+        ),
+    )
+
+    assert state.member_instance_ids[target] == {3}
+    assert state.metadata_resolution_steps[target] == ["t_instance_member"]
+
+    instance = prepare(instance_sql, "provider-limited-instance")
+    assert instance.local_result is None
+    scenario.on_result(
+        state,
+        instance,
+        provider_result(
+            instance_sql,
+            columns=["host", "port"],
+            rows=[["db-history.example", 3306]],
+        ),
+    )
+
+    assert state.resolved_endpoints[target] == {"db-history.example:3306"}
+    assert state.metadata_resolution_steps[target] == [
+        "t_instance_member",
+        "sql_instance",
+    ]
+    assert all(entry["outcome"] == "ok" for entry in state.query_trace)
 
 
 @pytest.mark.parametrize(

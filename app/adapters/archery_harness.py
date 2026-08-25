@@ -4274,6 +4274,7 @@ class ArcheryHarnessScenario:
                 payload,
                 requested_sql=requested_sql,
                 supplemental_text=text_blocks,
+                provider_limit_num=call.effective_arguments.get("limit_num"),
             )
         )
         deferred_binding = call.metadata.get("deferred_target_binding")
@@ -4306,7 +4307,13 @@ class ArcheryHarnessScenario:
                 failure=mismatch,
             )
 
-        result_sql = executed_sql or requested_sql
+        result_sql = (
+            requested_sql
+            if executed_sql is not None
+            and actual_sql_verified
+            and not self.client.sql_equivalent(requested_sql, executed_sql)
+            else executed_sql or requested_sql
+        )
         supplemental_stage = self._slow_query_analysis_stage(call)
         if (
             self._has_history_result(state)

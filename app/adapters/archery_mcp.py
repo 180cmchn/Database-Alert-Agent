@@ -1779,6 +1779,36 @@ class ArcheryMCPClient:
         )
 
     @classmethod
+    def execution_sql_equivalent(
+        cls,
+        expected: str,
+        actual: str,
+        *,
+        provider_limit_num: Any = None,
+    ) -> bool:
+        """Accept only the provider's declared, result-bounding SELECT rewrite."""
+
+        if cls.sql_equivalent(expected, actual):
+            return True
+        provider_limit = cls._coerce_positive_integer(provider_limit_num)
+        statement = cls._single_sql_statement(expected)
+        if provider_limit is None or statement is None:
+            return False
+        try:
+            statements = parse(statement, read="mysql")
+        except (ParseError, TokenError):
+            return False
+        if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+            return False
+        tree = statements[0]
+        if tree.args.get("limit") is not None or tree.args.get("offset") is not None:
+            return False
+        return cls.sql_equivalent(
+            f"{statement} LIMIT {provider_limit}",
+            actual,
+        )
+
+    @classmethod
     def matching_discovered_table(
         cls,
         sql: str,
@@ -2861,6 +2891,7 @@ class ArcheryMCPClient:
         *,
         requested_sql: str,
         supplemental_text: Sequence[str] = (),
+        provider_limit_num: Any = None,
     ) -> tuple[dict[str, Any], str | None, bool]:
         """Extract Archery's text-wrapped SQL result without constraining the Agent."""
 
@@ -2918,7 +2949,11 @@ class ArcheryMCPClient:
 
         executed_sql = declared_sqls[0] if declared_sqls else None
         actual_sql_verified = bool(declared_sqls) and all(
-            cls.sql_equivalent(requested_sql, actual_sql)
+            cls.execution_sql_equivalent(
+                requested_sql,
+                actual_sql,
+                provider_limit_num=provider_limit_num,
+            )
             for actual_sql in declared_sqls
         )
         if actual_sql_verified:
@@ -3384,7 +3419,7 @@ class ArcherySlowLogEvidenceTool:
         database_summary = result.db_name or "数据库名未解析"
         table_summary = result.table_name or "慢日志表名未解析"
         sql_summary = (
-            "实际执行 SQL 已由 Archery 回显并与模型提交一致"
+            "实际执行 SQL 已由 Archery 回显并通过 provider 执行契约核验"
             if result.actual_sql_verified
             else "Archery 未返回可与模型提交内容核对的实际执行 SQL"
         )
