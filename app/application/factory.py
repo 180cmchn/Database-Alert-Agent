@@ -197,6 +197,9 @@ def _build_archery_mcp_tool(
             },
             window_seconds=settings.archery_slow_log_window_seconds,
             timeout_seconds=settings.archery_mcp_timeout_seconds,
+            investigation_budget_seconds=(
+                settings.archery_investigation_budget_seconds
+            ),
             harness_runtime_dependencies=(
                 ArcheryHarnessRuntimeDependencies(repository)
                 if repository is not None

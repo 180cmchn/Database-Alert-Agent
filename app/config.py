@@ -190,10 +190,10 @@ class Settings(BaseSettings):
     )
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
-    # A slow-query investigation is an agent loop, not one MCP request. Keep its
-    # outer ToolExecutor deadline above a single MCP read timeout so the detail
-    # page reports the actual Archery/agent failure instead of a generic timeout.
-    archery_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
+    # The Host stops the Archery investigation cleanly before the outer tool
+    # deadline so compact history evidence survives an enrichment timeout.
+    archery_investigation_budget_seconds: float = Field(default=120, gt=0, le=1200)
+    archery_mcp_tool_timeout_seconds: float = Field(default=150, gt=0, le=1200)
 
     # Prometheus is a deployment-only SSE MCP evidence source. Its endpoint and
     # authentication material must not be changed through the admin API.
@@ -388,6 +388,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "FLASHDUTY_POLL_LOOKBACK_SECONDS must be greater than or equal to "
                 "FLASHDUTY_POLL_INTERVAL_SECONDS when polling is enabled"
+            )
+        if (
+            self.archery_mcp_tool_timeout_seconds
+            <= self.archery_investigation_budget_seconds
+        ):
+            raise ValueError(
+                "ARCHERY_MCP_TOOL_TIMEOUT_SECONDS must exceed "
+                "ARCHERY_INVESTIGATION_BUDGET_SECONDS"
             )
         return self
 

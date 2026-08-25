@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
@@ -66,8 +67,15 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v30"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v5"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v31"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v6"
+ARCHERY_HISTORY_PAGE_SIZE: Final = 100
+ARCHERY_HISTORY_RESULT_CHARS: Final = 12_000
+ARCHERY_SAMPLE_FULL_LENGTH_LIMIT: Final = 12_000
+ARCHERY_SAMPLE_STRUCTURE_CHARS: Final = 12_000
+ARCHERY_SAMPLE_CHUNK_RESULT_CHARS: Final = 12_000
+ARCHERY_SAMPLE_CHUNK_RESERVE_CHARS: Final = 2_000
+ARCHERY_SAMPLE_CHUNK_MIN_CHARS: Final = 1_000
 _MISSING: Final = object()
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -79,6 +87,25 @@ _SLOW_QUERY_IDENTITY_FIELDS: Final = (
     "sample",
     "ts_min",
     "ts_max",
+)
+_SLOW_QUERY_PIPELINE_FIELDS: Final = (
+    "id",
+    "sample_full_length",
+    "sample_representation",
+    "sample_structure_executable",
+    "sample_source_reconstructed",
+    "sample_sha256",
+    "sample_statement_type",
+    "sample_table_references",
+    "sample_in_lists",
+    "sample_recovery_status",
+    "priority",
+    "query_time_max_rank",
+    "query_time_sum_rank",
+    "explain_status",
+    "explain_source_sql_exact",
+    "explain_reused_from_history_id",
+    "explain_failure_reason",
 )
 _SLOW_QUERY_NUMERIC_FIELDS: Final = {"ts_cnt"}
 _SLOW_QUERY_NUMERIC_PREFIXES: Final = (
@@ -118,6 +145,15 @@ _HISTORY_SAMPLE_PROJECTION_EXPRESSIONS: Final = (
     "Filesort_cnt",
     "Bytes_sum",
     "LEFT(sample, '4000') AS sample",
+    "LENGTH(sample) AS sample_full_length",
+)
+_HISTORY_RANKING_PROJECTION_EXPRESSIONS: Final = (
+    "id",
+    "Query_time_max",
+    "Query_time_sum",
+)
+_HISTORY_COMPACT_PROJECTION_EXPRESSIONS: Final = (
+    *_HISTORY_SAMPLE_PROJECTION_EXPRESSIONS[:-2],
     "LENGTH(sample) AS sample_full_length",
 )
 
@@ -376,6 +412,8 @@ class ArcheryMCPClient:
         *,
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         timeout_seconds: float = 60,
+        investigation_budget_seconds: float = 120,
+        deterministic_history_pipeline: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
         harness_connector: Any | None = None,
         harness_runtime_dependencies: Any | None = None,
@@ -397,10 +435,16 @@ class ArcheryMCPClient:
             raise ArcheryMCPConfigurationError(
                 "Archery slow-log window must be between 60 and 86400 seconds"
             )
+        if investigation_budget_seconds <= 0:
+            raise ArcheryMCPConfigurationError(
+                "Archery investigation budget must be greater than zero"
+            )
         self.mcp_url = server.url.strip()
         self.slow_log_time_column = ARCHERY_SLOW_LOG_TIME_COLUMN
         self.window_seconds = window_seconds
         self.timeout_seconds = timeout_seconds
+        self.investigation_budget_seconds = investigation_budget_seconds
+        self.deterministic_history_pipeline = deterministic_history_pipeline
         self.model = model
         self.prompts = server.prompts
         self._headers = dict(server.headers)
@@ -429,6 +473,8 @@ class ArcheryMCPClient:
         environment: Mapping[str, str],
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         timeout_seconds: float = 60,
+        investigation_budget_seconds: float = 120,
+        deterministic_history_pipeline: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
         harness_runtime_dependencies: Any | None = None,
     ) -> ArcheryMCPClient:
@@ -442,6 +488,8 @@ class ArcheryMCPClient:
             model,
             window_seconds=window_seconds,
             timeout_seconds=timeout_seconds,
+            investigation_budget_seconds=investigation_budget_seconds,
+            deterministic_history_pipeline=deterministic_history_pipeline,
             transport=transport,
             harness_runtime_dependencies=harness_runtime_dependencies,
         )
@@ -641,6 +689,20 @@ class ArcheryMCPClient:
         return retrieval
 
     @classmethod
+    def history_sample_chunk_retrieval(
+        cls,
+        sql: str,
+    ) -> tuple[int, int, int] | None:
+        retrieval = cls.history_id_retrieval(sql)
+        if retrieval is None or not retrieval[1].startswith("sample_chunk:"):
+            return None
+        try:
+            _, raw_offset, raw_size = retrieval[1].split(":", 2)
+            return retrieval[0], int(raw_offset), int(raw_size)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
     def history_id_retrieval_validation(
         cls,
         sql: str,
@@ -759,6 +821,15 @@ class ArcheryMCPClient:
             qualifier=qualifier,
         ):
             projection_kind = "sample_prefix"
+        elif len(projections) == 1 and is_column(projections[0], "sample"):
+            projection_kind = "sample"
+        elif (
+            chunk := cls._history_sample_chunk_projection(
+                projections,
+                qualifier=qualifier,
+            )
+        ) is not None:
+            projection_kind = f"sample_chunk:{chunk[0]}:{chunk[1]}"
         if projection_kind is None:
             return None, "history_recovery_projection_forbidden"
 
@@ -949,6 +1020,150 @@ class ArcheryMCPClient:
         expressions.append(expression)
         return tuple(expressions)
 
+    @classmethod
+    def _history_sample_chunk_projection(
+        cls,
+        projections: Sequence[exp.Expression],
+        *,
+        qualifier: str,
+    ) -> tuple[int, int] | None:
+        if len(projections) != 1 or not isinstance(projections[0], exp.Alias):
+            return None
+        projection = projections[0]
+        if cls._ascii_identifier(projection.alias) != "sample_chunk":
+            return None
+        substring = projection.this
+        if not isinstance(substring, exp.Substring):
+            return None
+        sample = substring.this
+        column_name = (
+            cls._ascii_identifier(sample.name) if isinstance(sample, exp.Column) else None
+        )
+        column_table = (
+            cls._ascii_identifier(sample.table)
+            if isinstance(sample, exp.Column) and sample.table
+            else None
+        )
+        if not (
+            isinstance(sample, exp.Column)
+            and column_name == "sample"
+            and not sample.db
+            and not sample.catalog
+            and (not sample.table or column_table == qualifier)
+        ):
+            return None
+        start = substring.args.get("start")
+        length = substring.args.get("length")
+        if not (
+            isinstance(start, exp.Literal)
+            and start.is_int
+            and isinstance(length, exp.Literal)
+            and length.is_int
+        ):
+            return None
+        offset = cls._coerce_positive_integer(start.this)
+        size = cls._coerce_positive_integer(length.this)
+        if offset is None or size is None or size > cls.history_sample_chunk_size():
+            return None
+        return offset, size
+
+    @staticmethod
+    def history_sample_chunk_size(
+        max_result_chars: int = ARCHERY_SAMPLE_CHUNK_RESULT_CHARS,
+    ) -> int:
+        """Use most of the MCP envelope while reserving room for JSON metadata."""
+
+        return max(
+            ARCHERY_SAMPLE_CHUNK_MIN_CHARS,
+            max_result_chars - ARCHERY_SAMPLE_CHUNK_RESERVE_CHARS,
+        )
+
+    @staticmethod
+    def history_sample_sql(row_id: int) -> str:
+        return (
+            f"SELECT sample FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+            f"WHERE id = {row_id}"
+        )
+
+    @staticmethod
+    def history_sample_chunk_sql(row_id: int, offset: int, size: int) -> str:
+        return (
+            f"SELECT SUBSTRING(sample, {offset}, {size}) AS sample_chunk FROM "
+            f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
+        )
+
+    @staticmethod
+    def history_ranking_projection_sql() -> str:
+        return ", ".join(_HISTORY_RANKING_PROJECTION_EXPRESSIONS)
+
+    @staticmethod
+    def history_compact_projection_sql() -> str:
+        return ", ".join(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS)
+
+    @classmethod
+    def is_history_ranking_projection(cls, sql: str) -> bool:
+        columns = cls._simple_select_columns(sql)
+        return tuple(column.casefold() for column in columns) == tuple(
+            item.casefold() for item in _HISTORY_RANKING_PROJECTION_EXPRESSIONS
+        )
+
+    @classmethod
+    def is_history_compact_projection(cls, sql: str) -> bool:
+        parser_input = cls._sql_without_comments(sql)
+        if parser_input is None:
+            return False
+        try:
+            statements = parse(parser_input, read="mysql")
+        except (ParseError, TokenError):
+            return False
+        if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+            return False
+        tree = statements[0]
+        tables = list(tree.find_all(exp.Table))
+        if len(tables) != 1:
+            return False
+        qualifier = cls._ascii_identifier(tables[0].alias or tables[0].name)
+        if qualifier is None:
+            return False
+        projections = list(tree.expressions)
+        if len(projections) != len(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS):
+            return False
+
+        def direct_column(value: exp.Expression, expected: str) -> bool:
+            if isinstance(value, exp.Alias):
+                if cls._ascii_identifier(value.alias) != expected.casefold():
+                    return False
+                value = value.this
+            return bool(
+                isinstance(value, exp.Column)
+                and cls._ascii_identifier(value.name) == expected.casefold()
+                and not value.db
+                and not value.catalog
+                and (
+                    not value.table
+                    or cls._ascii_identifier(value.table) == qualifier
+                )
+            )
+
+        if any(
+            not direct_column(value, expected)
+            for value, expected in zip(
+                projections[:-1],
+                _HISTORY_COMPACT_PROJECTION_EXPRESSIONS[:-1],
+                strict=True,
+            )
+        ):
+            return False
+        length_projection = projections[-1]
+        return bool(
+            isinstance(length_projection, exp.Alias)
+            and cls._ascii_identifier(length_projection.alias)
+            == "sample_full_length"
+            and isinstance(length_projection.this, exp.Length)
+            and length_projection.this.args.get("binary") is True
+            and direct_column(length_projection.this.this, "sample")
+        )
+
     @staticmethod
     def history_sample_projection_sql(row_id: int) -> str:
         """Build the only field-level recovery projection accepted by policy."""
@@ -1046,6 +1261,208 @@ class ArcheryMCPClient:
         return cls._is_information_schema_query(sql, "statistics")
 
     @classmethod
+    def prioritize_history_rows(
+        cls,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Rank all rows twice and return the deterministic Top-20%-first order."""
+
+        normalized: list[dict[str, Any]] = []
+        for source_index, row in enumerate(rows):
+            row_id = cls._coerce_positive_integer(cls._casefolded_value(row, "id"))
+            if row_id is None:
+                continue
+            normalized.append(
+                {
+                    "id": row_id,
+                    "source_index": source_index,
+                    "query_time_max": cls._numeric_or_negative_infinity(
+                        cls._casefolded_value(row, "query_time_max")
+                    ),
+                    "query_time_sum": cls._numeric_or_negative_infinity(
+                        cls._casefolded_value(row, "query_time_sum")
+                    ),
+                }
+            )
+        if not normalized:
+            return {"ordered_ids": [], "high_priority_ids": [], "ranks": {}}
+
+        def ranked(field: str) -> list[dict[str, Any]]:
+            return sorted(
+                normalized,
+                key=lambda item: (
+                    item[field],
+                    item["id"],
+                    -item["source_index"],
+                ),
+                reverse=True,
+            )
+
+        max_rows = ranked("query_time_max")
+        sum_rows = ranked("query_time_sum")
+        top_count = max(1, (len(normalized) + 4) // 5)
+        max_top = [item["id"] for item in max_rows[:top_count]]
+        sum_top = [item["id"] for item in sum_rows[:top_count]]
+        max_ranks = {item["id"]: index for index, item in enumerate(max_rows, 1)}
+        sum_ranks = {item["id"]: index for index, item in enumerate(sum_rows, 1)}
+        high_ids = set(max_top) | set(sum_top)
+        both = sorted(
+            set(max_top) & set(sum_top),
+            key=lambda row_id: (
+                min(max_ranks[row_id], sum_ranks[row_id]),
+                max(max_ranks[row_id], sum_ranks[row_id]),
+                -row_id,
+            ),
+        )
+        ordered_high = list(both)
+        seen = set(ordered_high)
+        for index in range(top_count):
+            for queue in (max_top, sum_top):
+                row_id = queue[index]
+                if row_id not in seen:
+                    seen.add(row_id)
+                    ordered_high.append(row_id)
+        ordered_low = sorted(
+            (item["id"] for item in normalized if item["id"] not in high_ids),
+            key=lambda row_id: (
+                min(max_ranks[row_id], sum_ranks[row_id]),
+                max(max_ranks[row_id], sum_ranks[row_id]),
+                -row_id,
+            ),
+        )
+        return {
+            "ordered_ids": [*ordered_high, *ordered_low],
+            "high_priority_ids": ordered_high,
+            "ranks": {
+                str(row_id): {
+                    "query_time_max_rank": max_ranks[row_id],
+                    "query_time_sum_rank": sum_ranks[row_id],
+                    "priority": "high" if row_id in high_ids else "normal",
+                }
+                for row_id in max_ranks
+            },
+        }
+
+    @staticmethod
+    def _numeric_or_negative_infinity(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float("-inf")
+        return numeric if isfinite(numeric) else float("-inf")
+
+    @classmethod
+    def compress_sample_for_agent(
+        cls,
+        sample: str,
+        *,
+        max_chars: int = ARCHERY_SAMPLE_STRUCTURE_CHARS,
+    ) -> dict[str, Any]:
+        """Build a bounded display SQL while retaining both ends of literal IN lists."""
+
+        sample_hash = sha256(sample.encode("utf-8")).hexdigest()
+        if len(sample) <= max_chars:
+            return {
+                "sample": sample,
+                "representation": "full",
+                "structure_executable": cls.classify_explainable_statement(sample)
+                is not None,
+                "sample_sha256": sample_hash,
+                "in_lists": [],
+            }
+        try:
+            statements = parse(sample, read="mysql")
+        except (ParseError, TokenError):
+            statements = []
+        if len(statements) != 1 or statements[0] is None:
+            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
+        source_tree = statements[0]
+        source_lists = [
+            node
+            for node in source_tree.find_all(exp.In)
+            if node.args.get("query") is None and len(node.expressions) > 2
+        ]
+        if not source_lists:
+            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
+        counts = [len(node.expressions) for node in source_lists]
+
+        def render(fraction: float) -> tuple[str, list[int]]:
+            tree = source_tree.copy()
+            target_lists = [
+                node
+                for node in tree.find_all(exp.In)
+                if node.args.get("query") is None and len(node.expressions) > 2
+            ]
+            retained_counts: list[int] = []
+            for node, count in zip(target_lists, counts, strict=True):
+                retained = min(count, max(2, int(count * fraction)))
+                head_count = (retained + 1) // 2
+                tail_count = retained // 2
+                expressions = list(node.expressions)
+                node.set(
+                    "expressions",
+                    [
+                        *(item.copy() for item in expressions[:head_count]),
+                        *(item.copy() for item in expressions[count - tail_count :]),
+                    ],
+                )
+                retained_counts.append(retained)
+            return tree.sql(dialect="mysql"), retained_counts
+
+        minimum_sql, minimum_counts = render(0.0)
+        if len(minimum_sql) > max_chars:
+            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
+        best_sql = minimum_sql
+        best_counts = minimum_counts
+        lower = 0.0
+        upper = 1.0
+        for _ in range(24):
+            midpoint = (lower + upper) / 2
+            candidate_sql, candidate_counts = render(midpoint)
+            if len(candidate_sql) <= max_chars:
+                lower = midpoint
+                best_sql = candidate_sql
+                best_counts = candidate_counts
+            else:
+                upper = midpoint
+        statement_type = cls.classify_explainable_statement(best_sql)
+        return {
+            "sample": best_sql,
+            "representation": "structured",
+            "structure_executable": statement_type is not None,
+            "sample_sha256": sample_hash,
+            "in_lists": [
+                {
+                    "original_value_count": original,
+                    "retained_value_count": retained,
+                    "omitted_value_count": original - retained,
+                    "head_value_count": (retained + 1) // 2,
+                    "tail_value_count": retained // 2,
+                }
+                for original, retained in zip(counts, best_counts, strict=True)
+            ],
+        }
+
+    @staticmethod
+    def _sample_head_tail_fallback(
+        sample: str,
+        sample_hash: str,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        marker = "\n/* sample middle omitted for Agent context */\n"
+        available = max(max_chars - len(marker), 0)
+        head_chars = (available + 1) // 2
+        tail_chars = available // 2
+        display = f"{sample[:head_chars]}{marker}{sample[-tail_chars:] if tail_chars else ''}"
+        return {
+            "sample": display[:max_chars],
+            "representation": "structured",
+            "structure_executable": False,
+            "sample_sha256": sample_hash,
+            "in_lists": [],
+        }
+
+    @classmethod
     def select_explainable_history_rows(
         cls,
         payload: Mapping[str, Any],
@@ -1059,11 +1476,23 @@ class ArcheryMCPClient:
         for source_index, row in enumerate(cls._tabular_rows(payload)):
             sample = cls._casefolded_value(row, "sample")
             row_id = cls._coerce_positive_integer(cls._casefolded_value(row, "id"))
+            reconstructed = (
+                cls._casefolded_value(row, "sample_source_reconstructed") is True
+                and isinstance(cls._casefolded_value(row, "sample_sha256"), str)
+            )
+            statement_type = cls._casefolded_value(row, "sample_statement_type")
+            safely_classified = cls.classify_explainable_statement(sample or "")
             if (
                 not isinstance(sample, str)
                 or row_id in blocked_ids
-                or not cls._history_sample_is_complete(row, sample)
-                or cls.classify_explainable_statement(sample) is None
+                or (
+                    not reconstructed
+                    and not cls._history_sample_is_complete(row, sample)
+                )
+                or (
+                    safely_classified is None
+                    and statement_type not in {"select", "insert", "update", "delete", "replace"}
+                )
             ):
                 continue
             candidate = dict(row)
@@ -1089,8 +1518,18 @@ class ArcheryMCPClient:
         for candidate in candidates:
             checksum_value = cls._casefolded_value(candidate, "checksum")
             checksum = str(checksum_value).strip().casefold() if checksum_value is not None else ""
-            dedupe_key = checksum or cls._canonical_sql(
+            endpoint = str(
+                cls._casefolded_value(candidate, "hostname_max") or ""
+            ).strip().casefold()
+            db_name = str(cls._casefolded_value(candidate, "db_max") or "").strip().casefold()
+            sql_key = checksum or cls._canonical_sql(
                 str(cls._casefolded_value(candidate, "sample"))
+            )
+            dedupe_key = json.dumps(
+                [endpoint, db_name, sql_key],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                default=str,
             )
             if dedupe_key in checksums:
                 continue
@@ -1139,7 +1578,9 @@ class ArcheryMCPClient:
                     history_payload,
                     sample_prefix_ids=sample_prefix_ids,
                 )
-                if cls._canonical_sql(
+                if cls._casefolded_value(row, "sample_representation")
+                != "structured"
+                and cls._canonical_sql(
                     str(cls._casefolded_value(row, "sample") or "")
                 )
                 == canonical_inner
@@ -1155,7 +1596,24 @@ class ArcheryMCPClient:
         """Project only stable history identity and prioritization fields."""
 
         projected: dict[str, Any] = {}
-        for field in ("id", "checksum", "sample", "Query_time_max", "hostname_max", "db_max"):
+        for field in (
+            "id",
+            "checksum",
+            "sample",
+            "Query_time_max",
+            "Query_time_sum",
+            "hostname_max",
+            "db_max",
+            "sample_full_length",
+            "sample_representation",
+            "sample_source_reconstructed",
+            "sample_sha256",
+            "sample_statement_type",
+            "sample_table_references",
+            "priority",
+            "query_time_max_rank",
+            "query_time_sum_rank",
+        ):
             value = cls._casefolded_value(row, field.casefold())
             if value is not None:
                 projected[field] = sanitize(value)
@@ -1907,6 +2365,62 @@ class ArcheryMCPClient:
         if instance_id is None or not isinstance(db_name, str) or not db_name.strip():
             return None
         return instance_id, db_name.strip().casefold()
+
+    @classmethod
+    def instance_directory_references(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        supplemental_text: Sequence[str] = (),
+    ) -> dict[str, str]:
+        """Return endpoint-to-ref navigation hints without granting authorization."""
+
+        references: dict[str, str] = {}
+        for row in cls._tabular_rows(payload):
+            normalized = {
+                cls._normalized_column_name(str(key)): value for key, value in row.items()
+            }
+            instance_id = next(
+                (
+                    cls._coerce_positive_integer(normalized.get(key))
+                    for key in ("id", "instanceid")
+                    if cls._coerce_positive_integer(normalized.get(key)) is not None
+                ),
+                None,
+            )
+            instance_ref = next(
+                (
+                    normalized[key].strip()
+                    for key in ("name", "instancename", "instanceref")
+                    if isinstance(normalized.get(key), str) and normalized[key].strip()
+                ),
+                str(instance_id) if instance_id is not None else None,
+            )
+            endpoints = cls.allowlisted_instance_endpoints(
+                {"rows": [row]},
+                expected_instance_ref=None,
+            ).values()
+            if instance_ref is not None:
+                for endpoint_set in endpoints:
+                    for endpoint in endpoint_set:
+                        references[endpoint.casefold()] = instance_ref
+        for text in cls._discovery_text_blocks(payload, supplemental_text):
+            in_instance_list = False
+            for line in text.splitlines():
+                if _INSTANCE_LIST_HEADER_TEXT.fullmatch(line):
+                    in_instance_list = True
+                    continue
+                if not in_instance_list:
+                    continue
+                match = _INSTANCE_LIST_ROW_TEXT.fullmatch(line)
+                if match is None:
+                    if line.strip():
+                        in_instance_list = False
+                    continue
+                endpoint = cls._normalize_endpoint(match.group("endpoint"))
+                if endpoint is not None:
+                    references[endpoint.casefold()] = match.group("instance_ref")
+        return references
 
     @classmethod
     def allowlisted_instance_endpoints(
@@ -2886,6 +3400,20 @@ class ArcheryMCPClient:
         return uncommented.lstrip() if uncommented is not None else ""
 
     @staticmethod
+    def _coerce_nonnegative_integer(value: Any) -> int | None:
+        if type(value) is int:
+            return value if 0 <= value <= 9_223_372_036_854_775_807 else None
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not candidate or len(candidate) > 19 or not candidate.isascii():
+            return None
+        if not candidate.isdecimal():
+            return None
+        parsed = int(candidate)
+        return parsed if parsed <= 9_223_372_036_854_775_807 else None
+
+    @staticmethod
     def _coerce_positive_integer(value: Any) -> int | None:
         if type(value) is int:
             return value if 0 < value <= 9_223_372_036_854_775_807 else None
@@ -3583,6 +4111,22 @@ class ArcherySlowLogEvidenceTool:
             f"{evidence_summary}。"
             "具体根因仍须结合日志内容和其他实时信号判断。"
         )
+        if result.payload.get("enrichment_partial") is True:
+            unfinished_count = len(
+                result.payload.get("enrichment_unfinished_ids") or []
+            )
+            stop_reason = str(
+                result.payload.get("enrichment_stop_reason") or ""
+            ).upper()
+            stop_summary = (
+                "内部调查预算到期"
+                if stop_reason in {"BUDGET_EXHAUSTED", "DEADLINE_EXCEEDED"}
+                else "内部深度调查提前终止"
+            )
+            summary += (
+                f"{stop_summary}，仍有 {unfinished_count} 条 sample/EXPLAIN "
+                "未完成；已完成结果和全量紧凑证据均已保留。"
+            )
         ineligible_reason = (
             ""
             if has_log_content
@@ -3683,6 +4227,8 @@ class ArcherySlowLogEvidenceTool:
         reported_row_count = self._reported_row_count(result.payload)
         total_row_count = max(reported_row_count or 0, len(source_rows))
         partial = ArcheryMCPClient.is_result_incomplete(result.payload)
+        history_scan_complete = result.payload.get("history_scan_complete") is not False
+        enrichment_partial = result.payload.get("enrichment_partial") is True
         final_result_payload, final_result_text = self._final_result_passthrough(
             result.payload
         )
@@ -3709,7 +4255,17 @@ class ArcherySlowLogEvidenceTool:
             "omitted_row_count": max(total_row_count - len(semantic_rows), 0),
             "rows": semantic_rows,
             "partial": partial,
-            "root_cause_eligible": bool(semantic_rows) and not partial,
+            "history_scan_complete": history_scan_complete,
+            "enrichment_partial": enrichment_partial,
+            "enrichment_stop_reason": sanitize(
+                result.payload.get("enrichment_stop_reason")
+            ),
+            "enrichment_unfinished_ids": sanitize(
+                result.payload.get("enrichment_unfinished_ids") or []
+            ),
+            "root_cause_eligible": bool(semantic_rows)
+            and history_scan_complete
+            and not partial,
             "root_cause_ineligible_reason": root_cause_ineligible_reason,
         }
         if final_result_payload is not None:
@@ -3728,9 +4284,16 @@ class ArcherySlowLogEvidenceTool:
         for field in _SLOW_QUERY_IDENTITY_FIELDS:
             if field in casefolded:
                 semantic[field] = sanitize(casefolded[field])
+        for field in _SLOW_QUERY_PIPELINE_FIELDS:
+            if field in casefolded:
+                semantic[field] = sanitize(casefolded[field])
+        retained_fields = {
+            *_SLOW_QUERY_IDENTITY_FIELDS,
+            *_SLOW_QUERY_PIPELINE_FIELDS,
+        }
         for key, value in row.items():
             field = str(key)
-            if field.casefold() in _SLOW_QUERY_IDENTITY_FIELDS:
+            if field.casefold() in retained_fields:
                 continue
             if cls._is_numeric_metric_field(field) and value is not None:
                 semantic[field] = sanitize(value)

@@ -748,11 +748,24 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     ),
                     trace_key=f"decision:{decision_key}:action",
                 )
+                if (
+                    isinstance(action, CallToolAction)
+                    and prepared is not None
+                    and prepared.metadata.get("internal_only") is True
+                ):
+                    message_action = {
+                        "action": "call_tool",
+                        "tool_name": action.tool_name,
+                        "objective": action.objective,
+                        "arguments": {"internal_host_call": True},
+                    }
+                else:
+                    message_action = action.model_dump(mode="json")
                 ctx.messages.append(
                     {
                         "role": "assistant",
                         "content": json.dumps(
-                            action.model_dump(mode="json"),
+                            message_action,
                             ensure_ascii=True,
                             sort_keys=True,
                         ),

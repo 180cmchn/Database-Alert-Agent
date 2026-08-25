@@ -253,6 +253,19 @@ def test_wecom_page_url_is_validated() -> None:
     assert any("WECOM_PAGE_BASE_URL" in issue for issue in enabled_without_page.readiness_issues())
 
 
+def test_archery_outer_timeout_must_leave_budget_finalization_margin() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="ARCHERY_MCP_TOOL_TIMEOUT_SECONDS must exceed",
+    ):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            archery_investigation_budget_seconds=120,
+            archery_mcp_tool_timeout_seconds=120,
+        )
+
+
 def test_flashduty_polling_interval_and_scope_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -20,12 +20,17 @@ from mcp import types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
 
 from app.adapters.archery_mcp import (
+    ARCHERY_HISTORY_PAGE_SIZE,
+    ARCHERY_HISTORY_RESULT_CHARS,
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
     ARCHERY_MCP_QUERY_TOOL_NAME,
     ARCHERY_MCP_RESOURCE_GROUPS_TOOL_NAME,
     ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_SAMPLE_CHUNK_MIN_CHARS,
+    ARCHERY_SAMPLE_CHUNK_RESULT_CHARS,
+    ARCHERY_SAMPLE_FULL_LENGTH_LIMIT,
     ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE,
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPClient,
@@ -74,8 +79,8 @@ from app.mcp_runtime import (
 )
 
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v5"
-ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v5"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v6"
+ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v6"
 _FINISH_TOOL_NAME = "finish_archery_investigation"
 _RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
 _RESULT_CONTENT_STATES = ("complete", "content_too_long", "uncertain")
@@ -122,6 +127,27 @@ _SUPPLEMENTAL_STAGES = (
     "explain",
     "indexes",
 )
+_HISTORY_PIPELINE_IDLE = "IDLE"
+_HISTORY_PIPELINE_RANKING = "RANKING"
+_HISTORY_PIPELINE_COMPACT = "COMPACT"
+_HISTORY_PIPELINE_RECONCILE = "RECONCILE"
+_HISTORY_PIPELINE_ENRICHMENT = "ENRICHMENT"
+_HISTORY_PIPELINE_COMPLETED = "COMPLETED"
+_HISTORY_PIPELINE_PHASES = {
+    _HISTORY_PIPELINE_IDLE,
+    _HISTORY_PIPELINE_RANKING,
+    _HISTORY_PIPELINE_COMPACT,
+    _HISTORY_PIPELINE_RECONCILE,
+    _HISTORY_PIPELINE_ENRICHMENT,
+    _HISTORY_PIPELINE_COMPLETED,
+}
+_SAMPLE_PENDING = "PENDING"
+_SAMPLE_DIRECT_PENDING = "DIRECT_PENDING"
+_SAMPLE_CHUNK_PENDING = "CHUNK_PENDING"
+_SAMPLE_READY = "READY"
+_SAMPLE_ANALYZED = "ANALYZED"
+_SAMPLE_FAILED = "FAILED"
+_SAMPLE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 _FINISH_TOOL = {
     "type": "function",
     "function": {
@@ -199,7 +225,9 @@ class ArcheryHarnessState:
     mcp_roundtrip_count: int = 0
     attempted_model_calls: list[str] = field(default_factory=list)
     executed_model_calls: list[str] = field(default_factory=list)
+    executed_host_calls: list[str] = field(default_factory=list)
     model_request_ids: list[str] = field(default_factory=list)
+    host_request_ids: list[str] = field(default_factory=list)
     model_decision_count: int = 0
     recorded_call_ids: set[str] = field(default_factory=set)
     slow_log_tables: dict[tuple[int, str], set[str]] = field(default_factory=dict)
@@ -232,6 +260,7 @@ class ArcheryHarnessState:
     slow_query_index_results: list[dict[str, Any]] = field(default_factory=list)
     slow_query_analysis_failures: list[dict[str, Any]] = field(default_factory=list)
     analysis_instance_endpoints: dict[int, set[str]] = field(default_factory=dict)
+    analysis_instance_refs_by_endpoint: dict[str, str] = field(default_factory=dict)
     analysis_database_names: dict[int, set[str]] = field(default_factory=dict)
     history_result_target: tuple[int, str] | None = None
     history_recovery_ids: set[int] = field(default_factory=set)
@@ -260,6 +289,37 @@ class ArcheryHarnessState:
     pending_history_candidate: dict[str, Any] | None = None
     pending_supplemental_candidate: dict[str, Any] | None = None
     result_assessments: list[dict[str, Any]] = field(default_factory=list)
+    # Deterministic history pipeline fields are intentionally separate from the
+    # legacy SELECT * recovery state so old checkpoints remain resumable.
+    history_pipeline_enabled: bool = False
+    history_pipeline_phase: str = _HISTORY_PIPELINE_IDLE
+    history_pipeline_target: tuple[int, str] | None = None
+    history_pipeline_endpoint: str | None = None
+    history_pipeline_requested_sql: str = ""
+    history_pipeline_executed_sqls: list[str] = field(default_factory=list)
+    history_snapshot_max_id: int | None = None
+    history_page_cursor: int | None = None
+    history_page_size: int = ARCHERY_HISTORY_PAGE_SIZE
+    history_ranking_rows: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history_compact_rows: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history_ranking_scan_complete: bool = False
+    history_compact_scan_complete: bool = False
+    history_ranking_page_count: int = 0
+    history_compact_page_count: int = 0
+    history_reconcile_ids: list[int] = field(default_factory=list)
+    history_processing_order: list[int] = field(default_factory=list)
+    history_high_priority_ids: set[int] = field(default_factory=set)
+    history_rank_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history_sample_states: dict[int, str] = field(default_factory=dict)
+    history_sample_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
+    history_current_id: int | None = None
+    history_chunk_offset: int = 1
+    history_chunk_size: int = 0
+    history_chunk_parts: list[str] = field(default_factory=list)
+    history_exact_sample_id: int | None = None
+    history_exact_sample: str | None = None
+    history_host_call_ids: set[str] = field(default_factory=set)
+    history_host_stage_attempts: set[str] = field(default_factory=set)
     finish_accepted: bool = False
     finish_summary: str | None = None
 
@@ -361,6 +421,24 @@ def _history_payload_with_recovery_status(
     state: ArcheryHarnessState,
 ) -> dict[str, Any]:
     projected = dict(payload)
+    if state.history_pipeline_enabled and "history_scan_complete" in projected:
+        if projected.get("history_scan_complete") is False:
+            projected["result_incomplete"] = True
+            pipeline_reason = (
+                "history_snapshot_inconsistent"
+                if projected.get("history_ranking_scan_complete") is True
+                and projected.get("history_compact_scan_complete") is True
+                else "history_scan_incomplete"
+            )
+            projected["result_incomplete_reasons"] = list(
+                dict.fromkeys(
+                    [
+                        *list(projected.get("result_incomplete_reasons") or []),
+                        pipeline_reason,
+                    ]
+                )
+            )
+        return ArcheryMCPClient.with_result_completeness(projected)
     if _history_recovery_complete(state):
         projected["result_completeness_assessment"] = "complete"
         projected.pop("result_incomplete", None)
@@ -630,6 +708,17 @@ class ArcheryHarnessPlanner:
         tools: list[ToolSpec],
         reasoning_callback: ReasoningDeltaCallback | None = None,
     ) -> dict[str, Any]:
+        host_call = self.scenario.next_host_call(tools)
+        if host_call is not None:
+            self.last_reasoning_content = None
+            self.registry.pending.append(host_call)
+            return {
+                "action": "call_tool",
+                "tool_name": host_call.name,
+                "objective": "Execute deterministic Archery history pipeline work",
+                "hypothesis_ids": [],
+                "arguments": host_call.arguments,
+            }
         model_messages = deepcopy(messages)
         pending_assessment = self.state.pending_result_assessment
         if isinstance(pending_assessment, Mapping):
@@ -937,6 +1026,7 @@ class ArcheryHarnessScenario:
                 setattr(state, field_name, [])
         for field_name in (
             "analysis_instance_endpoints",
+            "analysis_instance_refs_by_endpoint",
             "analysis_database_names",
         ):
             if not hasattr(state, field_name):
@@ -1084,6 +1174,8 @@ class ArcheryHarnessScenario:
             ("directive_activations", []),
             ("emitted_directive_keys", set()),
             ("result_assessments", []),
+            ("executed_host_calls", []),
+            ("host_request_ids", []),
         ):
             if not hasattr(state, field_name):
                 setattr(state, field_name, default)
@@ -1093,6 +1185,42 @@ class ArcheryHarnessScenario:
             state.pending_history_candidate = None
         if not hasattr(state, "pending_supplemental_candidate"):
             state.pending_supplemental_candidate = None
+        pipeline_defaults: dict[str, Any] = {
+            "history_pipeline_enabled": False,
+            "history_pipeline_phase": _HISTORY_PIPELINE_IDLE,
+            "history_pipeline_target": None,
+            "history_pipeline_endpoint": None,
+            "history_pipeline_requested_sql": "",
+            "history_pipeline_executed_sqls": [],
+            "history_snapshot_max_id": None,
+            "history_page_cursor": None,
+            "history_page_size": ARCHERY_HISTORY_PAGE_SIZE,
+            "history_ranking_rows": {},
+            "history_compact_rows": {},
+            "history_ranking_scan_complete": False,
+            "history_compact_scan_complete": False,
+            "history_ranking_page_count": 0,
+            "history_compact_page_count": 0,
+            "history_reconcile_ids": [],
+            "history_processing_order": [],
+            "history_high_priority_ids": set(),
+            "history_rank_metadata": {},
+            "history_sample_states": {},
+            "history_sample_metadata": {},
+            "history_current_id": None,
+            "history_chunk_offset": 1,
+            "history_chunk_size": 0,
+            "history_chunk_parts": [],
+            "history_exact_sample_id": None,
+            "history_exact_sample": None,
+            "history_host_call_ids": set(),
+            "history_host_stage_attempts": set(),
+        }
+        for field_name, default in pipeline_defaults.items():
+            if not hasattr(state, field_name):
+                setattr(state, field_name, deepcopy(default))
+        if state.history_pipeline_phase not in _HISTORY_PIPELINE_PHASES:
+            state.history_pipeline_phase = _HISTORY_PIPELINE_IDLE
         if not hasattr(state, "finish_accepted"):
             state.finish_accepted = False
         if not hasattr(state, "finish_summary"):
@@ -1109,6 +1237,588 @@ class ArcheryHarnessScenario:
             window_end=state.window_end,
             alert_context=state.alert_context,
         )
+
+    def next_host_call(
+        self,
+        tools: Sequence[ToolSpec],
+    ) -> MCPModelToolCall | None:
+        """Return one deterministic pipeline call without consulting the model."""
+
+        state = self.state
+        if not state.history_pipeline_enabled or state.finish_accepted:
+            return None
+        available = {tool.name: tool for tool in tools}
+        if ARCHERY_MCP_QUERY_TOOL_NAME not in available:
+            return None
+        if (
+            state.history_pipeline_phase == _HISTORY_PIPELINE_IDLE
+            and not self._start_history_pipeline_if_ready(state)
+        ):
+            return None
+        sql: str | None = None
+        limit_num: int | None = None
+        max_result_chars = ARCHERY_HISTORY_RESULT_CHARS
+        if state.history_pipeline_phase == _HISTORY_PIPELINE_RANKING:
+            sql = self._history_pipeline_page_sql(state, projection="ranking")
+            if not state.history_pipeline_requested_sql:
+                state.history_pipeline_requested_sql = sql
+            limit_num = state.history_page_size
+        elif state.history_pipeline_phase == _HISTORY_PIPELINE_COMPACT:
+            sql = self._history_pipeline_page_sql(state, projection="compact")
+            limit_num = state.history_page_size
+        elif state.history_pipeline_phase == _HISTORY_PIPELINE_RECONCILE:
+            if not state.history_reconcile_ids:
+                self._finalize_history_pipeline_scan(state)
+                return self.next_host_call(tools)
+            sql = self._history_pipeline_page_sql(
+                state,
+                projection="compact",
+                exact_id=state.history_reconcile_ids[0],
+                page_size=1,
+            )
+            limit_num = 1
+        elif state.history_pipeline_phase == _HISTORY_PIPELINE_ENRICHMENT:
+            row_id = self._ensure_current_history_id(state)
+            if row_id is None:
+                state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+                state.finish_summary = (
+                    "Deterministic Archery history enrichment completed."
+                )
+                return self._make_host_call(
+                    _FINISH_TOOL_NAME,
+                    {"reason": state.finish_summary},
+                    purpose="finish-pipeline",
+                    state=state,
+                )
+            sample_state = state.history_sample_states.get(row_id, _SAMPLE_PENDING)
+            if sample_state in {_SAMPLE_PENDING, _SAMPLE_DIRECT_PENDING}:
+                full_length = self.client._coerce_nonnegative_integer(
+                    self.client._casefolded_value(
+                        state.history_compact_rows.get(row_id, {}),
+                        "sample_full_length",
+                    )
+                )
+                if full_length is not None and full_length <= ARCHERY_SAMPLE_FULL_LENGTH_LIMIT:
+                    state.history_sample_states[row_id] = _SAMPLE_DIRECT_PENDING
+                    sql = self.client.history_sample_sql(row_id)
+                    limit_num = 1
+                else:
+                    self._start_history_chunk_recovery(state, row_id)
+                    sample_state = _SAMPLE_CHUNK_PENDING
+            if sample_state == _SAMPLE_CHUNK_PENDING:
+                sql = self.client.history_sample_chunk_sql(
+                    row_id,
+                    state.history_chunk_offset,
+                    state.history_chunk_size,
+                )
+                limit_num = 1
+            elif sample_state == _SAMPLE_READY:
+                return self._next_host_supplemental_call(
+                    state,
+                    row_id=row_id,
+                    available=available,
+                    tools=tools,
+                )
+        if sql is None:
+            return None
+        target = state.history_pipeline_target or state.history_result_target
+        if target is None:
+            return None
+        arguments: dict[str, Any] = {
+            "instance_id": target[0],
+            "db_name": target[1],
+            "sql_content": sql,
+            "max_result_chars": max_result_chars,
+        }
+        if limit_num is not None:
+            arguments["limit_num"] = limit_num
+        digest = sha256(
+            json.dumps(
+                arguments,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:20]
+        call_id = f"archery-host-{digest}"
+        state.history_host_call_ids.add(call_id)
+        return MCPModelToolCall(
+            call_id=call_id,
+            name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            arguments=arguments,
+            request_id=f"host-request-{digest}",
+        )
+
+    def _start_history_pipeline_if_ready(
+        self,
+        state: ArcheryHarnessState,
+    ) -> bool:
+        required_columns = {
+            "id",
+            "hostname_max",
+            "db_max",
+            "checksum",
+            "ts_min",
+            "ts_max",
+            "query_time_max",
+            "query_time_sum",
+            "sample",
+        }
+        candidates: list[tuple[tuple[int, str], str]] = []
+        for target, endpoints_value in state.resolved_endpoints.items():
+            if target[1].casefold() != "archery":
+                continue
+            discovered_tables = state.slow_log_tables.get(target)
+            if discovered_tables and ARCHERY_SLOW_QUERY_REVIEW_TABLE not in {
+                self.client.clean_table_name(table).casefold()
+                for table in discovered_tables
+            }:
+                continue
+            discovered_columns = state.table_columns.get(target, {}).get(
+                ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
+            )
+            if discovered_columns and not required_columns <= {
+                column.casefold() for column in discovered_columns
+            }:
+                continue
+            endpoints = sorted(endpoints_value)
+            if len(endpoints) == 1:
+                candidates.append((target, endpoints[0]))
+        if len(candidates) != 1:
+            return False
+        target, endpoint = candidates[0]
+        state.history_pipeline_phase = _HISTORY_PIPELINE_RANKING
+        state.history_pipeline_target = target
+        state.history_result_target = target
+        state.history_pipeline_endpoint = endpoint
+        state.history_page_cursor = None
+        state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+        return True
+
+    def _history_pipeline_page_sql(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        projection: str,
+        exact_id: int | None = None,
+        page_size: int | None = None,
+    ) -> str:
+        endpoint = str(state.history_pipeline_endpoint or "").replace("'", "''")
+        start = state.window_start.astimezone(
+            ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        end = state.window_end.astimezone(
+            ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        lower = (state.window_start - timedelta(hours=1)).astimezone(
+            ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        selected = (
+            self.client.history_ranking_projection_sql()
+            if projection == "ranking"
+            else self.client.history_compact_projection_sql()
+        )
+        predicates = [
+            f"hostname_max = '{endpoint}'",
+            f"ts_min >= '{lower}'",
+            f"ts_min < '{end}'",
+            f"ts_max >= '{start}'",
+        ]
+        if state.history_snapshot_max_id is not None:
+            predicates.append(f"id <= {state.history_snapshot_max_id}")
+        if state.history_page_cursor is not None and exact_id is None:
+            predicates.append(f"id < {state.history_page_cursor}")
+        if exact_id is not None:
+            predicates.append(f"id = {exact_id}")
+        return (
+            f"SELECT {selected} FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE "
+            + " AND ".join(predicates)
+            + f" ORDER BY id DESC LIMIT {page_size or state.history_page_size}"
+        )
+
+    def _ensure_current_history_id(
+        self,
+        state: ArcheryHarnessState,
+    ) -> int | None:
+        current = state.history_current_id
+        if current is not None and state.history_sample_states.get(current) not in {
+            _SAMPLE_ANALYZED,
+            _SAMPLE_FAILED,
+            _SAMPLE_BUDGET_EXHAUSTED,
+        }:
+            return current
+        state.history_current_id = next(
+            (
+                row_id
+                for row_id in state.history_processing_order
+                if state.history_sample_states.get(row_id, _SAMPLE_PENDING)
+                not in {_SAMPLE_ANALYZED, _SAMPLE_FAILED, _SAMPLE_BUDGET_EXHAUSTED}
+            ),
+            None,
+        )
+        return state.history_current_id
+
+    def _start_history_chunk_recovery(
+        self,
+        state: ArcheryHarnessState,
+        row_id: int,
+    ) -> None:
+        state.history_sample_states[row_id] = _SAMPLE_CHUNK_PENDING
+        state.history_chunk_offset = 1
+        state.history_chunk_size = self.client.history_sample_chunk_size(
+            ARCHERY_SAMPLE_CHUNK_RESULT_CHARS
+        )
+        state.history_chunk_parts = []
+        state.history_exact_sample_id = None
+        state.history_exact_sample = None
+
+    def _next_host_supplemental_call(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        row_id: int,
+        available: Mapping[str, ToolSpec],
+        tools: Sequence[ToolSpec],
+    ) -> MCPModelToolCall | None:
+        source = state.history_id_rows.get(row_id)
+        exact_sample = state.history_exact_sample
+        if not isinstance(source, Mapping) or not isinstance(exact_sample, str):
+            self._finish_host_history_id(
+                state,
+                row_id,
+                explain_status="failed",
+                reason_code="exact_sample_unavailable",
+            )
+            return self.next_host_call(tools)
+        if reused_from := self._reusable_explain_source_id(state, source):
+            self._finish_host_history_id(
+                state,
+                row_id,
+                explain_status="reused",
+                reused_from=reused_from,
+            )
+            return self.next_host_call(tools)
+        endpoint = self.client._normalize_endpoint(
+            self.client._casefolded_value(source, "hostname_max")
+        )
+        db_name_value = self.client._casefolded_value(source, "db_max")
+        db_name = db_name_value.strip() if isinstance(db_name_value, str) else ""
+        if endpoint is None or not db_name:
+            self._finish_host_history_id(
+                state,
+                row_id,
+                explain_status="failed",
+                reason_code="history_target_incomplete",
+            )
+            return self.next_host_call(tools)
+        matching_ids = sorted(
+            instance_id
+            for instance_id, endpoints in state.analysis_instance_endpoints.items()
+            if endpoint.casefold() in {item.casefold() for item in endpoints}
+        )
+        target_attempt = f"instance:{row_id}:{endpoint.casefold()}"
+        if len(matching_ids) != 1:
+            if target_attempt in state.history_host_stage_attempts:
+                self._finish_host_history_id(
+                    state,
+                    row_id,
+                    explain_status="failed",
+                    reason_code=(
+                        "instance_target_ambiguous"
+                        if len(matching_ids) > 1
+                        else "instance_not_allowlisted"
+                    ),
+                )
+                return self.next_host_call(tools)
+            tool = available.get(ARCHERY_MCP_INSTANCES_TOOL_NAME)
+            if tool is None:
+                return None
+            properties = tool.input_schema.get("properties")
+            arguments = (
+                {
+                    "instance_ref": state.analysis_instance_refs_by_endpoint.get(
+                        endpoint.casefold(), endpoint
+                    )
+                }
+                if isinstance(properties, Mapping) and "instance_ref" in properties
+                else {}
+            )
+            state.history_host_stage_attempts.add(target_attempt)
+            return self._make_host_call(
+                ARCHERY_MCP_INSTANCES_TOOL_NAME,
+                arguments,
+                purpose=f"allowlist-{row_id}",
+                state=state,
+            )
+        instance_id = matching_ids[0]
+        database_attempt = f"database:{row_id}:{instance_id}:{db_name.casefold()}"
+        if db_name not in state.analysis_database_names.get(instance_id, set()):
+            if database_attempt in state.history_host_stage_attempts:
+                self._finish_host_history_id(
+                    state,
+                    row_id,
+                    explain_status="failed",
+                    reason_code="database_not_allowlisted",
+                )
+                return self.next_host_call(tools)
+            if ARCHERY_MCP_DATABASES_TOOL_NAME not in available:
+                return None
+            state.history_host_stage_attempts.add(database_attempt)
+            return self._make_host_call(
+                ARCHERY_MCP_DATABASES_TOOL_NAME,
+                {"instance_id": instance_id},
+                purpose=f"databases-{row_id}",
+                state=state,
+            )
+        table_names = sorted(self._history_row_table_names(source), key=str.casefold)
+        for table_name in table_names:
+            if self._host_table_stage_resolved(
+                state,
+                stage="table_structure",
+                instance_id=instance_id,
+                db_name=db_name,
+                table_name=table_name,
+            ):
+                continue
+            attempt = f"columns:{instance_id}:{db_name.casefold()}:{table_name.casefold()}"
+            if attempt in state.history_host_stage_attempts:
+                continue
+            if ARCHERY_MCP_COLUMNS_TOOL_NAME not in available:
+                return None
+            state.history_host_stage_attempts.add(attempt)
+            return self._make_host_call(
+                ARCHERY_MCP_COLUMNS_TOOL_NAME,
+                {
+                    "instance_id": instance_id,
+                    "db_name": db_name,
+                    "tb_name": table_name,
+                },
+                purpose=f"columns-{row_id}-{table_name}",
+                state=state,
+            )
+        explain_attempt = f"explain:{row_id}"
+        if not self._host_source_stage_resolved(state, row_id=row_id, stage="explain"):
+            if explain_attempt not in state.history_host_stage_attempts:
+                state.history_host_stage_attempts.add(explain_attempt)
+                explain_sql = f"EXPLAIN {exact_sample}"
+                return self._make_host_call(
+                    ARCHERY_MCP_QUERY_TOOL_NAME,
+                    {
+                        "instance_id": instance_id,
+                        "db_name": db_name,
+                        "sql_content": explain_sql,
+                        "max_result_chars": max(
+                            ARCHERY_HISTORY_RESULT_CHARS,
+                            len(
+                                json.dumps(
+                                    explain_sql,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                            )
+                            + ARCHERY_HISTORY_RESULT_CHARS,
+                        ),
+                    },
+                    purpose=f"explain-{row_id}",
+                    state=state,
+                )
+        for table_name in table_names:
+            if self._host_table_stage_resolved(
+                state,
+                stage="indexes",
+                instance_id=instance_id,
+                db_name=db_name,
+                table_name=table_name,
+            ):
+                continue
+            attempt = f"indexes:{instance_id}:{db_name.casefold()}:{table_name.casefold()}"
+            if attempt in state.history_host_stage_attempts:
+                continue
+            escaped_db = db_name.replace("'", "''")
+            escaped_table = table_name.replace("'", "''")
+            state.history_host_stage_attempts.add(attempt)
+            return self._make_host_call(
+                ARCHERY_MCP_QUERY_TOOL_NAME,
+                {
+                    "instance_id": instance_id,
+                    "db_name": db_name,
+                    "sql_content": (
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, NON_UNIQUE, "
+                        "SEQ_IN_INDEX, COLUMN_NAME, COLLATION, CARDINALITY, SUB_PART, "
+                        "NULLABLE, INDEX_TYPE FROM information_schema.STATISTICS "
+                        f"WHERE TABLE_SCHEMA = '{escaped_db}' AND "
+                        f"TABLE_NAME = '{escaped_table}' ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+                    ),
+                    "limit_num": ARCHERY_HISTORY_PAGE_SIZE,
+                    "max_result_chars": ARCHERY_HISTORY_RESULT_CHARS,
+                },
+                purpose=f"indexes-{row_id}-{table_name}",
+                state=state,
+            )
+        explain_succeeded = any(
+            self.client._coerce_positive_integer(
+                self.client._casefolded_value(
+                    item.get("source_history_row", {}), "id"
+                )
+            )
+            == row_id
+            for item in state.slow_query_explain_results
+            if isinstance(item, Mapping)
+        )
+        self._finish_host_history_id(
+            state,
+            row_id,
+            explain_status="succeeded" if explain_succeeded else "failed",
+            reason_code=None if explain_succeeded else "explain_failed",
+        )
+        return self.next_host_call(tools)
+
+    def _make_host_call(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        purpose: str,
+        state: ArcheryHarnessState,
+    ) -> MCPModelToolCall:
+        digest = sha256(
+            json.dumps(
+                [tool_name, dict(arguments)],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()[:20]
+        safe_purpose = re.sub(r"[^A-Za-z0-9_-]+", "-", purpose).strip("-")[:40]
+        call_id = f"archery-host-{safe_purpose or 'call'}-{digest}"
+        state.history_host_call_ids.add(call_id)
+        return MCPModelToolCall(
+            call_id=call_id,
+            name=tool_name,
+            arguments=dict(arguments),
+            request_id=f"host-request-{digest}",
+        )
+
+    def _reusable_explain_source_id(
+        self,
+        state: ArcheryHarnessState,
+        source: Mapping[str, Any],
+    ) -> int | None:
+        expected = (
+            str(self.client._casefolded_value(source, "hostname_max") or "").casefold(),
+            str(self.client._casefolded_value(source, "db_max") or "").casefold(),
+            str(self.client._casefolded_value(source, "checksum") or "").casefold(),
+        )
+        for item in state.slow_query_explain_results:
+            item_source = item.get("source_history_row")
+            if not isinstance(item_source, Mapping):
+                continue
+            actual = (
+                str(self.client._casefolded_value(item_source, "hostname_max") or "").casefold(),
+                str(self.client._casefolded_value(item_source, "db_max") or "").casefold(),
+                str(self.client._casefolded_value(item_source, "checksum") or "").casefold(),
+            )
+            if actual == expected:
+                return self.client._coerce_positive_integer(
+                    self.client._casefolded_value(item_source, "id")
+                )
+        return None
+
+    def _host_source_stage_resolved(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        row_id: int,
+        stage: str,
+    ) -> bool:
+        return any(
+            item.get("stage") == stage
+            and self.client._coerce_positive_integer(
+                self.client._casefolded_value(
+                    item.get("source_history_row", {}), "id"
+                )
+            )
+            == row_id
+            for item in [
+                *state.slow_query_explain_results,
+                *state.slow_query_analysis_failures,
+            ]
+            if isinstance(item, Mapping)
+        )
+
+    def _host_table_stage_resolved(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        stage: str,
+        instance_id: int,
+        db_name: str,
+        table_name: str,
+    ) -> bool:
+        results = (
+            state.slow_query_table_structure_results
+            if stage == "table_structure"
+            else state.slow_query_index_results
+        )
+        return any(
+            isinstance(item, Mapping)
+            and item.get("stage") in {None, stage}
+            and isinstance(item.get("target"), Mapping)
+            and item.get("target", {}).get("instance_id") == instance_id
+            and str(item.get("target", {}).get("db_name") or "") == db_name
+            and self.client.clean_table_name(
+                str(item.get("target", {}).get("table_name") or "")
+            ).casefold()
+            == self.client.clean_table_name(table_name).casefold()
+            for item in [*results, *state.slow_query_analysis_failures]
+        )
+
+    def _finish_host_history_id(
+        self,
+        state: ArcheryHarnessState,
+        row_id: int,
+        *,
+        explain_status: str,
+        reason_code: str | None = None,
+        reused_from: int | None = None,
+    ) -> None:
+        state.history_sample_states[row_id] = _SAMPLE_ANALYZED
+        metadata = state.history_sample_metadata.setdefault(row_id, {})
+        metadata["explain_status"] = explain_status
+        metadata["explain_source_sql_exact"] = explain_status != "reused"
+        if reason_code is not None:
+            metadata["explain_failure_reason"] = reason_code
+            if not any(
+                item.get("reason_code") == reason_code
+                and self.client._coerce_positive_integer(
+                    self.client._casefolded_value(
+                        item.get("source_history_row", {}), "id"
+                    )
+                )
+                == row_id
+                for item in state.slow_query_analysis_failures
+                if isinstance(item, Mapping)
+            ):
+                state.slow_query_analysis_failures.append(
+                    self._local_rejection(
+                        stage="explain",
+                        target={"history_id": row_id},
+                        error_type="analysis_unavailable",
+                        reason_code=reason_code,
+                        detail="Exact sample EXPLAIN could not be completed.",
+                        source_history_row=self.client.slow_query_source_row(
+                            state.history_id_rows.get(row_id, {})
+                        ),
+                        terminal=True,
+                    )
+                )
+        if reused_from is not None:
+            metadata["explain_reused_from_history_id"] = reused_from
+        state.history_exact_sample_id = None
+        state.history_exact_sample = None
+        state.history_current_id = None
+        self._refresh_history_pipeline_result(state)
 
     @staticmethod
     def validate_result_assessment_call(
@@ -1243,6 +1953,9 @@ class ArcheryHarnessScenario:
                     deepcopy(item) for item in model_call.provider_output_items
                 ],
             }
+            if model_call.call_id in state.history_host_call_ids:
+                metadata["host_generated"] = True
+                metadata["internal_only"] = True
 
         if action.tool_name in {_RESULT_ASSESSMENT_TOOL_NAME, _FINISH_TOOL_NAME}:
             return PreparedCall(
@@ -1469,6 +2182,32 @@ class ArcheryHarnessScenario:
                             "history 查询形态。"
                         ),
                     ), None
+                if (
+                    state.history_pipeline_enabled
+                    and self.client.is_history_ranking_projection(statement)
+                ):
+                    if not self._is_scoped_history_ranking_query(state, statement):
+                        return self._local_rejection(
+                            stage="history_recovery",
+                            target=target,
+                            reason_code="history_ranking_query_forbidden",
+                            detail=(
+                                "首次 history 排名查询必须使用固定三列投影、完整告警窗口、"
+                                "hostname_max、ORDER BY id DESC 和有界 LIMIT。"
+                            ),
+                        ), None
+                    if self._is_initial_history_target(
+                        state,
+                        arguments=arguments,
+                        sql=statement,
+                    ):
+                        return None, None
+                    return self._local_rejection(
+                        stage="history_recovery",
+                        target=target,
+                        reason_code="history_target_mismatch",
+                        detail="history 排名查询必须发送到已验证的 Archery 元数据库目标。",
+                    ), None
                 if self.client.is_history_id_only_projection(statement):
                     if not self._is_scoped_history_id_listing(state, statement):
                         return self._local_rejection(
@@ -1639,10 +2378,22 @@ class ArcheryHarnessScenario:
                     reason_code="invalid_explain_statement",
                     detail="仅允许普通 EXPLAIN 包裹可解释的单语句。",
                 ), None
-            source_row = self.client.history_row_for_explain(
-                statement,
-                self._history_payload(state),
-                sample_prefix_ids=state.history_sample_prefix_ids,
+            inner_sql = self.client.classify_plain_explain(statement)
+            exact_row = (
+                state.history_id_rows.get(state.history_exact_sample_id or -1)
+                if inner_sql is not None
+                and state.history_exact_sample is not None
+                and self.client.sql_equivalent(state.history_exact_sample, inner_sql)
+                else None
+            )
+            source_row = (
+                dict(exact_row)
+                if isinstance(exact_row, Mapping)
+                else self.client.history_row_for_explain(
+                    statement,
+                    self._history_payload(state),
+                    sample_prefix_ids=state.history_sample_prefix_ids,
+                )
             )
             if source_row is None:
                 return self._local_rejection(
@@ -1940,6 +2691,35 @@ class ArcheryHarnessScenario:
             and not self._target_schema_validation_deferred(arguments)
         ):
             return False
+        if state.history_pipeline_enabled:
+            if self.client.is_history_ranking_projection(sql):
+                return bool(
+                    state.history_pipeline_phase == _HISTORY_PIPELINE_RANKING
+                    and self._is_scoped_history_ranking_query(state, sql)
+                )
+            if self.client.is_history_compact_projection(sql):
+                return bool(
+                    state.history_pipeline_phase
+                    in {_HISTORY_PIPELINE_COMPACT, _HISTORY_PIPELINE_RECONCILE}
+                    and self._is_scoped_history_compact_query(state, sql)
+                )
+            retrieval = self.client.history_id_retrieval(sql)
+            if retrieval is not None and (
+                retrieval[1] == "sample"
+                or retrieval[1].startswith("sample_chunk:")
+            ):
+                row_id, projection = retrieval
+                max_result_chars = arguments.get("max_result_chars")
+                return bool(
+                    state.history_pipeline_phase == _HISTORY_PIPELINE_ENRICHMENT
+                    and row_id == state.history_current_id
+                    and row_id in state.history_compact_rows
+                    and max_result_chars == ARCHERY_SAMPLE_CHUNK_RESULT_CHARS
+                    and (
+                        projection == "sample"
+                        or self.client.history_sample_chunk_retrieval(sql) is not None
+                    )
+                )
         uncommented = self.client._sql_without_comments(sql) or ""
         if re.search(r"(?is)(?<![A-Za-z0-9_$])`?id`?\s+in\s*\(", uncommented):
             return False
@@ -2020,6 +2800,51 @@ class ArcheryHarnessScenario:
             detail=detail,
         )
 
+    def _is_scoped_history_ranking_query(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+    ) -> bool:
+        return self._is_scoped_history_pipeline_query(
+            state,
+            sql,
+            projection="ranking",
+        )
+
+    def _is_scoped_history_compact_query(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+    ) -> bool:
+        return self._is_scoped_history_pipeline_query(
+            state,
+            sql,
+            projection="compact",
+        )
+
+    def _is_scoped_history_pipeline_query(
+        self,
+        state: ArcheryHarnessState,
+        sql: str,
+        *,
+        projection: str,
+    ) -> bool:
+        if not self._has_simple_history_source(sql, projection=projection):
+            return False
+        if not self._has_scoped_history_window_predicates(
+            state,
+            sql,
+            require_ts_max=True,
+            allow_id_bounds=True,
+        ):
+            return False
+        tail = re.search(r"(?is)\b(?:order\s+by|limit)\b.*$", sql)
+        return tail is not None and re.fullmatch(
+            r"(?is)\s*order\s+by\s+`?id`?\s+desc\s+"
+            r"limit\s+(?:[1-9]\d?|100)\s*;?\s*",
+            tail.group(0),
+        ) is not None
+
     def _is_scoped_history_id_listing(
         self,
         state: ArcheryHarnessState,
@@ -2078,6 +2903,14 @@ class ArcheryHarnessScenario:
             projection_pattern = (
                 r"(?:(?:`?[A-Za-z_][A-Za-z0-9_$]*`?)\s*\.\s*)?`?id`?"
             )
+        elif projection == "ranking":
+            if not self.client.is_history_ranking_projection(statement):
+                return False
+            projection_pattern = r".+?"
+        elif projection == "compact":
+            if not self.client.is_history_compact_projection(statement):
+                return False
+            projection_pattern = r".+?"
         else:
             return False
         return re.fullmatch(
@@ -2094,6 +2927,7 @@ class ArcheryHarnessScenario:
         sql: str,
         *,
         require_ts_max: bool,
+        allow_id_bounds: bool = False,
     ) -> bool:
         endpoint_match = re.search(
             r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
@@ -2174,6 +3008,16 @@ class ArcheryHarnessScenario:
             match = matches[0]
             time_literals[name] = match.group("literal")
             remainder = remainder[: match.start()] + " " + remainder[match.end() :]
+        if allow_id_bounds:
+            id_bound = re.compile(
+                r"(?is)(?:`?[A-Za-z_][A-Za-z0-9_$]*`?\s*\.\s*)?"
+                r"`?id`?\s*(?:<=|<|=)\s*[1-9]\d*"
+            )
+            matches = list(id_bound.finditer(remainder))
+            if len(matches) > 2:
+                return False
+            for match in reversed(matches):
+                remainder = remainder[: match.start()] + " " + remainder[match.end() :]
         if re.sub(r"(?is)\band\b|[\s()]", "", remainder):
             return False
         if not self._history_time_literal_matches(
@@ -2230,15 +3074,24 @@ class ArcheryHarnessScenario:
                 .strip()
                 == expected_db
                 and expected_table
-                in {
-                    self.client.clean_table_name(item)
-                    for item in self.client.explainable_table_references(
-                        str(self.client._casefolded_value(row, "sample") or "")
-                    )
-                }
+                in self._history_row_table_names(row)
             ),
             None,
         )
+
+    def _history_row_table_names(
+        self,
+        row: Mapping[str, Any],
+    ) -> set[str]:
+        recorded = self.client._casefolded_value(row, "sample_table_references")
+        if isinstance(recorded, list) and all(isinstance(item, str) for item in recorded):
+            return {self.client.clean_table_name(item) for item in recorded}
+        return {
+            self.client.clean_table_name(item)
+            for item in self.client.explainable_table_references(
+                str(self.client._casefolded_value(row, "sample") or "")
+            )
+        }
 
     def _bind_supplemental_target(
         self,
@@ -2332,7 +3185,13 @@ class ArcheryHarnessScenario:
                 source_history_row=source,
                 terminal=True,
             ), None
-        sample = str(source.get("sample") or "")
+        source_id = self.client._coerce_positive_integer(source.get("id"))
+        sample = (
+            state.history_exact_sample
+            if source_id == state.history_exact_sample_id
+            and isinstance(state.history_exact_sample, str)
+            else str(source.get("sample") or "")
+        )
         mismatched_schemas = sorted(
             {
                 reference.schema
@@ -2763,10 +3622,19 @@ class ArcheryHarnessScenario:
         projected_result = self.client.structured_sql_result(payload)
 
         if stage == "explain":
-            source_row = self.client.history_row_for_explain(
-                result_sql,
-                self._history_payload(state),
-                sample_prefix_ids=state.history_sample_prefix_ids,
+            source_row = (
+                dict(state.history_id_rows[state.history_exact_sample_id])
+                if state.history_exact_sample_id in state.history_id_rows
+                and state.history_exact_sample is not None
+                and self.client.sql_equivalent(
+                    state.history_exact_sample,
+                    self.client.classify_plain_explain(result_sql) or "",
+                )
+                else self.client.history_row_for_explain(
+                    result_sql,
+                    self._history_payload(state),
+                    sample_prefix_ids=state.history_sample_prefix_ids,
+                )
             )
             if source_row is None or self._source_key(
                 self.client.slow_query_source_row(source_row)
@@ -3813,12 +4681,8 @@ class ArcheryHarnessScenario:
                     key,
                     {"stage": stage, "status": _SUPPLEMENTAL_PENDING, **base},
                 )
-            sample = str(source.get("sample") or "")
             for table_name in sorted(
-                {
-                    self.client.clean_table_name(item)
-                    for item in self.client.explainable_table_references(sample)
-                },
+                self._history_row_table_names(source),
                 key=str.casefold,
             ):
                 for stage in ("table_structure", "indexes"):
@@ -4107,7 +4971,22 @@ class ArcheryHarnessScenario:
         pending_work_items: list[dict[str, Any]] = []
         directive_ids: list[str] = []
         reason_code: str | None = None
-        if state.history_recovery_required and not _history_recovery_all_terminal(state):
+        if state.history_pipeline_enabled and state.history_pipeline_phase in {
+            _HISTORY_PIPELINE_RANKING,
+            _HISTORY_PIPELINE_COMPACT,
+            _HISTORY_PIPELINE_RECONCILE,
+            _HISTORY_PIPELINE_ENRICHMENT,
+        }:
+            pending_ids = [
+                row_id
+                for row_id in state.history_processing_order
+                if state.history_sample_states.get(row_id)
+                not in {_SAMPLE_ANALYZED, _SAMPLE_FAILED, _SAMPLE_BUDGET_EXHAUSTED}
+            ]
+            pending_stages = [state.history_pipeline_phase.casefold()]
+            directive_ids = ["archery.history.complete_before_supplemental"]
+            reason_code = "history_pipeline_pending"
+        elif state.history_recovery_required and not _history_recovery_all_terminal(state):
             pending_stages = ["history_recovery"]
             directive_ids = [
                 "archery.history.truncation.list_ids"
@@ -4115,6 +4994,11 @@ class ArcheryHarnessScenario:
                 else "archery.history.truncation.fetch_single_id"
             ]
             reason_code = "history_recovery_pending"
+        elif (
+            state.history_pipeline_enabled
+            and state.history_pipeline_phase == _HISTORY_PIPELINE_COMPLETED
+        ):
+            pass
         elif state.history_window_state == _HISTORY_WINDOW_PENDING:
             pending_stages = ["history_window"]
             directive_ids = ["archery.history.window_query"]
@@ -4191,6 +5075,650 @@ class ArcheryHarnessScenario:
                     sort_keys=True,
                 ),
             ),
+        )
+
+    def _history_pipeline_result_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        result_sql: str,
+        actual_sql_verified: bool,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]] | None:
+        if not state.history_pipeline_enabled:
+            return None
+        is_ranking = self.client.is_history_ranking_projection(result_sql)
+        is_compact = self.client.is_history_compact_projection(result_sql)
+        retrieval = self.client.history_id_retrieval(result_sql)
+        is_sample = retrieval is not None and (
+            retrieval[1] == "sample" or retrieval[1].startswith("sample_chunk:")
+        )
+        if not (is_ranking or is_compact or is_sample):
+            return None
+        if not actual_sql_verified:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_actual_sql_unverified",
+                detail="Host pipeline result did not include a verified executed SQL.",
+            )
+        state.history_pipeline_executed_sqls.append(result_sql)
+        if is_ranking or is_compact:
+            return self._history_pipeline_page_transition(
+                state,
+                call,
+                raw_result,
+                payload,
+                result_sql=result_sql,
+                projection="ranking" if is_ranking else "compact",
+            )
+        assert retrieval is not None
+        if state.history_pipeline_phase != _HISTORY_PIPELINE_ENRICHMENT:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_phase_mismatch",
+                detail="A sample recovery result arrived outside the enrichment phase.",
+            )
+        row_id, projection = retrieval
+        if row_id != state.history_current_id:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_id_mismatch",
+                detail="A sample recovery result did not match the active history id.",
+                row_id=row_id,
+            )
+        if projection == "sample":
+            return self._history_direct_sample_transition(
+                state,
+                call,
+                raw_result,
+                payload,
+                row_id=row_id,
+            )
+        chunk = self.client.history_sample_chunk_retrieval(result_sql)
+        if chunk is None:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_chunk_projection_invalid",
+                detail="The returned sample chunk SQL was not the authorized projection.",
+                row_id=row_id,
+            )
+        return self._history_sample_chunk_transition(
+            state,
+            call,
+            raw_result,
+            payload,
+            row_id=row_id,
+            offset=chunk[1],
+            size=chunk[2],
+        )
+
+    def _history_pipeline_page_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        result_sql: str,
+        projection: str,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        target = self.client.target_key(call.effective_arguments)
+        endpoint_match = re.search(
+            r"(?is)\bhostname_max\s*=\s*'(?P<value>(?:''|[^'])*)'",
+            result_sql,
+        )
+        endpoint = (
+            self.client._normalize_endpoint(
+                endpoint_match.group("value").replace("''", "'")
+            )
+            if endpoint_match is not None
+            else None
+        )
+        if projection == "ranking" and state.history_pipeline_phase == _HISTORY_PIPELINE_IDLE:
+            if target is None or endpoint is None:
+                return self._pipeline_failure_transition(
+                    state,
+                    call,
+                    raw_result,
+                    reason_code="history_pipeline_scope_unresolved",
+                    detail="The first ranking page could not be bound to its target and endpoint.",
+                )
+            state.history_pipeline_phase = _HISTORY_PIPELINE_RANKING
+            state.history_pipeline_target = target
+            state.history_result_target = target
+            state.history_pipeline_endpoint = endpoint
+            state.history_pipeline_requested_sql = str(
+                call.effective_arguments.get("sql_content") or result_sql
+            )
+            requested_page_size = self.client._coerce_positive_integer(
+                call.effective_arguments.get("limit_num")
+            )
+            if requested_page_size is None:
+                limit_match = re.search(
+                    r"(?is)\blimit\s+(?P<value>[1-9]\d*)\s*;?\s*$",
+                    result_sql,
+                )
+                requested_page_size = (
+                    self.client._coerce_positive_integer(limit_match.group("value"))
+                    if limit_match is not None
+                    else None
+                )
+            state.history_page_size = min(
+                requested_page_size or ARCHERY_HISTORY_PAGE_SIZE,
+                ARCHERY_HISTORY_PAGE_SIZE,
+            )
+        expected_phase = (
+            _HISTORY_PIPELINE_RANKING
+            if projection == "ranking"
+            else _HISTORY_PIPELINE_RECONCILE
+            if state.history_pipeline_phase == _HISTORY_PIPELINE_RECONCILE
+            else _HISTORY_PIPELINE_COMPACT
+        )
+        if state.history_pipeline_phase != expected_phase:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_phase_mismatch",
+                detail=f"Unexpected {projection} page for phase {state.history_pipeline_phase}.",
+            )
+        if self.client.is_result_incomplete(payload):
+            if state.history_page_size > 1:
+                state.history_page_size = max(1, state.history_page_size // 2)
+                return self._pipeline_progress_transition(state, call, raw_result)
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_page_incomplete",
+                detail=f"The {projection} page remained incomplete at page size 1.",
+            )
+        rows = self.client._tabular_rows(payload)
+        parsed_rows: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            row_id = self.client._coerce_positive_integer(
+                self.client._casefolded_value(row, "id")
+            )
+            required_fields = (
+                {"id", "query_time_max", "query_time_sum"}
+                if projection == "ranking"
+                else {
+                    "id",
+                    "hostname_max",
+                    "db_max",
+                    "checksum",
+                    "query_time_max",
+                    "query_time_sum",
+                    "sample_full_length",
+                }
+            )
+            row_fields = {str(key).casefold() for key in row}
+            sample_length = (
+                self.client._coerce_nonnegative_integer(
+                    self.client._casefolded_value(row, "sample_full_length")
+                )
+                if projection == "compact"
+                else 1
+            )
+            if (
+                row_id is None
+                or not required_fields <= row_fields
+                or sample_length is None
+            ):
+                return self._pipeline_failure_transition(
+                    state,
+                    call,
+                    raw_result,
+                    reason_code="history_pipeline_page_row_invalid",
+                    detail=(
+                        f"The {projection} page contained a row without its fixed "
+                        "projection or a non-negative sample length."
+                    ),
+                )
+            parsed_rows.append((row_id, dict(row)))
+        page_ids = [row_id for row_id, _ in parsed_rows]
+        if len(page_ids) != len(set(page_ids)) or page_ids != sorted(page_ids, reverse=True):
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_page_order_invalid",
+                detail=f"The {projection} page was not unique and ordered by id DESC.",
+            )
+        if (
+            projection == "compact"
+            and state.history_pipeline_phase == _HISTORY_PIPELINE_RECONCILE
+        ):
+            expected_id = (
+                state.history_reconcile_ids[0]
+                if state.history_reconcile_ids
+                else None
+            )
+            if page_ids not in ([], [expected_id]):
+                return self._pipeline_failure_transition(
+                    state,
+                    call,
+                    raw_result,
+                    reason_code="history_reconcile_id_mismatch",
+                    detail="A compact single-id reconciliation returned an unexpected id.",
+                )
+            if parsed_rows:
+                state.history_compact_rows[parsed_rows[0][0]] = parsed_rows[0][1]
+            if state.history_reconcile_ids:
+                state.history_reconcile_ids.pop(0)
+            state.history_compact_page_count += 1
+            if not state.history_reconcile_ids:
+                self._finalize_history_pipeline_scan(state)
+            return self._pipeline_progress_transition(state, call, raw_result)
+        destination = (
+            state.history_ranking_rows
+            if projection == "ranking"
+            else state.history_compact_rows
+        )
+        if set(page_ids) & set(destination):
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_pipeline_page_overlap",
+                detail=f"The {projection} keyset page repeated an earlier id.",
+            )
+        destination.update(parsed_rows)
+        if projection == "ranking":
+            state.history_ranking_page_count += 1
+            if state.history_snapshot_max_id is None and page_ids:
+                state.history_snapshot_max_id = page_ids[0]
+        else:
+            state.history_compact_page_count += 1
+        if len(page_ids) == state.history_page_size and page_ids:
+            state.history_page_cursor = page_ids[-1]
+        elif projection == "ranking":
+            state.history_ranking_scan_complete = True
+            state.history_pipeline_phase = _HISTORY_PIPELINE_COMPACT
+            state.history_page_cursor = None
+            state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+        else:
+            state.history_compact_scan_complete = True
+            state.history_page_cursor = None
+            state.history_reconcile_ids = sorted(
+                set(state.history_ranking_rows) - set(state.history_compact_rows),
+                reverse=True,
+            )
+            if state.history_reconcile_ids:
+                state.history_pipeline_phase = _HISTORY_PIPELINE_RECONCILE
+            else:
+                self._finalize_history_pipeline_scan(state)
+        return self._pipeline_progress_transition(state, call, raw_result)
+
+    def _finalize_history_pipeline_scan(self, state: ArcheryHarnessState) -> None:
+        ranking_ids = set(state.history_ranking_rows)
+        compact_ids = set(state.history_compact_rows)
+        usable_ids = ranking_ids & compact_ids
+        scan_consistent = bool(
+            state.history_ranking_scan_complete
+            and state.history_compact_scan_complete
+            and ranking_ids == compact_ids
+        )
+        if ranking_ids != compact_ids:
+            state.slow_query_analysis_failures.append(
+                self._local_rejection(
+                    stage="history_recovery",
+                    target={
+                        "ranking_only_ids": sorted(ranking_ids - compact_ids),
+                        "compact_only_ids": sorted(compact_ids - ranking_ids),
+                    },
+                    error_type="result_mismatch",
+                    reason_code="history_snapshot_inconsistent",
+                    detail="Ranking and compact history scans returned different id sets.",
+                    terminal=True,
+                )
+            )
+        rows = [
+            {
+                **state.history_compact_rows[row_id],
+                **state.history_ranking_rows[row_id],
+            }
+            for row_id in sorted(usable_ids, reverse=True)
+        ]
+        priority = self.client.prioritize_history_rows(rows)
+        state.history_processing_order = list(priority["ordered_ids"])
+        state.history_high_priority_ids = set(priority["high_priority_ids"])
+        state.history_rank_metadata = {
+            int(row_id): dict(metadata)
+            for row_id, metadata in priority["ranks"].items()
+        }
+        state.history_id_rows = {}
+        for row in rows:
+            row_id = self.client._coerce_positive_integer(
+                self.client._casefolded_value(row, "id")
+            )
+            assert row_id is not None
+            rank = state.history_rank_metadata.get(row_id, {})
+            state.history_id_rows[row_id] = {
+                **row,
+                **rank,
+                "sample_recovery_status": _SAMPLE_PENDING,
+            }
+            state.history_sample_states[row_id] = _SAMPLE_PENDING
+        state.history_recovery_ids = set(usable_ids)
+        state.history_recovery_listing_completed = True
+        state.history_recovery_required = False
+        state.history_window_state = (
+            _HISTORY_WINDOW_SUCCEEDED if usable_ids else _HISTORY_WINDOW_NO_DATA
+        )
+        state.history_pipeline_phase = (
+            _HISTORY_PIPELINE_ENRICHMENT
+            if usable_ids
+            else _HISTORY_PIPELINE_COMPLETED
+        )
+        state.history_current_id = None
+        self._refresh_history_pipeline_result(
+            state,
+            scan_consistent=scan_consistent,
+        )
+        if not usable_ids:
+            state.finish_accepted = True
+            state.finish_summary = "The bounded Archery history scan returned no rows."
+
+    def _refresh_history_pipeline_result(
+        self,
+        state: ArcheryHarnessState,
+        *,
+        scan_consistent: bool | None = None,
+    ) -> None:
+        if scan_consistent is None:
+            scan_consistent = bool(
+                state.history_ranking_scan_complete
+                and state.history_compact_scan_complete
+                and set(state.history_ranking_rows) == set(state.history_compact_rows)
+            )
+        rows: list[dict[str, Any]] = []
+        for row_id in sorted(state.history_id_rows, reverse=True):
+            row = dict(state.history_id_rows[row_id])
+            row["sample_recovery_status"] = state.history_sample_states.get(
+                row_id, _SAMPLE_PENDING
+            )
+            if metadata := state.history_sample_metadata.get(row_id):
+                row.update(deepcopy(metadata))
+            rows.append(row)
+        payload: dict[str, Any] = {
+            "rows": rows,
+            "row_count": len(rows),
+            "history_scan_complete": scan_consistent,
+            "history_ranking_scan_complete": state.history_ranking_scan_complete,
+            "history_compact_scan_complete": state.history_compact_scan_complete,
+            "history_snapshot_consistent": scan_consistent,
+            "history_ranking_page_count": state.history_ranking_page_count,
+            "history_compact_page_count": state.history_compact_page_count,
+            "history_high_priority_ids": sorted(state.history_high_priority_ids),
+            "sample_recovery_complete_count": sum(
+                status in {_SAMPLE_READY, _SAMPLE_ANALYZED}
+                for status in state.history_sample_states.values()
+            ),
+            "sample_recovery_pending_count": sum(
+                status
+                not in {
+                    _SAMPLE_READY,
+                    _SAMPLE_ANALYZED,
+                    _SAMPLE_FAILED,
+                    _SAMPLE_BUDGET_EXHAUSTED,
+                }
+                for status in state.history_sample_states.values()
+            ),
+            "result_incomplete": not scan_consistent,
+            "result_incomplete_reasons": (
+                [] if scan_consistent else ["history_snapshot_inconsistent"]
+            ),
+        }
+        target = state.history_pipeline_target
+        result = ArcherySlowLogQueryResult(
+            payload=payload,
+            requested_sql=state.history_pipeline_requested_sql,
+            window_start=state.window_start,
+            window_end=state.window_end,
+            model_tool_calls=tuple(state.executed_model_calls),
+            model_request_ids=tuple(state.model_request_ids),
+            executed_sql=(
+                state.history_pipeline_executed_sqls[0]
+                if state.history_pipeline_executed_sqls
+                else None
+            ),
+            actual_sql_verified=bool(state.history_pipeline_executed_sqls),
+            instance_id=target[0] if target is not None else None,
+            db_name=target[1] if target is not None else None,
+            table_name=ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+            query_time_column="ts_min",
+            metadata_resolution_tables=tuple(
+                state.metadata_resolution_steps.get(target, [])
+                if target is not None
+                else []
+            ),
+            diagnostics=self._diagnostics(state, target=target, completed=True),
+        )
+        state.final_result = result
+
+    def _history_direct_sample_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        row_id: int,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        if self.client.is_result_incomplete(payload):
+            self._start_history_chunk_recovery(state, row_id)
+            return self._pipeline_progress_transition(state, call, raw_result)
+        rows = self.client._tabular_rows(payload)
+        sample = (
+            self.client._casefolded_value(rows[0], "sample")
+            if len(rows) == 1
+            else None
+        )
+        expected_length = self.client._coerce_nonnegative_integer(
+            self.client._casefolded_value(
+                state.history_compact_rows.get(row_id, {}),
+                "sample_full_length",
+            )
+        )
+        if not isinstance(sample, str) or len(sample.encode("utf-8")) != expected_length:
+            self._start_history_chunk_recovery(state, row_id)
+            return self._pipeline_progress_transition(state, call, raw_result)
+        self._accept_reconstructed_sample(state, row_id, sample)
+        return self._pipeline_progress_transition(state, call, raw_result)
+
+    def _history_sample_chunk_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        row_id: int,
+        offset: int,
+        size: int,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        if offset != state.history_chunk_offset or size != state.history_chunk_size:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_chunk_sequence_mismatch",
+                detail="A sample chunk did not match the Host-generated offset and size.",
+                row_id=row_id,
+            )
+        if self.client.is_result_incomplete(payload):
+            if state.history_chunk_size > self.client.history_sample_chunk_size(
+                ARCHERY_SAMPLE_CHUNK_RESULT_CHARS
+            ) // 10:
+                state.history_chunk_size = max(
+                    1_000,
+                    state.history_chunk_size // 2,
+                )
+                return self._pipeline_progress_transition(state, call, raw_result)
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_chunk_incomplete",
+                detail="A sample chunk remained incomplete at the minimum safe size.",
+                row_id=row_id,
+            )
+        rows = self.client._tabular_rows(payload)
+        chunk = (
+            self.client._casefolded_value(rows[0], "sample_chunk")
+            if len(rows) == 1
+            else None
+        )
+        if not isinstance(chunk, str) or not chunk:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_chunk_missing",
+                detail="A required sample chunk was empty or structurally invalid.",
+                row_id=row_id,
+            )
+        state.history_chunk_parts.append(chunk)
+        reconstructed = "".join(state.history_chunk_parts)
+        expected_length = self.client._coerce_nonnegative_integer(
+            self.client._casefolded_value(
+                state.history_compact_rows.get(row_id, {}),
+                "sample_full_length",
+            )
+        )
+        actual_length = len(reconstructed.encode("utf-8"))
+        if expected_length is None or actual_length > expected_length:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_length_mismatch",
+                detail="Reassembled sample chunks exceeded the verified LENGTH(sample).",
+                row_id=row_id,
+            )
+        if actual_length == expected_length:
+            self._accept_reconstructed_sample(state, row_id, reconstructed)
+        elif len(chunk) < size:
+            return self._pipeline_failure_transition(
+                state,
+                call,
+                raw_result,
+                reason_code="history_sample_length_mismatch",
+                detail="Sample chunks ended before reaching the verified LENGTH(sample).",
+                row_id=row_id,
+            )
+        else:
+            state.history_chunk_offset += len(chunk)
+        return self._pipeline_progress_transition(state, call, raw_result)
+
+    def _accept_reconstructed_sample(
+        self,
+        state: ArcheryHarnessState,
+        row_id: int,
+        sample: str,
+    ) -> None:
+        compacted = self.client.compress_sample_for_agent(sample)
+        statement_type = self.client.classify_explainable_statement(sample)
+        references = self.client.explainable_physical_table_reference_sequence(sample)
+        metadata = {
+            "sample": compacted["sample"],
+            "sample_representation": compacted["representation"],
+            "sample_structure_executable": compacted["structure_executable"],
+            "sample_source_reconstructed": True,
+            "sample_sha256": compacted["sample_sha256"],
+            "sample_statement_type": statement_type,
+            "sample_table_references": [
+                reference.table for reference in references or ()
+            ],
+            "sample_in_lists": compacted["in_lists"],
+        }
+        state.history_sample_metadata[row_id] = metadata
+        state.history_id_rows[row_id].update(deepcopy(metadata))
+        if statement_type is None or references is None:
+            state.history_sample_states[row_id] = _SAMPLE_ANALYZED
+            state.history_sample_metadata[row_id]["explain_status"] = "not_applicable"
+            state.history_sample_metadata[row_id]["explain_skip_reason"] = (
+                "sample_not_supported_by_plain_explain"
+            )
+            state.history_exact_sample_id = None
+            state.history_exact_sample = None
+            state.history_current_id = None
+        else:
+            state.history_sample_states[row_id] = _SAMPLE_READY
+            state.history_exact_sample_id = row_id
+            state.history_exact_sample = sample
+        state.history_chunk_parts = []
+        state.history_chunk_offset = 1
+        state.history_chunk_size = 0
+        self._refresh_history_pipeline_result(state)
+
+    def _pipeline_failure_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+        *,
+        reason_code: str,
+        detail: str,
+        row_id: int | None = None,
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        target = {"history_id": row_id} if row_id is not None else {}
+        failure = self._local_rejection(
+            stage="history_recovery",
+            target=target,
+            error_type="result_mismatch",
+            reason_code=reason_code,
+            detail=detail,
+            terminal=True,
+        )
+        state.slow_query_analysis_failures.append(failure)
+        if row_id is not None:
+            state.history_sample_states[row_id] = _SAMPLE_FAILED
+            state.history_sample_metadata.setdefault(row_id, {}).update(
+                {
+                    "sample_recovery_status": _SAMPLE_FAILED,
+                    "sample_recovery_failure": reason_code,
+                }
+            )
+            state.history_current_id = None
+            state.history_exact_sample_id = None
+            state.history_exact_sample = None
+            self._refresh_history_pipeline_result(state)
+        else:
+            state.history_window_state = _HISTORY_WINDOW_FAILED_TERMINAL
+            state.history_window_failure = failure
+            state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+            state.finish_accepted = True
+            state.finish_summary = detail
+        return self._pipeline_progress_transition(state, call, raw_result)
+
+    def _pipeline_progress_transition(
+        self,
+        state: ArcheryHarnessState,
+        call: PreparedCall,
+        raw_result: Mapping[str, Any],
+    ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
+        return self._internal_only_transition(
+            state,
+            call,
+            raw_result=raw_result,
+            trigger_source="HOST_PIPELINE",
+            subject_key=str(call.metadata.get("call_id") or call.tool_name),
+            directive_facts={
+                "phase": state.history_pipeline_phase,
+                "history_id": state.history_current_id,
+            },
         )
 
     def on_result(
@@ -4314,11 +5842,22 @@ class ArcheryHarnessScenario:
             and not self.client.sql_equivalent(requested_sql, executed_sql)
             else executed_sql or requested_sql
         )
+        pipeline_transition = self._history_pipeline_result_transition(
+            state,
+            call,
+            result,
+            normalized_payload,
+            result_sql=result_sql,
+            actual_sql_verified=actual_sql_verified,
+        )
+        if pipeline_transition is not None:
+            return pipeline_transition
         supplemental_stage = self._slow_query_analysis_stage(call)
         if (
             self._has_history_result(state)
             and supplemental_stage is not None
             and call.metadata.get("result_assessment_complete") is not True
+            and call.metadata.get("host_generated") is not True
         ):
             messages = self._tool_result_messages(
                 call,
@@ -4366,6 +5905,12 @@ class ArcheryHarnessScenario:
             )
 
         if call.tool_name == ARCHERY_MCP_INSTANCES_TOOL_NAME:
+            state.analysis_instance_refs_by_endpoint.update(
+                self.client.instance_directory_references(
+                    payload,
+                    supplemental_text=text_blocks,
+                )
+            )
             instance_ref = call.effective_arguments.get("instance_ref")
             scoped_text_discovery = bool(
                 isinstance(instance_ref, str) and instance_ref.strip()
@@ -5026,6 +6571,49 @@ class ArcheryHarnessScenario:
             trace["error_type"] = error.code
             trace["error_detail"] = safe_error_detail(error.message)
         requested_sql = call.effective_arguments.get("sql_content")
+        if (
+            call.metadata.get("host_generated") is True
+            and isinstance(requested_sql, str)
+        ):
+            pipeline_retrieval = self.client.history_id_retrieval(requested_sql)
+            if pipeline_retrieval is not None and pipeline_retrieval[1] == "sample":
+                self._start_history_chunk_recovery(
+                    state,
+                    pipeline_retrieval[0],
+                )
+            elif pipeline_retrieval is not None and pipeline_retrieval[1].startswith(
+                "sample_chunk:"
+            ):
+                row_id = pipeline_retrieval[0]
+                if state.history_chunk_size > ARCHERY_SAMPLE_CHUNK_MIN_CHARS:
+                    state.history_chunk_size = max(
+                        ARCHERY_SAMPLE_CHUNK_MIN_CHARS,
+                        state.history_chunk_size // 2,
+                    )
+                else:
+                    state.history_sample_states[row_id] = _SAMPLE_FAILED
+                    state.history_sample_metadata.setdefault(row_id, {}).update(
+                        {
+                            "sample_recovery_status": _SAMPLE_FAILED,
+                            "sample_recovery_failure": "history_sample_chunk_tool_failure",
+                        }
+                    )
+                    state.history_current_id = None
+                    state.history_exact_sample_id = None
+                    state.history_exact_sample = None
+                    self._refresh_history_pipeline_result(state)
+            elif (
+                state.history_pipeline_phase
+                in {
+                    _HISTORY_PIPELINE_RANKING,
+                    _HISTORY_PIPELINE_COMPACT,
+                    _HISTORY_PIPELINE_RECONCILE,
+                }
+                and self.client.has_slow_log_reference(requested_sql)
+            ):
+                state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+                state.finish_accepted = True
+                state.finish_summary = "The deterministic history scan failed."
         if isinstance(requested_sql, str):
             state.last_query_error = error.message
             retrieval = self.client.history_id_retrieval(requested_sql)
@@ -5134,7 +6722,25 @@ class ArcheryHarnessScenario:
                 f"Transport status={status.value}, error={safe_error_detail(error.message)}. "
                 "Preserve prior successful observations and choose the next safe probe."
             )
-        messages = self._tool_result_messages(call, canonical)
+        if call.metadata.get("host_generated") is True:
+            messages = [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "type": "archery_host_pipeline_failure",
+                            "tool_name": call.tool_name,
+                            "status": status.value,
+                            "error_code": error.code,
+                            "detail": safe_error_detail(error.message),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                }
+            ]
+        else:
+            messages = self._tool_result_messages(call, canonical)
         directive_ids: list[str] = []
         if (
             state.history_window_state == _HISTORY_WINDOW_FAILED_TERMINAL
@@ -5249,10 +6855,37 @@ class ArcheryHarnessScenario:
     ) -> ScenarioTransition[ArcheryHarnessState, dict[str, Any]]:
         """Return raw feedback to the internal model without creating a UI observation."""
 
-        messages = self._tool_result_messages(
-            call,
-            self._raw_model_tool_result(raw_result),
-        )
+        if call.metadata.get("host_generated") is True:
+            current_id = state.history_current_id
+            row = state.history_id_rows.get(current_id or -1, {})
+            progress = {
+                "type": "archery_host_pipeline_progress",
+                "phase": state.history_pipeline_phase,
+                "history_id": current_id,
+                "sample_state": state.history_sample_states.get(current_id or -1),
+                "source": self.client.slow_query_source_row(row) if row else None,
+                "instruction": (
+                    "Host generated and validated this mechanical call. Continue only "
+                    "with unresolved target discovery; Host owns paging, sample recovery, "
+                    "metadata SQL, and exact EXPLAIN execution."
+                ),
+            }
+            messages = [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        progress,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            ]
+        else:
+            messages = self._tool_result_messages(
+                call,
+                self._raw_model_tool_result(raw_result),
+            )
         if directive_ids:
             messages.extend(
                 self._workflow_directive_messages(
@@ -5469,10 +7102,17 @@ class ArcheryHarnessScenario:
         if marker in state.recorded_call_ids:
             return
         state.recorded_call_ids.add(marker)
-        state.executed_model_calls.append(call.tool_name)
+        host_generated = call.metadata.get("host_generated") is True
+        if host_generated:
+            state.executed_host_calls.append(call.tool_name)
+        else:
+            state.executed_model_calls.append(call.tool_name)
         request_id = call.metadata.get("request_id")
         if isinstance(request_id, str) and request_id:
-            state.model_request_ids.append(request_id)
+            if host_generated:
+                state.host_request_ids.append(request_id)
+            else:
+                state.model_request_ids.append(request_id)
         state.mcp_roundtrip_count += 1
         trace = self._trace(state, call)
         if trace is not None:
@@ -5498,8 +7138,12 @@ class ArcheryHarnessScenario:
         return {
             "model_attempted_tool_calls": list(state.attempted_model_calls),
             "model_executed_tool_calls": list(state.executed_model_calls),
+            "host_executed_tool_calls": list(state.executed_host_calls),
+            "host_request_ids": list(state.host_request_ids),
             "model_decision_count": state.model_decision_count,
-            "mcp_tool_call_count": len(state.executed_model_calls),
+            "mcp_tool_call_count": (
+                len(state.executed_model_calls) + len(state.executed_host_calls)
+            ),
             "mcp_roundtrip_count": state.mcp_roundtrip_count,
             "mcp_session_attempts": state.session_attempts,
             "model_selection_errors": deepcopy(state.consecutive_model_errors),
@@ -5555,6 +7199,7 @@ async def execute_archery_harness(
         occurred_at=occurred_at,
         alert_context=dict(alert_context),
         alert_endpoint=client.alert_endpoint_from_context(alert_context),
+        history_pipeline_enabled=client.deterministic_history_pipeline,
         workflow_revision=client.prompts.workflow_revision,
         workflow_directives=dict(client.prompts.workflow_directives),
     )
@@ -5610,7 +7255,7 @@ async def execute_archery_harness(
                 remote_tool_calls=None,
                 host_bootstrap_calls=None,
                 session_attempts=None,
-                wall_time_seconds=None,
+                wall_time_seconds=client.investigation_budget_seconds,
             )
         ),
         checkpoint_hook=checkpoint_store,
@@ -5655,11 +7300,186 @@ def client_window(
     return slow_log_window(occurred_at, window_seconds=client.window_seconds)
 
 
+def _materialize_incomplete_pipeline_scan(
+    client: ArcheryMCPClient,
+    state: ArcheryHarnessState,
+) -> None:
+    if state.final_result is not None:
+        return
+    available_ids = set(state.history_ranking_rows)
+    if state.history_compact_rows:
+        available_ids &= set(state.history_compact_rows)
+    if not available_ids:
+        return
+    rows = [
+        {
+            **state.history_compact_rows.get(row_id, {}),
+            **state.history_ranking_rows[row_id],
+        }
+        for row_id in sorted(available_ids, reverse=True)
+    ]
+    priority = client.prioritize_history_rows(rows)
+    state.history_processing_order = list(priority["ordered_ids"])
+    state.history_high_priority_ids = set(priority["high_priority_ids"])
+    state.history_rank_metadata = {
+        int(row_id): dict(metadata)
+        for row_id, metadata in priority["ranks"].items()
+    }
+    state.history_id_rows = {}
+    for row in rows:
+        row_id = client._coerce_positive_integer(client._casefolded_value(row, "id"))
+        assert row_id is not None
+        state.history_id_rows[row_id] = {
+            **row,
+            **state.history_rank_metadata.get(row_id, {}),
+            "sample_recovery_status": _SAMPLE_BUDGET_EXHAUSTED,
+        }
+        state.history_sample_states[row_id] = _SAMPLE_BUDGET_EXHAUSTED
+    state.history_recovery_ids = set(available_ids)
+    state.history_recovery_required = False
+    state.history_recovery_listing_completed = state.history_ranking_scan_complete
+    state.history_window_state = _HISTORY_WINDOW_FAILED_TERMINAL
+    state.history_window_failure = {
+        "stage": "history_recovery",
+        "error_type": "investigation_stopped",
+        "reason_code": "history_scan_incomplete",
+        "detail": "The deterministic history scan stopped before both logical scans completed.",
+    }
+    target = state.history_pipeline_target
+    state.final_result = ArcherySlowLogQueryResult(
+        payload={
+            "rows": list(state.history_id_rows.values()),
+            "row_count": len(state.history_id_rows),
+            "history_scan_complete": False,
+            "history_ranking_scan_complete": state.history_ranking_scan_complete,
+            "history_compact_scan_complete": state.history_compact_scan_complete,
+            "history_snapshot_consistent": False,
+            "result_incomplete": True,
+            "result_incomplete_reasons": ["history_scan_incomplete"],
+        },
+        requested_sql=state.history_pipeline_requested_sql,
+        window_start=state.window_start,
+        window_end=state.window_end,
+        model_tool_calls=tuple(state.executed_model_calls),
+        model_request_ids=tuple(state.model_request_ids),
+        executed_sql=(
+            state.history_pipeline_executed_sqls[0]
+            if state.history_pipeline_executed_sqls
+            else None
+        ),
+        actual_sql_verified=bool(state.history_pipeline_executed_sqls),
+        instance_id=target[0] if target is not None else None,
+        db_name=target[1] if target is not None else None,
+        table_name=ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+        query_time_column="ts_min",
+        query_completed=True,
+    )
+    state.history_pipeline_phase = _HISTORY_PIPELINE_ENRICHMENT
+
+
+def _finalize_deterministic_pipeline_stop(
+    client: ArcheryMCPClient,
+    state: ArcheryHarnessState,
+    *,
+    stop_reason: str,
+) -> None:
+    if not state.history_pipeline_enabled:
+        return
+    _materialize_incomplete_pipeline_scan(client, state)
+    if (
+        state.history_pipeline_phase != _HISTORY_PIPELINE_ENRICHMENT
+        or state.final_result is None
+    ):
+        return
+    normalized_stop_reason = stop_reason.upper()
+    budget_exhausted = normalized_stop_reason in {
+        RuntimeStopReason.BUDGET_EXHAUSTED.value,
+        RuntimeStopReason.DEADLINE_EXCEEDED.value,
+    }
+    unfinished: list[int] = []
+    for row_id in state.history_processing_order:
+        status = state.history_sample_states.get(row_id, _SAMPLE_PENDING)
+        if status in {_SAMPLE_ANALYZED, _SAMPLE_FAILED}:
+            continue
+        unfinished.append(row_id)
+        metadata = state.history_sample_metadata.setdefault(row_id, {})
+        if status == _SAMPLE_READY:
+            state.history_sample_states[row_id] = _SAMPLE_ANALYZED
+            metadata["explain_status"] = (
+                "budget_exhausted" if budget_exhausted else "investigation_stopped"
+            )
+            metadata["explain_source_sql_exact"] = True
+        else:
+            terminal_status = (
+                _SAMPLE_BUDGET_EXHAUSTED if budget_exhausted else _SAMPLE_FAILED
+            )
+            state.history_sample_states[row_id] = terminal_status
+            metadata["sample_recovery_status"] = terminal_status
+    if unfinished:
+        state.slow_query_analysis_failures.append(
+            {
+                "stage": "explain",
+                "target": {"history_ids": unfinished},
+                "error_type": (
+                    "budget_exhausted" if budget_exhausted else "investigation_stopped"
+                ),
+                "reason_code": (
+                    "archery_investigation_budget_exhausted"
+                    if budget_exhausted
+                    else "archery_investigation_stopped"
+                ),
+                "detail": (
+                    "Archery investigation stopped at its internal deadline; compact "
+                    "history evidence and completed enrichment were retained."
+                    if budget_exhausted
+                    else "Archery enrichment stopped before all rows reached a terminal state; "
+                    "compact history evidence and completed enrichment were retained."
+                ),
+                "terminal": True,
+            }
+        )
+    state.history_exact_sample_id = None
+    state.history_exact_sample = None
+    state.history_chunk_parts = []
+    state.history_current_id = None
+    state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+    rows: list[dict[str, Any]] = []
+    for source in state.final_result.payload.get("rows", []):
+        if not isinstance(source, Mapping):
+            continue
+        row = dict(source)
+        row_id = ArcheryMCPClient._coerce_positive_integer(
+            ArcheryMCPClient._casefolded_value(row, "id")
+        )
+        if row_id is not None:
+            row["sample_recovery_status"] = state.history_sample_states.get(
+                row_id, _SAMPLE_BUDGET_EXHAUSTED
+            )
+            row.update(deepcopy(state.history_sample_metadata.get(row_id, {})))
+        rows.append(row)
+    payload = {
+        **state.final_result.payload,
+        "rows": rows,
+        "enrichment_partial": bool(unfinished),
+        "enrichment_stop_reason": stop_reason,
+        "enrichment_unfinished_ids": unfinished,
+        "sample_recovery_pending_count": 0,
+    }
+    state.final_result = replace(state.final_result, payload=payload)
+
+
 def _query_result(
     client: ArcheryMCPClient,
     harness: MCPHarnessResult[ArcheryHarnessState, dict[str, Any]],
 ) -> ArcherySlowLogQueryResult:
     state = harness.state
+    _finalize_deterministic_pipeline_stop(
+        client,
+        state,
+        stop_reason=(
+            harness.finish.reason.value if harness.finish is not None else "unknown"
+        ),
+    )
     _record_history_recovery_terminal_failure(
         state,
         detail=(
@@ -5767,7 +7587,35 @@ def _query_result(
             harness.finish.reason.value if harness.finish is not None else None
         )
         diagnostics["query_trace"] = deepcopy(state.query_trace)
-        diagnostics["history_recovery_complete"] = _history_recovery_complete(state)
+        if state.history_pipeline_enabled:
+            diagnostics["history_recovery_complete"] = bool(
+                final_result.payload.get("history_scan_complete")
+            )
+            diagnostics["history_recovery_missing_ids"] = [
+                row_id
+                for row_id in state.history_processing_order
+                if state.history_sample_states.get(row_id)
+                in {
+                    _SAMPLE_PENDING,
+                    _SAMPLE_DIRECT_PENDING,
+                    _SAMPLE_CHUNK_PENDING,
+                    _SAMPLE_READY,
+                    _SAMPLE_BUDGET_EXHAUSTED,
+                }
+            ]
+            diagnostics["history_id_states"] = {
+                str(row_id): status
+                for row_id, status in sorted(state.history_sample_states.items())
+            }
+        else:
+            diagnostics["history_recovery_complete"] = _history_recovery_complete(state)
+            diagnostics["history_recovery_missing_ids"] = sorted(
+                _history_recovery_missing_ids(state)
+            )
+            diagnostics["history_id_states"] = {
+                str(row_id): _history_id_status(state, row_id)
+                for row_id in sorted(state.history_recovery_ids)
+            }
         diagnostics["history_window_state"] = state.history_window_state
         diagnostics["history_window_failure"] = deepcopy(
             state.history_window_failure
@@ -5778,13 +7626,6 @@ def _query_result(
         diagnostics["history_recovery_id_listing_failed_terminal"] = (
             state.history_recovery_listing_failed_terminal
         )
-        diagnostics["history_recovery_missing_ids"] = sorted(
-            _history_recovery_missing_ids(state)
-        )
-        diagnostics["history_id_states"] = {
-            str(row_id): _history_id_status(state, row_id)
-            for row_id in sorted(state.history_recovery_ids)
-        }
         diagnostics["supplemental_stage_states"] = dict(
             state.supplemental_stage_states
         )
@@ -5852,8 +7693,12 @@ def _query_result(
     diagnostics.update(
         {
             "model_executed_tool_calls": list(state.executed_model_calls),
+            "host_executed_tool_calls": list(state.executed_host_calls),
+            "host_request_ids": list(state.host_request_ids),
             "model_decision_count": state.model_decision_count,
-            "mcp_tool_call_count": len(state.executed_model_calls),
+            "mcp_tool_call_count": (
+                len(state.executed_model_calls) + len(state.executed_host_calls)
+            ),
             "mcp_session_attempts": harness.budget.consumed.session_attempts,
             "reconnect_error_type": (
                 ArcheryMCPProtocolError.__name__
@@ -5915,6 +7760,13 @@ def _build_slow_query_analysis(
             str(source.get("sample") or ""),
         )
 
+    def analysis_group_key(source: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(client._casefolded_value(source, "hostname_max") or "").casefold(),
+            str(client._casefolded_value(source, "db_max") or "").casefold(),
+            str(client._casefolded_value(source, "checksum") or "").casefold(),
+        )
+
     expected: list[dict[str, Any]] = []
     for row in candidates:
         source = client.slow_query_source_row(row)
@@ -5937,6 +7789,19 @@ def _build_slow_query_analysis(
             and db_name.strip() in state.analysis_database_names.get(instance_id, set())
         )
         sample = str(source.get("sample") or "")
+        recorded_tables = source.get("sample_table_references")
+        tables = (
+            {
+                client.clean_table_name(str(item))
+                for item in recorded_tables
+                if isinstance(item, str)
+            }
+            if isinstance(recorded_tables, list)
+            else {
+                client.clean_table_name(item)
+                for item in client.explainable_table_references(sample)
+            }
+        )
         expected.append(
             {
                 "source": source,
@@ -5945,10 +7810,7 @@ def _build_slow_query_analysis(
                 "db_name": db_name.strip() if isinstance(db_name, str) else None,
                 "target_bound": instance_id is not None and db_is_allowlisted,
                 "endpoint": endpoint.casefold() if endpoint is not None else None,
-                "tables": {
-                    client.clean_table_name(item)
-                    for item in client.explainable_table_references(sample)
-                },
+                "tables": tables,
             }
         )
 
@@ -5970,7 +7832,14 @@ def _build_slow_query_analysis(
                 continue
             if require_source and (
                 not isinstance(item_source, Mapping)
-                or source_key(item_source) != work["source_key"]
+                or (
+                    source_key(item_source) != work["source_key"]
+                    and (
+                        not analysis_group_key(item_source)[2]
+                        or analysis_group_key(item_source)
+                        != analysis_group_key(work["source"])
+                    )
+                )
             ):
                 continue
             if item_target.get("instance_id") != work["instance_id"]:
@@ -6034,7 +7903,10 @@ def _build_slow_query_analysis(
         if primary["endpoint"] is not None:
             target["hostname"] = primary["endpoint"]
 
-    if not candidates:
+    if not candidates and history_payload.get("enrichment_partial") is True:
+        status = "partial"
+        missing_stages = ["explain"]
+    elif not candidates:
         status = "not_applicable"
         missing_stages = []
         if not any(

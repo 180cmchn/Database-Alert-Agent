@@ -308,6 +308,7 @@ def _client(
             prompts=ARCHERY_PROMPTS,
         ),
         model or PromptFollowingMCPModel(),
+        deterministic_history_pipeline=False,
         transport=transport,
     )
 
@@ -888,6 +889,60 @@ def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> Non
     assert not ArcheryMCPClient.is_history_id_retrieval_query(
         f"SELECT * FROM {history_table} WHERE id = 24413640 AND 1 = 1"
     )
+
+
+def test_history_sample_and_chunk_retrieval_use_closed_host_shapes() -> None:
+    sample_sql = ArcheryMCPClient.history_sample_sql(24413640)
+    chunk_sql = ArcheryMCPClient.history_sample_chunk_sql(24413640, 1, 10_000)
+
+    assert ArcheryMCPClient.history_id_retrieval(sample_sql) == (
+        24413640,
+        "sample",
+    )
+    assert ArcheryMCPClient.history_sample_chunk_retrieval(chunk_sql) == (
+        24413640,
+        1,
+        10_000,
+    )
+    assert ArcheryMCPClient.history_sample_chunk_size(12_000) == 10_000
+    invalid = (
+        chunk_sql.replace("10000", "10001"),
+        chunk_sql.replace("SUBSTRING(sample, 1", "SUBSTRING(sample, 0"),
+        chunk_sql.replace("AS sample_chunk", "AS sample"),
+        chunk_sql.replace("WHERE id = 24413640", "WHERE id IN (24413640, 24413641)"),
+    )
+    assert all(
+        ArcheryMCPClient.history_sample_chunk_retrieval(sql) is None
+        for sql in invalid
+    )
+
+
+def test_agent_sample_structure_retains_both_ends_of_large_literal_in() -> None:
+    sample = (
+        "SELECT * FROM orders WHERE id IN ("
+        + ",".join(str(value) for value in range(20_000))
+        + ") AND status = 'open'"
+    )
+
+    structured = ArcheryMCPClient.compress_sample_for_agent(sample)
+
+    assert structured["representation"] == "structured"
+    assert structured["structure_executable"] is True
+    assert len(structured["sample"]) <= 12_000
+    assert "IN (0," in structured["sample"]
+    assert "19999)" in structured["sample"]
+    assert structured["in_lists"][0]["omitted_value_count"] > 0
+
+
+def test_non_in_oversized_sample_uses_non_executable_head_tail_display() -> None:
+    sample = "SELECT * FROM notes WHERE body = '" + ("x" * 13_000) + "'"
+
+    structured = ArcheryMCPClient.compress_sample_for_agent(sample)
+
+    assert structured["representation"] == "structured"
+    assert structured["structure_executable"] is False
+    assert len(structured["sample"]) == 12_000
+    assert "sample middle omitted for Agent context" in structured["sample"]
 
 
 @pytest.mark.parametrize(
@@ -3333,6 +3388,12 @@ def test_allowlist_discovery_parses_strict_live_text_contracts() -> None:
         {"result": instances},
         expected_instance_ref="missing",
     ) == {}
+    assert ArcheryMCPClient.instance_directory_references(
+        {"result": instances}
+    ) == {
+        "100.84.97.100:3306": "pcm",
+        "100.84.97.141:3307": "archery",
+    }
     assert ArcheryMCPClient.allowlisted_database_names(
         {"result": databases},
         expected_instance_id=3,

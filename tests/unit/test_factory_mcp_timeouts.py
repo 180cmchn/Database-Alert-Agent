@@ -86,6 +86,7 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         mcp_settings_path=_write_mcp_catalog(tmp_path),
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-token",
+        archery_investigation_budget_seconds=123,
         archery_mcp_tool_timeout_seconds=611,
         prometheus_mcp_sse_url="https://prometheus.example.test/sse",
         prometheus_mcp_tool_timeout_seconds=733,
@@ -97,6 +98,8 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         prometheus_tool = runtime.service.tool_registry.get(PROMETHEUS_METRICS_TOOL_NAME)
 
         assert isinstance(archery_tool, ArcherySlowLogEvidenceTool)
+        assert archery_tool.client.investigation_budget_seconds == 123
+        assert archery_tool.client.deterministic_history_pipeline is True
         assert archery_tool.default_timeout_seconds == 611
         assert runtime.service.tool_registry.spec(ARCHERY_SLOW_LOG_TOOL_NAME).timeout == 611
 

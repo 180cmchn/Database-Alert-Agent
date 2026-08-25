@@ -409,6 +409,7 @@ def _client(
             prompts=ARCHERY_PROMPTS,
         ),
         model,
+        deterministic_history_pipeline=False,
         harness_connector=connector,
         harness_runtime_dependencies=(
             ArcheryHarnessRuntimeDependencies(repository)

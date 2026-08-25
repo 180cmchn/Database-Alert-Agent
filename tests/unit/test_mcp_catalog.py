@@ -75,10 +75,10 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     ).hexdigest()
     assert archery.prompts.workflow_directives[
         "archery.history.truncation.fetch_single_id"
-    ].startswith("取得完整 id 清单后")
+    ].startswith("紧凑扫描完成后")
     assert archery.prompts.workflow_directives[
         "archery.history.truncation.project_sample_prefix"
-    ].endswith("绝不能进入 EXPLAIN。")
+    ].endswith("始终保留原文长度和 SHA-256 绑定。")
     assert set(archery.prompts.workflow_directives) == {
         "archery.alert.scope",
         "archery.tools.dynamic_contract",
