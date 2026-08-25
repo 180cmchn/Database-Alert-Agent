@@ -66,8 +66,8 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v29"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v4"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v30"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v5"
 _MISSING: Final = object()
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -176,6 +176,29 @@ _SLOW_LOG_TABLE_TEXT: Final = re.compile(
     r"(?i)(?<![A-Za-z0-9_$])"
     r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?(?:[_$-]*log|[_$-]*review[_$-]*history)[A-Za-z0-9_$-]*)"
     r"(?![A-Za-z0-9_$])"
+)
+_INSTANCE_LIST_HEADER_TEXT: Final = re.compile(
+    r"^\s*实例清单（第\s*\d+\s*页）[：:]\s*$"
+)
+_INSTANCE_LIST_ROW_TEXT: Final = re.compile(
+    r"^\s*\d+\.\s*\[ID:(?P<instance_id>[1-9]\d*)\]\s+"
+    r"(?P<instance_ref>\S+)\s+(?P<endpoint>\S+:\d{1,5})\s+"
+    r"资源组:\[[^\]\r\n]*\]\s*$"
+)
+_DATABASE_LIST_HEADER_TEXT: Final = re.compile(
+    r"^\s*实例\s+(?P<instance_id>[1-9]\d*)\s+的数据库清单[：:]\s*$"
+)
+_DATABASE_LIST_ROW_TEXT: Final = re.compile(
+    r"^\s*\d+\.\s+(?P<db_name>\S+)\s*$"
+)
+_ALLOWLIST_REJECTION_TEXT: Final = re.compile(
+    r"^\s*(?:"
+    r"未在\s*allowlist\.json\s*中找到实例引用|"
+    r"实例不在白名单中?[，,\s]*(?:已)?拒绝执行|"
+    r"实例不在\s*allowlist[，,\s]*(?:已)?拒绝执行|"
+    r"instance\b[^\r\n]{0,200}\b(?:not|isn't)\b[^\r\n]{0,100}\ballowlist\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
 )
 _INFORMATION_SCHEMA_PROJECTION_FIELDS: Final = {
     "columns": {
@@ -1889,8 +1912,16 @@ class ArcheryMCPClient:
     def allowlisted_instance_endpoints(
         cls,
         payload: Mapping[str, Any],
+        *,
+        expected_instance_ref: str | None = None,
+        supplemental_text: Sequence[str] = (),
     ) -> dict[int, set[str]]:
-        """Extract only row-local explicit allowlist instance/endpoint pairs."""
+        """Extract only explicit allowlist instance/endpoint pairs.
+
+        Current Archery MCP deployments return discovery rows either as normal
+        tabular data or as a strictly formatted numbered list. Prose without the
+        provider's list header is never treated as authorization data.
+        """
 
         discovered: dict[int, set[str]] = {}
         for row in cls._tabular_rows(payload):
@@ -1906,6 +1937,20 @@ class ArcheryMCPClient:
                 None,
             )
             if instance_id is None:
+                continue
+            instance_name = next(
+                (
+                    normalized[key].strip()
+                    for key in ("name", "instancename", "instanceref")
+                    if isinstance(normalized.get(key), str) and normalized[key].strip()
+                ),
+                None,
+            )
+            if not cls._instance_ref_matches(
+                expected_instance_ref,
+                instance_id=instance_id,
+                instance_name=instance_name,
+            ):
                 continue
             endpoints: set[str] = set()
             host = next(
@@ -1934,11 +1979,55 @@ class ArcheryMCPClient:
                     endpoints.add(endpoint.casefold())
             if endpoints:
                 discovered.setdefault(instance_id, set()).update(endpoints)
+        for text in cls._discovery_text_blocks(payload, supplemental_text):
+            lines = text.splitlines()
+            in_instance_list = False
+            for line in lines:
+                if _INSTANCE_LIST_HEADER_TEXT.fullmatch(line):
+                    in_instance_list = True
+                    continue
+                if not in_instance_list:
+                    continue
+                match = _INSTANCE_LIST_ROW_TEXT.fullmatch(line)
+                if match is None:
+                    if line.strip():
+                        in_instance_list = False
+                    continue
+                instance_id = cls._coerce_positive_integer(match.group("instance_id"))
+                if instance_id is None or not cls._instance_ref_matches(
+                    expected_instance_ref,
+                    instance_id=instance_id,
+                    instance_name=match.group("instance_ref"),
+                ):
+                    continue
+                endpoint = cls._normalize_endpoint(match.group("endpoint"))
+                if endpoint is not None:
+                    discovered.setdefault(instance_id, set()).add(endpoint.casefold())
         return discovered
 
+    @staticmethod
+    def _instance_ref_matches(
+        expected: str | None,
+        *,
+        instance_id: int,
+        instance_name: str | None,
+    ) -> bool:
+        if expected is None or not expected.strip():
+            return True
+        normalized = expected.strip().casefold()
+        return normalized == str(instance_id) or bool(
+            instance_name and normalized == instance_name.strip().casefold()
+        )
+
     @classmethod
-    def allowlisted_database_names(cls, payload: Mapping[str, Any]) -> set[str]:
-        """Extract database names only from explicit tabular name fields."""
+    def allowlisted_database_names(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        expected_instance_id: int | None = None,
+        supplemental_text: Sequence[str] = (),
+    ) -> set[str]:
+        """Extract database names only from explicit discovery rows."""
 
         names: set[str] = set()
         for row in cls._tabular_rows(payload):
@@ -1949,7 +2038,59 @@ class ArcheryMCPClient:
                 value = normalized.get(key)
                 if isinstance(value, str) and value.strip():
                     names.add(value.strip())
+        for text in cls._discovery_text_blocks(payload, supplemental_text):
+            lines = text.splitlines()
+            active_instance_id: int | None = None
+            for line in lines:
+                header = _DATABASE_LIST_HEADER_TEXT.fullmatch(line)
+                if header is not None:
+                    active_instance_id = cls._coerce_positive_integer(
+                        header.group("instance_id")
+                    )
+                    continue
+                if active_instance_id is None:
+                    continue
+                match = _DATABASE_LIST_ROW_TEXT.fullmatch(line)
+                if match is None:
+                    if line.strip():
+                        active_instance_id = None
+                    continue
+                if (
+                    expected_instance_id is not None
+                    and active_instance_id != expected_instance_id
+                ):
+                    continue
+                candidate = match.group("db_name")
+                if cls._safe_discovered_database_name(candidate):
+                    names.add(candidate)
         return names
+
+    @classmethod
+    def _discovery_text_blocks(
+        cls,
+        payload: Mapping[str, Any],
+        supplemental_text: Sequence[str],
+    ) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                [
+                    *cls._metadata_text(payload),
+                    *(item for item in supplemental_text if isinstance(item, str)),
+                ]
+            )
+        )
+
+    @staticmethod
+    def _safe_discovered_database_name(value: str) -> bool:
+        candidate = value.strip()
+        return bool(
+            candidate
+            and len(candidate.encode("utf-8")) <= 64
+            and all(
+                character.isalnum() or character in {"_", "$", "-"}
+                for character in candidate
+            )
+        )
 
     @classmethod
     def reported_execution_target_values(
@@ -3250,6 +3391,14 @@ class ArcheryMCPClient:
                 decoded,
                 tool_name=tool_name,
             )
+        for text in ArcheryMCPClient._discovery_text_blocks(
+            payload,
+            supplemental_text,
+        ):
+            if _ALLOWLIST_REJECTION_TEXT.search(text):
+                raise ArcheryMCPToolError(
+                    f"{tool_name} failed: {safe_error_detail(text)}"
+                )
 
     @staticmethod
     def tool_text_blocks(result: Mapping[str, Any]) -> tuple[str, ...]:

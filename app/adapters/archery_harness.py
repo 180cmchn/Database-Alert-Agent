@@ -74,8 +74,8 @@ from app.mcp_runtime import (
 )
 
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v4"
-ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v4"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v5"
+ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v5"
 _FINISH_TOOL_NAME = "finish_archery_investigation"
 _RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
 _RESULT_CONTENT_STATES = ("complete", "content_too_long", "uncertain")
@@ -4365,15 +4365,33 @@ class ArcheryHarnessScenario:
                 failure=incomplete_failure,
             )
 
-        if self._has_history_result(state) and call.tool_name == ARCHERY_MCP_INSTANCES_TOOL_NAME:
-            discovered_instances = self.client.allowlisted_instance_endpoints(payload)
+        if call.tool_name == ARCHERY_MCP_INSTANCES_TOOL_NAME:
+            instance_ref = call.effective_arguments.get("instance_ref")
+            scoped_text_discovery = bool(
+                isinstance(instance_ref, str) and instance_ref.strip()
+            )
+            discovered_instances = self.client.allowlisted_instance_endpoints(
+                payload,
+                expected_instance_ref=(
+                    instance_ref if isinstance(instance_ref, str) else None
+                ),
+                supplemental_text=text_blocks,
+            )
+            if not self.client._tabular_rows(payload) and not scoped_text_discovery:
+                # The live MCP's unfiltered numbered text is an instance catalog,
+                # while instance_ref performs the execution-allowlist lookup.
+                discovered_instances = {}
             for instance_id, endpoints in discovered_instances.items():
                 state.analysis_instance_endpoints.setdefault(instance_id, set()).update(
                     endpoints
                 )
-            for row in self.client.select_explainable_history_rows(
-                self._history_payload(state),
-                sample_prefix_ids=state.history_sample_prefix_ids,
+            for row in (
+                self.client.select_explainable_history_rows(
+                    self._history_payload(state),
+                    sample_prefix_ids=state.history_sample_prefix_ids,
+                )
+                if self._has_history_result(state)
+                else []
             ):
                 source = self.client.slow_query_source_row(row)
                 endpoint = self.client._normalize_endpoint(source.get("hostname_max"))
@@ -4462,7 +4480,11 @@ class ArcheryHarnessScenario:
                         failure=failure,
                     )
                 else:
-                    databases = self.client.allowlisted_database_names(payload)
+                    databases = self.client.allowlisted_database_names(
+                        payload,
+                        expected_instance_id=instance_id,
+                        supplemental_text=text_blocks,
+                    )
                     if databases:
                         state.analysis_database_names.setdefault(instance_id, set()).update(
                             databases
@@ -5076,6 +5098,12 @@ class ArcheryHarnessScenario:
                     error_type=error.code,
                     detail=error.message,
                 )
+                if (
+                    call.tool_name == ARCHERY_MCP_INSTANCES_TOOL_NAME
+                    and failure.get("reason_code") == "instance_not_allowlisted"
+                ):
+                    state.analysis_instance_endpoints.clear()
+                    state.analysis_database_names.clear()
                 state.slow_query_analysis_failures.append(failure)
                 self._mark_supplemental_stage_terminal(
                     state,
@@ -5859,6 +5887,19 @@ def _build_slow_query_analysis(
     table_results = deepcopy(getattr(state, "slow_query_table_structure_results", []))
     index_results = deepcopy(getattr(state, "slow_query_index_results", []))
     failures = deepcopy(getattr(state, "slow_query_analysis_failures", []))
+    history_recovery_succeeded = bool(
+        _history_recovery_complete(state)
+        and not client.is_result_incomplete(history_payload)
+    )
+    unresolved_failures = [
+        failure
+        for failure in failures
+        if not (
+            failure.get("stage") == "history_recovery"
+            and failure.get("terminal") is False
+            and history_recovery_succeeded
+        )
+    ]
     candidates = client.select_explainable_history_rows(
         history_payload,
         sample_prefix_ids=getattr(state, "history_sample_prefix_ids", set()),
@@ -6009,13 +6050,13 @@ def _build_slow_query_analysis(
                     "detail": "history 结果中没有可由普通 EXPLAIN 安全分析的单语句 sample。",
                 }
             )
-    elif total_work > 0 and completed_work == total_work and not failures:
+    elif total_work > 0 and completed_work == total_work and not unresolved_failures:
         status = "succeeded"
     elif completed_work:
         status = "partial"
     else:
         status = "failed"
-        if not failures:
+        if not unresolved_failures:
             failures.append(
                 {
                     "stage": "explain",
@@ -6031,6 +6072,9 @@ def _build_slow_query_analysis(
             "status": status,
             "source_history_row": source_history_row,
             "target": target,
+            "stage_states": deepcopy(
+                getattr(state, "supplemental_stage_states", {})
+            ),
             "explain_results": explain_results,
             "table_structure_results": table_results,
             "index_results": index_results,

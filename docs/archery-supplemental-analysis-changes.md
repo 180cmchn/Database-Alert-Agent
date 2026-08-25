@@ -66,6 +66,10 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 
 - sample 绑定真实 history `id/checksum/sample`，相同 checksum 只选择优先级最高的一行。
 - `hostname_max` 必须唯一匹配 allowlist 实例，`db_max` 必须出现在该实例真实数据库列表中。
+- 同一调查中 history 前已经取得的结构化 allowlist 行会保留到补充阶段，但只授权数据库发现；真实
+  MCP 无筛选返回的编号文本是实例目录，必须经过精确 `instance_ref` 定向查询成功后才成为执行
+  allowlist。数据库清单未确认前仍禁止业务目标 SQL。真实 MCP 文本使用带固定标题的严格解析器，
+  普通 prose 或 `allowlist.json` 拒绝文本不能产生授权。
 - sample 中的显式 schema、CTE 内物理表和 DML 目标必须与 `db_max` 精确一致。
 - 先取得表字段或明确记录字段阶段失败，之后才能执行普通 EXPLAIN；字段和索引事实可在相同实例、
   数据库和表之间复用，EXPLAIN 仍绑定具体 history 行。
@@ -77,6 +81,9 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 - `final_result_payload` 继续只做格式转换并完整透传，不过滤、聚合、排序或设置程序侧大小上限。
 - EXPLAIN、字段、索引和失败原因通过独立 `slow_query_analysis` 进入主 Agent；补充失败不改变 history
   的成功状态、可用性或根因资格。
+- 最终完整 history 已覆盖的显式非终态恢复失败投影为 `RECOVERED`；终态或未恢复失败仍为 `FAILED`。
+- 因目标解析或工具能力导致的内部 `UNAVAILABLE` 会原样进入 evidence unit；`NO_DATA` 仅表示已执行
+  的查询没有数据或缺少更精确的历史状态，不能再代替依赖阻断。
 - 本地策略拒绝也进入 checkpoint lineage；当前策略直接判定的本地拒绝不会新增远端调用 debit，
   也不会保存成远端响应 artifact。若旧 PENDING 调用在崩溃前已经持久化 append-only remote debit，
   恢复后该 debit 作为不可退款 reservation 保留，但当前策略仍可在 transport 前拒绝该调用。

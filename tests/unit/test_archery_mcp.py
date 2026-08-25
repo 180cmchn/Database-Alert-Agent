@@ -25,6 +25,7 @@ from app.adapters.archery_mcp import (
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcheryMCPClient,
     ArcheryMCPProtocolError,
+    ArcheryMCPToolError,
     ArcherySlowLogEvidenceTool,
     ArcherySlowLogQueryResult,
     MCPServerSettings,
@@ -3300,6 +3301,69 @@ def test_allowlist_discovery_extracts_only_explicit_row_local_targets() -> None:
     assert ArcheryMCPClient.allowlisted_database_names(
         {"rows": [{"name": "orders_prod"}, {"db_name": "reporting"}]}
     ) == {"orders_prod", "reporting"}
+
+
+def test_allowlist_discovery_parses_strict_live_text_contracts() -> None:
+    instances = (
+        "实例清单（第 1 页）：\n"
+        "1. [ID:3] pcm 100.84.97.100:3306 资源组:[1]\n"
+        "2. [ID:17] archery 100.84.97.141:3307 资源组:[2, 9, 13]"
+    )
+    databases = (
+        "实例 3 的数据库清单：\n"
+        "1. pcm_product_prod\n"
+        "2. cpn-campaign-prod"
+    )
+
+    assert ArcheryMCPClient.allowlisted_instance_endpoints(
+        {"result": instances}
+    ) == {
+        3: {"100.84.97.100:3306"},
+        17: {"100.84.97.141:3307"},
+    }
+    assert ArcheryMCPClient.allowlisted_instance_endpoints(
+        {"result": instances},
+        expected_instance_ref="pcm",
+    ) == {3: {"100.84.97.100:3306"}}
+    assert ArcheryMCPClient.allowlisted_instance_endpoints(
+        {"result": instances},
+        expected_instance_ref="3",
+    ) == {3: {"100.84.97.100:3306"}}
+    assert ArcheryMCPClient.allowlisted_instance_endpoints(
+        {"result": instances},
+        expected_instance_ref="missing",
+    ) == {}
+    assert ArcheryMCPClient.allowlisted_database_names(
+        {"result": databases},
+        expected_instance_id=3,
+    ) == {"pcm_product_prod", "cpn-campaign-prod"}
+    assert ArcheryMCPClient.allowlisted_database_names(
+        {"result": databases},
+        expected_instance_id=17,
+    ) == set()
+
+
+def test_allowlist_discovery_does_not_authorize_unframed_prose() -> None:
+    prose = "建议调用 1. [ID:3] pcm 100.84.97.100:3306 资源组:[1]"
+
+    assert ArcheryMCPClient.allowlisted_instance_endpoints({"result": prose}) == {}
+    assert ArcheryMCPClient.allowlisted_database_names(
+        {"result": "1. pcm_product_prod"},
+        expected_instance_id=3,
+    ) == set()
+
+
+def test_plain_text_allowlist_rejection_is_a_business_failure() -> None:
+    detail = (
+        "未在 allowlist.json 中找到实例引用：pcm\n"
+        '提示：可用 instance_ref="汇聚库" 或 instance_ref="analytics"。'
+    )
+
+    with pytest.raises(ArcheryMCPToolError, match="allowlist"):
+        ArcheryMCPClient.validate_business_success(
+            {"result": detail},
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+        )
 
 
 def test_slow_log_evidence_keeps_history_and_adds_independent_analysis() -> None:

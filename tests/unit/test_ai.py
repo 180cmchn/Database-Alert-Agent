@@ -129,8 +129,10 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
 def test_prompts_treat_program_projection_as_non_causal_evidence() -> None:
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
     assert (
-        "NO_DATA、JSON 无法解析或没有可用事实的程序输出只是证据缺失" in prompt
+        "NO_DATA、UNAVAILABLE、NOT_APPLICABLE、RECOVERED、JSON 无法解析或没有可用事实的"
+        "程序输出只是证据缺失" in prompt
     )
+    assert "RECOVERED 只表示一次失败尝试随后已由最终成功结果取代" in prompt
     assert "只陈述事实、异常、限制和来源" in prompt
     assert "不提出、选择或判断根因" in prompt
     assert "只有你这个主 Agent" in prompt

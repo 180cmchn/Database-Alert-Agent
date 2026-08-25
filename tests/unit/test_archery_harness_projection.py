@@ -119,6 +119,91 @@ def test_pre_history_response_mismatch_does_not_authorize_metadata_lineage(
     assert state.query_trace[-1]["reason_code"] == reason_code
 
 
+def test_pre_history_instance_allowlist_is_reused_only_for_database_discovery() -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    instances_text = (
+        "实例清单（第 1 页）：\n"
+        "1. [ID:3] pcm orders-db.example:3306 资源组:[1]"
+    )
+    catalog = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            objective="Discover the MCP instance catalog",
+            hypothesis_ids=(),
+            arguments={},
+        ),
+        state=state,
+    )
+    result = {
+        "structuredContent": {"result": instances_text},
+        "content": [{"type": "text", "text": instances_text}],
+    }
+
+    scenario.on_result(state, catalog, result)
+
+    assert state.analysis_instance_endpoints == {}
+    allowlist = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_INSTANCES_TOOL_NAME,
+            objective="Resolve one execution-allowlisted instance",
+            hypothesis_ids=(),
+            arguments={"instance_ref": "pcm"},
+        ),
+        state=state,
+    )
+    scenario.on_result(state, allowlist, result)
+
+    assert state.analysis_instance_endpoints == {3: {"orders-db.example:3306"}}
+    state.final_result = archery_harness_module.ArcherySlowLogQueryResult(
+        payload={
+            "rows": [
+                {
+                    "id": 1040,
+                    "checksum": "pre-history-discovery",
+                    "sample": "SELECT * FROM orders WHERE id = 1",
+                    "hostname_max": "orders-db.example:3306",
+                    "db_max": "orders_prod",
+                }
+            ]
+        },
+        requested_sql=FINAL_SQL,
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    databases = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_DATABASES_TOOL_NAME,
+            objective="Discover databases for the bound instance",
+            hypothesis_ids=(),
+            arguments={"instance_id": 3},
+        ),
+        state=state,
+    )
+    columns_sql = (
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
+    )
+    columns = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Do not authorize SQL before database discovery",
+            hypothesis_ids=(),
+            arguments={
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "sql_content": columns_sql,
+            },
+        ),
+        state=state,
+    )
+
+    assert "local_rejection" not in databases.metadata
+    assert columns.metadata["local_rejection"]["reason_code"] == (
+        "database_not_allowlisted"
+    )
+
+
 def test_successful_history_response_without_deferred_target_binding_is_not_adopted() -> None:
     scenario = _scenario()
     state = scenario.initial_state()
@@ -1575,6 +1660,14 @@ def test_structure_and_indexes_are_reused_for_same_physical_table() -> None:
         ),
         state=state,
     )
+    assert "local_rejection" not in prepared.metadata
+    state.slow_query_analysis_failures = [
+        {
+            "stage": "history_recovery",
+            "reason_code": "history_recovery_limit_forbidden",
+            "terminal": False,
+        }
+    ]
     analysis = archery_harness_module._build_slow_query_analysis(
         scenario.client,
         state,
@@ -1583,9 +1676,9 @@ def test_structure_and_indexes_are_reused_for_same_physical_table() -> None:
 
     assert incomplete["status"] == "partial"
     assert incomplete["missing_stages"] == ["explain"]
-    assert "local_rejection" not in prepared.metadata
     assert analysis["status"] == "succeeded"
     assert analysis["missing_stages"] == []
+    assert analysis["failures"] == state.slow_query_analysis_failures
 
 
 def test_finish_waits_for_each_candidate_explain_work_item() -> None:
@@ -1921,6 +2014,12 @@ def test_analysis_success_requires_same_source_target_and_table() -> None:
     }
     state.analysis_instance_endpoints = {3: {"orders-db.example:3306"}}
     state.analysis_database_names = {3: {"orders_prod"}}
+    state.supplemental_stage_states = {
+        "target_resolution": "SUCCEEDED",
+        "explain": "SUCCEEDED",
+        "table_structure": "FAILED_TERMINAL",
+        "indexes": "SUCCEEDED",
+    }
     state.slow_query_explain_results = [
         {
             "source_history_row": source,
@@ -1951,3 +2050,4 @@ def test_analysis_success_requires_same_source_target_and_table() -> None:
 
     assert analysis["status"] == "partial"
     assert analysis["missing_stages"] == ["table_structure"]
+    assert analysis["stage_states"] == state.supplemental_stage_states

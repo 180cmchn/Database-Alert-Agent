@@ -1377,6 +1377,153 @@ def test_not_applicable_status_is_derived_from_each_supplemental_failure() -> No
     )
 
 
+def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -> None:
+    artifact_id = uuid4()
+    history = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 41}],
+        "result_completeness_assessment": "complete",
+    }
+    supplemental = {
+        "status": "failed",
+        "stage_states": {
+            "target_resolution": "FAILED_TERMINAL",
+            "explain": "UNAVAILABLE",
+            "table_structure": "UNAVAILABLE",
+            "indexes": "UNAVAILABLE",
+        },
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": ["explain", "table_structure", "indexes"],
+        "failures": [
+            {
+                "stage": "history_recovery",
+                "reason_code": "history_recovery_limit_forbidden",
+                "terminal": False,
+            },
+            {
+                "stage": "history_recovery",
+                "reason_code": "history_recovery_incomplete",
+                "terminal": True,
+            },
+            {
+                "stage": "target_resolution",
+                "reason_code": "instance_not_allowlisted",
+                "terminal": True,
+            },
+        ],
+    }
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+        structured_data={
+            "final_result_payload": history,
+            "slow_query_analysis": supplemental,
+        },
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery result",
+        analysis_usable=False,
+        source_coverage_complete=True,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        passthrough_payload=history,
+        slow_query_analysis=supplemental,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
+    by_reason = {
+        str(unit.data.get("reason_code")): unit
+        for unit in units
+        if unit.data.get("reason_code")
+    }
+    by_stage = {
+        unit.stage: unit
+        for unit in units
+        if unit.unit_key.endswith(":missing")
+    }
+
+    recovered = by_reason["history_recovery_limit_forbidden"]
+    assert recovered.status == EvidenceUnitStatus.RECOVERED
+    assert recovered.root_cause_ineligible_reason == "supplemental_recovered"
+    assert by_reason["history_recovery_incomplete"].status == EvidenceUnitStatus.FAILED
+    assert by_reason["instance_not_allowlisted"].status == EvidenceUnitStatus.FAILED
+    assert set(by_stage) == {"explain", "table_structure", "indexes"}
+    assert all(
+        unit.status == EvidenceUnitStatus.UNAVAILABLE for unit in by_stage.values()
+    )
+    assert all(
+        unit.data["stage_state"] == "UNAVAILABLE" for unit in by_stage.values()
+    )
+    DurableOuterToolDispatcher._validate_evidence_unit_sources(
+        parent.model_dump(mode="json"),
+        units,
+        artifact_id=artifact_id,
+    )
+
+
+def test_nonterminal_history_failure_stays_failed_while_recovery_is_incomplete() -> None:
+    artifact_id = uuid4()
+    history = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 41}],
+        "history_recovery_complete": False,
+        "history_recovery_missing_ids": [42],
+    }
+    supplemental = {
+        "status": "failed",
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [],
+        "missing_stages": [],
+        "failures": [
+            {
+                "stage": "history_recovery",
+                "reason_code": "history_recovery_limit_forbidden",
+                "terminal": False,
+            }
+        ],
+    }
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+        structured_data={
+            "final_result_payload": history,
+            "slow_query_analysis": supplemental,
+        },
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery result",
+        analysis_usable=False,
+        source_coverage_complete=True,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        passthrough_payload=history,
+        slow_query_analysis=supplemental,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
+    recovery_failure = next(
+        unit for unit in units if unit.stage == "history_recovery"
+    )
+
+    assert recovery_failure.status == EvidenceUnitStatus.FAILED
+    assert recovery_failure.root_cause_ineligible_reason == "supplemental_failed"
+
+
 def test_missing_history_payload_uses_an_existing_raw_source_path() -> None:
     artifact_id = uuid4()
     supplemental = {

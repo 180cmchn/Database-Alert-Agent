@@ -35,7 +35,7 @@
 9. history 成功后，从结果中选择可由普通 EXPLAIN 安全分析的单语句 sample，并保留其 history `id`、`checksum` 和原始 `sample` 作为绑定依据。优先 `Query_time_max` 较高的记录，相同指标时优先较新的 id；相同 checksum 不重复分析。可分析类型包括 SELECT、WITH 形式，以及目标 MySQL/TiDB 版本支持普通 EXPLAIN 的 INSERT、UPDATE、DELETE 和 REPLACE。DDL、CALL、存储过程、事务/管理语句、已有 EXPLAIN、无法可靠识别的语句和多语句 SQL 不可分析。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.target_binding -->
-10. 使用 history 行的 `hostname_max` 与 MCP 返回的真实 allowlist 实例 host:port 严格匹配，取得业务实例的真实 `instance_id`；使用该行的 `db_max` 作为业务数据库，并确认该库存在于该实例的真实返回中。sample 中若存在显式 schema，其名称必须与 `db_max` 精确一致；CTE 内物理表和 DML 目标表也适用。实例、host:port、数据库或显式 schema 任一无法严格匹配时，保留真实错误，不得改用 Archery 元数据库、猜测其它目标或开始该 sample 的补充查询。
+10. 使用 history 行的 `hostname_max` 与 MCP 返回的真实 allowlist 实例 host:port 严格匹配，取得业务实例的真实 `instance_id`。同一调查中第 3 步已经成功返回的结构化 allowlist 行可以复用；无筛选调用返回的“实例清单（第 N 页）”编号文本只是实例目录，不是执行授权，必须使用目录中的精确名称或 ID 作为 `instance_ref` 再查询一次，只有该定向查询成功返回的明确 ID、host、port 才可用于绑定。实例 allowlist 只授权下一步数据库发现；仍必须使用该行的 `db_max` 作为业务数据库，并确认该库存在于该实例随后真实返回的数据库清单中，数据库清单确认前不得执行任何业务目标 SQL。sample 中若存在显式 schema，其名称必须与 `db_max` 精确一致；CTE 内物理表和 DML 目标表也适用。实例、host:port、数据库或显式 schema 任一无法严格匹配时，保留真实错误，不得改用 Archery 元数据库、猜测其它目标或开始该 sample 的补充查询。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.table_structure -->
 11. 在第 10 条确认的业务实例和 `db_max` 中，先读取 sample 引用的真实表和字段。表结构优先使用 `information_schema.COLUMNS`；也可使用 MCP 的 `list_table_columns`。不得猜测表或字段。只有字段结构已成功取得，或该阶段的失败已如实记录后，才可继续普通 EXPLAIN。

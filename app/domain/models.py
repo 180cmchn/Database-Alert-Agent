@@ -74,6 +74,8 @@ class EvidenceUnitStatus(StrEnum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     NO_DATA = "NO_DATA"
+    RECOVERED = "RECOVERED"
+    UNAVAILABLE = "UNAVAILABLE"
     NOT_APPLICABLE = "NOT_APPLICABLE"
 
 

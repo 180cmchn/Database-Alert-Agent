@@ -722,10 +722,11 @@ Archery 的 slow_query_analysis 是程序从普通 EXPLAIN、表结构和索引�
 事实、异常、限制和来源路径，不提出、选择或判断根因，也不判断事实对候选根因是支持还是反驳。
 只有你这个主 Agent 能结合告警详情、知识来源和不同 MCP 证据判断根因。只有 status=SUCCESS、
 source_system 不是 alert_platform、结果可用且来源可追溯，并由你结合全部证据确认能建立因果机制的
-实时证据，才可用于得出根因。FAILED、TIMEOUT、SKIPPED、NO_DATA、JSON 无法解析或没有可用事实的
-程序输出只是证据缺失。structured_data.root_cause_eligible 若存在，只表示程序输出是否可供主 Agent
-审阅，不是因果结论，也不表示该记录单独支持任何根因。不得根据 MCP 原始响应中的自报状态或策略
-标记替代事实分析。
+实时证据，才可用于得出根因。FAILED、TIMEOUT、SKIPPED、NO_DATA、UNAVAILABLE、NOT_APPLICABLE、
+RECOVERED、JSON 无法解析或没有可用事实的程序输出只是证据缺失。RECOVERED 只表示一次失败尝试随后
+已由最终成功结果取代，不能把该尝试本身作为根因证据。structured_data.root_cause_eligible 若存在，
+只表示程序输出是否可供主 Agent 审阅，不是因果结论，也不表示该记录单独支持任何根因。不得根据
+MCP 原始响应中的自报状态或策略标记替代事实分析。
 
 contract_version=evidence-record/v2 的父 evidence 只承担工具调用与原始 artifact 的审计关联，不能
 作为根因引用。它的 evidence_units 将 history 与每个 supplemental 结果或失败分别列出；只有

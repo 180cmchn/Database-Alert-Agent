@@ -161,7 +161,13 @@ export interface ProgressRecord {
 
 export type ToolStatus = "SUCCESS" | "NO_DATA" | "TIMEOUT" | "FAILED" | "SKIPPED";
 
-export type EvidenceUnitStatus = "SUCCESS" | "FAILED" | "NO_DATA" | "NOT_APPLICABLE";
+export type EvidenceUnitStatus =
+  | "SUCCESS"
+  | "FAILED"
+  | "NO_DATA"
+  | "RECOVERED"
+  | "UNAVAILABLE"
+  | "NOT_APPLICABLE";
 
 export interface EvidenceUnit {
   contract_version: "evidence-unit/v2";

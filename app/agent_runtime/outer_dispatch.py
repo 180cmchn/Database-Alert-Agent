@@ -1099,6 +1099,11 @@ class DurableOuterToolDispatcher:
                 )
 
         overall_status = str(supplemental.get("status") or "").casefold()
+        history_recovery_succeeded = bool(
+            isinstance(rows, list)
+            and not history_incomplete
+            and not analysis.passthrough_parse_failed
+        )
         failure_stages: set[str] = set()
         failures = supplemental.get("failures")
         if isinstance(failures, list):
@@ -1106,50 +1111,104 @@ class DurableOuterToolDispatcher:
                 if not isinstance(failure, Mapping):
                     continue
                 stage = str(failure.get("stage") or "supplemental")
-                failure_stages.add(stage)
+                recovered = bool(
+                    stage == "history_recovery"
+                    and failure.get("terminal") is False
+                    and history_recovery_succeeded
+                )
+                if not recovered:
+                    failure_stages.add(stage)
                 not_applicable = (
                     str(failure.get("reason_code") or "").casefold()
                     == "no_safe_explainable_sample"
                 )
+                status = (
+                    EvidenceUnitStatus.RECOVERED
+                    if recovered
+                    else EvidenceUnitStatus.NOT_APPLICABLE
+                    if not_applicable
+                    else EvidenceUnitStatus.FAILED
+                )
+                summary = (
+                    f"Archery supplemental {stage} 第 {index + 1} 项失败后已恢复。"
+                    if recovered
+                    else f"Archery supplemental {stage} 第 {index + 1} 项未成功。"
+                )
                 append_unit(
                     unit_key=stable_unit_key(
                         stage=stage,
-                        outcome="failure",
+                        outcome="recovered" if recovered else "failure",
                         data=failure,
                     ),
                     kind=EvidenceUnitKind.SUPPLEMENTAL,
                     stage=stage,
                     result_index=index,
-                    status=(
-                        EvidenceUnitStatus.NOT_APPLICABLE
-                        if not_applicable
-                        else EvidenceUnitStatus.FAILED
-                    ),
-                    summary=f"Archery supplemental {stage} 第 {index + 1} 项未成功。",
+                    status=status,
+                    summary=summary,
                     data=failure,
                     source_paths=[f"/structured_data/slow_query_analysis/failures/{index}"],
                     eligible=False,
                     ineligible_reason=(
-                        "supplemental_not_applicable" if not_applicable else "supplemental_failed"
+                        "supplemental_recovered"
+                        if recovered
+                        else "supplemental_not_applicable"
+                        if not_applicable
+                        else "supplemental_failed"
                     ),
                 )
 
+        raw_stage_states = supplemental.get("stage_states")
+        stage_states = raw_stage_states if isinstance(raw_stage_states, Mapping) else {}
         missing_stages = supplemental.get("missing_stages")
         if isinstance(missing_stages, list):
             for index, raw_stage in enumerate(missing_stages):
                 stage = str(raw_stage or "supplemental")
                 if stage in failure_stages:
                     continue
+                stage_state = str(stage_states.get(stage) or "").upper()
+                status = (
+                    EvidenceUnitStatus.UNAVAILABLE
+                    if stage_state == "UNAVAILABLE"
+                    else EvidenceUnitStatus.FAILED
+                    if stage_state == "FAILED_TERMINAL"
+                    else EvidenceUnitStatus.NOT_APPLICABLE
+                    if stage_state == "NOT_APPLICABLE"
+                    else EvidenceUnitStatus.NO_DATA
+                )
+                summary = (
+                    f"Archery supplemental {stage} 因前置条件不可用而未执行。"
+                    if status == EvidenceUnitStatus.UNAVAILABLE
+                    else f"Archery supplemental {stage} 未取得结果。"
+                )
+                ineligible_reason = (
+                    "supplemental_unavailable"
+                    if status == EvidenceUnitStatus.UNAVAILABLE
+                    else "supplemental_failed"
+                    if status == EvidenceUnitStatus.FAILED
+                    else "supplemental_not_applicable"
+                    if status == EvidenceUnitStatus.NOT_APPLICABLE
+                    else "supplemental_result_missing"
+                )
+                source_paths = [
+                    f"/structured_data/slow_query_analysis/missing_stages/{index}"
+                ]
+                missing_data = {"stage": stage, "overall_status": overall_status}
+                if stage_state:
+                    escaped_stage = stage.replace("~", "~0").replace("/", "~1")
+                    source_paths.append(
+                        f"/structured_data/slow_query_analysis/stage_states/{escaped_stage}"
+                    )
+                    missing_data["stage_state"] = stage_state
                 append_unit(
                     unit_key=f"supplemental:{stage}:missing",
                     kind=EvidenceUnitKind.SUPPLEMENTAL,
                     stage=stage,
-                    status=EvidenceUnitStatus.NO_DATA,
-                    summary=f"Archery supplemental {stage} 没有取得结果。",
-                    data={"stage": stage, "overall_status": overall_status},
-                    source_paths=[f"/structured_data/slow_query_analysis/missing_stages/{index}"],
+                    status=status,
+                    summary=summary,
+                    data=missing_data,
+                    source_paths=source_paths,
                     eligible=False,
-                    ineligible_reason="supplemental_result_missing",
+                    ineligible_reason=ineligible_reason,
                 )
         return units
 

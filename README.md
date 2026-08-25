@@ -196,12 +196,18 @@ Host 按稳定 directive ID 将 `workflow.md` 中对应的原文片段追加到�
 谓词、错误目标表及未授权 id。所有本地拒绝都会把结构化 reason code、详情和下一步动作返回模型。
 
 完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max` 严格
-绑定；任何 sample 都不能直接执行，但与完整 sample 绑定的普通 `EXPLAIN` 可以包裹 SELECT、WITH
-以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断 sample 前缀始终禁止。目标及实际执行 SQL 核对
-成功的 EXPLAIN、表结构和索引结果分别形成独立 supplemental 证据单元；失败单元只形成证据缺口，
-不修改或降级完整 history 单元。只要仍有 history id 或适用的 supplemental 阶段处于 `PENDING`，
-内部 `finish` 就会被拒绝；全部工作项进入成功、失败、不适用或不可用等终态后即可结束，不要求全部
-成功。新 Archery 父 evidence 只关联调用和原始 artifact，根因必须引用具备资格的具体子单元 ID。
+绑定。实例发现工具的结构化 allowlist 行可以在同一调查中保留并复用；真实 MCP 无筛选返回的
+“实例清单（第 N 页）”编号文本仅作为目录和审计信息，必须通过精确 `instance_ref` 定向查询成功后
+才能进入执行 allowlist。实例 allowlist 也只授权对应实例的数据库发现；只有 `db_max` 同时出现在该
+实例随后真实返回的数据库清单中，业务目标 SQL 才能通过 transport 前门禁。任何 sample 都不能直接执行，但与完整 sample
+绑定的普通 `EXPLAIN` 可以包裹 SELECT、WITH 以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断
+sample 前缀始终禁止。目标及实际执行 SQL 核对成功的 EXPLAIN、表结构和索引结果分别形成独立
+supplemental 证据单元；失败单元只形成证据缺口，不修改或降级完整 history 单元。只要仍有 history
+id 或适用的 supplemental 阶段处于 `PENDING`，内部 `finish` 就会被拒绝；全部工作项进入成功、失败、
+不适用或不可用等终态后即可结束，不要求全部成功。新 Archery 父 evidence 只关联调用和原始 artifact，
+根因必须引用具备资格的具体子单元 ID。已由完整 history 最终结果覆盖的显式非终态恢复失败显示为
+`RECOVERED`；因目标解析或工具能力阻断而未执行的下游阶段显示为 `UNAVAILABLE`，只有实际空结果继续
+使用 `NO_DATA`。
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json

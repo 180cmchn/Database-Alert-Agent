@@ -79,6 +79,8 @@ function evidenceUnitQualification(
   if (unit.root_cause_eligible) return "根因可用";
   if (unit.status === "FAILED") return "不可用";
   if (unit.status === "NO_DATA") return "无数据";
+  if (unit.status === "RECOVERED") return "已恢复";
+  if (unit.status === "UNAVAILABLE") return "前置条件不可用";
   if (unit.status === "NOT_APPLICABLE") return "不适用";
   return "根因不可用";
 }
