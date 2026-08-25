@@ -69,8 +69,8 @@
   - 已实现高优先级 sample 队列、直接 sample 查询、初始约 10000 字符分片、截断/失败后减半和最低 1000 字符限制。
   - 已实现重组后 UTF-8 字节长度核验和 SHA-256 记录。
   - 已保证结构化展示 SQL无法获得 Explain 授权；Explain 实际参数来自 Host 内保存的完整原始 SQL。
-  - 已实现业务目标、数据库、显式 schema、字段、索引和 Explain 的顺序绑定。
-  - 已实现相同 `(instance_id, db_name, checksum)` 的 Explain 复用。
+  - 已实现业务目标、数据库、显式 schema、字段、索引和 Explain 的顺序绑定；单条 history 的 enrichment 固定为字段、索引、Explain。
+  - 已实现相同 `(instance_id, db_name, checksum)` 的 Explain 复用；复用依据持久化 target provenance，且排除当前 history ID 自复用。
   - 已实现预算停止时保留完整紧凑扫描或已取得的部分扫描行，并列出 enrichment 未完成 ID。
   - 已将 Host 调用与模型调用分别记录为 `host_executed_tool_calls`、`host_request_ids` 和 `model_executed_tool_calls`、`model_request_ids`；`mcp_tool_call_count` 统计两类远端调用总和。
 - `app/mcp_runtime/harness.py`
@@ -83,14 +83,17 @@
   - 已同步两个逻辑扫描、keyset 分页、Top 20%、sample 字节长度、分片、结构化展示、完整原 SQL Explain、目标绑定、partial 结果和 provider `LIMIT` 契约。
 - 测试
   - 新增 `tests/unit/test_archery_harness_deterministic.py`。
+  - 新增 `tests/unit/test_archery_harness_deterministic_checkpoint.py` 和 `tests/unit/test_archery_harness_deterministic_replay.py`。
   - 已覆盖无表发现缓存启动、Top 20% 并集、Host 规划不调用模型、缺失 compact ID reconcile、扫描/补充预算停止、超长 IN 分片恢复、完整原 SQL Explain、上下文不泄漏以及 Host/模型审计拆分。
+  - 已覆盖 ranking/compact 分页、sample 分片、完整 sample、Explain 暂存响应和预算停止的 checkpoint 恢复。
+  - 已覆盖 Explain 同目标复用及跨实例/数据库隔离、各远端阶段故障隔离，以及使用真实 Archery 工具 Schema 的离线 Replay。
   - 其它 Archery、配置、factory 和 catalog 测试已同步。
 
 ### 3.2 当前分支和提交上下文
 
 - 工作分支：`dev`。
-- 本次实现建立在本地提交 `3b5d730 fix: 完成history_recovery状态归并、实例目录与执行allowlist分离、保留UNAVAILABLE语义` 之上。
-- 在本交接文档生成时，`3b5d730` 尚比 `origin/dev` 超前一个提交；推送本次实现时会将该提交和本次新提交一起推送到 `origin/dev`。
+- 本轮补测和修正建立在提交 `b9dfd16 fix: 实现慢查询确定性恢复并绑定完整原始语句执行计划` 之上。
+- 开始本轮工作时，本地 `dev` 与 `origin/dev` 同步。
 
 ## 4. 当前验证
 
@@ -101,6 +104,8 @@
 ```bash
 .venv/Scripts/pytest.exe -q \
   tests/unit/test_archery_harness_deterministic.py \
+  tests/unit/test_archery_harness_deterministic_checkpoint.py \
+  tests/unit/test_archery_harness_deterministic_replay.py \
   tests/unit/test_archery_mcp.py \
   tests/unit/test_archery_harness_policy.py \
   tests/unit/test_archery_harness_history.py \
@@ -111,7 +116,7 @@
   tests/unit/test_archery_harness_analysis.py -x
 ```
 
-结果：`332 passed`。
+结果：`348 passed`。
 
 - 隔离现有运行时配置后的完整测试：
 
@@ -121,18 +126,22 @@ trap 'rm -f "$runtime_settings_path"' EXIT
 RUNTIME_SETTINGS_PATH="$runtime_settings_path" .venv/Scripts/pytest.exe -q
 ```
 
-结果：`1058 passed, 4 skipped, 17 warnings`。
+结果：`1074 passed, 4 skipped`。跳过项均要求显式启用外部集成或 Kafka 环境，本轮未启用。
+
+- 前端测试和生产构建：
+
+```bash
+npm test
+npm run build
+```
+
+结果：`23 passed`，生产构建通过。
 
 - 静态和语法检查：
 
 ```bash
-.venv/Scripts/ruff.exe check .
-.venv/Scripts/python.exe -m py_compile \
-  app/adapters/archery_harness.py \
-  app/adapters/archery_mcp.py \
-  app/mcp_runtime/harness.py \
-  app/config.py \
-  app/application/factory.py
+.venv/bin/ruff check app tests migrations
+.venv/bin/python -m compileall -q app tests
 git diff --check
 ```
 
@@ -140,27 +149,32 @@ git diff --check
 
 ### 4.2 验证注意事项
 
-- 不隔离 `RUNTIME_SETTINGS_PATH` 时，工作区现有 `data/runtime-settings.json` 会覆盖测试配置并造成与代码无关的失败。不得为了测试修改或删除该用户文件。
+- 如果工作区存在 `data/runtime-settings.json`，不隔离 `RUNTIME_SETTINGS_PATH` 时它会覆盖测试配置并可能造成与代码无关的失败。不得为了测试修改或删除该用户文件。
 - 测试期间没有发起真实 MCP 请求，也没有写入 `data/alerts.db`。
+- 原 Run `2cbd4238-dbf6-4e91-87a4-a3006e14e2bf` 在当前数据库和只读备份中均不存在，因此使用脱敏的真实 Schema Replay 完成离线验证；Replay 确认确定性处理开始前只有 3 次模型决策，且没有逐行模型评估。
 - `ruff format --check` 没有作为全仓门槛执行。现有大文件在 `HEAD` 中已有格式差异，整文件格式化会引入大规模无关机械变更；新测试文件已经按 Ruff 格式化。
 
-## 5. 尚未完成
+## 5. 本轮补足与后续事项
 
-以下内容不阻断当前单元测试，但接手 Agent 应优先补足：
+### 5.1 已补足
 
-1. 为新确定性状态机增加专项 checkpoint 恢复测试，至少覆盖 ranking/compact 分页中途、sample 分片中途、完整 sample 已恢复但 Explain 未执行、Explain 已返回但状态转换未持久化，以及预算停止后的恢复。
-2. 增加使用真实 Archery 工具 Schema 的 Replay 端到端测试，验证无筛选实例目录中的 endpoint 会映射为精确 `instance_ref`，随后只有定向实例查询结果才授予执行 allowlist。
-3. 增加新确定性路径中的重复 checksum Explain 复用专项测试，确认完整 SQL不会因复用进入 Agent 展示证据，并确认不同实例或不同数据库不能跨目标复用。
-4. 增加远端故障专项测试，覆盖 ranking/compact 页失败、sample 直接读取失败后切换分片、分片在最低尺寸仍失败、字段/索引失败后继续 Explain，以及 Explain 失败后继续下一个 history ID。
-5. 使用原 Run artifact 做一次完全只读的离线回放，确认新流程不会重新产生逐行模型完整性评估；不得在没有用户批准时连接真实 MCP。
-6. `app/adapters/archery_harness.py` 本次增加了较多状态机代码。功能稳定后可考虑提取独立 deterministic history pipeline 模块，但重构前必须先完成上述 checkpoint 和 Replay 覆盖。
-7. 部署后需要观察实际 `host_executed_tool_calls`、`model_decision_count`、预算覆盖率、未完成 ID 和 Explain 成功率，确认 120 秒预算在真实 MCP 延迟下合理；调整预算属于部署配置变更，应先获得用户确认。
+1. checkpoint 恢复专项覆盖已完成，包括 ranking/compact 分页中途、sample 分片中途、完整 sample 已恢复但 Explain 未执行、Explain 响应已暂存但状态转换未持久化，以及预算停止后的恢复。
+2. 真实 Archery 工具 Schema 的离线 Replay 已完成，验证目录 endpoint 到定向 `instance_ref` 的导航和定向查询后的执行 allowlist 授权。
+3. Explain 复用边界和结果脱敏专项覆盖已完成，跨实例或跨数据库不会复用。
+4. 远端故障专项覆盖已完成，失败会保留部分证据或继续下一个阶段/history ID。
+5. 原 Run artifact 因本地不存在无法直接回放，已用等价的脱敏真实 Schema Replay 验证模型决策次数和无逐行模型评估行为。
+
+### 5.2 后续非阻断事项
+
+1. `app/adapters/archery_harness.py` 的确定性状态机后续可考虑提取为独立模块；现有 checkpoint 和 Replay 测试应作为重构保护。
+2. 部署到公司内网后观察实际 `host_executed_tool_calls`、`model_decision_count`、预算覆盖率、未完成 ID 和 Explain 成功率，确认 120 秒预算在真实 MCP 延迟下合理；调整预算属于部署配置变更，应先获得用户确认。
+3. 本机不具备公司内网连通性，本轮不要求也不执行 Archery MCP 或 Prometheus MCP 的真实请求。
 
 ## 6. 建议接手顺序
 
 1. 阅读 `config/mcp/prompts/archery/workflow.md`，确认业务契约。
 2. 阅读 `app/adapters/archery_mcp.py` 中 history SQL、优先级、sample 分片和结构化展示辅助函数。
 3. 阅读 `app/adapters/archery_harness.py` 中 `_HISTORY_PIPELINE_*` 状态、`next_host_call`、pipeline result transitions 和 `_finalize_deterministic_pipeline_stop`。
-4. 阅读 `tests/unit/test_archery_harness_deterministic.py`，从现有 8 个行为测试扩展 checkpoint、Replay、复用和失败隔离覆盖。
+4. 修改确定性路径时同步运行 deterministic、checkpoint 和 Replay 三组专项测试。
 5. 每轮修改先运行相关 Archery 测试，最后使用隔离 `RUNTIME_SETTINGS_PATH` 执行完整测试。
 6. 保持 `data/alerts.db`、`data/runtime-settings.json` 和真实 MCP 不变，除非用户明确授权。

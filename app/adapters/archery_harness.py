@@ -1596,32 +1596,6 @@ class ArcheryHarnessScenario:
                 purpose=f"columns-{row_id}-{table_name}",
                 state=state,
             )
-        explain_attempt = f"explain:{row_id}"
-        if not self._host_source_stage_resolved(state, row_id=row_id, stage="explain"):
-            if explain_attempt not in state.history_host_stage_attempts:
-                state.history_host_stage_attempts.add(explain_attempt)
-                explain_sql = f"EXPLAIN {exact_sample}"
-                return self._make_host_call(
-                    ARCHERY_MCP_QUERY_TOOL_NAME,
-                    {
-                        "instance_id": instance_id,
-                        "db_name": db_name,
-                        "sql_content": explain_sql,
-                        "max_result_chars": max(
-                            ARCHERY_HISTORY_RESULT_CHARS,
-                            len(
-                                json.dumps(
-                                    explain_sql,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                )
-                            )
-                            + ARCHERY_HISTORY_RESULT_CHARS,
-                        ),
-                    },
-                    purpose=f"explain-{row_id}",
-                    state=state,
-                )
         for table_name in table_names:
             if self._host_table_stage_resolved(
                 state,
@@ -1655,6 +1629,32 @@ class ArcheryHarnessScenario:
                 purpose=f"indexes-{row_id}-{table_name}",
                 state=state,
             )
+        explain_attempt = f"explain:{row_id}"
+        if not self._host_source_stage_resolved(state, row_id=row_id, stage="explain"):
+            if explain_attempt not in state.history_host_stage_attempts:
+                state.history_host_stage_attempts.add(explain_attempt)
+                explain_sql = f"EXPLAIN {exact_sample}"
+                return self._make_host_call(
+                    ARCHERY_MCP_QUERY_TOOL_NAME,
+                    {
+                        "instance_id": instance_id,
+                        "db_name": db_name,
+                        "sql_content": explain_sql,
+                        "max_result_chars": max(
+                            ARCHERY_HISTORY_RESULT_CHARS,
+                            len(
+                                json.dumps(
+                                    explain_sql,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                            )
+                            + ARCHERY_HISTORY_RESULT_CHARS,
+                        ),
+                    },
+                    purpose=f"explain-{row_id}",
+                    state=state,
+                )
         explain_succeeded = any(
             self.client._coerce_positive_integer(
                 self.client._casefolded_value(
@@ -1705,24 +1705,42 @@ class ArcheryHarnessScenario:
         state: ArcheryHarnessState,
         source: Mapping[str, Any],
     ) -> int | None:
+        endpoint = self.client._normalize_endpoint(
+            self.client._casefolded_value(source, "hostname_max")
+        )
+        matching_instance_ids = sorted(
+            instance_id
+            for instance_id, endpoints in state.analysis_instance_endpoints.items()
+            if endpoint is not None
+            and endpoint.casefold() in {item.casefold() for item in endpoints}
+        )
+        if len(matching_instance_ids) != 1:
+            return None
         expected = (
-            str(self.client._casefolded_value(source, "hostname_max") or "").casefold(),
+            matching_instance_ids[0],
             str(self.client._casefolded_value(source, "db_max") or "").casefold(),
             str(self.client._casefolded_value(source, "checksum") or "").casefold(),
         )
+        current_source_id = self.client._coerce_positive_integer(
+            self.client._casefolded_value(source, "id")
+        )
         for item in state.slow_query_explain_results:
             item_source = item.get("source_history_row")
-            if not isinstance(item_source, Mapping):
+            item_target = item.get("target")
+            if not isinstance(item_source, Mapping) or not isinstance(
+                item_target, Mapping
+            ):
                 continue
             actual = (
-                str(self.client._casefolded_value(item_source, "hostname_max") or "").casefold(),
-                str(self.client._casefolded_value(item_source, "db_max") or "").casefold(),
+                self.client._coerce_positive_integer(item_target.get("instance_id")),
+                str(item_target.get("db_name") or "").casefold(),
                 str(self.client._casefolded_value(item_source, "checksum") or "").casefold(),
             )
-            if actual == expected:
-                return self.client._coerce_positive_integer(
-                    self.client._casefolded_value(item_source, "id")
-                )
+            reusable_source_id = self.client._coerce_positive_integer(
+                self.client._casefolded_value(item_source, "id")
+            )
+            if actual == expected and reusable_source_id != current_source_id:
+                return reusable_source_id
         return None
 
     def _host_source_stage_resolved(

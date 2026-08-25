@@ -6,10 +6,12 @@ import pytest
 
 from app.adapters import archery_harness as archery_harness_module
 from app.adapters.archery_mcp import (
+    ARCHERY_SAMPLE_CHUNK_MIN_CHARS,
     ARCHERY_SAMPLE_CHUNK_RESULT_CHARS,
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
     ArcherySlowLogEvidenceTool,
 )
+from app.agent_runtime import InvocationError, ToolInvocationStatus
 from tests.unit.archery_harness_support import (
     TARGET_ARGUMENTS,
     _analysis_tools,
@@ -42,6 +44,27 @@ def _apply_query_result(scenario, state, call, rows):
     return scenario.on_result(state, prepared, fixture.result)
 
 
+def _apply_query_failure(
+    scenario,
+    state,
+    call,
+    *,
+    code: str = "remote_query_failed",
+):
+    prepared = _prepare_host_call(scenario, state, call)
+    assert "local_rejection" not in prepared.metadata
+    return scenario.on_failure(
+        state,
+        prepared,
+        InvocationError(
+            code=code,
+            message="sanitized remote query failure",
+            retryable=False,
+        ),
+        ToolInvocationStatus.FAILED,
+    )
+
+
 def _pipeline_scenario():
     scenario = _scenario()
     state = scenario.state
@@ -64,6 +87,125 @@ def _pipeline_scenario():
     state.resolved_endpoints[target] = {"db-1.example:3306"}
     specs = scenario.build_tool_specs(_analysis_tools())
     return scenario, state, specs
+
+
+def _history_compact_row(
+    row_id: int,
+    *,
+    endpoint: str = "db-1.example:3306",
+    db_name: str = "orders_prod",
+    checksum: str | None = None,
+    sample_full_length: int = 64,
+):
+    return {
+        "id": row_id,
+        "hostname_max": endpoint,
+        "db_max": db_name,
+        "checksum": checksum or f"checksum-{row_id}",
+        "ts_min": "2026-07-23 15:59:00",
+        "ts_max": "2026-07-23 16:00:00",
+        "Query_time_max": float(row_id),
+        "Query_time_sum": float(row_id * 10),
+        "sample_full_length": sample_full_length,
+    }
+
+
+def _prime_enrichment(scenario, state, rows):
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    state.history_pipeline_target = target
+    state.history_result_target = target
+    state.history_pipeline_endpoint = "db-1.example:3306"
+    state.history_ranking_rows = {
+        row["id"]: {
+            "id": row["id"],
+            "Query_time_max": row["Query_time_max"],
+            "Query_time_sum": row["Query_time_sum"],
+        }
+        for row in rows
+    }
+    state.history_compact_rows = {row["id"]: dict(row) for row in rows}
+    state.history_ranking_scan_complete = True
+    state.history_compact_scan_complete = True
+    scenario._finalize_history_pipeline_scan(state)
+
+
+def _prime_reuse_candidate(
+    scenario,
+    state,
+    *,
+    current_instance_id: int,
+    current_db_name: str = "orders_prod",
+    prior_instance_id: int = 3,
+    prior_db_name: str = "orders_prod",
+):
+    endpoint = "db-1.example:3306"
+    prior_sample = "SELECT * FROM orders WHERE id = 2"
+    exact_sample = (
+        "SELECT * FROM orders WHERE id IN ("
+        + ",".join(str(value) for value in range(6000))
+        + ")"
+    )
+    rows = [
+        _history_compact_row(
+            2,
+            db_name=prior_db_name,
+            checksum="shared-checksum",
+            sample_full_length=len(prior_sample),
+        ),
+        _history_compact_row(
+            1,
+            db_name=current_db_name,
+            checksum="shared-checksum",
+            sample_full_length=len(exact_sample),
+        ),
+    ]
+    _prime_enrichment(scenario, state, rows)
+    scenario._accept_reconstructed_sample(state, 2, prior_sample)
+    prior_source = dict(state.history_id_rows[2])
+    state.history_sample_states[2] = "ANALYZED"
+    state.history_exact_sample_id = None
+    state.history_exact_sample = None
+    scenario._accept_reconstructed_sample(state, 1, exact_sample)
+    state.history_processing_order = [2, 1]
+    state.history_current_id = 1
+    state.analysis_instance_endpoints = {current_instance_id: {endpoint}}
+    state.analysis_database_names = {current_instance_id: {current_db_name}}
+    state.slow_query_table_structure_results.append(
+        {
+            "stage": "table_structure",
+            "target": {
+                "instance_id": current_instance_id,
+                "db_name": current_db_name,
+                "table_name": "orders",
+            },
+            "result": {"row_count": 1, "rows": [{"COLUMN_NAME": "id"}]},
+        }
+    )
+    state.slow_query_index_results.append(
+        {
+            "stage": "indexes",
+            "target": {
+                "instance_id": current_instance_id,
+                "db_name": current_db_name,
+                "table_name": "orders",
+            },
+            "result": {"row_count": 1, "rows": [{"INDEX_NAME": "PRIMARY"}]},
+        }
+    )
+    state.slow_query_explain_results.append(
+        {
+            "stage": "explain",
+            "source_history_row": prior_source,
+            "target": {
+                "instance_id": prior_instance_id,
+                "db_name": prior_db_name,
+            },
+            "statement_type": "select",
+            "result": {"row_count": 1, "rows": [{"table": "orders"}]},
+        }
+    )
+    scenario._refresh_history_pipeline_result(state)
+    return exact_sample
 
 
 def test_pipeline_starts_after_verified_archery_target_without_table_discovery() -> None:
@@ -373,6 +515,17 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
         }
     )
 
+    indexes = scenario.next_host_call(specs)
+    assert indexes is not None
+    assert "information_schema.STATISTICS" in indexes.arguments["sql_content"]
+    assert sample not in indexes.arguments["sql_content"]
+    _apply_query_result(
+        scenario,
+        state,
+        indexes,
+        [{"INDEX_NAME": "PRIMARY", "COLUMN_NAME": "id"}],
+    )
+
     explain = scenario.next_host_call(specs)
     assert explain is not None
     assert explain.arguments["sql_content"] == f"EXPLAIN {sample}"
@@ -390,17 +543,6 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
     )
     assert sample not in str(state.slow_query_explain_results[0])
 
-    state.slow_query_index_results.append(
-        {
-            "stage": "indexes",
-            "target": {
-                "instance_id": 3,
-                "db_name": "orders_prod",
-                "table_name": "orders",
-            },
-            "result": {"row_count": 1, "rows": [{"INDEX_NAME": "PRIMARY"}]},
-        }
-    )
     finish = scenario.next_host_call(specs)
     assert finish is not None
     assert finish.name == "finish_archery_investigation"
@@ -412,3 +554,228 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
     final_row = state.final_result.payload["rows"][0]
     assert final_row["sample"] == projected["sample"]
     assert sample not in str(state.final_result.payload)
+
+
+def test_explain_reuse_is_bound_to_instance_database_and_checksum() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    exact_sample = _prime_reuse_candidate(
+        scenario,
+        state,
+        current_instance_id=3,
+    )
+
+    finish = scenario.next_host_call(specs)
+
+    assert finish is not None
+    assert finish.name == "finish_archery_investigation"
+    assert state.history_sample_states[1] == "ANALYZED"
+    assert state.history_sample_metadata[1]["explain_status"] == "reused"
+    assert state.history_sample_metadata[1]["explain_reused_from_history_id"] == 2
+    assert state.history_exact_sample is None
+    assert exact_sample not in str(state.final_result.payload)
+    assert exact_sample not in str(state.slow_query_explain_results)
+
+
+@pytest.mark.parametrize(
+    ("current_instance_id", "current_db_name"),
+    [
+        (4, "orders_prod"),
+        (3, "payments_prod"),
+    ],
+)
+def test_explain_is_not_reused_across_instance_or_database(
+    current_instance_id: int,
+    current_db_name: str,
+) -> None:
+    scenario, state, specs = _pipeline_scenario()
+    exact_sample = _prime_reuse_candidate(
+        scenario,
+        state,
+        current_instance_id=current_instance_id,
+        current_db_name=current_db_name,
+    )
+
+    explain = scenario.next_host_call(specs)
+
+    assert explain is not None
+    assert explain.name == "sql_query_gymJPA"
+    assert explain.arguments["instance_id"] == current_instance_id
+    assert explain.arguments["db_name"] == current_db_name
+    assert explain.arguments["sql_content"] == f"EXPLAIN {exact_sample}"
+    assert state.history_sample_metadata[1].get("explain_reused_from_history_id") is None
+
+
+@pytest.mark.parametrize("phase", ["RANKING", "COMPACT"])
+def test_history_page_failure_retains_available_partial_rows(phase: str) -> None:
+    scenario, state, specs = _pipeline_scenario()
+    initial = scenario.next_host_call(specs)
+    assert initial is not None
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    state.history_pipeline_phase = phase
+    state.history_pipeline_target = target
+    state.history_result_target = target
+    state.history_pipeline_endpoint = "db-1.example:3306"
+    state.history_snapshot_max_id = 3
+    state.history_page_cursor = 2
+    state.history_ranking_rows = {
+        row_id: {
+            "id": row_id,
+            "Query_time_max": float(row_id),
+            "Query_time_sum": float(row_id * 10),
+        }
+        for row_id in (3, 2)
+    }
+    state.history_ranking_page_count = 1
+    if phase == "COMPACT":
+        state.history_ranking_scan_complete = True
+        state.history_compact_rows = {3: _history_compact_row(3)}
+        state.history_compact_page_count = 1
+
+    failed_page = scenario.next_host_call(specs)
+    assert failed_page is not None
+    _apply_query_failure(scenario, state, failed_page)
+    archery_harness_module._finalize_deterministic_pipeline_stop(
+        scenario.client,
+        state,
+        stop_reason="FAILED",
+    )
+
+    assert state.history_pipeline_phase == "COMPLETED"
+    assert state.final_result is not None
+    assert state.final_result.payload["result_incomplete"] is True
+    expected_ids = [3, 2] if phase == "RANKING" else [3]
+    assert [row["id"] for row in state.final_result.payload["rows"]] == expected_ids
+    assert state.final_result.payload["enrichment_unfinished_ids"] == expected_ids
+
+
+def test_direct_sample_failure_switches_to_chunk_recovery() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    sample = "SELECT * FROM orders WHERE id = 1"
+    _prime_enrichment(
+        scenario,
+        state,
+        [_history_compact_row(1, sample_full_length=len(sample))],
+    )
+
+    direct_sample = scenario.next_host_call(specs)
+    assert direct_sample is not None
+    assert "SELECT sample FROM" in direct_sample.arguments["sql_content"]
+    _apply_query_failure(scenario, state, direct_sample)
+
+    assert state.history_sample_states[1] == "CHUNK_PENDING"
+    assert state.history_chunk_offset == 1
+    chunk = scenario.next_host_call(specs)
+    assert chunk is not None
+    assert "SUBSTRING(sample, 1," in chunk.arguments["sql_content"]
+
+
+def test_minimum_chunk_failure_marks_one_row_failed_and_continues_next_id() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    _prime_enrichment(
+        scenario,
+        state,
+        [
+            _history_compact_row(2, sample_full_length=20_000),
+            _history_compact_row(1, sample_full_length=20),
+        ],
+    )
+    state.history_current_id = 2
+    scenario._start_history_chunk_recovery(state, 2)
+    state.history_chunk_size = ARCHERY_SAMPLE_CHUNK_MIN_CHARS
+
+    final_chunk_attempt = scenario.next_host_call(specs)
+    assert final_chunk_attempt is not None
+    _apply_query_failure(scenario, state, final_chunk_attempt)
+    next_sample = scenario.next_host_call(specs)
+
+    assert state.history_sample_states[2] == "FAILED"
+    assert state.history_sample_metadata[2]["sample_recovery_failure"] == (
+        "history_sample_chunk_tool_failure"
+    )
+    assert next_sample is not None
+    assert "id = 1" in next_sample.arguments["sql_content"]
+    assert state.history_current_id == 1
+
+
+def test_structure_and_index_failures_do_not_block_exact_explain() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    sample = "SELECT * FROM orders WHERE customer_id = 42"
+    _prime_enrichment(
+        scenario,
+        state,
+        [_history_compact_row(42, sample_full_length=len(sample))],
+    )
+    state.history_current_id = 42
+    scenario._accept_reconstructed_sample(state, 42, sample)
+    state.analysis_instance_endpoints[3] = {"db-1.example:3306"}
+    state.analysis_database_names[3] = {"orders_prod"}
+
+    columns = scenario.next_host_call(specs)
+    assert columns is not None
+    assert columns.name == "list_table_columns_gymJPA"
+    _apply_query_failure(scenario, state, columns, code="columns_unavailable")
+
+    indexes = scenario.next_host_call(specs)
+    assert indexes is not None
+    assert "information_schema.STATISTICS" in indexes.arguments["sql_content"]
+    _apply_query_failure(scenario, state, indexes, code="indexes_unavailable")
+
+    explain = scenario.next_host_call(specs)
+    assert explain is not None
+    assert explain.arguments["sql_content"] == f"EXPLAIN {sample}"
+    assert {
+        failure["stage"] for failure in state.slow_query_analysis_failures
+    } >= {"table_structure", "indexes"}
+
+
+def test_explain_failure_finishes_current_row_and_continues_next_id() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    samples = {
+        2: "SELECT * FROM orders WHERE id = 2",
+        1: "SELECT * FROM orders WHERE id = 1",
+    }
+    _prime_enrichment(
+        scenario,
+        state,
+        [
+            _history_compact_row(
+                row_id,
+                sample_full_length=len(sample),
+            )
+            for row_id, sample in samples.items()
+        ],
+    )
+    state.history_current_id = 2
+    scenario._accept_reconstructed_sample(state, 2, samples[2])
+    state.analysis_instance_endpoints[3] = {"db-1.example:3306"}
+    state.analysis_database_names[3] = {"orders_prod"}
+    for stage, result in (
+        ("table_structure", {"COLUMN_NAME": "id"}),
+        ("indexes", {"INDEX_NAME": "PRIMARY"}),
+    ):
+        target_result = {
+            "stage": stage,
+            "target": {
+                "instance_id": 3,
+                "db_name": "orders_prod",
+                "table_name": "orders",
+            },
+            "result": {"row_count": 1, "rows": [result]},
+        }
+        (
+            state.slow_query_table_structure_results
+            if stage == "table_structure"
+            else state.slow_query_index_results
+        ).append(target_result)
+
+    explain = scenario.next_host_call(specs)
+    assert explain is not None
+    assert explain.arguments["sql_content"] == f"EXPLAIN {samples[2]}"
+    _apply_query_failure(scenario, state, explain, code="explain_unavailable")
+    next_sample = scenario.next_host_call(specs)
+
+    assert state.history_sample_states[2] == "ANALYZED"
+    assert state.history_sample_metadata[2]["explain_status"] == "failed"
+    assert next_sample is not None
+    assert "id = 1" in next_sample.arguments["sql_content"]
+    assert state.history_current_id == 1

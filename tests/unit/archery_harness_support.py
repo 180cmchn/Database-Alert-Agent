@@ -401,6 +401,7 @@ def _client(
     connector: ReplayMCPConnector,
     *,
     repository: SQLAlchemyAlertRepository | None = None,
+    deterministic_history_pipeline: bool = False,
 ) -> ArcheryMCPClient:
     return ArcheryMCPClient(
         MCPServerSettings(
@@ -409,7 +410,7 @@ def _client(
             prompts=ARCHERY_PROMPTS,
         ),
         model,
-        deterministic_history_pipeline=False,
+        deterministic_history_pipeline=deterministic_history_pipeline,
         harness_connector=connector,
         harness_runtime_dependencies=(
             ArcheryHarnessRuntimeDependencies(repository)
