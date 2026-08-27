@@ -192,8 +192,8 @@ class Settings(BaseSettings):
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     # The Host stops the Archery investigation cleanly before the outer tool
     # deadline so compact history evidence survives an enrichment timeout.
-    archery_investigation_budget_seconds: float = Field(default=120, gt=0, le=1200)
-    archery_mcp_tool_timeout_seconds: float = Field(default=150, gt=0, le=1200)
+    archery_investigation_budget_seconds: float = Field(default=150, gt=0, le=1200)
+    archery_mcp_tool_timeout_seconds: float = Field(default=180, gt=0, le=1200)
 
     # Prometheus is a deployment-only SSE MCP evidence source. Its endpoint and
     # authentication material must not be changed through the admin API.

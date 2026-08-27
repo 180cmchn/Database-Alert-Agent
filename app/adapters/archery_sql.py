@@ -49,7 +49,7 @@ def strip_mysql_comments(sql: str) -> str | None:
 
 
 def canonical_sql(sql: str) -> str | None:
-    """Return a formatting-insensitive key while preserving literal semantics."""
+    """Return a formatting-insensitive key with a non-semantic top-level LIMIT."""
 
     scanned = _scan(sql)
     if scanned is None:
@@ -57,16 +57,46 @@ def canonical_sql(sql: str) -> str | None:
     tokens = list(scanned[1])
     while tokens and tokens[-1] == _Token("symbol", ";"):
         tokens.pop()
+    tokens = _without_terminal_top_level_limit(tokens)
     if not tokens:
         return None
     return json.dumps(
-        [
-            _canonical_token(token)
-            for token in tokens
-        ],
+        [_canonical_token(token) for token in tokens],
         ensure_ascii=True,
         separators=(",", ":"),
     )
+
+
+def _without_terminal_top_level_limit(tokens: list[_Token]) -> list[_Token]:
+    """Drop a plain terminal LIMIT value while retaining nested limits and offsets."""
+
+    depth = 0
+    depths: list[int] = []
+    for token in tokens:
+        depths.append(depth)
+        if token == _Token("symbol", "("):
+            depth += 1
+        elif token == _Token("symbol", ")"):
+            depth -= 1
+            if depth < 0:
+                return tokens
+    if depth != 0:
+        return tokens
+    for index in range(len(tokens) - 2, -1, -1):
+        token = tokens[index]
+        if (
+            depths[index] == 0
+            and token.kind == "word"
+            and token.value.casefold() == "limit"
+            and _is_plain_limit_value(tokens[index + 1])
+            and index + 2 == len(tokens)
+        ):
+            return tokens[:index]
+    return tokens
+
+
+def _is_plain_limit_value(token: _Token) -> bool:
+    return token.kind in {"word", "literal"} or token == _Token("symbol", "?")
 
 
 def unquoted_words(sql: str) -> tuple[str, ...] | None:

@@ -1640,6 +1640,7 @@ class ArcheryHarnessScenario:
                         "instance_id": instance_id,
                         "db_name": db_name,
                         "sql_content": explain_sql,
+                        "limit_num": ARCHERY_HISTORY_PAGE_SIZE,
                         "max_result_chars": max(
                             ARCHERY_HISTORY_RESULT_CHARS,
                             len(
@@ -2211,7 +2212,7 @@ class ArcheryHarnessScenario:
                             reason_code="history_ranking_query_forbidden",
                             detail=(
                                 "首次 history 排名查询必须使用固定三列投影、完整告警窗口、"
-                                "hostname_max、ORDER BY id DESC 和有界 LIMIT。"
+                                "hostname_max 和 ORDER BY id DESC。"
                             ),
                         ), None
                     if self._is_initial_history_target(
@@ -2341,7 +2342,7 @@ class ArcheryHarnessScenario:
                     return self._local_rejection(
                         stage="history_recovery",
                         target={**target, "history_id": row_id},
-                        reason_code="history_recovery_limit_forbidden",
+                        reason_code="history_recovery_result_size_forbidden",
                         detail=(
                             "单 id history 查询的 max_result_chars 只允许省略或设为 24000。"
                         ),
@@ -2856,10 +2857,10 @@ class ArcheryHarnessScenario:
             allow_id_bounds=True,
         ):
             return False
-        tail = re.search(r"(?is)\b(?:order\s+by|limit)\b.*$", sql)
+        tail = re.search(r"(?is)\border\s+by\b.*$", sql)
         return tail is not None and re.fullmatch(
-            r"(?is)\s*order\s+by\s+`?id`?\s+desc\s+"
-            r"limit\s+(?:[1-9]\d?|100)\s*;?\s*",
+            r"(?is)\s*order\s+by\s+`?id`?\s+desc"
+            r"(?:\s+limit\s+\d+)?\s*;?\s*",
             tail.group(0),
         ) is not None
 
@@ -5222,15 +5223,7 @@ class ArcheryHarnessScenario:
                 call.effective_arguments.get("limit_num")
             )
             if requested_page_size is None:
-                limit_match = re.search(
-                    r"(?is)\blimit\s+(?P<value>[1-9]\d*)\s*;?\s*$",
-                    result_sql,
-                )
-                requested_page_size = (
-                    self.client._coerce_positive_integer(limit_match.group("value"))
-                    if limit_match is not None
-                    else None
-                )
+                requested_page_size = self.client.top_level_limit_value(result_sql)
             state.history_page_size = min(
                 requested_page_size or ARCHERY_HISTORY_PAGE_SIZE,
                 ARCHERY_HISTORY_PAGE_SIZE,
@@ -5358,7 +5351,13 @@ class ArcheryHarnessScenario:
                 state.history_snapshot_max_id = page_ids[0]
         else:
             state.history_compact_page_count += 1
-        if len(page_ids) == state.history_page_size and page_ids:
+        executed_page_size = self.client.top_level_limit_value(result_sql)
+        response_page_size = (
+            executed_page_size
+            if executed_page_size is not None
+            else state.history_page_size
+        )
+        if len(page_ids) == response_page_size and page_ids:
             state.history_page_cursor = page_ids[-1]
         elif projection == "ranking":
             state.history_ranking_scan_complete = True
@@ -5820,7 +5819,6 @@ class ArcheryHarnessScenario:
                 payload,
                 requested_sql=requested_sql,
                 supplemental_text=text_blocks,
-                provider_limit_num=call.effective_arguments.get("limit_num"),
             )
         )
         deferred_binding = call.metadata.get("deferred_target_binding")

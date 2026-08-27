@@ -26,7 +26,7 @@
 - 所有可安全进行普通 Explain 的记录都应尝试 Explain。Top 20% 并集优先，其余记录继续，直到全部完成或内部预算耗尽。
 - Explain 复用边界为 `(instance_id, db_name, checksum)`。
 - 保留原有 SQL 完整性校验、目标 provenance、证据绑定、Explain 资格、根因资格、partial/completeness 语义和审计能力。
-- Archery harness 内部调查预算为 `120s`，外层工具超时为 `150s`。预算到期时保留紧凑 history、已完成 sample/Explain、未完成 ID 和覆盖率，不得只返回通用 `TIMEOUT`。
+- Archery harness 内部调查预算为 `150s`，外层工具超时为 `180s`。预算到期时保留紧凑 history、已完成 sample/Explain、未完成 ID 和覆盖率，不得只返回通用 `TIMEOUT`。
 
 ### 1.3 安全和操作约束
 
@@ -39,7 +39,7 @@
 
 ## 2. 实施计划
 
-1. 保留并验证 provider 末尾 `LIMIT` 的受约束等价规则，只允许原请求为无顶层 `LIMIT/OFFSET` 的单一顶层 `SELECT`，且追加值与调用参数 `limit_num` 精确一致。
+1. 将任意受支持 SQL 的普通顶层末尾 `LIMIT` 统一视为结果边界：存在与数值不参与 SQL 身份核对，也不要求匹配 `limit_num`；`OFFSET`、嵌套 `LIMIT` 和其它改写仍保持原始语义。
 2. 在 Archery Host 中建立 `RANKING -> COMPACT -> RECONCILE -> ENRICHMENT -> COMPLETED` 确定性状态机。
 3. 对两个逻辑扫描实施固定投影、快照最大 ID、keyset 分页、页结构/顺序/唯一性校验以及 ID 集一致性检查。
 4. 计算两套 Top 20% 排名并形成统一优先队列。
@@ -47,7 +47,7 @@
 6. 将超长 sample 转换为有界展示结构，但将完整 SQL只保留在 Host 内部的当前 sample 状态中。
 7. 依次完成业务实例定向 allowlist、数据库确认、显式 schema 校验、表字段、索引和普通 Explain；Explain 参数只能从 Host 保存的完整 SQL生成。
 8. 按业务实例、数据库和 checksum 复用 Explain，并将结果绑定回各 history ID。
-9. 接入 120 秒内部预算和 150 秒外层超时，在各阶段停止时物化可用的部分证据。
+9. 接入 150 秒内部预算和 180 秒外层超时，在各阶段停止时物化可用的部分证据。
 10. 将 Host 内部调用从模型消息和模型调用审计中隔离，同时保留独立 Host 调用计数、请求 ID 和持久化审计。
 11. 同步 workflow、README、环境变量示例、配置校验、factory 和测试。
 12. 完成静态检查、Archery 回归、隔离运行时配置的完整测试；真实 MCP 验证继续保持禁用，除非用户另行批准。
@@ -57,7 +57,7 @@
 ### 3.1 已完成
 
 - `app/adapters/archery_mcp.py`
-  - 已实现受约束的 provider 末尾 `LIMIT` 等价校验。
+  - 已实现普通顶层 `LIMIT` 存在与数值无关的统一 SQL 等价校验，并保留实际值仅用于分页进度判断。
   - 已实现固定 ranking/compact SQL、keyset 条件、单 ID reconcile、sample 全文和 `SUBSTRING` 分片 SQL生成与解析。
   - 已实现 Top 20% 双排名并集。
   - 已实现超长 literal `IN/NOT IN` 的头尾保留结构化展示及相关计数元数据。
@@ -76,8 +76,8 @@
 - `app/mcp_runtime/harness.py`
   - `internal_only` 的 Host 调用结果不再追加到模型消息，避免完整 sample 或机械调用结果进入后续模型上下文。
 - `app/config.py`、`app/application/factory.py`、`.env.example`、`README.md`
-  - 已加入 `ARCHERY_INVESTIGATION_BUDGET_SECONDS=120`。
-  - 默认 `ARCHERY_MCP_TOOL_TIMEOUT_SECONDS` 已调整为 `150`。
+  - 已加入 `ARCHERY_INVESTIGATION_BUDGET_SECONDS=150`。
+  - 默认 `ARCHERY_MCP_TOOL_TIMEOUT_SECONDS` 已调整为 `180`。
   - 已加入内部预算必须小于外层工具超时的配置校验。
 - `config/mcp/prompts/archery/workflow.md`
   - 已同步两个逻辑扫描、keyset 分页、Top 20%、sample 字节长度、分片、结构化展示、完整原 SQL Explain、目标绑定、partial 结果和 provider `LIMIT` 契约。
@@ -167,7 +167,7 @@ git diff --check
 ### 5.2 后续非阻断事项
 
 1. `app/adapters/archery_harness.py` 的确定性状态机后续可考虑提取为独立模块；现有 checkpoint 和 Replay 测试应作为重构保护。
-2. 部署到公司内网后观察实际 `host_executed_tool_calls`、`model_decision_count`、预算覆盖率、未完成 ID 和 Explain 成功率，确认 120 秒预算在真实 MCP 延迟下合理；调整预算属于部署配置变更，应先获得用户确认。
+2. 部署到公司内网后观察实际 `host_executed_tool_calls`、`model_decision_count`、预算覆盖率、未完成 ID 和 Explain 成功率，确认 150 秒预算在真实 MCP 延迟下合理；调整预算属于部署配置变更，应先获得用户确认。
 3. 本机不具备公司内网连通性，本轮不要求也不执行 Archery MCP 或 Prometheus MCP 的真实请求。
 
 ## 6. 建议接手顺序

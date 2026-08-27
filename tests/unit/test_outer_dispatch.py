@@ -1377,6 +1377,74 @@ def test_not_applicable_status_is_derived_from_each_supplemental_failure() -> No
     )
 
 
+def test_missing_stage_with_successful_results_is_partial() -> None:
+    artifact_id = uuid4()
+    history = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [{"id": 41}],
+    }
+    index_result = {
+        "stage": "indexes",
+        "target": {"table_name": "orders"},
+        "result": {
+            "row_count": 1,
+            "rows": [{"INDEX_NAME": "PRIMARY", "COLUMN_NAME": "id"}],
+        },
+    }
+    supplemental = {
+        "status": "partial",
+        "stage_states": {"indexes": "SUCCEEDED"},
+        "explain_results": [],
+        "table_structure_results": [],
+        "index_results": [index_result],
+        "missing_stages": ["indexes"],
+        "failures": [],
+    }
+    parent = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery result",
+        structured_data={
+            "final_result_payload": history,
+            "slow_query_analysis": supplemental,
+        },
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery result",
+        analysis_usable=False,
+        source_coverage_complete=True,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        passthrough_payload=history,
+        slow_query_analysis=supplemental,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
+    completed = next(
+        unit
+        for unit in units
+        if unit.stage == "indexes" and unit.result_index == 0
+    )
+    partial = next(unit for unit in units if unit.unit_key == "supplemental:indexes:missing")
+
+    assert completed.status == EvidenceUnitStatus.SUCCESS
+    assert completed.root_cause_eligible is True
+    assert partial.status == EvidenceUnitStatus.PARTIAL
+    assert partial.summary == "Archery supplemental indexes 已取得部分结果，但覆盖不完整。"
+    assert partial.root_cause_eligible is False
+    assert partial.root_cause_ineligible_reason == "supplemental_partial"
+    DurableOuterToolDispatcher._validate_evidence_unit_sources(
+        parent.model_dump(mode="json"),
+        units,
+        artifact_id=artifact_id,
+    )
+
+
 def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -> None:
     artifact_id = uuid4()
     history = {
@@ -1399,7 +1467,7 @@ def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -
         "failures": [
             {
                 "stage": "history_recovery",
-                "reason_code": "history_recovery_limit_forbidden",
+                "reason_code": "history_recovery_result_size_forbidden",
                 "terminal": False,
             },
             {
@@ -1450,7 +1518,7 @@ def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -
         if unit.unit_key.endswith(":missing")
     }
 
-    recovered = by_reason["history_recovery_limit_forbidden"]
+    recovered = by_reason["history_recovery_result_size_forbidden"]
     assert recovered.status == EvidenceUnitStatus.RECOVERED
     assert recovered.root_cause_ineligible_reason == "supplemental_recovered"
     assert by_reason["history_recovery_incomplete"].status == EvidenceUnitStatus.FAILED
@@ -1486,7 +1554,7 @@ def test_nonterminal_history_failure_stays_failed_while_recovery_is_incomplete()
         "failures": [
             {
                 "stage": "history_recovery",
-                "reason_code": "history_recovery_limit_forbidden",
+                "reason_code": "history_recovery_result_size_forbidden",
                 "terminal": False,
             }
         ],

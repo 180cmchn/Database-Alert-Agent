@@ -222,6 +222,41 @@ def test_pipeline_starts_after_verified_archery_target_without_table_discovery()
     assert "hostname_max = 'db-1.example:3306'" in ranking.arguments["sql_content"]
 
 
+
+@pytest.mark.parametrize("suffix", ["", " LIMIT 0", " LIMIT 1", " LIMIT 1000"])
+def test_history_scope_ignores_plain_limit_presence_and_value(suffix: str) -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    without_limit = ranking.arguments["sql_content"].rsplit(" LIMIT ", 1)[0]
+
+    assert scenario._is_scoped_history_ranking_query(state, without_limit + suffix)
+
+
+def test_pipeline_uses_executed_limit_only_for_page_progress() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    prepared = _prepare_host_call(scenario, state, ranking)
+    actual_sql = ranking.arguments["sql_content"].rsplit(" LIMIT ", 1)[0] + " LIMIT 2"
+    scenario.on_result(
+        state,
+        prepared,
+        _success(
+            actual_sql,
+            rows=[
+                {"id": 2, "Query_time_max": 8.0, "Query_time_sum": 9.0},
+                {"id": 1, "Query_time_max": 4.0, "Query_time_sum": 5.0},
+            ],
+        ).result,
+    )
+
+    assert state.history_pipeline_phase == "RANKING"
+    assert state.history_page_cursor == 1
+    next_page = scenario.next_host_call(specs)
+    assert next_page is not None
+    assert "id < 1" in next_page.arguments["sql_content"]
+
 def test_history_priority_uses_union_of_both_top_twenty_percent_rankings() -> None:
     scenario, _, _ = _pipeline_scenario()
     rows = [

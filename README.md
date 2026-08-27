@@ -192,8 +192,8 @@ Host 按稳定 directive ID 将 `workflow.md` 中对应的原文片段追加到�
 
 动态 MCP Schema 负责普通 required、类型和额外参数校验；专用 Host 只保留只读边界、单语句和数据
 范围等安全门禁。单 id history 恢复使用 MySQL AST 做语义校验，允许大小写、空白、反引号、别名、
-`ORDER BY id ASC|DESC` 和 `LIMIT 1` 等安全等价写法，但仍在 transport 前拒绝 JOIN、子查询、额外
-谓词、错误目标表及未授权 id。所有本地拒绝都会把结构化 reason code、详情和下一步动作返回模型。
+`ORDER BY id ASC|DESC` 和任意普通顶层 `LIMIT`；该 `LIMIT` 的存在与数值不参与 SQL 身份或本地拒绝
+判定，`OFFSET` 仍保持独立语义。JOIN、子查询、额外谓词、错误目标表及未授权 id 仍在 transport 前拒绝。
 
 完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max` 严格
 绑定。实例发现工具的结构化 allowlist 行可以在同一调查中保留并复用；真实 MCP 无筛选返回的
@@ -206,8 +206,8 @@ supplemental 证据单元；失败单元只形成证据缺口，不修改或降�
 id 或适用的 supplemental 阶段处于 `PENDING`，内部 `finish` 就会被拒绝；全部工作项进入成功、失败、
 不适用或不可用等终态后即可结束，不要求全部成功。新 Archery 父 evidence 只关联调用和原始 artifact，
 根因必须引用具备资格的具体子单元 ID。已由完整 history 最终结果覆盖的显式非终态恢复失败显示为
-`RECOVERED`；因目标解析或工具能力阻断而未执行的下游阶段显示为 `UNAVAILABLE`，只有实际空结果继续
-使用 `NO_DATA`。
+`RECOVERED`；因目标解析或工具能力阻断而未执行的下游阶段显示为 `UNAVAILABLE`；同一阶段已有
+成功结果但仍有目标未覆盖时显示为 `PARTIAL`；只有实际空结果继续使用 `NO_DATA`。
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json
@@ -215,8 +215,8 @@ ARCHERY_MCP_URL=https://archery.example.internal/mcp
 ARCHERY_MCP_TOKEN=replace-me
 ARCHERY_SLOW_LOG_WINDOW_SECONDS=300
 ARCHERY_MCP_TIMEOUT_SECONDS=60
-ARCHERY_INVESTIGATION_BUDGET_SECONDS=120
-ARCHERY_MCP_TOOL_TIMEOUT_SECONDS=150
+ARCHERY_INVESTIGATION_BUDGET_SECONDS=150
+ARCHERY_MCP_TOOL_TIMEOUT_SECONDS=180
 ```
 
 ## Prometheus MCP

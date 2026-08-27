@@ -163,6 +163,7 @@ export type ToolStatus = "SUCCESS" | "NO_DATA" | "TIMEOUT" | "FAILED" | "SKIPPED
 
 export type EvidenceUnitStatus =
   | "SUCCESS"
+  | "PARTIAL"
   | "FAILED"
   | "NO_DATA"
   | "RECOVERED"

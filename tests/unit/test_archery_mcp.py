@@ -954,6 +954,9 @@ def test_non_in_oversized_sample_uses_non_executable_head_tail_display() -> None
         "order by `id` asc limit 1",
         "SELECT h.* FROM archery.mysql_slow_query_review_history AS h "
         "WHERE h.id = 24413454 ORDER BY h.id DESC LIMIT 1",
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 0",
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 2",
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 999999",
         "SELECT * FROM mysql_slow_query_review_history h WHERE 24413454 = h.id",
         "SELECT * FROM `archery`.`mysql_slow_query_review_history` AS `H` "
         "WHERE (`H`.`ID` = 24413454);",
@@ -1019,18 +1022,14 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_order_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 2",
-            "history_recovery_limit_forbidden",
-        ),
-        (
             "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
             "OFFSET 1",
-            "history_recovery_limit_forbidden",
+            "history_recovery_offset_forbidden",
         ),
         (
             "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
             "LIMIT 1 OFFSET 0",
-            "history_recovery_limit_forbidden",
+            "history_recovery_offset_forbidden",
         ),
         (
             "SELECT * FROM mysql_slow_query_review_history WHERE id = "
@@ -3084,6 +3083,35 @@ def test_archery_mcp_requires_exact_positive_sample_full_length_when_present() -
     assert [row["id"] for row in selected] == [99]
 
 
+def test_table_columns_from_payload_parses_live_data_dictionary_text() -> None:
+    result = {
+        "structuredContent": {
+            "result": (
+                "实例 3 / 数据库 pcm_product_prod / 表 t_menu_rule 的字段（数据字典）：\n"
+                "- id\n"
+                "- `rule_code`\n"
+                "- updated_user"
+            )
+        }
+    }
+
+    payload = ArcheryMCPClient.extract_tool_payload(result)
+
+    assert ArcheryMCPClient.table_columns_from_payload(payload) == {
+        "id",
+        "rule_code",
+        "updated_user",
+    }
+
+
+def test_table_columns_from_payload_rejects_unbound_bullet_text() -> None:
+    payload = {
+        "result": "可能相关的字段：\n- id\n- rule_code",
+    }
+
+    assert ArcheryMCPClient.table_columns_from_payload(payload) == set()
+
+
 def test_sql_equivalence_preserves_physical_table_identity() -> None:
     assert ArcheryMCPClient.sql_equivalent(
         "SELECT LOW_PRIORITY * FROM orders",
@@ -3120,7 +3148,7 @@ def test_sql_equivalence_preserves_optimizer_hint_identity() -> None:
     )
 
 
-def test_normalized_query_accepts_provider_appended_declared_limit() -> None:
+def test_normalized_query_accepts_top_level_limit_without_provider_contract() -> None:
     requested = (
         "SELECT f_instance_id FROM t_instance_member "
         "WHERE f_ip = '100.84.97.117' AND f_port = '3306'"
@@ -3144,67 +3172,96 @@ def test_normalized_query_accepts_provider_appended_declared_limit() -> None:
         }
     }
 
-    payload, executed_sql, actual_sql_verified = (
-        ArcheryMCPClient.normalize_query_payload(
-            response,
-            requested_sql=requested,
-            provider_limit_num=100,
-        )
-    )
-    _payload_without_contract, _executed_without_contract, verified_without_contract = (
-        ArcheryMCPClient.normalize_query_payload(
-            response,
-            requested_sql=requested,
-        )
+    payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        response,
+        requested_sql=requested,
     )
 
     assert payload["rows"] == [[3]]
     assert payload["column_list"] == ["f_instance_id"]
     assert executed_sql == embedded["full_sql"]
     assert actual_sql_verified is True
-    assert verified_without_contract is False
+
+
+def test_normalized_explain_accepts_any_top_level_limit_value() -> None:
+    requested = (
+        "EXPLAIN SELECT * FROM orders WHERE customer_id = 7\n\n"
+        "AND status = 'pending' LIMIT 1"
+    )
+    actual = requested.rsplit(" LIMIT ", 1)[0] + " LIMIT 100"
+    embedded = {
+        "full_sql": actual + ";",
+        "rows": [{"table": "orders", "type": "ref"}],
+    }
+    response = {
+        "result": (
+            "SQL 查询已执行。\n"
+            f"执行的SQL：{actual}\n\n"
+            "返回 1 行。\n结果：\n"
+            + json.dumps(embedded)
+        )
+    }
+
+    payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
+        response,
+        requested_sql=requested,
+    )
+
+    assert payload["rows"] == [{"table": "orders", "type": "ref"}]
+    assert executed_sql == embedded["full_sql"]
+    assert actual_sql_verified is True
 
 
 @pytest.mark.parametrize(
-    ("requested", "actual", "provider_limit_num"),
+    ("requested", "actual"),
     [
         (
             "SELECT host, port FROM sql_instance WHERE id = 3",
             "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 100",
-            20,
-        ),
-        (
-            "SELECT host, port FROM sql_instance WHERE id = 3",
-            "SELECT host, port FROM sql_instance WHERE id = 4 LIMIT 100",
-            100,
-        ),
-        (
-            "SELECT host, port FROM sql_instance WHERE id = 3",
-            "SELECT id, host, port FROM sql_instance WHERE id = 3 LIMIT 100",
-            100,
         ),
         (
             "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 1",
             "SELECT host, port FROM sql_instance WHERE id = 3 LIMIT 100",
-            100,
         ),
         (
             "EXPLAIN SELECT * FROM orders WHERE id = 3",
+            "EXPLAIN SELECT * FROM orders WHERE id = 3 LIMIT 99",
+        ),
+        (
+            "EXPLAIN SELECT * FROM orders WHERE id = 3 LIMIT 1",
             "EXPLAIN SELECT * FROM orders WHERE id = 3 LIMIT 100",
-            100,
         ),
     ],
 )
-def test_execution_sql_equivalence_rejects_unbound_provider_rewrites(
+def test_sql_equivalence_ignores_plain_top_level_limit(
     requested: str,
     actual: str,
-    provider_limit_num: int,
 ) -> None:
-    assert not ArcheryMCPClient.execution_sql_equivalent(
-        requested,
-        actual,
-        provider_limit_num=provider_limit_num,
-    )
+    assert ArcheryMCPClient.sql_equivalent(requested, actual)
+
+
+@pytest.mark.parametrize(
+    ("requested", "actual"),
+    [
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3",
+            "SELECT host, port FROM sql_instance WHERE id = 4 LIMIT 100",
+        ),
+        (
+            "SELECT host, port FROM sql_instance WHERE id = 3",
+            "SELECT id, host, port FROM sql_instance WHERE id = 3 LIMIT 100",
+        ),
+        (
+            "EXPLAIN SELECT * FROM orders WHERE id = 3",
+            "EXPLAIN SELECT * FROM orders WHERE id = 4 LIMIT 100",
+        ),
+    ],
+)
+def test_sql_equivalence_rejects_non_limit_rewrites(
+    requested: str,
+    actual: str,
+) -> None:
+    assert not ArcheryMCPClient.sql_equivalent(requested, actual)
 
 
 def test_normalized_query_rejects_echoed_physical_table_change() -> None:

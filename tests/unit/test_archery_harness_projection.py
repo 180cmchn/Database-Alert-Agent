@@ -1664,7 +1664,7 @@ def test_structure_and_indexes_are_reused_for_same_physical_table() -> None:
     state.slow_query_analysis_failures = [
         {
             "stage": "history_recovery",
-            "reason_code": "history_recovery_limit_forbidden",
+            "reason_code": "history_recovery_result_size_forbidden",
             "terminal": False,
         }
     ]

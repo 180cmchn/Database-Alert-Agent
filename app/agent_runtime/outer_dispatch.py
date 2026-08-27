@@ -1074,6 +1074,7 @@ class DurableOuterToolDispatcher:
         supplemental_eligible = (
             evidence.status == ToolStatus.SUCCESS and analysis.source_coverage_complete
         )
+        successful_result_stages: set[str] = set()
         for field_name, stage in result_fields.items():
             results = supplemental.get(field_name)
             if not isinstance(results, list):
@@ -1081,6 +1082,7 @@ class DurableOuterToolDispatcher:
             for index, result in enumerate(results):
                 if not isinstance(result, Mapping):
                     continue
+                successful_result_stages.add(stage)
                 append_unit(
                     unit_key=stable_unit_key(
                         stage=stage,
@@ -1166,6 +1168,9 @@ class DurableOuterToolDispatcher:
                 if stage in failure_stages:
                     continue
                 stage_state = str(stage_states.get(stage) or "").upper()
+                partially_covered = (
+                    stage_state == "SUCCEEDED" and stage in successful_result_stages
+                )
                 status = (
                     EvidenceUnitStatus.UNAVAILABLE
                     if stage_state == "UNAVAILABLE"
@@ -1173,11 +1178,15 @@ class DurableOuterToolDispatcher:
                     if stage_state == "FAILED_TERMINAL"
                     else EvidenceUnitStatus.NOT_APPLICABLE
                     if stage_state == "NOT_APPLICABLE"
+                    else EvidenceUnitStatus.PARTIAL
+                    if partially_covered
                     else EvidenceUnitStatus.NO_DATA
                 )
                 summary = (
                     f"Archery supplemental {stage} 因前置条件不可用而未执行。"
                     if status == EvidenceUnitStatus.UNAVAILABLE
+                    else f"Archery supplemental {stage} 已取得部分结果，但覆盖不完整。"
+                    if status == EvidenceUnitStatus.PARTIAL
                     else f"Archery supplemental {stage} 未取得结果。"
                 )
                 ineligible_reason = (
@@ -1187,6 +1196,8 @@ class DurableOuterToolDispatcher:
                     if status == EvidenceUnitStatus.FAILED
                     else "supplemental_not_applicable"
                     if status == EvidenceUnitStatus.NOT_APPLICABLE
+                    else "supplemental_partial"
+                    if status == EvidenceUnitStatus.PARTIAL
                     else "supplemental_result_missing"
                 )
                 source_paths = [

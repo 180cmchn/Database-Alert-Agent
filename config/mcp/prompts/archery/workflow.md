@@ -5,13 +5,13 @@
 2. 按 MCP 动态发现的工具描述和 Schema 自主选择调用，每次调用后根据真实返回决定下一步。若发现认证工具，根据当前会话状态自主判断是否调用；Host 不会预先调用或隐藏固定认证工具。实例 ID、数据库、表和字段必须来自工具返回，不猜测部署结构。
 <!-- /directive -->
 <!-- directive:id=archery.metadata.archery_target -->
-3. 先用 MCP 发现 allowlist 中的 Archery 实例及 Archery 数据库；记下其真实 MCP `instance_id`。在后续 Archery 元数据与 history 查询中必须使用该实例 `instance_id` 和 `db_name = archery`。
+3. 先用 MCP 发现 Archery 实例及 Archery 数据库；记下其真实 MCP `instance_id`。在后续 Archery 元数据与 history 查询中必须使用该实例 `instance_id` 和 `db_name = archery`。
 <!-- /directive -->
 <!-- directive:id=archery.metadata.alert_endpoint_mapping -->
 4. 查询 `t_instance_member` 的真实字段，查询条件使用告警详情的 `alarm_host`、`alarm_port` 等值于 `f_ip`、`f_port`，取得 `f_instance_id`；再查询 `sql_instance`，在 SQL 的 WHERE 条件中以 `f_instance_id` 的值等值于 `id` 查询真实 host 和 port。
 <!-- /directive -->
 <!-- directive:id=archery.history.window_query -->
-5. 将 `sql_instance` 返回的真实 host 和 port 严格组合为 host:port，作为 `mysql_slow_query_review_history.hostname_max` 的等值条件；确认 history 表的 `hostname_max`、`id`、`Query_time_max`、`Query_time_sum`、`sample` 和时间字段后，先查询固定投影 `id, Query_time_max, Query_time_sum`。查询必须包含 `hostname_max` 等值条件和第 8 条的完整时间范围，使用 `ORDER BY id DESC` 和不超过 100 的 `LIMIT`，并设置 `max_result_chars = 12000`。Host 在首次查询后接管分页、sample 恢复和补充分析，模型不得自行重复这些机械调用。
+5. 将 `sql_instance` 返回的真实 host 和 port 严格组合为 host:port，作为 `mysql_slow_query_review_history.hostname_max` 的等值条件；确认 history 表的 `hostname_max`、`id`、`Query_time_max`、`Query_time_sum`、`sample` 和时间字段后，先查询固定投影 `id, Query_time_max, Query_time_sum`。查询必须包含 `hostname_max` 等值条件和第 8 条的完整时间范围，并使用 `ORDER BY id DESC`，同时设置 `max_result_chars = 12000`。普通顶层 `LIMIT` 可省略或使用任意值；其存在与数值只作为结果分页信息，不参与 SQL 身份、目标绑定或本地拒绝判定。Host 在首次查询后接管分页、sample 恢复和补充分析，模型不得自行重复这些机械调用。
 <!-- /directive -->
 <!-- directive:id=archery.history.truncation.list_ids -->
 6. 排名投影使用 `id` keyset 物理分页；Host 固定首次最大 id，后续页使用 `id < 上一页末 id`，禁止 OFFSET。完整取得排名行后，再以相同 hostname、时间范围、快照上界和 keyset 顺序查询程序固定的紧凑字段，并包含 `LENGTH(sample) AS sample_full_length`。两个逻辑扫描的 id 集合必须一致；不一致时只保留可验证交集并标记 `history_snapshot_inconsistent`。所有页完成后，分别按 `Query_time_max` 和 `Query_time_sum` 降序取前 `ceil(N * 20%)`，截止位用 id 降序打破并列，两套结果取并集作为高优先级队列，其余 id 随后处理。
@@ -47,7 +47,7 @@
 13. 索引优先查询 `information_schema.STATISTICS`，避免 `SHOW INDEX` 被 MCP 自动追加 LIMIT 后产生语法错误。结构和索引条件必须使用第 10、11 条得到的真实数据库及表名。从 history 恢复开始到补充阶段结束，调用范围只允许：history 恢复查询、严格目标解析、真实表字段/索引元数据查询，以及已绑定 sample 的普通 EXPLAIN。不得直接执行 sample，也不得调用任意业务 SELECT、其它管理语句或与本次调查无关的探测。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.response_binding -->
-14. 收集补充结果时，必须使用 MCP 返回中的实际执行 SQL 和实际目标与请求、绑定 sample 及第 10 条目标进行核对。对于原请求不含顶层 `LIMIT` 的单一 `SELECT`，若唯一差异是 MCP 在语句末尾自动追加 `LIMIT N`，且 `N` 与该次调用显式提交的 `limit_num` 精确一致，这是已声明的 provider 结果限流，不视为 SQL 不一致；该例外不适用于已有顶层 `LIMIT` 的请求、`EXPLAIN` 或任何其它改写。若返回明确回显的 SQL、物理 schema/表名、`instance_id`、host:port 或数据库存在其它不一致，不得将该结果投影为该 history sample 的 EXPLAIN、表结构或索引事实；将不一致记录为对应补充阶段的证据缺口。
+14. 收集补充结果时，必须使用 MCP 返回中的实际执行 SQL 和实际目标与请求、绑定 sample 及第 10 条目标进行核对。对任意受支持 SQL，普通顶层末尾 `LIMIT` 的存在与数值都不参与 SQL 身份核对，也不要求与调用参数 `limit_num` 一致；这适用于原请求已有 `LIMIT`、没有 `LIMIT`、普通 `EXPLAIN` 及受支持 DML。`OFFSET`、嵌套 `LIMIT` 和任何其它改写仍保持原始语义。若返回明确回显的 SQL 在这些非 `LIMIT` 部分、物理 schema/表名、`instance_id`、host:port 或数据库存在其它不一致，不得将该结果投影为该 history sample 的 EXPLAIN、表结构或索引事实；将不一致记录为对应补充阶段的证据缺口。
 <!-- /directive -->
 <!-- directive:id=archery.supplemental.failure_isolation -->
 15. EXPLAIN、目标解析、表结构、索引或第 14 条核对失败时，不要丢弃、替换、修改或降级已经取得的 history。继续尝试其它仍安全且有价值的允许阶段，并保留真实 `stage`、`target`、错误类型、reason code 和错误详情。权限、allowlist、表不存在、目标版本不支持 EXPLAIN、sample 解析失败或结果核对失败都只是补充分析缺口，不得改变 history 的状态、内容、可用性或根因资格。

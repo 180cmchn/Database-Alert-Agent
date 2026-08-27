@@ -116,8 +116,9 @@ limited to ids returned by the bound window's id listing. Validate these recover
 MySQL parser and AST: require one SELECT from the exact history table, one authorized id equality
 predicate, no join, subquery, or extra predicate, and only the full or fixed sample-prefix
 projection. Accept semantically equivalent casing, whitespace, quoting, aliases, optional id
-ordering, and `LIMIT 1`. Any explicit sample schema, including CTE
-physical sources and DML targets, must exactly match the row's `db_max`.
+ordering, and any plain top-level `LIMIT`; its presence and value do not participate in SQL identity
+or local rejection. `OFFSET` and nested limits remain semantic. Any explicit sample schema,
+including CTE physical sources and DML targets, must exactly match the row's `db_max`.
 
 The upstream Archery MCP currently returns unstructured result text. After each history window or
 per-id response, use the local result-assessment action to explicitly classify that raw response as

@@ -67,7 +67,7 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v31"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v32"
 ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v6"
 ARCHERY_HISTORY_PAGE_SIZE: Final = 100
 ARCHERY_HISTORY_RESULT_CHARS: Final = 12_000
@@ -171,6 +171,13 @@ _QUERY_TIMEOUT_TEXT: Final = re.compile(
     r"|query\s+execution\s+was\s+interrupted"
     r"|maximum\s+statement\s+execution\s+time\s+exceeded",
     re.IGNORECASE,
+)
+_TABLE_COLUMNS_TEXT_HEADER: Final = re.compile(
+    r"^\s*实例\s+\d+\s*/\s*数据库\s+\S+\s*/\s*表\s+\S+\s*"
+    r"的字段(?:（数据字典）|\(数据字典\))?\s*[：:]\s*$"
+)
+_TABLE_COLUMNS_TEXT_ITEM: Final = re.compile(
+    r"^\s*-\s+(?P<column>`[^`\r\n]+`|[A-Za-z_][A-Za-z0-9_$]*)\s*$"
 )
 _FAILURE_STATUSES: Final = {
     "error",
@@ -412,7 +419,7 @@ class ArcheryMCPClient:
         *,
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         timeout_seconds: float = 60,
-        investigation_budget_seconds: float = 120,
+        investigation_budget_seconds: float = 150,
         deterministic_history_pipeline: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
         harness_connector: Any | None = None,
@@ -473,7 +480,7 @@ class ArcheryMCPClient:
         environment: Mapping[str, str],
         window_seconds: int = ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS,
         timeout_seconds: float = 60,
-        investigation_budget_seconds: float = 120,
+        investigation_budget_seconds: float = 150,
         deterministic_history_pipeline: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
         harness_runtime_dependencies: Any | None = None,
@@ -707,11 +714,11 @@ class ArcheryMCPClient:
         cls,
         sql: str,
     ) -> tuple[tuple[int, str] | None, str | None]:
-        """Validate a bounded per-id query through sqlglot's MySQL AST.
+        """Validate one per-id query through sqlglot's MySQL AST.
 
-        Formatting, quoting, aliases, an id-only ORDER BY, and LIMIT 1 are
-        immaterial. Additional data sources, predicates, projections, or query
-        operators fail closed before transport.
+        Formatting, quoting, aliases, an id-only ORDER BY, and a plain top-level
+        LIMIT with any value are immaterial. Additional data sources, predicates,
+        projections, offsets, or query operators fail closed before transport.
         """
 
         parser_input = cls._sql_without_comments(sql)
@@ -875,17 +882,7 @@ class ArcheryMCPClient:
                 return None, "history_recovery_order_forbidden"
 
         if tree.args.get("offset") is not None:
-            return None, "history_recovery_limit_forbidden"
-
-        limit = tree.args.get("limit")
-        if limit is not None:
-            limit_value = limit.expression if isinstance(limit, exp.Limit) else None
-            if (
-                not isinstance(limit_value, exp.Literal)
-                or not limit_value.is_int
-                or int(limit_value.this) != 1
-            ):
-                return None, "history_recovery_limit_forbidden"
+            return None, "history_recovery_offset_forbidden"
         return (row_id, projection_kind), None
 
     @staticmethod
@@ -2236,7 +2233,7 @@ class ArcheryMCPClient:
 
     @classmethod
     def sql_equivalent(cls, expected: str, actual: str) -> bool:
-        """Compare SQL formatting while preserving physical table identity."""
+        """Compare SQL identity while ignoring a plain top-level LIMIT value."""
 
         expected_identity = canonical_sql(expected)
         actual_identity = canonical_sql(actual)
@@ -2259,35 +2256,6 @@ class ArcheryMCPClient:
             and expected_paths == actual_paths
         )
 
-    @classmethod
-    def execution_sql_equivalent(
-        cls,
-        expected: str,
-        actual: str,
-        *,
-        provider_limit_num: Any = None,
-    ) -> bool:
-        """Accept only the provider's declared, result-bounding SELECT rewrite."""
-
-        if cls.sql_equivalent(expected, actual):
-            return True
-        provider_limit = cls._coerce_positive_integer(provider_limit_num)
-        statement = cls._single_sql_statement(expected)
-        if provider_limit is None or statement is None:
-            return False
-        try:
-            statements = parse(statement, read="mysql")
-        except (ParseError, TokenError):
-            return False
-        if len(statements) != 1 or not isinstance(statements[0], exp.Select):
-            return False
-        tree = statements[0]
-        if tree.args.get("limit") is not None or tree.args.get("offset") is not None:
-            return False
-        return cls.sql_equivalent(
-            f"{statement} LIMIT {provider_limit}",
-            actual,
-        )
 
     @classmethod
     def matching_discovered_table(
@@ -2812,7 +2780,7 @@ class ArcheryMCPClient:
                         "field",
                     } and isinstance(value, str):
                         columns.add(value.strip())
-                    elif isinstance(value, (Mapping, list, tuple)):
+                    if isinstance(value, (Mapping, list, tuple, str)):
                         pending.append(value)
             elif isinstance(current, (list, tuple)):
                 marker = id(current)
@@ -2820,7 +2788,27 @@ class ArcheryMCPClient:
                     continue
                 visited_containers.add(marker)
                 pending.extend(current)
+            elif isinstance(current, str):
+                columns.update(cls._table_columns_from_text(current))
         return {column for column in columns if column}
+
+    @staticmethod
+    def _table_columns_from_text(text: str) -> set[str]:
+        """Parse the live MCP's bound data-dictionary bullet-list response."""
+
+        columns: set[str] = set()
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if _TABLE_COLUMNS_TEXT_HEADER.fullmatch(line) is None:
+                continue
+            for candidate in lines[index + 1 :]:
+                if not candidate.strip() and not columns:
+                    continue
+                match = _TABLE_COLUMNS_TEXT_ITEM.fullmatch(candidate)
+                if match is None:
+                    break
+                columns.add(match.group("column").strip("`"))
+        return columns
 
     @staticmethod
     def _normalized_column_name(value: str) -> str:
@@ -3217,10 +3205,8 @@ class ArcheryMCPClient:
         if where is None:
             return None
         body = where.group("body").strip()
-        limit = re.search(r"(?is)\s+limit\s+(?P<count>\d+)\s*$", body)
+        limit = re.search(r"(?is)\s+limit\s+\d+\s*$", body)
         if limit is not None:
-            if cls._coerce_positive_integer(limit.group("count")) != 1:
-                return None
             body = body[: limit.start()].strip()
         elif re.search(r"(?i)\blimit\b", body):
             return None
@@ -3427,6 +3413,27 @@ class ArcheryMCPClient:
         parsed = int(candidate)
         return parsed if 0 < parsed <= 9_223_372_036_854_775_807 else None
 
+    @classmethod
+    def top_level_limit_value(cls, sql: str) -> int | None:
+        """Return a literal top-level LIMIT for pagination mechanics only."""
+
+        parser_input = cls._sql_without_comments(sql)
+        if parser_input is None:
+            return None
+        try:
+            statements = parse(parser_input, read="mysql")
+        except (ParseError, TokenError):
+            return None
+        if len(statements) != 1:
+            return None
+        limit = statements[0].args.get("limit")
+        value = limit.expression if isinstance(limit, exp.Limit) else None
+        return (
+            cls._coerce_nonnegative_integer(value.this)
+            if isinstance(value, exp.Literal) and value.is_int
+            else None
+        )
+
     @staticmethod
     def _is_query_timeout_detail(value: Any) -> bool:
         """Classify an observed server error for diagnostic stage reporting only."""
@@ -3560,7 +3567,6 @@ class ArcheryMCPClient:
         *,
         requested_sql: str,
         supplemental_text: Sequence[str] = (),
-        provider_limit_num: Any = None,
     ) -> tuple[dict[str, Any], str | None, bool]:
         """Extract Archery's text-wrapped SQL result without constraining the Agent."""
 
@@ -3618,11 +3624,7 @@ class ArcheryMCPClient:
 
         executed_sql = declared_sqls[0] if declared_sqls else None
         actual_sql_verified = bool(declared_sqls) and all(
-            cls.execution_sql_equivalent(
-                requested_sql,
-                actual_sql,
-                provider_limit_num=provider_limit_num,
-            )
+            cls.sql_equivalent(requested_sql, actual_sql)
             for actual_sql in declared_sqls
         )
         if actual_sql_verified:
@@ -3825,8 +3827,8 @@ class ArcheryMCPClient:
     def _executed_sqls_from_text(text: str) -> tuple[str, ...]:
         matches = re.finditer(
             r"(?is)执行的SQL\s*[：:]\s*(?P<sql>.*?)"
-            r"(?:\r?\n\s*\r?\n|\r?\n\s*返回\s*\d+\s*行|"
-            r"\r?\n\s*结果\s*[：:]|$)",
+            r"(?=\r?\n(?:[^\S\r\n]*\r?\n)?[^\S\r\n]*"
+            r"(?:执行的SQL\s*[：:]|返回\s*\d+\s*行|结果\s*[：:])|$)",
             text,
         )
         return tuple(

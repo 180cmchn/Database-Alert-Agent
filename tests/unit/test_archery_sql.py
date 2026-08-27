@@ -20,6 +20,28 @@ def test_canonical_sql_ignores_formatting_comments_and_keyword_case() -> None:
     assert canonical_sql(left) == canonical_sql(right)
 
 
+def test_canonical_sql_ignores_plain_top_level_limit_presence_and_value() -> None:
+    pairs = (
+        ("SELECT * FROM orders WHERE id = 1", "SELECT * FROM orders WHERE id = 1 LIMIT 0"),
+        ("UPDATE orders SET status = 1", "UPDATE orders SET status = 1 LIMIT 999"),
+        ("DELETE FROM orders WHERE id = 1", "DELETE FROM orders WHERE id = 1 LIMIT 2"),
+        ("EXPLAIN SELECT * FROM orders", "EXPLAIN SELECT * FROM orders LIMIT 100"),
+    )
+
+    assert all(canonical_sql(left) == canonical_sql(right) for left, right in pairs)
+
+
+def test_canonical_sql_keeps_nested_limits_and_offsets_semantic() -> None:
+    assert canonical_sql(
+        "SELECT * FROM orders WHERE id IN (SELECT id FROM audit LIMIT 1)"
+    ) != canonical_sql(
+        "SELECT * FROM orders WHERE id IN (SELECT id FROM audit LIMIT 2)"
+    )
+    assert canonical_sql("SELECT * FROM orders LIMIT 1 OFFSET 0") != canonical_sql(
+        "SELECT * FROM orders"
+    )
+
+
 def test_canonical_sql_preserves_literal_case_and_internal_whitespace() -> None:
     original = "SELECT * FROM orders WHERE note = 'A  B'"
 

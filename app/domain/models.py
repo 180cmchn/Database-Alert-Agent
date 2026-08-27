@@ -72,6 +72,7 @@ class EvidenceUnitKind(StrEnum):
 
 class EvidenceUnitStatus(StrEnum):
     SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     NO_DATA = "NO_DATA"
     RECOVERED = "RECOVERED"

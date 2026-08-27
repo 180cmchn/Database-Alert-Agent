@@ -6,6 +6,7 @@ import {
   BrainCircuit,
   Check,
   CheckCircle2,
+  ChevronDown,
   CircleAlert,
   Clock3,
   Database,
@@ -77,12 +78,89 @@ function evidenceUnitQualification(
   unit: Pick<EvidenceUnit, "root_cause_eligible" | "status">,
 ): string {
   if (unit.root_cause_eligible) return "根因可用";
+  if (unit.status === "PARTIAL") return "覆盖不完整";
   if (unit.status === "FAILED") return "不可用";
   if (unit.status === "NO_DATA") return "无数据";
   if (unit.status === "RECOVERED") return "已恢复";
   if (unit.status === "UNAVAILABLE") return "前置条件不可用";
   if (unit.status === "NOT_APPLICABLE") return "不适用";
   return "根因不可用";
+}
+
+function historySampleCoverage(unit: EvidenceUnit): string | null {
+  if (unit.kind !== "HISTORY") return null;
+  const rows = Array.isArray(unit.data.rows) ? unit.data.rows : [];
+  const recordedRowCount = unit.data.row_count;
+  const rowCount = typeof recordedRowCount === "number" && Number.isInteger(recordedRowCount)
+    ? Math.max(recordedRowCount, 0)
+    : rows.length;
+  if (rowCount === 0) return null;
+
+  let fullCount = 0;
+  let structuredCount = 0;
+  let prefixCount = 0;
+  rows.forEach((row) => {
+    if (typeof row !== "object" || row === null || Array.isArray(row)) return;
+    const values = row as Record<string, unknown>;
+    if (values.sample_representation === "full") fullCount += 1;
+    else if (values.sample_representation === "structured") structuredCount += 1;
+    else if (typeof values.sample === "string") prefixCount += 1;
+  });
+
+  const missingCount = Math.max(
+    rowCount - fullCount - structuredCount - prefixCount,
+    0,
+  );
+  const parts = [`Sample：${fullCount} / ${rowCount} 完整`];
+  if (structuredCount > 0) parts.push(`${structuredCount} 条结构化摘要`);
+  if (prefixCount > 0) parts.push(`${prefixCount} 条前缀`);
+  if (missingCount > 0) parts.push(`${missingCount} 条未恢复`);
+  return parts.join(" · ");
+}
+
+function EvidenceUnitDetails({ units }: { units: EvidenceUnit[] }) {
+  const eligibleCount = units.filter((unit) => unit.root_cause_eligible).length;
+  const ineligibleCount = units.length - eligibleCount;
+
+  return (
+    <details className="evidence-unit-details">
+      <summary aria-label={`显示或隐藏 ${units.length} 项工具内部状态`}>
+        <span className="evidence-unit-summary-copy">
+          <strong>工具内部状态</strong>
+          <span>{units.length} 项</span>
+          {eligibleCount > 0 && (
+            <span className="evidence-unit-eligible">根因可用 {eligibleCount}</span>
+          )}
+          {ineligibleCount > 0 && <span>不参与根因 {ineligibleCount}</span>}
+        </span>
+        <span className="evidence-unit-toggle" aria-hidden="true">
+          <span className="evidence-unit-show-label">显示更多</span>
+          <span className="evidence-unit-hide-label">收起</span>
+          <ChevronDown size={14} />
+        </span>
+      </summary>
+      <div className="evidence-unit-list">
+        {units.map((unit) => (
+          <div className="evidence-unit-row" key={unit.id}>
+            <div>
+              <strong>
+                {unit.kind === "HISTORY" && unit.status === "SUCCESS"
+                  ? `History 行集完整 · ${evidenceUnitQualification(unit)}`
+                  : unit.kind === "HISTORY" ? "History" : unit.stage}
+              </strong>
+              <span>{historySampleCoverage(unit) ?? unit.summary}</span>
+            </div>
+            {!(unit.kind === "HISTORY" && unit.status === "SUCCESS") && (
+              <span className={`evidence-unit-status unit-${unit.status.toLowerCase()}`}>
+                {unit.status} · {evidenceUnitQualification(unit)}
+              </span>
+            )}
+            <small>单元 {compactId(unit.id)} · 父证据 {compactId(unit.parent_evidence_id)}</small>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 export function AlertDetailPage() {
@@ -397,21 +475,8 @@ export function AlertDetailPage() {
                 </div>
                 <p>{evidence.summary}</p>
                 {evidence.error && <div className="tool-error">{evidence.error}</div>}
-                {(evidence.evidence_units?.length ?? 0) > 0 && (
-                  <div className="evidence-unit-list">
-                    {evidence.evidence_units?.map((unit) => (
-                      <div className="evidence-unit-row" key={unit.id}>
-                        <div>
-                          <strong>{unit.kind === "HISTORY" ? "History" : unit.stage}</strong>
-                          <span>{unit.summary}</span>
-                        </div>
-                        <span className={`evidence-unit-status unit-${unit.status.toLowerCase()}`}>
-                          {unit.status} · {evidenceUnitQualification(unit)}
-                        </span>
-                        <small>单元 {compactId(unit.id)} · 父证据 {compactId(unit.parent_evidence_id)}</small>
-                      </div>
-                    ))}
-                  </div>
+                {evidence.evidence_units.length > 0 && (
+                  <EvidenceUnitDetails units={evidence.evidence_units} />
                 )}
                 {(Object.keys(evidence.structured_data).length > 0 || Object.keys(evidence.request).length > 0) && (
                   <details className="json-details">

@@ -253,6 +253,13 @@ def test_wecom_page_url_is_validated() -> None:
     assert any("WECOM_PAGE_BASE_URL" in issue for issue in enabled_without_page.readiness_issues())
 
 
+def test_archery_default_timeouts_leave_budget_finalization_margin() -> None:
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.archery_investigation_budget_seconds == 150
+    assert settings.archery_mcp_tool_timeout_seconds == 180
+
+
 def test_archery_outer_timeout_must_leave_budget_finalization_margin() -> None:
     with pytest.raises(
         ValidationError,

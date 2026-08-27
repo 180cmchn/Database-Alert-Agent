@@ -150,6 +150,50 @@ def test_provider_appended_limit_preserves_metadata_resolution_lineage() -> None
     assert all(entry["outcome"] == "ok" for entry in state.query_trace)
 
 
+@pytest.mark.parametrize("limit_value", [0, 2, 10, 1000])
+def test_pre_history_metadata_lookup_ignores_limit_value(limit_value: int) -> None:
+    scenario = _scenario()
+    state = scenario.initial_state()
+    target = (17, "archery")
+    state.table_columns = {
+        target: {
+            "t_instance_member": {"f_instance_id", "f_ip", "f_port", "f_role"},
+            "sql_instance": {"id", "host", "port"},
+        }
+    }
+    member_sql = (
+        "SELECT f_instance_id, f_ip, f_port, f_role FROM t_instance_member "
+        "WHERE f_ip = 'db-1.example' AND f_port = 3306 "
+        f"LIMIT {limit_value}"
+    )
+    member = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Resolve the alert endpoint",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": member_sql},
+        ),
+        state=state,
+    )
+    assert member.local_result is None
+
+    state.member_instance_ids[target] = {53}
+    instance_sql = (
+        "SELECT host, port FROM sql_instance WHERE id = 53 "
+        f"LIMIT {limit_value}"
+    )
+    instance = scenario.prepare_call(
+        SimpleNamespace(
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+            objective="Resolve the Archery instance endpoint",
+            hypothesis_ids=(),
+            arguments={**TARGET_ARGUMENTS, "sql_content": instance_sql},
+        ),
+        state=state,
+    )
+    assert instance.local_result is None
+
+
 @pytest.mark.parametrize(
     ("unsafe_sql", "arguments", "reason_code"),
     [
