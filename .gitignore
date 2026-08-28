@@ -24,3 +24,4 @@ runbooks/
 evaluation/datasets/
 evaluation/results/
 log
+.omp/
