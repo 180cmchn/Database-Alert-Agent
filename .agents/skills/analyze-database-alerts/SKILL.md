@@ -11,9 +11,10 @@ processors collect and structure facts; they never decide causality.
 
 All investigation actions requested by the Agent must declare `read_only` intent. Do not request
 database writes, DDL, configuration changes, failover, restart, scaling, privilege changes, session
-termination, or other side effects. MCP authorization is established by the key issued for that MCP.
-The application connection layer forwards calls according to the dynamically discovered tool Schema
-and does not rewrite model arguments.
+termination, or other side effects. This restriction governs evidence collection and tool execution
+only; do not carry it over to the user-facing remediation steps. MCP authorization is established by
+the key issued for that MCP. The application connection layer forwards calls according to the
+dynamically discovered tool Schema and does not rewrite model arguments.
 
 ## 1. Start from the authoritative alert detail
 
@@ -234,8 +235,19 @@ Return a concise, traceable result:
 - summarize the symptom, scope, and impact without overstating certainty;
 - list actually retrieved knowledge references before AI analysis bases;
 - attach qualifying live evidence IDs to every `SUPPORTED` root cause;
-- propose only read-only recovery verification or investigation steps;
-- place change actions under risks or approval-required notes rather than instructions to execute;
+- for every `SUPPORTED` root cause, propose at least one evidence-grounded action that can remove the
+  cause, restore service, or reduce impact; recommendations may include state-changing operations
+  such as terminating a specific query or session, failover, throttling, scaling, or configuration
+  changes when the evidence supports them;
+- do not ask the DBA to repeat metric, log, instance, database, or SQL checks already completed through
+  MCP evidence collection;
+- identify the real target when evidence provides it and never invent a SQL statement, session or
+  process ID, instance, parameter, or value;
+- keep state-changing actions in the recommendation steps, while recording prerequisites, expected
+  results, business risk, approval needs, stop conditions, and rollback guidance in the step details
+  or risks; recommendations are not claims that the application executed those actions;
+- when no root cause is established, return no remediation steps instead of speculative changes or
+  repeated read-only investigation;
 - state material evidence gaps without naming speculative causes;
 - use `现有结果无法得出根因` whenever the evidence does not establish one.
 

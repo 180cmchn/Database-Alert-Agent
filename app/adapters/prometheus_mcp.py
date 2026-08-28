@@ -30,15 +30,17 @@ from app.domain.tool_calling import (
     mcp_tool_result_messages,
 )
 from app.mcp_catalog import (
+    MCP_TRANSPORTS,
     MCPCatalogConfigurationError,
     MCPPromptBundle,
+    MCPTransport,
     load_mcp_catalog,
 )
 
 PROMETHEUS_MCP_SERVER_NAME: Final = "prometheus"
 PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-sse-mcp-agent-v14"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v15"
 PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v2"
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _FINISH_TOOL_NAME: Final = "finish_prometheus_investigation"
@@ -162,7 +164,7 @@ class PrometheusMCPError(RuntimeError):
 
 
 class PrometheusMCPConfigurationError(PrometheusMCPError):
-    """The SSE endpoint or its deployment settings are invalid."""
+    """The MCP endpoint or its deployment settings are invalid."""
 
 
 class PrometheusMCPProtocolError(PrometheusMCPError):
@@ -181,9 +183,7 @@ class PrometheusMCPToolError(PrometheusMCPError):
         super().__init__(message)
         self.raw_call_result = deepcopy(raw_call_result)
         self.details = (
-            {"raw_call_result": deepcopy(raw_call_result)}
-            if raw_call_result is not None
-            else {}
+            {"raw_call_result": deepcopy(raw_call_result)} if raw_call_result is not None else {}
         )
 
 
@@ -205,6 +205,7 @@ class PrometheusMCPServerSettings:
     url: str
     headers: dict[str, str]
     prompts: MCPPromptBundle
+    transport: MCPTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,16 +262,12 @@ def has_monitoring_observation(value: Any, *, observation_context: bool = False)
             return False
         if not isinstance(decoded, (dict, list)):
             return False
-        return has_monitoring_observation(
-            decoded, observation_context=observation_context
-        )
+        return has_monitoring_observation(decoded, observation_context=observation_context)
     if isinstance(value, list):
         return any(
             has_monitoring_observation(
                 item,
-                observation_context=(
-                    observation_context and not isinstance(item, dict)
-                ),
+                observation_context=(observation_context and not isinstance(item, dict)),
             )
             for item in value
         )
@@ -280,9 +277,7 @@ def has_monitoring_observation(value: Any, *, observation_context: bool = False)
     for key, nested in value.items():
         normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
         nested_context = normalized_key in _OBSERVATION_KEYS
-        if has_monitoring_observation(
-            nested, observation_context=nested_context
-        ):
+        if has_monitoring_observation(nested, observation_context=nested_context):
             return True
     return False
 
@@ -290,7 +285,7 @@ def has_monitoring_observation(value: Any, *, observation_context: bool = False)
 def load_prometheus_mcp_server_settings(
     path: Path, *, environment: Mapping[str, str]
 ) -> PrometheusMCPServerSettings:
-    """Resolve one SSE server configuration without persisting its secrets."""
+    """Resolve one MCP server configuration without persisting its secrets."""
 
     try:
         descriptor = load_mcp_catalog(path).require(PROMETHEUS_MCP_SERVER_NAME)
@@ -301,6 +296,7 @@ def load_prometheus_mcp_server_settings(
         url=connection.url,
         headers=dict(connection.headers),
         prompts=descriptor.prompts,
+        transport=connection.transport,
     )
 
 
@@ -326,8 +322,12 @@ class PrometheusMCPClient:
             or parsed.fragment
         ):
             raise PrometheusMCPConfigurationError(
-                "Prometheus MCP SSE URL must be an absolute HTTP(S) endpoint without "
+                "Prometheus MCP URL must be an absolute HTTP(S) endpoint without "
                 "embedded credentials, query, or fragment"
+            )
+        if server.transport not in MCP_TRANSPORTS:
+            raise PrometheusMCPConfigurationError(
+                "Prometheus MCP transport must be sse or streamable_http"
             )
         if not timeout_seconds > 0:
             raise PrometheusMCPConfigurationError("Prometheus MCP timeout must be positive")
@@ -335,15 +335,14 @@ class PrometheusMCPClient:
             raise PrometheusMCPConfigurationError(
                 "Prometheus MCP SSE read timeout must be positive"
             )
+        self.mcp_transport = server.transport
         self.mcp_url = server.url.strip()
         self._headers = dict(server.headers)
         self.model = model
         self.prompts = server.prompts
         self.timeout_seconds = timeout_seconds
         self.sse_read_timeout_seconds = (
-            sse_read_timeout_seconds
-            if sse_read_timeout_seconds is not None
-            else timeout_seconds
+            sse_read_timeout_seconds if sse_read_timeout_seconds is not None else timeout_seconds
         )
         self.harness_runtime_dependencies = harness_runtime_dependencies
 
@@ -365,18 +364,14 @@ class PrometheusMCPClient:
         harness_runtime_dependencies: Any | None = None,
     ) -> PrometheusMCPClient:
         return cls(
-            load_prometheus_mcp_server_settings(
-                settings_path, environment=environment
-            ),
+            load_prometheus_mcp_server_settings(settings_path, environment=environment),
             model,
             timeout_seconds=timeout_seconds,
             sse_read_timeout_seconds=sse_read_timeout_seconds,
             harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
-    async def collect_alert_window(
-        self, context: InvestigationContext
-    ) -> PrometheusMCPQueryResult:
+    async def collect_alert_window(self, context: InvestigationContext) -> PrometheusMCPQueryResult:
         from app.adapters.prometheus_harness import collect_prometheus_with_harness
 
         return await collect_prometheus_with_harness(self, context)
@@ -541,10 +536,7 @@ class PrometheusMCPClient:
         if not isinstance(value, Mapping):
             return {}
         metric_name = value.get("__name__")
-        if (
-            isinstance(metric_name, str)
-            and _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(metric_name)
-        ):
+        if isinstance(metric_name, str) and _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(metric_name):
             return {"__name__": metric_name}
         return {}
 
@@ -569,13 +561,9 @@ class PrometheusMCPClient:
     ) -> bool:
         lower = window_start.astimezone(UTC)
         upper = window_end.astimezone(UTC)
-        timestamps = [
-            cls._timestamp(timestamp)
-            for timestamp, _ in samples
-        ]
+        timestamps = [cls._timestamp(timestamp) for timestamp, _ in samples]
         return bool(timestamps) and all(
-            timestamp is not None and lower <= timestamp <= upper
-            for timestamp in timestamps
+            timestamp is not None and lower <= timestamp <= upper for timestamp in timestamps
         )
 
     @staticmethod
@@ -615,8 +603,7 @@ class PrometheusMCPClient:
         alert: NormalizedAlert,
     ) -> list[str]:
         labels = {
-            re.sub(r"[^a-z0-9]", "", str(key).casefold()): value
-            for key, value in metric.items()
+            re.sub(r"[^a-z0-9]", "", str(key).casefold()): value for key, value in metric.items()
         }
         database = alert.database
         matched: list[str] = []
@@ -632,16 +619,11 @@ class PrometheusMCPClient:
                 if (endpoint := cls._label_endpoint(value)) is not None
             ]
             if preferred_endpoints:
-                if any(
-                    endpoint[0].casefold() != expected_host
-                    for endpoint in preferred_endpoints
-                ):
+                if any(endpoint[0].casefold() != expected_host for endpoint in preferred_endpoints):
                     return []
                 if database.port is not None:
                     endpoint_ports = {
-                        port
-                        for _host, port in preferred_endpoints
-                        if port is not None
+                        port for _host, port in preferred_endpoints if port is not None
                     }
                     if any(port != database.port for port in endpoint_ports):
                         return []
@@ -682,17 +664,12 @@ class PrometheusMCPClient:
                 if not cls._label_matches_instance(value, database.instance):
                     return []
                 matched.append("database.instance")
-            if any(
-                cls._label_equals(value, database.instance) for value in host_values
-            ):
+            if any(cls._label_equals(value, database.instance) for value in host_values):
                 matched.append("database.instance")
 
         cluster_values = cls._label_values(labels, _TARGET_CLUSTER_LABEL_KEYS)
         if alert.cluster and cluster_values:
-            if any(
-                not cls._label_equals(value, alert.cluster)
-                for value in cluster_values
-            ):
+            if any(not cls._label_equals(value, alert.cluster) for value in cluster_values):
                 return []
             matched.append("cluster")
 
@@ -700,8 +677,7 @@ class PrometheusMCPClient:
             database_values = cls._label_values(labels, _TARGET_DATABASE_LABEL_KEYS)
             if database_values:
                 if any(
-                    not cls._label_equals(value, database.database)
-                    for value in database_values
+                    not cls._label_equals(value, database.database) for value in database_values
                 ):
                     return []
                 matched.append("database.database")
@@ -714,11 +690,7 @@ class PrometheusMCPClient:
         labels: Mapping[str, Any],
         keys: set[str],
     ) -> list[Any]:
-        return [
-            value
-            for key in keys
-            if cls._has_label_value(value := labels.get(key))
-        ]
+        return [value for key in keys if cls._has_label_value(value := labels.get(key))]
 
     @staticmethod
     def _has_label_value(value: Any) -> bool:
@@ -726,10 +698,7 @@ class PrometheusMCPClient:
 
     @staticmethod
     def _label_equals(value: Any, expected: str) -> bool:
-        return (
-            isinstance(value, str)
-            and value.strip().casefold() == expected.strip().casefold()
-        )
+        return isinstance(value, str) and value.strip().casefold() == expected.strip().casefold()
 
     @classmethod
     def _label_matches_host(cls, value: Any, expected_host: str) -> bool:
@@ -748,9 +717,7 @@ class PrometheusMCPClient:
             return False
         if candidate_endpoint[0].casefold() != expected_endpoint[0].casefold():
             return False
-        return expected_endpoint[1] is None or (
-            candidate_endpoint[1] == expected_endpoint[1]
-        )
+        return expected_endpoint[1] is None or (candidate_endpoint[1] == expected_endpoint[1])
 
     @staticmethod
     def _label_endpoint(value: Any) -> tuple[str, int | None] | None:
@@ -758,9 +725,7 @@ class PrometheusMCPClient:
             return None
         candidate = value.strip()
         try:
-            parsed = urlsplit(
-                candidate if "://" in candidate else f"//{candidate}"
-            )
+            parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
             parsed_host = parsed.hostname
             parsed_port = parsed.port
         except ValueError:
@@ -1181,41 +1146,23 @@ class PrometheusMCPClient:
 
         converted: dict[str, dict[str, Any]] = {}
         for tool in tools:
-            raw = (
-                tool.model_dump(mode="json") if hasattr(tool, "model_dump") else tool
-            )
+            raw = tool.model_dump(mode="json") if hasattr(tool, "model_dump") else tool
             if not isinstance(raw, dict):
-                raise PrometheusMCPProtocolError(
-                    "Prometheus MCP tool schema is not an object"
-                )
+                raise PrometheusMCPProtocolError("Prometheus MCP tool schema is not an object")
             name = raw.get("name")
-            schema = (
-                raw.get("inputSchema")
-                or raw.get("input_schema")
-                or {"type": "object"}
-            )
-            if (
-                not isinstance(name, str)
-                or not name
-                or not isinstance(schema, dict)
-            ):
-                raise PrometheusMCPProtocolError(
-                    "Prometheus MCP returned an invalid tool schema"
-                )
+            schema = raw.get("inputSchema") or raw.get("input_schema") or {"type": "object"}
+            if not isinstance(name, str) or not name or not isinstance(schema, dict):
+                raise PrometheusMCPProtocolError("Prometheus MCP returned an invalid tool schema")
             converted[name] = {
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": str(
-                        raw.get("description") or f"Prometheus MCP tool {name}"
-                    ),
+                    "description": str(raw.get("description") or f"Prometheus MCP tool {name}"),
                     "parameters": deepcopy(schema),
                 },
             }
         if not converted:
-            raise PrometheusMCPProtocolError(
-                "Prometheus MCP exposed no valid tools"
-            )
+            raise PrometheusMCPProtocolError("Prometheus MCP exposed no valid tools")
         return [converted[name] for name in sorted(converted)]
 
     def host_investigation_state_message(
@@ -1303,9 +1250,7 @@ class PrometheusMCPClient:
             else raw_result
         )
         if not isinstance(raw, dict):
-            raise PrometheusMCPProtocolError(
-                "Prometheus MCP tool result is not an object"
-            )
+            raise PrometheusMCPProtocolError("Prometheus MCP tool result is not an object")
         return deepcopy(raw)
 
     @staticmethod
@@ -1440,9 +1385,7 @@ class PrometheusMCPClient:
                     {
                         "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
                         "alert": preprocess_alert_data(
-                            context.alert.model_dump(
-                                mode="json", exclude={"raw_payload"}
-                            )
+                            context.alert.model_dump(mode="json", exclude={"raw_payload"})
                         ),
                         "required_window": {
                             "start": window_start.isoformat(),
@@ -1525,15 +1468,10 @@ class PrometheusMCPEvidenceTool:
             structured_data["reason_code"] = "database_not_monitored"
             structured_data["root_cause_eligible"] = False
             structured_data["root_cause_ineligible_reason"] = "database_not_monitored"
-            structured_data = self._with_missing_evidence_inventory(
-                structured_data, result
-            )
+            structured_data = self._with_missing_evidence_inventory(structured_data, result)
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "Prometheus MCP 中没有配置告警数据库对应的监控信息，"
-                    "已跳过后续指标查询。"
-                ),
+                summary=("Prometheus MCP 中没有配置告警数据库对应的监控信息，已跳过后续指标查询。"),
                 structured_data=structured_data,
             )
         if has_monitoring_data:

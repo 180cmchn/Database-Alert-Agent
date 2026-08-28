@@ -21,7 +21,10 @@ from app.domain.models import (
     KnowledgeReference,
     Recommendation,
     RecommendationStep,
+    RootCauseAnalysisStep,
     RootCauseAssessment,
+    RootCauseExplainEvidence,
+    RootCauseSqlEvidence,
     RootCauseStatus,
     ToolStatus,
 )
@@ -33,6 +36,7 @@ def make_evidence_unit(
     unit_key: str,
     status: EvidenceUnitStatus,
     eligible: bool,
+    data: dict | None = None,
 ) -> EvidenceUnit:
     return EvidenceUnit(
         id=EvidenceUnit.build_id(parent.id, unit_key),
@@ -42,12 +46,10 @@ def make_evidence_unit(
         stage=unit_key,
         status=status,
         summary=f"{unit_key} result",
-        data={"unit": unit_key},
+        data=data or {"unit": unit_key},
         root_cause_eligible=eligible,
         root_cause_ineligible_reason=None if eligible else "unit_unusable",
-        source_artifact_id=(
-            parent.source_artifact_id or uuid5(parent.id, "test-source-artifact")
-        ),
+        source_artifact_id=(parent.source_artifact_id or uuid5(parent.id, "test-source-artifact")),
         source_paths=[f"/structured_data/{unit_key}"],
     )
 
@@ -68,21 +70,36 @@ def make_recommendation(
     summary: str = INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     root_causes: list[RootCauseAssessment] | None = None,
     likely_causes: list[str] | None = None,
-    action: str = "只读核对指标",
+    action: str | None = "终止证据标识的阻塞会话",
+    add_analysis_process: bool = True,
 ) -> Recommendation:
-    causes = root_causes or []
+    raw_causes = root_causes or []
+    causes = [
+        item
+        if item.analysis_process or not item.evidence_refs or not add_analysis_process
+        else item.model_copy(
+            update={
+                "analysis_process": [
+                    RootCauseAnalysisStep(
+                        observation="实时证据记录了与告警时间一致的数据库事实。",
+                        inference="该事实支持测试中的根因机制。",
+                        evidence_refs=[item.evidence_refs[0]],
+                    )
+                ]
+            }
+        )
+        for item in raw_causes
+    ]
     return Recommendation(
         summary=summary,
-        likely_causes=(
-            [item.cause for item in causes] if likely_causes is None else likely_causes
-        ),
+        likely_causes=([item.cause for item in causes] if likely_causes is None else likely_causes),
         analysis_bases=[
             AnalysisBasis(
                 source=AnalysisBasisSource.AI,
                 statement="AI 已审阅告警、知识与实时证据。",
             )
         ],
-        steps=[RecommendationStep(order=1, action=action)],
+        steps=[] if action is None else [RecommendationStep(order=1, action=action)],
         confidence=0.5,
         root_causes=causes,
     )
@@ -104,6 +121,41 @@ def make_live_evidence(
         structured_data=structured_data or {},
         truncated=truncated,
     )
+
+
+def make_archery_sql_evidence() -> tuple[EvidenceRecord, EvidenceUnit, EvidenceUnit]:
+    artifact_id = uuid4()
+    parent = make_live_evidence(source_system="archery_mcp").model_copy(
+        update={
+            "contract_version": EVIDENCE_RECORD_V2,
+            "source_artifact_id": artifact_id,
+        }
+    )
+    history = make_evidence_unit(
+        parent,
+        unit_key="history",
+        status=EvidenceUnitStatus.SUCCESS,
+        eligible=True,
+        data={
+            "rows": [
+                {
+                    "id": 42,
+                    "sample": "SELECT * FROM orders WHERE customer_id = 42",
+                }
+            ]
+        },
+    )
+    explain = make_evidence_unit(
+        parent,
+        unit_key="explain",
+        status=EvidenceUnitStatus.SUCCESS,
+        eligible=True,
+        data={
+            "source_history_row": {"id": 42},
+            "result": {"rows": [{"table": "orders", "type": "ALL", "rows": 900_000}]},
+        },
+    )
+    return parent.model_copy(update={"evidence_units": [history, explain]}), history, explain
 
 
 def test_similar_incident_context_requires_flashduty_api_identity() -> None:
@@ -427,6 +479,7 @@ def test_program_projection_usability_does_not_create_a_root_cause() -> None:
     assert result.root_causes == []
     assert result.likely_causes == []
     assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
+    assert result.steps == []
 
 
 def test_verified_unknown_status_is_not_silently_promoted() -> None:
@@ -508,13 +561,16 @@ def test_legacy_root_cause_json_remains_readable() -> None:
 
     assert cause.status == RootCauseStatus.UNKNOWN
     assert cause.hypothesis_id is None
+    assert cause.analysis_process == []
+    assert cause.problem_sql is None
+    assert cause.explain_result is None
 
 
 @pytest.mark.asyncio
 async def test_rule_validator_accepts_fixed_no_cause_as_evidence_insufficient() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    recommendation = make_recommendation()
+    recommendation = make_recommendation(action=None)
 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
@@ -527,7 +583,7 @@ async def test_rule_validator_accepts_fixed_no_cause_as_evidence_insufficient() 
 async def test_rule_validator_rejects_empty_cause_with_noncanonical_summary() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    recommendation = make_recommendation(summary="可能是连接池问题。")
+    recommendation = make_recommendation(summary="可能是连接池问题。", action=None)
 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
@@ -559,6 +615,93 @@ async def test_rule_validator_accepts_supported_with_live_evidence() -> None:
         alert,
         recommendation,
         [evidence],
+    )
+
+    assert result.passed is True
+    assert result.evidence_sufficient is True
+    assert result.issues == []
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_requires_sql_explain_and_analysis_audit_details() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent, history, _ = make_archery_sql_evidence()
+    recommendation = make_recommendation(
+        summary="全表扫描导致连接持续占用。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="订单查询全表扫描并长期占用连接槽位。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(history.id)],
+                confidence=0.95,
+                verified=True,
+            )
+        ],
+        add_analysis_process=False,
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [parent],
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("必须给出分析过程与依据" in issue for issue in result.issues)
+    assert any("必须展示具体 SQL、SQL 结构或 sample ID" in issue for issue in result.issues)
+    assert any("存在成功 EXPLAIN" in issue for issue in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_accepts_auditable_sql_explain_conclusion() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent, history, explain = make_archery_sql_evidence()
+    history_ref = str(history.id)
+    explain_ref = str(explain.id)
+    recommendation = make_recommendation(
+        summary="全表扫描导致连接持续占用。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="订单查询全表扫描并长期占用连接槽位。",
+                analysis_process=[
+                    RootCauseAnalysisStep(
+                        observation="慢日志 sample 42 的耗时与告警窗口重合。",
+                        inference="该 SQL 是告警窗口内持续占用连接的查询。",
+                        evidence_refs=[history_ref],
+                    ),
+                    RootCauseAnalysisStep(
+                        observation="EXPLAIN 显示 orders 表 type=ALL、rows=900000。",
+                        inference="全表扫描放大执行耗时并解释连接持续占用。",
+                        evidence_refs=[explain_ref],
+                    ),
+                ],
+                problem_sql=RootCauseSqlEvidence(
+                    statement="SELECT * FROM orders WHERE customer_id = 42",
+                    sample_id="42",
+                    evidence_ref=history_ref,
+                ),
+                explain_result=RootCauseExplainEvidence(
+                    result="table=orders, type=ALL, rows=900000",
+                    interpretation="未使用索引的全表扫描造成高扫描量和长执行时间。",
+                    evidence_ref=explain_ref,
+                ),
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[history_ref, explain_ref],
+                confidence=0.95,
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [parent],
     )
 
     assert result.passed is True
@@ -776,12 +919,60 @@ async def test_rule_validator_rejects_hypothesis_binding_in_new_result() -> None
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_does_not_enforce_action_permissions() -> None:
+async def test_rule_validator_rejects_steps_without_a_supported_root_cause() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
-    recommendation = make_recommendation(action="立即重启数据库实例恢复服务")
+    recommendation = make_recommendation(action="再次核对数据库指标")
 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
+
+    assert result.passed is False
+    assert "无法得出根因时 steps 必须为空" in result.issues
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_requires_remediation_for_supported_root_cause() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="阻塞会话持续占用连接槽位，导致连接耗尽。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="阻塞会话持续占用连接槽位，导致连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+        action=None,
+    )
+
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [evidence])
+
+    assert result.passed is False
+    assert "SUPPORTED 根因必须至少提供一项实际处置步骤" in result.issues
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_accepts_state_changing_remediation() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="阻塞会话持续占用连接槽位，导致连接耗尽。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="阻塞会话持续占用连接槽位，导致连接耗尽。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+        action="终止证据中标识的阻塞会话 session-42，释放连接槽位。",
+    )
+
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [evidence])
 
     assert result.passed is True
     assert result.issues == []

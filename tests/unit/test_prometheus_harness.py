@@ -44,7 +44,7 @@ from app.domain.models import (
 )
 from app.domain.ports import RunLeaseConflict
 from app.domain.tool_calling import MCPModelToolCall
-from app.mcp_catalog import MCPPromptBundle
+from app.mcp_catalog import MCPPromptBundle, MCPTransport
 from app.mcp_runtime import DiscoveredMCPTool, RepositoryMCPCheckpointStore
 
 _ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
@@ -169,19 +169,19 @@ def _client(
     *,
     repository: SQLAlchemyAlertRepository | None = None,
     timeout_seconds: float = 60,
+    mcp_transport: MCPTransport = "sse",
 ) -> PrometheusMCPClient:
     return PrometheusMCPClient(
         PrometheusMCPServerSettings(
             url="https://prometheus.example.test/sse",
             headers={},
             prompts=PROMETHEUS_PROMPTS,
+            transport=mcp_transport,
         ),
         model,
         timeout_seconds=timeout_seconds,
         harness_runtime_dependencies=(
-            PrometheusHarnessRuntimeDependencies(repository)
-            if repository is not None
-            else None
+            PrometheusHarnessRuntimeDependencies(repository) if repository is not None else None
         ),
     )
 
@@ -331,9 +331,7 @@ def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() 
     assert messages[-2]["type"] == "function_call_output"
     assert messages[-2]["call_id"] == "prom-function-call"
     assert json.loads(messages[-2]["output"]) == {"value": 1}
-    assert json.loads(messages[-1]["content"]) == {
-        "host_control": {"instruction": "continue"}
-    }
+    assert json.loads(messages[-1]["content"]) == {"host_control": {"instruction": "continue"}}
 
 
 def test_prometheus_protocol_failure_returns_complete_raw_response_to_model() -> None:
@@ -448,9 +446,7 @@ async def test_prometheus_sse_transport_disables_http_redirects(
         return _AsyncContext((object(), object()))
 
     monkeypatch.setattr(prometheus_harness_module, "sse_client", recording_sse_client)
-    connector = prometheus_harness_module.PrometheusSSEMCPConnector(
-        _client(_SequenceModel([]))
-    )
+    connector = prometheus_harness_module.PrometheusMCPConnector(_client(_SequenceModel([])))
 
     session = await connector.open_session()
     factory = captured["httpx_client_factory"]
@@ -462,6 +458,83 @@ async def test_prometheus_sse_transport_disables_http_redirects(
         assert client.follow_redirects is False
     finally:
         await client.aclose()
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_transport", ("sse", "streamable_http"))
+async def test_prometheus_connector_uses_configured_mcp_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    mcp_transport: MCPTransport,
+) -> None:
+    calls: dict[str, Any] = {}
+    read_stream = object()
+    write_stream = object()
+    client = _client(_SequenceModel([]), mcp_transport=mcp_transport)
+
+    if mcp_transport == "sse":
+
+        def sse_connector(url: str, **kwargs: Any) -> _AsyncContext:
+            calls["sse"] = {"url": url, **kwargs}
+            return _AsyncContext((read_stream, write_stream))
+
+        def unexpected_streamable(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("streamable HTTP connector must not be used")
+
+        monkeypatch.setattr(prometheus_harness_module, "sse_client", sse_connector)
+        monkeypatch.setattr(
+            prometheus_harness_module,
+            "streamable_http_client",
+            unexpected_streamable,
+        )
+    else:
+        http_client = object()
+
+        def async_http_client(**kwargs: Any) -> _AsyncContext:
+            calls["http_client"] = kwargs
+            return _AsyncContext(http_client)
+
+        def streamable_connector(url: str, *, http_client: Any) -> _AsyncContext:
+            calls["streamable"] = {"url": url, "http_client": http_client}
+            return _AsyncContext((read_stream, write_stream, lambda: "streamable-session"))
+
+        def unexpected_sse(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("SSE connector must not be used")
+
+        monkeypatch.setattr(
+            prometheus_harness_module.httpx,
+            "AsyncClient",
+            async_http_client,
+        )
+        monkeypatch.setattr(
+            prometheus_harness_module,
+            "streamable_http_client",
+            streamable_connector,
+        )
+        monkeypatch.setattr(prometheus_harness_module, "sse_client", unexpected_sse)
+
+    session = await prometheus_harness_module.PrometheusMCPConnector(client).open_session()
+    try:
+        if mcp_transport == "sse":
+            assert calls["sse"] == {
+                "url": "https://prometheus.example.test/sse",
+                "headers": {},
+                "timeout": 60,
+                "sse_read_timeout": 60,
+                "httpx_client_factory": prometheus_harness_module._no_redirect_http_client,
+            }
+            assert session.session_id.startswith("prometheus-mcp-")
+        else:
+            assert calls["streamable"] == {
+                "url": "https://prometheus.example.test/sse",
+                "http_client": http_client,
+            }
+            assert calls["http_client"]["headers"] == {}
+            assert calls["http_client"]["auth"] is None
+            assert calls["http_client"]["follow_redirects"] is False
+            assert calls["http_client"]["timeout"].connect == 60
+            assert session.session_id == "streamable-session"
+    finally:
         await session.close()
 
 
@@ -497,10 +570,11 @@ async def test_prometheus_connector_discovers_all_pages_until_cursor_is_exhauste
             return None
 
     raw_session = PagedSession()
-    session = prometheus_harness_module.PrometheusSSEMCPToolSession(
+    session = prometheus_harness_module.PrometheusMCPToolSession(
         client=_client(_SequenceModel([])),
         stack=Stack(),  # type: ignore[arg-type]
         session=raw_session,
+        session_id="paged-session",
     )
 
     tools = await session.list_tools()
@@ -523,9 +597,7 @@ async def test_prometheus_whole_run_timeout_bounds_repeated_model_failures() -> 
             raise RuntimeError("temporary model failure")
 
     result = await asyncio.wait_for(
-        _client(AlwaysFailingModel([]), timeout_seconds=0.03).collect_alert_window(
-            _context()
-        ),
+        _client(AlwaysFailingModel([]), timeout_seconds=0.03).collect_alert_window(_context()),
         timeout=0.5,
     )
 
@@ -550,9 +622,7 @@ async def test_prometheus_cancellation_propagates_and_closes_session() -> None:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
-    task = asyncio.create_task(
-        _client(BlockingModel([])).collect_alert_window(_context())
-    )
+    task = asyncio.create_task(_client(BlockingModel([])).collect_alert_window(_context()))
     await asyncio.wait_for(planning_started.wait(), timeout=0.5)
     task.cancel()
 
@@ -564,9 +634,7 @@ async def test_prometheus_cancellation_propagates_and_closes_session() -> None:
 
 @pytest.mark.asyncio
 async def test_shared_harness_recovers_from_temporary_missing_model_tool_call() -> None:
-    _HarnessSession.results = [
-        {"structuredContent": {"series": [{"value": 1}]}}
-    ]
+    _HarnessSession.results = [{"structuredContent": {"series": [{"value": 1}]}}]
     model = _SequenceModel(
         [
             RuntimeError("provider returned zero tool calls"),
@@ -602,9 +670,7 @@ async def test_shared_harness_recovers_from_temporary_missing_model_tool_call() 
 
 @pytest.mark.asyncio
 async def test_shared_harness_forwards_window_and_operation_arguments_unchanged() -> None:
-    _HarnessSession.results = [
-        {"structuredContent": {"series": [{"value": 1}]}}
-    ]
+    _HarnessSession.results = [{"structuredContent": {"series": [{"value": 1}]}}]
     model = _SequenceModel(
         [
             MCPModelToolCall(
@@ -653,9 +719,7 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
             "trace_id": "raw-response-trace",
             "api_key": "mcp-owned-secret",
         },
-        "structuredContent": {
-            "data": {"result": [{"values": [[1_893_456_000, "1"]]}]}
-        },
+        "structuredContent": {"data": {"result": [{"values": [[1_893_456_000, "1"]]}]}},
         "isError": False,
     }
     _HarnessSession.results = [
@@ -705,8 +769,7 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
     host_control = next(
         payload
         for message in model.messages[1]
-        if message.get("role") == "user"
-        and isinstance(message.get("content"), str)
+        if message.get("role") == "user" and isinstance(message.get("content"), str)
         for payload in [json.loads(message["content"])]
         if "host_control" in payload
     )
@@ -835,21 +898,17 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
     result = await _client(model).collect_alert_window(_context())
 
     assert _HarnessSession.calls[0][1]["query"] == "mysql_up"
-    assert _HarnessSession.calls[-1][1]["query"] == (
-        "rate(mysql_global_status_slow_queries[5m])"
-    )
+    assert _HarnessSession.calls[-1][1]["query"] == ("rate(mysql_global_status_slow_queries[5m])")
     assert len(result.responses) == 2
     assert result.has_monitoring_data is False
-    assert all(
-        item["projection_kind"] == "auxiliary" for item in result.responses
-    )
+    assert all(item["projection_kind"] == "auxiliary" for item in result.responses)
     assert result.finished_by_model is True
     assert [attempt["outcome"] for attempt in result.tool_attempts] == [
         "result",
         "transport_error",
         "result",
     ]
-    assert result.tool_attempts[1]["error_type"] == "prometheus_sse_transport_error"
+    assert result.tool_attempts[1]["error_type"] == "prometheus_mcp_transport_error"
     assert result.tool_attempts[1]["evidence_disposition"] == "MISSING"
     assert result.tool_attempts[1]["is_contradiction"] is False
     assert "request-query-1" in result.model_request_ids
@@ -857,11 +916,13 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
     finish_messages = model.messages[2]
     assert sum(item.get("id") == "retry-reasoning-item" for item in finish_messages) == 1
     assert sum(item.get("id") == "retry-function-item" for item in finish_messages) == 1
-    assert sum(
-        item.get("type") == "function_call_output"
-        and item.get("call_id") == "query-2"
-        for item in finish_messages
-    ) == 1
+    assert (
+        sum(
+            item.get("type") == "function_call_output" and item.get("call_id") == "query-2"
+            for item in finish_messages
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -1082,9 +1143,7 @@ async def test_raw_response_is_artifacted_when_investigation_is_cancelled(
         await _client(
             model,
             repository=repository,
-        ).collect_alert_window(
-            context.model_copy(update={"outer_dispatch_id": outer_dispatch_id})
-        )
+        ).collect_alert_window(context.model_copy(update={"outer_dispatch_id": outer_dispatch_id}))
 
     followup_context = json.dumps(model.messages[1], ensure_ascii=False)
     assert "agent-artifact://" not in followup_context
@@ -1095,12 +1154,14 @@ async def test_raw_response_is_artifacted_when_investigation_is_cancelled(
 
     async with repository.session_factory() as session:
         rows = (
-            await session.execute(
-                select(AgentArtifactRow).where(
-                    AgentArtifactRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(rows) == 1
     stored = await repository.get_agent_artifact(rows[0].id)
     assert stored is not None
@@ -1188,16 +1249,16 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
     assert len(_HarnessSession.calls) == 1
     async with repository.session_factory() as session:
         artifacts_before_finish = (
-            await session.execute(
-                select(AgentArtifactRow).where(
-                    AgentArtifactRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(artifacts_before_finish) == 1
-    stored_before_finish = await repository.get_agent_artifact(
-        artifacts_before_finish[0].id
-    )
+    stored_before_finish = await repository.get_agent_artifact(artifacts_before_finish[0].id)
     assert stored_before_finish is not None
     artifact_before_finish, content_before_finish = stored_before_finish
     assert artifact_before_finish.metadata["internal_only"] is True
@@ -1229,19 +1290,23 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
     assert "prometheus_mcp_remote_response" not in followup_context
     async with repository.session_factory() as session:
         artifacts = (
-            await session.execute(
-                select(AgentArtifactRow).where(
-                    AgentArtifactRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         invocations = (
-            await session.execute(
-                select(ToolInvocationRow).where(
-                    ToolInvocationRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(ToolInvocationRow).where(ToolInvocationRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(artifacts) == 1
     assert len(invocations) == 1
     assert invocations[0].status == ToolInvocationStatus.SUCCEEDED.value
@@ -1296,12 +1361,14 @@ async def test_is_error_response_is_persisted_after_investigation_completion(
     assert result.tool_attempts[0]["outcome"] == "tool_error"
     async with repository.session_factory() as session:
         rows = (
-            await session.execute(
-                select(AgentArtifactRow).where(
-                    AgentArtifactRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(rows) == 1
     stored = await repository.get_agent_artifact(rows[0].id)
     assert stored is not None
@@ -1342,12 +1409,14 @@ async def test_transport_failure_without_response_creates_no_response_artifact(
 
     async with repository.session_factory() as session:
         rows = (
-            await session.execute(
-                select(AgentArtifactRow).where(
-                    AgentArtifactRow.run_id == str(run.id)
+            (
+                await session.execute(
+                    select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert rows == []
     await repository.close()
 
@@ -1414,14 +1483,10 @@ async def test_prometheus_planner_records_reasoning_once_without_delta_streams(
     finish_decisions = [
         event
         for event in events
-        if event.kind == AgentEventKind.MODEL_DECISION
-        and event.payload.get("action") == "finish"
+        if event.kind == AgentEventKind.MODEL_DECISION and event.payload.get("action") == "finish"
     ]
     assert len(finish_decisions) == 1
-    assert (
-        finish_decisions[0].payload["reasoning"]
-        == "先确认监控范围，再决定是否查询指标。"
-    )
+    assert finish_decisions[0].payload["reasoning"] == "先确认监控范围，再决定是否查询指标。"
     await repository.close()
 
 
@@ -1515,9 +1580,7 @@ async def test_only_target_matched_alert_window_projection_is_persisted_to_trace
             ]
         )
 
-        result = await _client(model, repository=repository).collect_alert_window(
-            context
-        )
+        result = await _client(model, repository=repository).collect_alert_window(context)
 
         assert result.has_monitoring_data is True
         assert len(result.responses) == 2
@@ -1551,12 +1614,14 @@ async def test_only_target_matched_alert_window_projection_is_persisted_to_trace
 
         async with repository.session_factory() as session:
             artifacts = (
-                await session.execute(
-                    select(AgentArtifactRow).where(
-                        AgentArtifactRow.run_id == str(run.id)
+                (
+                    await session.execute(
+                        select(AgentArtifactRow).where(AgentArtifactRow.run_id == str(run.id))
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(artifacts) == 2
         stored_responses = []
         for row in artifacts:
@@ -1641,9 +1706,7 @@ async def test_semantically_empty_range_result_is_preserved_until_model_finishes
             "result",
             "result",
         ]
-        assert result.tool_attempts[0]["arguments"] == result.tool_attempts[0][
-            "model_arguments"
-        ]
+        assert result.tool_attempts[0]["arguments"] == result.tool_attempts[0]["model_arguments"]
         events = await repository.list_agent_events(str(run.id))
         no_data_events = [
             event
@@ -1654,12 +1717,14 @@ async def test_semantically_empty_range_result_is_preserved_until_model_finishes
         assert no_data_events == []
         async with repository.session_factory() as session:
             invocations = (
-                await session.execute(
-                    select(ToolInvocationRow).where(
-                        ToolInvocationRow.run_id == str(run.id)
+                (
+                    await session.execute(
+                        select(ToolInvocationRow).where(ToolInvocationRow.run_id == str(run.id))
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(invocations) == 2
         assert {invocation.status for invocation in invocations} == {
             ToolInvocationStatus.SUCCEEDED.value
@@ -1779,16 +1844,16 @@ async def test_repository_harness_uses_context_fencing_and_ignores_foreign_event
         assert checkpoint.manifest_hash == manifest.digest()
         async with repository.session_factory() as session:
             invocations = (
-                await session.execute(
-                    select(ToolInvocationRow).where(
-                        ToolInvocationRow.run_id == str(run.id)
+                (
+                    await session.execute(
+                        select(ToolInvocationRow).where(ToolInvocationRow.run_id == str(run.id))
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(invocations) == 2
-        assert {invocation.provider for invocation in invocations} == {
-            PROMETHEUS_MCP_SERVER_NAME
-        }
+        assert {invocation.provider for invocation in invocations} == {PROMETHEUS_MCP_SERVER_NAME}
 
         stale_context, _, stale_run = await _durable_context(
             repository,
@@ -1801,17 +1866,18 @@ async def test_repository_harness_uses_context_fencing_and_ignores_foreign_event
                 _SequenceModel([]),
                 repository=repository,
             ).collect_alert_window(
-                stale_context.model_copy(
-                    update={"fencing_token": stale_context.fencing_token + 1}
-                )
+                stale_context.model_copy(update={"fencing_token": stale_context.fencing_token + 1})
             )
 
         assert _HarnessSession.session_count == sessions_before_stale_call
         assert await repository.list_agent_events(str(stale_run.id)) == []
-        assert await repository.load_checkpoint(
-            str(stale_run.id),
-            namespace=f"mcp:{PROMETHEUS_MCP_SERVER_NAME}",
-        ) is None
+        assert (
+            await repository.load_checkpoint(
+                str(stale_run.id),
+                namespace=f"mcp:{PROMETHEUS_MCP_SERVER_NAME}",
+            )
+            is None
+        )
     finally:
         await repository.close()
 

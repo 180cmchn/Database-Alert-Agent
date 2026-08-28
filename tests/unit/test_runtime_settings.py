@@ -323,8 +323,7 @@ def test_generic_mcp_environment_is_loaded_from_dotenv_without_entering_settings
 ) -> None:
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(
-        "NEW_MCP_URL=https://mcp.example.test/sse\n"
-        "NEW_MCP_API_KEY=dotenv-secret\n",
+        "NEW_MCP_URL=https://mcp.example.test/sse\nNEW_MCP_API_KEY=dotenv-secret\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -430,7 +429,7 @@ def test_openai_responses_is_eligible_for_mcp_tool_calling_readiness(
         mcp_settings_path=catalog_path,
         archery_mcp_url="https://archery.example.test/mcp",
         archery_mcp_token="test-token",
-        prometheus_mcp_sse_url="https://prometheus.example.test/sse",
+        prometheus_mcp_url="https://prometheus.example.test/mcp",
     )
 
     assert not any(
@@ -564,10 +563,13 @@ async def test_runtime_reload_reverts_removed_override_to_deployment_baseline(
     reverted, changed, revision = await manager.reload_if_changed(effective)
 
     assert changed is True
-    assert revision == RuntimeSettingsManager(
-        baseline.runtime_settings_path,
-        deployment_baseline=baseline,
-    ).revision
+    assert (
+        revision
+        == RuntimeSettingsManager(
+            baseline.runtime_settings_path,
+            deployment_baseline=baseline,
+        ).revision
+    )
     assert reverted.stream_main_agent_reasoning is False
     assert reverted.scheduler_workers == 1
 

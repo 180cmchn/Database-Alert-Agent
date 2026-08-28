@@ -194,7 +194,7 @@ class _BlockAfterFirstRemoteResultModel(_SequenceModel):
         return await super().request_mcp_tool_call(messages=messages, tools=tools)
 
 
-def _descriptor(*, transport: str = "streamable_http") -> MCPServerDescriptor:
+def _descriptor() -> MCPServerDescriptor:
     return MCPServerDescriptor(
         name="example",
         url_template="${EXAMPLE_MCP_URL}",
@@ -206,16 +206,17 @@ def _descriptor(*, transport: str = "streamable_http") -> MCPServerDescriptor:
             workflow="Inspect one result before choosing the next query.",
             safety="Use this MCP according to its configured role.",
         ),
-        provider_options={"transport": transport},
+        provider_options={},
         referenced_environment_variables=("EXAMPLE_MCP_URL",),
         optional_environment_variables=(),
     )
 
 
-def _connection() -> ResolvedMCPConnection:
+def _connection(*, transport: str = "streamable_http") -> ResolvedMCPConnection:
     return ResolvedMCPConnection(
         url="https://mcp.example.test/endpoint",
         headers={"Authorization": "test-token"},
+        transport=transport,  # type: ignore[arg-type]
     )
 
 
@@ -988,9 +989,7 @@ async def test_process_crash_response_checkpoint_allows_chat_recovery_without_re
     restarted_repository = SQLAlchemyAlertRepository(database_url)
     await restarted_repository.initialize()
 
-    resumed_model = _SequenceModel(
-        [("finish_investigation", {"reason": "recovered raw response"})]
-    )
+    resumed_model = _SequenceModel([("finish_investigation", {"reason": "recovered raw response"})])
     resumed_tool = GenericMCPEvidenceTool(
         _descriptor(),
         _connection(),
@@ -1153,9 +1152,7 @@ async def test_chat_orphan_artifact_recovers_after_first_checkpoint_write_failur
         "outer_dispatch_id": str(context.outer_dispatch_id),
     }
     assert artifact_before.uri == f"agent-artifact://{artifact_id}"
-    assert {
-        key: artifact_before.metadata[key] for key in expected_identity
-    } == expected_identity
+    assert {key: artifact_before.metadata[key] for key in expected_identity} == expected_identity
     assert {key: payload_before[key] for key in expected_identity} == expected_identity
     assert payload_before["contract"] == "declarative-mcp-remote-response/v2"
     assert payload_before["arguments"] == arguments
@@ -1171,9 +1168,7 @@ async def test_chat_orphan_artifact_recovers_after_first_checkpoint_write_failur
         "provider_output_items": [],
     }
 
-    resumed_model = _SequenceModel(
-        [("finish_investigation", {"reason": "chat orphan recovered"})]
-    )
+    resumed_model = _SequenceModel([("finish_investigation", {"reason": "chat orphan recovered"})])
     resumed_tool = GenericMCPEvidenceTool(
         _descriptor(),
         _connection(),
@@ -1300,9 +1295,7 @@ async def test_responses_orphan_artifact_recovers_after_first_checkpoint_write_f
         "input_tokens": 17,
         "output_tokens": 9,
     }
-    assert payload_before["model_call"]["provider_output_items"] == list(
-        provider_output_items
-    )
+    assert payload_before["model_call"]["provider_output_items"] == list(provider_output_items)
 
     resumed_model = _SequenceModel(
         [("finish_investigation", {"reason": "responses orphan recovered"})]
@@ -2411,8 +2404,8 @@ async def test_open_session_uses_configured_transport(
     transport: str,
 ) -> None:
     tool = GenericMCPEvidenceTool(
-        _descriptor(transport=transport),
-        _connection(),
+        _descriptor(),
+        _connection(transport=transport),
         _FailingModel(),
         timeout_seconds=12.5,
     )

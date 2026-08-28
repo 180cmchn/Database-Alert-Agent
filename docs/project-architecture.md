@@ -310,7 +310,7 @@ mindmap
 | 内容 | 维护位置 | 维护要求 |
 | --- | --- | --- |
 | ReAct 决策规则 | `app/adapters/ai.py` 中的 `REACT_PROMPT` | 每轮一个真实工具或 `finish`，不得在该阶段提前生成根因 |
-| 最终结论规则 | `app/adapters/ai.py` 中的 `SYSTEM_PROMPT` | 只有主 Agent 综合全部输入；严格执行两种结论形态 |
+| 最终结论与处置规则 | `app/adapters/ai.py` 中的 `SYSTEM_PROMPT` | 只有主 Agent 综合全部输入；严格执行两种结论形态；已建立根因时输出实际处置动作而不重复 MCP 只读取证，未建立根因时不输出猜测性步骤 |
 | 输出结构 | `InvestigationDecision`、`Recommendation` 的 Pydantic Schema | 模型输出先做 Schema 校验，不合规时要求模型只修复 JSON |
 | 版本 | `app/adapters/ai.py` 中的 `PROMPT_VERSION` | 改变提示词语义时同步递增，并让新运行写入 snapshot / manifest |
 | 回归测试 | `tests/unit/test_ai.py`、`tests/unit/test_workflow.py` | 覆盖提示词关键约束、单工具轮次、finish、轮次上限和降级结果 |
@@ -392,16 +392,19 @@ mindmap
 
 | 条件 | 最终状态 | 结果要求 |
 | --- | --- | --- |
-| 主 Agent 建立了完整因果机制，且引用合格实时证据 | `COMPLETED` | 根因 `status=SUPPORTED`、`verified=true`，引用真实 evidence ID |
+| 主 Agent 建立了完整因果机制，且引用合格实时证据 | `COMPLETED` | 根因 `status=SUPPORTED`、`verified=true`，引用真实 evidence ID；每项根因提供可复核的 `analysis_process`，涉及 SQL 时提供 `problem_sql`，对应普通 EXPLAIN 成功时提供 `explain_result` |
 | 证据缺失、失败、不适用、只有知识线索，或无法建立因果机制 | `INCONCLUSIVE` | `root_causes=[]`、`likely_causes=[]`、摘要严格为 `现有结果无法得出根因` |
 
 系统不输出暂定原因、可能原因、被排除原因，也不使用 `SUPPORT`、`UNKNOWN`、`CONTRADICTED` 等旧状态。`FAILED` 表示执行链路失败，不等同于“没有根因”。
+
+`analysis_process` 是面向用户的“可核验事实 → 推导”审计说明，不保存或展示模型内部思维链。问题 SQL 不超过 4000 字符时逐字展示；超长或仅有结构化 sample 时只展示真实 sample ID 和/或 SQL 结构，不重建缺失字面量。
 
 ### 5.3 可靠性与恢复
 
 - **运行快照**：每次分析冻结模型、提示词版本、工具 Schema/Policy 版本和关键参数，避免运行中配置漂移。
 - **租约与 fencing token**：Worker 只有持有当前租约才能更新运行，防止多个执行者同时写入。
 - **LangGraph checkpoint**：进程恢复时从持久化状态继续，并校验 manifest digest。
+- **跨版本恢复**：过期运行的 manifest 与当前模型、提示词、工具策略或配置不兼容时，不混用旧 checkpoint；旧尝试以明确原因安全终止，并自动使用当前运行快照创建新尝试。
 - **Durable outer dispatch**：外层工具调用先落库再越过远端边界；中断后不盲目重放未知结果。
 - **MCP checkpoint 与 artifact**：远端响应先形成可恢复状态，再进入下一步模型决策；完整结果独立留存。
 - **Provider 终态门禁**：内部 `finish` 只在必要 history id 和适用 supplemental 阶段均离开 `PENDING`

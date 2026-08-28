@@ -179,9 +179,7 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
             "FlashDuty alert detail is required before knowledge matching and MCP selection"
         )
     try:
-        enriched = sanitize_alert(
-            preprocess_normalized_alert(await enricher.enrich(baseline))
-        )
+        enriched = sanitize_alert(preprocess_normalized_alert(await enricher.enrich(baseline)))
     except Exception as exc:
         logger.warning(
             "flashduty_alert_detail_unavailable alert_id=%s error=%s: %s",
@@ -227,9 +225,7 @@ async def enrich_alert_node(state: AgentState, ctx: NodeContext) -> dict[str, An
     progress = ProgressRecord(
         run_id=run.id,
         stage=InvestigationStage.RECEIVED,
-        message=(
-            "已获取 FlashDuty 告警详情。"
-        ),
+        message=("已获取 FlashDuty 告警详情。"),
         details={
             "flashduty_detail_status": "loaded",
         },
@@ -453,9 +449,7 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
                         delta_index=delta_index,
                         trace_key=f"{durable_stream_id}:delta:{delta_index}",
                     )
-                    reasoning_callback_invoked = (
-                        reasoning_callback_invoked or emitted is not None
-                    )
+                    reasoning_callback_invoked = reasoning_callback_invoked or emitted is not None
 
                 # Persisting one durable event per main-Agent reasoning
                 # delta (insert plus a full-history idempotency read)
@@ -486,9 +480,7 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
                     metadata=AdvisorMetadata(
                         provider=str(getattr(ctx.advisor, "provider", "unavailable")),
                         model=str(getattr(ctx.advisor, "model", type(ctx.advisor).__name__)),
-                        prompt_version=str(
-                            getattr(ctx.advisor, "prompt_version", "unavailable")
-                        ),
+                        prompt_version=str(getattr(ctx.advisor, "prompt_version", "unavailable")),
                     ),
                 )
         await sink.append(
@@ -661,8 +653,7 @@ def _accepts_keyword_argument(callable_obj: Any, argument: str) -> bool:
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == argument
-        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        parameter.name == argument or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
 
@@ -721,18 +712,14 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         delta_index: int,
     ) -> None:
         nonlocal final_reasoning_callback_invoked
-        durable_stream_id = (
-            f"main-agent:final:request:{reasoning_request_attempt}:{stream_id}"
-        )
+        durable_stream_id = f"main-agent:final:request:{reasoning_request_attempt}:{stream_id}"
         emitted = await emitter.emit_reasoning_delta(
             content,
             stream_id=durable_stream_id,
             delta_index=delta_index,
             trace_key=f"{durable_stream_id}:delta:{delta_index}",
         )
-        final_reasoning_callback_invoked = (
-            final_reasoning_callback_invoked or emitted is not None
-        )
+        final_reasoning_callback_invoked = final_reasoning_callback_invoked or emitted is not None
 
     try:
         advise_kwargs = {
@@ -742,9 +729,10 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         # Same rationale as the ReAct node: durable delta persistence
         # dominates the final-analysis wall time, so it stays opt-in and
         # the complete reasoning is recorded once after advise returns.
-        if _accepts_keyword_argument(
-            ctx.advisor.advise, "reasoning_callback"
-        ) and state.stream_main_agent_reasoning:
+        if (
+            _accepts_keyword_argument(ctx.advisor.advise, "reasoning_callback")
+            and state.stream_main_agent_reasoning
+        ):
             recommendation, advisor_metadata = await ctx.advisor.advise(
                 alert,
                 knowledge,
@@ -913,11 +901,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         }
 
     # Determine final status
-    passed = (
-        validation_passed
-        and evidence_sufficient
-        and not advisor_degraded
-    )
+    passed = validation_passed and evidence_sufficient and not advisor_degraded
     final_status = AlertStatus.COMPLETED if passed else AlertStatus.INCONCLUSIVE
     run_status = RunStatus.COMPLETED if passed else RunStatus.INCONCLUSIVE
     final_stage = InvestigationStage.COMPLETED if passed else InvestigationStage.INCONCLUSIVE
@@ -928,6 +912,7 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
+                "steps": [],
                 "confidence": 0,
             }
         )

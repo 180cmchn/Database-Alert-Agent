@@ -2,6 +2,7 @@
   "mcpServers": {
     "archery": {
       "url": "${ARCHERY_MCP_URL}",
+      "transport": "streamable_http",
       "headers": {
         "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
       },
@@ -13,7 +14,8 @@
       }
     },
     "prometheus": {
-      "url": "${PROMETHEUS_MCP_SSE_URL}",
+      "url": "${PROMETHEUS_MCP_URL}",
+      "transport": "streamable_http",
       "optionalHeaders": {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
       },

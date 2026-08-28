@@ -142,9 +142,7 @@ class AlertAnalysisService:
         Returns:
             Tuple of (stored alert, was_created)
         """
-        normalized = preprocess_normalized_alert(
-            self.source_registry.normalize(source, payload)
-        )
+        normalized = preprocess_normalized_alert(self.source_registry.normalize(source, payload))
         alert = self.alert_sanitizer(normalized)
         stored, created = await self.repository.create_or_get(alert)
         if not created:
@@ -207,6 +205,66 @@ class AlertAnalysisService:
                 lease_owner,
                 self.investigation_lease_seconds,
             )
+            if run is not None:
+                incompatible_fields = await self._resume_manifest_incompatible_fields(
+                    run, generation_snapshot
+                )
+                if incompatible_fields:
+                    if not run.lease_owner:
+                        raise LeaseLostError(
+                            run_id=str(run.id),
+                            lease_owner="",
+                            fencing_token=run.fencing_token,
+                            reason="reclaimed run has no lease owner",
+                        )
+                    fields = ", ".join(incompatible_fields)
+                    error = (
+                        "Superseded because frozen run manifest is incompatible with "
+                        f"the current runtime: {fields}"
+                    )
+                    try:
+                        await self.repository.finalize_run(
+                            alert_id,
+                            str(run.id),
+                            lease_owner=run.lease_owner,
+                            fencing_token=run.fencing_token,
+                            run_status=RunStatus.FAILED,
+                            final_stage=InvestigationStage.FAILED,
+                            alert_status=AlertStatus.FAILED,
+                            progress=ProgressRecord(
+                                run_id=run.id,
+                                stage=InvestigationStage.FAILED,
+                                message=(
+                                    "运行环境已变更，旧检查点已安全终止；"
+                                    "将使用当前配置重新开始调查。"
+                                ),
+                                details={
+                                    "reason": "incompatible_resume_manifest",
+                                    "incompatible_fields": incompatible_fields,
+                                },
+                            ),
+                            error=error,
+                        )
+                    except RunCancellationRequested:
+                        await self.repository.finalize_requested_cancellation(alert_id, str(run.id))
+                        return await self.get(alert_id)
+                    except RunLeaseConflict as exc:
+                        raise LeaseLostError(
+                            run_id=str(run.id),
+                            lease_owner=run.lease_owner,
+                            fencing_token=run.fencing_token,
+                            reason=(
+                                "the lease was lost before the incompatible run could be superseded"
+                            ),
+                        ) from exc
+                    logger.info(
+                        "Restarting expired investigation with current runtime "
+                        "alert_id=%s run_id=%s incompatible_fields=%s",
+                        alert_id,
+                        run.id,
+                        fields,
+                    )
+                    run = None
             if run is None:
                 run_id = uuid4()
                 manifest = self._create_run_manifest(run_id, generation_snapshot)
@@ -297,8 +355,8 @@ class AlertAnalysisService:
                 final_state = await controlled
             except asyncio.CancelledError:
                 try:
-                    cancellation_requested = (
-                        await self.repository.is_run_cancellation_requested(str(run.id))
+                    cancellation_requested = await self.repository.is_run_cancellation_requested(
+                        str(run.id)
                     )
                 except Exception:
                     logger.warning(
@@ -416,22 +474,20 @@ class AlertAnalysisService:
                         raise RunCancellationRequested(run_id)
                     return await operation_task
             except TimeoutError:
-                raise TimeoutError(
-                    f"Analysis timed out after {timeout_seconds} seconds"
-                ) from None
+                raise TimeoutError(f"Analysis timed out after {timeout_seconds} seconds") from None
         finally:
             for task in (operation_task, cancellation_task):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(operation_task, cancellation_task, return_exceptions=True)
 
-    async def _require_compatible_resume_manifest(
+    async def _resume_manifest_incompatible_fields(
         self,
         run: InvestigationRun,
         generation_snapshot: AnalysisConfigSnapshot,
-    ) -> None:
+    ) -> list[str]:
         if run.fencing_token <= run.attempt:
-            return
+            return []
         frozen = await self.repository.get_run_manifest(str(run.id))
         if frozen is None:
             raise RuntimeError("Reclaimed run does not have a frozen manifest")
@@ -439,16 +495,22 @@ class AlertAnalysisService:
         ignored = {"created_at"}
         frozen_payload = frozen.model_dump(mode="json", exclude=ignored)
         current_payload = current.model_dump(mode="json", exclude=ignored)
-        incompatible_fields = sorted(
-            key
-            for key in frozen_payload
-            if frozen_payload.get(key) != current_payload.get(key)
+        return sorted(
+            key for key in frozen_payload if frozen_payload.get(key) != current_payload.get(key)
+        )
+
+    async def _require_compatible_resume_manifest(
+        self,
+        run: InvestigationRun,
+        generation_snapshot: AnalysisConfigSnapshot,
+    ) -> None:
+        incompatible_fields = await self._resume_manifest_incompatible_fields(
+            run, generation_snapshot
         )
         if incompatible_fields:
             fields = ", ".join(incompatible_fields)
             raise RuntimeError(
-                "Frozen run manifest is incompatible with the current runtime: "
-                f"{fields}"
+                f"Frozen run manifest is incompatible with the current runtime: {fields}"
             )
 
     async def _persist_terminal_state(
@@ -654,12 +716,8 @@ class AlertAnalysisService:
         tool_specs = self.tool_registry.available_specs()
         return AnalysisConfigSnapshot(
             knowledge_sources=list(self.knowledge_sources),
-            external_knowledge_enabled=(
-                "external_knowledge" in self.knowledge_registry.names()
-            ),
-            external_knowledge_min_relevance=(
-                self.external_knowledge_min_relevance
-            ),
+            external_knowledge_enabled=("external_knowledge" in self.knowledge_registry.names()),
+            external_knowledge_min_relevance=(self.external_knowledge_min_relevance),
             react_max_rounds=self.react_max_rounds,
             analysis_timeout_seconds=self.analysis_timeout_seconds,
             validation_enabled=True,
@@ -671,16 +729,10 @@ class AlertAnalysisService:
             or getattr(self.advisor, "model", ""),
             ai_mcp_model=getattr(self.advisor, "mcp_model", "")
             or getattr(self.advisor, "model", ""),
-            ai_react_reasoning_effort=getattr(
-                self.advisor, "react_reasoning_effort", ""
-            ),
+            ai_react_reasoning_effort=getattr(self.advisor, "react_reasoning_effort", ""),
             ai_reasoning_effort=getattr(self.advisor, "reasoning_effort", ""),
-            ai_mcp_reasoning_effort=getattr(
-                self.advisor, "mcp_reasoning_effort", ""
-            ),
-            ai_timeout_seconds=float(
-                self.runtime_manifest_config.get("ai_timeout_seconds", 300)
-            ),
+            ai_mcp_reasoning_effort=getattr(self.advisor, "mcp_reasoning_effort", ""),
+            ai_timeout_seconds=float(self.runtime_manifest_config.get("ai_timeout_seconds", 300)),
             # Historical snapshot field only; live model calls have no retry-count budget.
             ai_max_retries=0,
             ai_max_tokens=int(self.runtime_manifest_config.get("ai_max_tokens", 16_384)),
@@ -688,9 +740,7 @@ class AlertAnalysisService:
                 self.runtime_manifest_config.get("prompt_version")
                 or getattr(self.advisor, "prompt_version", "")
             ),
-            code_version=str(
-                self.runtime_manifest_config.get("code_version", "0.1.0")
-            ),
+            code_version=str(self.runtime_manifest_config.get("code_version", "0.1.0")),
             tool_schema_versions={item.name: item.schema_version for item in tool_specs},
             tool_policy_versions={item.name: item.policy_version for item in tool_specs},
         )

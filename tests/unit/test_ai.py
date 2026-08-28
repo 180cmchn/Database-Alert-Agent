@@ -123,7 +123,37 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
     assert "status 必须为 SUPPORTED" in ai_module.SYSTEM_PROMPT
     assert "现有结果无法得出根因" in ai_module.SYSTEM_PROMPT
     assert "不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED" in (ai_module.SYSTEM_PROMPT)
+
+
+def test_final_recommendations_are_actionable_without_repeating_mcp_checks() -> None:
+    prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
+    assert "steps 必须给出能够直接消除根因、恢复服务或降低影响的实际处置动作" in prompt
+    assert "允许在证据支持时建议终止指定查询或会话" in prompt
+    assert "不得把 tool_evidence 已完成的指标、日志、实例或数据库核查再次交给 DBA" in prompt
+    assert "root_causes=[]、likely_causes=[]、steps=[]" in prompt
+    assert "steps 仅允许只读核查" not in prompt
+    assert "所有工具调用都必须保持只读" in ai_module.REACT_PROMPT
     assert not hasattr(ai_module.OpenAICompatibleAdvisor, "choose_next_tool")
+
+
+def test_final_conclusion_requires_auditable_sql_and_explain_details() -> None:
+    prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
+
+    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v26"
+    assert "root_causes 是前端“AI 分析结论”的唯一正文" in prompt
+    assert "analysis_process 至少包含一项" in prompt
+    assert "事实 → 推导" in prompt
+    assert "完整原始 SQL 不超过 4000 字符" in prompt
+    assert "sample_id 和/或 structure" in prompt
+    assert "该问题 SQL 对应的普通 EXPLAIN 已成功" in prompt
+    assert "关键原始字段和值" in prompt
+
+    root_cause_schema = Recommendation.model_json_schema()["$defs"]["RootCauseAssessment"]
+    assert {
+        "analysis_process",
+        "problem_sql",
+        "explain_result",
+    } <= root_cause_schema["properties"].keys()
 
 
 def test_prompts_treat_program_projection_as_non_causal_evidence() -> None:
@@ -173,12 +203,14 @@ async def test_fake_advisor_returns_fixed_no_cause_for_partial_success() -> None
     assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
     assert recommendation.root_causes == []
     assert recommendation.likely_causes == []
+    assert recommendation.steps == []
 
 
 @pytest.mark.asyncio
 async def test_no_knowledge_remains_a_valid_optional_input() -> None:
     recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [])
     assert recommendation.knowledge_matches == []
+    assert recommendation.steps == []
     assert [item.source for item in recommendation.analysis_bases] == [AnalysisBasisSource.AI]
 
 
@@ -191,7 +223,9 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
         summary="Model analysis",
         knowledge_match_summary="model-overwritten-value",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
-        steps=[RecommendationStep(order=1, action="check read-only metrics")],
+        steps=[
+            RecommendationStep(order=1, action="terminate the evidence-identified blocking session")
+        ],
         confidence=0.3,
     )
 
@@ -238,7 +272,7 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
     model_response = Recommendation(
         summary="证据不足，需继续核查。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
         confidence=0.3,
     )
 
@@ -290,9 +324,7 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
                 "summary": "已完成程序事实投影。",
                 "observations": [
                     {
-                        "statement": (
-                            "慢查询数量升高；业务 checksum=" + business_checksum
-                        ),
+                        "statement": ("慢查询数量升高；业务 checksum=" + business_checksum),
                         "source_paths": [
                             "/structured_data/rows/0",
                             "/structured_data/raw_mcp_call_results/0",
@@ -522,7 +554,7 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
     valid_response = Recommendation(
         summary="中文分析结果",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
         confidence=0.3,
     )
     calls = 0
@@ -554,7 +586,7 @@ async def test_advisor_does_not_apply_archery_endpoint_output_gate() -> None:
             "而非告警目标实例）未能获取有效慢日志证据。"
         ),
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
         confidence=0.3,
     )
     calls = 0
@@ -581,7 +613,7 @@ async def test_advisor_accepts_schema_valid_archery_endpoint_statement_once() ->
     model_response = Recommendation(
         summary="Archery 查询的实例与告警目标不一致，因此慢日志无效。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="执行只读核查")],
+        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
         confidence=0.3,
     )
 
@@ -663,7 +695,9 @@ async def test_advisor_payload_uses_unified_knowledge_contract() -> None:
     model_response = Recommendation(
         summary="No semantic match",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
-        steps=[RecommendationStep(order=1, action="check read-only metrics")],
+        steps=[
+            RecommendationStep(order=1, action="terminate the evidence-identified blocking session")
+        ],
         confidence=0.3,
     )
 
@@ -1627,9 +1661,7 @@ async def test_responses_completion_maps_request_and_actual_reasoning() -> None:
                     {
                         "id": "rs_1",
                         "type": "reasoning",
-                        "summary": [
-                            {"type": "summary_text", "text": "provider reasoning"}
-                        ],
+                        "summary": [{"type": "summary_text", "text": "provider reasoning"}],
                         "encrypted_content": "opaque-replay-state",
                     },
                     {
@@ -1977,9 +2009,7 @@ async def test_responses_reads_legacy_reasoning_summary_shape() -> None:
                     },
                     {
                         "type": "message",
-                        "content": [
-                            {"type": "output_text", "text": '{"status":"ok"}'}
-                        ],
+                        "content": [{"type": "output_text", "text": '{"status":"ok"}'}],
                     },
                 ],
                 usage=None,

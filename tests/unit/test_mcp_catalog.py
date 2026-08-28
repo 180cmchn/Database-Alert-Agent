@@ -55,24 +55,26 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
 
     archery = catalog.require("archery")
     assert archery.url_template == "${ARCHERY_MCP_URL}"
-    assert archery.header_templates == {
-        "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
-    }
+    assert archery.header_templates == {"X-Archery-Token": "${ARCHERY_MCP_TOKEN}"}
     assert archery.referenced_environment_variables == (
         "ARCHERY_MCP_URL",
         "ARCHERY_MCP_TOKEN",
     )
+    assert archery.provider_options == {"transport": "streamable_http"}
     assert "慢查询日志" in archery.prompts.purpose
     assert "t_instance_member" in archery.prompts.workflow
     assert "mysql_slow_query_review_history" in archery.prompts.workflow
     assert "<!-- directive:" not in archery.prompts.workflow
     assert "<!-- /directive -->" not in archery.prompts.workflow
     authored_archery_workflow = (
-        PROJECT_ROOT / "config/mcp/prompts/archery/workflow.md"
-    ).read_text(encoding="utf-8").strip()
-    assert archery.prompts.workflow_revision == sha256(
-        authored_archery_workflow.encode("utf-8")
-    ).hexdigest()
+        (PROJECT_ROOT / "config/mcp/prompts/archery/workflow.md")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    assert (
+        archery.prompts.workflow_revision
+        == sha256(authored_archery_workflow.encode("utf-8")).hexdigest()
+    )
     assert archery.prompts.workflow_directives[
         "archery.history.truncation.fetch_single_id"
     ].startswith("紧凑扫描完成后")
@@ -104,14 +106,12 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert not hasattr(archery, "read_only")
 
     prometheus = catalog.require("prometheus")
-    assert prometheus.url_template == "${PROMETHEUS_MCP_SSE_URL}"
+    assert prometheus.url_template == "${PROMETHEUS_MCP_URL}"
     assert prometheus.header_templates == {}
     assert prometheus.optional_header_templates == {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
     }
-    assert prometheus.referenced_environment_variables == (
-        "PROMETHEUS_MCP_SSE_URL",
-    )
+    assert prometheus.referenced_environment_variables == ("PROMETHEUS_MCP_URL",)
     assert prometheus.optional_environment_variables == (
         "PROMETHEUS_MCP_API_KEY_HEADER",
         "PROMETHEUS_MCP_API_KEY",
@@ -167,12 +167,12 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert "`*_get_targets` 是可选的目标发现手段" in prometheus.prompts.workflow
     assert "返回 404" in prometheus.prompts.workflow
     assert "不设固定的 provider 调用顺序、重试次数上限" in prometheus.prompts.workflow
-    assert "`target=\"<alarm_host>:<alarm_port>\"`" in prometheus.prompts.workflow
+    assert '`target="<alarm_host>:<alarm_port>"`' in prometheus.prompts.workflow
     assert "`instance` 可能是同主机的采集端口" in prometheus.prompts.workflow
     assert "`mysql:cpu:usage` 是累计 CPU tick" in prometheus.prompts.workflow
     assert "`mysql:cpu:limit`" in prometheus.prompts.workflow
     assert "`*_execute_range_query`" in prometheus.prompts.workflow
-    assert prometheus.provider_options == {}
+    assert prometheus.provider_options == {"transport": "streamable_http"}
 
 
 def test_enabled_server_needs_only_connection_and_prompt_configuration(
@@ -184,6 +184,51 @@ def test_enabled_server_needs_only_connection_and_prompt_configuration(
 
     assert not hasattr(descriptor, "read_only")
     assert descriptor.provider_options == {}
+
+
+@pytest.mark.parametrize(
+    ("configured_transport", "expected_transport"),
+    [
+        (None, "streamable_http"),
+        ("sse", "sse"),
+        ("streamable_http", "streamable_http"),
+    ],
+)
+def test_catalog_resolves_the_configured_mcp_transport(
+    tmp_path: Path,
+    configured_transport: str | None,
+    expected_transport: str,
+) -> None:
+    server = _server_config(tmp_path)
+    if configured_transport is not None:
+        server["transport"] = configured_transport
+    descriptor = load_mcp_catalog(_write_settings(tmp_path, {"example": server})).require("example")
+
+    connection = descriptor.resolve_connection(
+        {
+            "EXAMPLE_MCP_URL": "https://mcp.example.test/endpoint",
+            "EXAMPLE_MCP_API_KEY": "test-token",
+        }
+    )
+
+    assert connection.transport == expected_transport
+
+
+@pytest.mark.parametrize("transport", ["stdio", "", True])
+def test_catalog_rejects_unsupported_mcp_transport(
+    tmp_path: Path,
+    transport: object,
+) -> None:
+    path = _write_settings(
+        tmp_path,
+        {"example": _server_config(tmp_path, transport=transport)},
+    )
+
+    with pytest.raises(
+        MCPCatalogConfigurationError,
+        match="transport must be sse or streamable_http",
+    ):
+        load_mcp_catalog(path)
 
 
 @pytest.mark.parametrize("legacy_field", ["readOnly", "maxAgentSteps", "toolPolicies"])
@@ -506,17 +551,13 @@ def test_workflow_directives_are_extracted_without_changing_rendered_text(
 
     bundle = load_mcp_catalog(path).require("example").prompts
 
-    assert bundle.workflow == (
-        "Before.\nList ids first.\nKeep the bounded window.\nAfter."
-    )
+    assert bundle.workflow == ("Before.\nList ids first.\nKeep the bounded window.\nAfter.")
     assert bundle.workflow_directives == {
         "example.history.list_ids": "List ids first.\nKeep the bounded window."
     }
     assert "<!-- directive:" not in bundle.workflow
     assert "<!-- /directive -->" not in bundle.workflow
-    assert bundle.workflow_revision == sha256(
-        authored_workflow.encode("utf-8")
-    ).hexdigest()
+    assert bundle.workflow_revision == sha256(authored_workflow.encode("utf-8")).hexdigest()
 
     renamed_workflow = authored_workflow.replace(
         "example.history.list_ids",
@@ -527,9 +568,7 @@ def test_workflow_directives_are_extracted_without_changing_rendered_text(
 
     assert renamed_bundle.workflow == bundle.workflow
     assert renamed_bundle.workflow_revision != bundle.workflow_revision
-    assert tuple(renamed_bundle.workflow_directives) == (
-        "example.history.enumerate_ids",
-    )
+    assert tuple(renamed_bundle.workflow_directives) == ("example.history.enumerate_ids",)
 
 
 @pytest.mark.parametrize(

@@ -3,7 +3,6 @@ import {
   ArrowLeft,
   Ban,
   Bot,
-  BrainCircuit,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -52,6 +51,7 @@ import type {
   AlertStatus,
   EvidenceUnit,
   InvestigationRun,
+  RootCauseAssessment,
   StoredAlert,
 } from "../types/api";
 
@@ -72,6 +72,58 @@ function basisLabel(source: AnalysisBasis["source"]): string {
 function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | null {
   if (!reference) return null;
   return `${reference.title} · ${reference.source}`;
+}
+
+function RootCauseContent({ rootCause }: { rootCause: RootCauseAssessment }) {
+  const analysisProcess = rootCause.analysis_process || [];
+  const problemSql = rootCause.problem_sql;
+  const explainResult = rootCause.explain_result;
+
+  return (
+    <div className="root-cause-content">
+      <strong className="root-cause-title">{rootCause.cause}</strong>
+
+      {problemSql && (
+        <div className="root-detail-block">
+          <span className="root-detail-label">问题 SQL</span>
+          {problemSql.statement && <pre className="root-sql"><code>{problemSql.statement}</code></pre>}
+          {problemSql.sample_id && <p><b>SQL sample ID：</b>{problemSql.sample_id}</p>}
+          {problemSql.structure && <p><b>SQL 结构：</b>{problemSql.structure}</p>}
+          <small>来源证据：{compactId(problemSql.evidence_ref, 6)}</small>
+        </div>
+      )}
+
+      {explainResult && (
+        <div className="root-detail-block">
+          <span className="root-detail-label">EXPLAIN 结果</span>
+          <pre className="root-explain-result">{explainResult.result}</pre>
+          <p><b>计划解读：</b>{explainResult.interpretation}</p>
+          <small>来源证据：{compactId(explainResult.evidence_ref, 6)}</small>
+        </div>
+      )}
+
+      {analysisProcess.length > 0 && (
+        <div className="root-detail-block">
+          <span className="root-detail-label">分析过程与依据</span>
+          <ol className="root-analysis-process">
+            {analysisProcess.map((step, index) => (
+              <li key={`${step.observation}-${index}`}>
+                <span>{index + 1}</span>
+                <div>
+                  <p><b>观察：</b>{step.observation}</p>
+                  <p><b>推导：</b>{step.inference}</p>
+                  <small>证据：{step.evidence_refs.map((id) => compactId(id, 6)).join("、")}</small>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      <p className="root-evidence-summary">{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>
+      {rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}
+    </div>
+  );
 }
 
 function evidenceUnitQualification(
@@ -495,25 +547,14 @@ export function AlertDetailPage() {
 
       {recommendation ? (
         <section className="recommendation-stack">
-          <div className="recommendation-hero">
-            <div className="recommendation-mark"><BrainCircuit size={27} /></div>
-            <div className="recommendation-copy">
-              <div className="recommendation-kicker"><span>AI 处理建议</span>{recommendation.knowledge_matches.length > 0 && <span className="knowledge-proof"><ExternalLink size={13} /> 知识命中</span>}</div>
-              <h2>{recommendation.summary}</h2>
-              <div className="recommendation-meta">
-                <span><Gauge size={15} /> 置信度 <strong>{formatPercent(recommendation.confidence)}</strong></span>
-                {record.advisor_metadata && <span><Bot size={15} /> {record.advisor_metadata.model}</span>}
-              </div>
-            </div>
-          </div>
 
-          <SectionCard eyebrow="ROOT CAUSE" title="采证后根因判断">
+          <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
             {visibleRootCauses.length > 0 ? (
               <div className="root-causes">
                 {visibleRootCauses.map((rootCause, index) => (
                   <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
                     <span className="root-index">{String(index + 1).padStart(2, "0")}</span>
-                    <div><strong>{rootCause.cause}</strong><p>{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>{rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}</div>
+                    <RootCauseContent rootCause={rootCause} />
                     <span className="root-confidence">{formatPercent(rootCause.confidence)}</span>
                     <span className="verified-label">{rootCause.verified ? <><Check size={13} /> 已验证</> : <><CircleAlert size={13} /> {rootCause.status}</>}</span>
                   </article>
@@ -525,20 +566,24 @@ export function AlertDetailPage() {
           </SectionCard>
 
           <section className="advice-grid">
-            <SectionCard eyebrow="ACTION PLAN" title="建议处置步骤">
-              <ol className="action-steps">
-                {recommendation.steps.map((step) => (
-                  <li key={step.order}>
-                    <span className="step-number">{String(step.order).padStart(2, "0")}</span>
-                    <div>
-                      <strong>{step.action}</strong>
-                      {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
-                      {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
-                      {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
-                    </div>
-                  </li>
-                ))}
-              </ol>
+            <SectionCard eyebrow="ACTION PLAN" title="建议处置步骤" description="基于已验证根因给出实际恢复动作；涉及变更时请遵循风险、审批和回滚要求">
+              {recommendation.steps.length > 0 ? (
+                <ol className="action-steps">
+                  {recommendation.steps.map((step) => (
+                    <li key={step.order}>
+                      <span className="step-number">{String(step.order).padStart(2, "0")}</span>
+                      <div>
+                        <strong>{step.action}</strong>
+                        {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
+                        {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
+                        {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p className="muted-copy">现有结果未建立根因，因此未生成猜测性处置步骤。</p>
+              )}
             </SectionCard>
 
             <div className="advice-side">
@@ -552,11 +597,11 @@ export function AlertDetailPage() {
           </section>
         </section>
       ) : (
-        <SectionCard eyebrow="AI ADVICE" title="处理建议">
+        <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
           <div className="waiting-panel large">
             <Bot size={29} />
-            <strong>{isActive ? "Agent 正在形成处理建议" : !record.selected_run_result_available ? "历史 AI 建议不可恢复" : "本次分析未生成建议"}</strong>
-            <span>{isActive ? "建议将在证据采集与确定性契约校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
+            <strong>{isActive ? "Agent 正在形成分析结论" : !record.selected_run_result_available ? "历史 AI 分析结论不可恢复" : "本次分析未生成结论"}</strong>
+            <span>{isActive ? "结论将在证据采集与确定性契约校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
           </div>
         </SectionCard>
       )}

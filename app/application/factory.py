@@ -197,13 +197,9 @@ def _build_archery_mcp_tool(
             },
             window_seconds=settings.archery_slow_log_window_seconds,
             timeout_seconds=settings.archery_mcp_timeout_seconds,
-            investigation_budget_seconds=(
-                settings.archery_investigation_budget_seconds
-            ),
+            investigation_budget_seconds=(settings.archery_investigation_budget_seconds),
             harness_runtime_dependencies=(
-                ArcheryHarnessRuntimeDependencies(repository)
-                if repository is not None
-                else None
+                ArcheryHarnessRuntimeDependencies(repository) if repository is not None else None
             ),
         ),
         default_timeout_seconds=settings.archery_mcp_tool_timeout_seconds,
@@ -215,7 +211,7 @@ def _build_prometheus_mcp_tool(
     model: AIAdvisor,
     repository: AlertRepository | None = None,
 ) -> PrometheusMCPEvidenceTool | None:
-    """Build the optional SSE monitoring evidence tool without loading ``.env``."""
+    """Build the optional Prometheus monitoring evidence tool without loading ``.env``."""
 
     if not settings.prometheus_mcp_enabled or not isinstance(model, MCPToolCallingModel):
         return None
@@ -224,16 +220,14 @@ def _build_prometheus_mcp_tool(
             settings.mcp_settings_path,
             model,
             environment={
-                "PROMETHEUS_MCP_SSE_URL": settings.prometheus_mcp_sse_url,
+                "PROMETHEUS_MCP_URL": settings.prometheus_mcp_url,
                 "PROMETHEUS_MCP_API_KEY_HEADER": settings.prometheus_mcp_api_key_header,
                 "PROMETHEUS_MCP_API_KEY": settings.prometheus_mcp_api_key,
             },
             timeout_seconds=settings.prometheus_mcp_timeout_seconds,
             sse_read_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
             harness_runtime_dependencies=(
-                PrometheusHarnessRuntimeDependencies(repository)
-                if repository is not None
-                else None
+                PrometheusHarnessRuntimeDependencies(repository) if repository is not None else None
             ),
         ),
         default_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
@@ -266,7 +260,7 @@ def _mcp_environment(settings: Settings) -> dict[str, str]:
         {
             "ARCHERY_MCP_URL": settings.archery_mcp_url,
             "ARCHERY_MCP_TOKEN": settings.archery_mcp_token,
-            "PROMETHEUS_MCP_SSE_URL": settings.prometheus_mcp_sse_url,
+            "PROMETHEUS_MCP_URL": settings.prometheus_mcp_url,
             "PROMETHEUS_MCP_API_KEY_HEADER": settings.prometheus_mcp_api_key_header,
             "PROMETHEUS_MCP_API_KEY": settings.prometheus_mcp_api_key,
         }
@@ -290,8 +284,7 @@ def _enabled_catalog_servers(
             if descriptor.explicitly_enabled:
                 raise MCPCatalogConfigurationError(
                     f"Explicitly enabled MCP server {descriptor.name!r} is missing required "
-                    "environment variables: "
-                    + ", ".join(missing)
+                    "environment variables: " + ", ".join(missing)
                 )
             continue
         enabled.append(descriptor)

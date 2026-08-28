@@ -33,7 +33,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
         source="incident_library",
         knowledge_id="connection-limit",
         title="连接使用率处置经验",
-        content="连接使用率过高时先执行只读核查。",
+        content="阻塞会话导致连接使用率过高时，终止已确认的阻塞会话并限制异常连接流量。",
         source_uri="https://knowledge.example.test/connection-limit",
         score=0.9,
         raw_score=0.1,
@@ -64,7 +64,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             raw_payload={"authorization": "Bearer must-not-appear"},
         ),
         recommendation=Recommendation(
-            summary="连接使用率达到 95%，请先执行只读核查。",
+            summary="阻塞会话导致连接使用率达到 95%，应释放阻塞连接并限制异常流量。",
             likely_causes=["连接池回收异常"],
             analysis_bases=[
                 AnalysisBasis(
@@ -80,7 +80,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             steps=[
                 RecommendationStep(
                     order=1,
-                    action="检查当前连接数与最大连接数。",
+                    action="终止已确认的阻塞会话并限制异常连接流量。",
                     source_ref=reference,
                 )
             ],

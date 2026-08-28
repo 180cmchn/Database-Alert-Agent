@@ -123,6 +123,109 @@ async def test_connector_closes_entered_contexts_when_initialize_is_cancelled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_transport", ("sse", "streamable_http"))
+async def test_connector_uses_configured_mcp_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    mcp_transport: str,
+) -> None:
+    calls: dict[str, Any] = {}
+    read_stream = object()
+    write_stream = object()
+
+    class _Context:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        async def __aenter__(self) -> Any:
+            return self.value
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    class _InitializedSession:
+        async def __aenter__(self) -> _InitializedSession:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        archery_harness_module,
+        "ClientSession",
+        lambda *_args, **_kwargs: _InitializedSession(),
+    )
+    client = _client(
+        _ScriptedModel([]),
+        ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, []),
+        mcp_transport=mcp_transport,  # type: ignore[arg-type]
+    )
+    if mcp_transport == "sse":
+
+        def sse_connector(url: str, **kwargs: Any) -> _Context:
+            calls["sse"] = {"url": url, **kwargs}
+            return _Context((read_stream, write_stream))
+
+        def unexpected_streamable(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("streamable HTTP connector must not be used")
+
+        monkeypatch.setattr(archery_harness_module, "sse_client", sse_connector)
+        monkeypatch.setattr(
+            archery_harness_module,
+            "streamable_http_client",
+            unexpected_streamable,
+        )
+    else:
+        http_client = object()
+
+        def async_http_client(**kwargs: Any) -> _Context:
+            calls["http_client"] = kwargs
+            return _Context(http_client)
+
+        def streamable_connector(url: str, *, http_client: Any) -> _Context:
+            calls["streamable"] = {"url": url, "http_client": http_client}
+            return _Context((read_stream, write_stream, lambda: "streamable-session"))
+
+        def unexpected_sse(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("SSE connector must not be used")
+
+        monkeypatch.setattr(
+            archery_harness_module.httpx,
+            "AsyncClient",
+            async_http_client,
+        )
+        monkeypatch.setattr(
+            archery_harness_module,
+            "streamable_http_client",
+            streamable_connector,
+        )
+        monkeypatch.setattr(archery_harness_module, "sse_client", unexpected_sse)
+
+    session = await ArcheryMCPConnector(client).open_session()
+    try:
+        if mcp_transport == "sse":
+            assert calls["sse"]["url"] == "https://archery.example.test/mcp"
+            assert calls["sse"]["headers"] == {"X-Archery-Token": "fixture-token"}
+            assert calls["sse"]["timeout"] == 60
+            assert calls["sse"]["sse_read_timeout"] == 60
+            assert calls["sse"]["httpx_client_factory"].keywords == {"transport": None}
+            assert session.session_id.startswith("archery-session-")
+        else:
+            assert calls["streamable"] == {
+                "url": "https://archery.example.test/mcp",
+                "http_client": http_client,
+            }
+            assert calls["http_client"]["headers"] == {"X-Archery-Token": "fixture-token"}
+            assert calls["http_client"]["follow_redirects"] is False
+            assert calls["http_client"]["timeout"].connect == 60
+            assert session.session_id == "streamable-session"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_archery_sdk_session_preserves_null_fields_and_aliases() -> None:
     class _RawSession:
         async def call_tool(self, *args: Any, **kwargs: Any) -> Any:
@@ -200,9 +303,7 @@ async def test_archery_sdk_session_lists_more_than_ten_tool_pages() -> None:
     tools = await sdk_session.list_tools()
 
     assert len(tools) == 12
-    assert [tool.name for tool in tools] == [
-        f"archery_tool_{page}" for page in range(1, 13)
-    ]
+    assert [tool.name for tool in tools] == [f"archery_tool_{page}" for page in range(1, 13)]
     assert requested_cursors == [None, *(f"cursor-{page}" for page in range(1, 12))]
 
 
@@ -265,9 +366,7 @@ async def test_bootstrap_records_session_without_calling_a_fixed_login_tool() ->
 
 @pytest.mark.asyncio
 async def test_shared_harness_repairs_model_response_without_local_step_limit() -> None:
-    model = _ScriptedModel(
-        [RuntimeError("model returned zero tool calls"), *_lineage_actions()]
-    )
+    model = _ScriptedModel([RuntimeError("model returned zero tool calls"), *_lineage_actions()])
     connector = ReplayMCPConnector(
         ARCHERY_HARNESS_PROVIDER,
         [
@@ -595,9 +694,7 @@ def test_dynamic_auth_allowlist_is_rebuilt_after_annotation_change() -> None:
     )
 
     assert allowed.local_result is None
-    assert rejected.metadata["local_rejection"]["reason_code"] == (
-        "pre_history_tool_forbidden"
-    )
+    assert rejected.metadata["local_rejection"]["reason_code"] == ("pre_history_tool_forbidden")
 
 
 @pytest.mark.asyncio
@@ -643,7 +740,7 @@ async def test_harness_parses_structured_response_result_history_rows() -> None:
                                 "response": {"result": wrapped_result},
                             }
                         },
-                    )
+                    ),
                 ],
             )
         ],

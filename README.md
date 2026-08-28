@@ -77,8 +77,11 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 - 已建立根因：状态 `SUPPORTED`、`verified=true`，并引用合格实时证据 ID；
 - 未建立根因：`root_causes=[]`、最终状态 `INCONCLUSIVE`、摘要 `现有结果无法得出根因`。
 
-新分析不输出 `SUPPORT`、`UNKNOWN`、`CONTRADICTED`、暂定原因或被排除原因。所有恢复建议仍以只读
-验证和排查为主；需要变更的动作只能列为风险或待审批事项。
+新分析不输出 `SUPPORT`、`UNKNOWN`、`CONTRADICTED`、暂定原因或被排除原因。调查期间的工具调用保持
+只读，但最终处置建议不受只读限制：建立根因后，主 Agent 必须给出能够消除根因、恢复服务或降低影响
+的实际动作，不得让 DBA 重复 MCP 已经完成的指标、日志、实例或数据库核查。终止查询或会话、切换、
+限流、扩缩容、参数或配置修改等动作必须基于现有证据，并同时说明目标、执行前提、预期结果、风险、
+审批或回滚要求；系统只生成建议，不会执行这些动作。无法建立根因时不生成猜测性处置步骤。
 
 结论后的 `validate` 节点是纯程序契约校验：它不读取原始 MCP artifact，不综合证据形成新根因，也不
 调用独立模型重新判断 `evidence_sufficient`。历史运行中的 `AGENT` 校验记录仍可读取，但新运行只写入
@@ -128,9 +131,14 @@ MCP 目录位于 `config/mcp/settings.json`。URL、Header 和 Key 只写环境�
 或部署环境。应用连接层负责认证、工具发现、协议解析、单次调用超时、持久化、artifact、checkpoint
 和来源追溯，并原样转发模型按远端 Schema 生成的调用。MCP 权限在服务端分发 Key 时确定。
 
+每个 MCP 可通过 `transport` 选择 `sse` 或 `streamable_http`；省略时默认
+`streamable_http`。当前 checked-in 的 Archery 与 Prometheus 配置都显式选择
+`streamable_http`。
+
 新增 MCP：
 
-1. 在 `mcpServers` 中与 `archery`、`prometheus` 同级追加 JSON 配置；
+1. 在 `mcpServers` 中与 `archery`、`prometheus` 同级追加 JSON 配置，并将
+   `transport` 设为 `sse` 或 `streamable_http`；
 2. 在 `config/mcp/prompts/<provider>/` 创建 `role.md`、`purpose.md`、`workflow.md`、`safety.md`；
 3. 在 `.env` 提供 JSON 引用的 URL 和 Key；
 4. 重启 API 与 Worker。主 Agent 会读取新的角色和作用并自主决定是否调用。
@@ -230,11 +238,15 @@ Prometheus 的作用是查询数据库监控指标，提示词位于 `config/mcp
 4. 不在覆盖范围内时返回 `Prometheus MCP 中没有配置告警数据库对应的监控信息`，该结果表示工具
    不适用，不否决其它证据。
 
+当前 checked-in 配置使用 `streamable_http` 和 `/mcp` endpoint；若部署的服务
+仅提供 SSE，可将 `config/mcp/settings.json` 中 Prometheus 的 `transport` 改为
+`sse`，并将 URL 指向该服务的 SSE endpoint。
+
 目标发现、指标目录和元数据只保存为内部审计 artifact。程序侧对目标与时间窗匹配的时序计算样本数、
 最小值、最大值、均值、最新值、变化量、缺口和异常排序，再把可追溯 observation 交给主 Agent。
 
 ```dotenv
-PROMETHEUS_MCP_SSE_URL=https://prometheus-mcp.example.internal/sse
+PROMETHEUS_MCP_URL=https://prometheus-mcp.example.internal/mcp
 PROMETHEUS_MCP_API_KEY_HEADER=
 PROMETHEUS_MCP_API_KEY=
 PROMETHEUS_MCP_TIMEOUT_SECONDS=60

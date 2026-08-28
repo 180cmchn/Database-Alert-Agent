@@ -40,7 +40,7 @@ from app.domain.tool_calling import (
     MCPToolCallingModel,
     mcp_tool_result_messages,
 )
-from app.mcp_catalog import MCPServerDescriptor, ResolvedMCPConnection
+from app.mcp_catalog import MCP_TRANSPORTS, MCPServerDescriptor, ResolvedMCPConnection
 
 _FINISH_TOOL_PREFIX = "finish_investigation"
 _REMOTE_RESPONSE_ARTIFACT_CONTRACT = "declarative-mcp-remote-response/v2"
@@ -398,8 +398,8 @@ class GenericMCPEvidenceTool:
         self.timeout_seconds = timeout_seconds
         self.repository = repository
         self.event_sink = event_sink or InMemoryEventSink()
-        transport = str(descriptor.provider_options.get("transport") or "streamable_http")
-        if transport not in {"streamable_http", "sse"}:
+        transport = connection.transport
+        if transport not in MCP_TRANSPORTS:
             raise GenericMCPConfigurationError("transport must be streamable_http or sse")
         self.transport = transport
         self.name = f"query_mcp_{descriptor.name}"
@@ -594,9 +594,7 @@ class GenericMCPEvidenceTool:
                         exclude_none=False,
                     )
                     if not isinstance(raw_payload, dict):
-                        raise GenericMCPConfigurationError(
-                            "MCP returned a non-object tool result"
-                        )
+                        raise GenericMCPConfigurationError("MCP returned a non-object tool result")
                     response_index = len(state.remote_responses)
                     response = _DeferredRemoteResponse(
                         tool_name=call.name,
@@ -678,8 +676,7 @@ class GenericMCPEvidenceTool:
         projected_result = _sanitize_complete(response.envelope)
         assert isinstance(projected_result, dict)
         is_error = (
-            projected_result.get("isError") is True
-            or projected_result.get("is_error") is True
+            projected_result.get("isError") is True or projected_result.get("is_error") is True
         )
         projection = _project_result_for_model(
             projected_result,
@@ -696,8 +693,7 @@ class GenericMCPEvidenceTool:
             "has_data": projection["has_data"] is True,
         }
         trace_prefix = (
-            f"declarative-mcp:{self.descriptor.name}:"
-            f"{trace_scope}:{response.decision_round}"
+            f"declarative-mcp:{self.descriptor.name}:{trace_scope}:{response.decision_round}"
         )
         await trace.emit_observation(
             json.dumps(
@@ -868,11 +864,7 @@ class GenericMCPEvidenceTool:
     ) -> None:
         """Recover a response artifact left by a failed pending checkpoint write."""
 
-        if (
-            self.repository is None
-            or state.completed
-            or state.pending_response_index is not None
-        ):
+        if self.repository is None or state.completed or state.pending_response_index is not None:
             return
         response_index = len(state.remote_responses)
         artifact_id = self._remote_response_artifact_id(
@@ -943,8 +935,7 @@ class GenericMCPEvidenceTool:
             "messages": deepcopy(state.messages),
             "observations": deepcopy(state.observations),
             "remote_responses": [
-                self._encode_remote_response(response)
-                for response in state.remote_responses
+                self._encode_remote_response(response) for response in state.remote_responses
             ],
             "decision_round": state.decision_round,
             "pending_response_index": state.pending_response_index,
@@ -997,26 +988,18 @@ class GenericMCPEvidenceTool:
             or pending_response_index != len(observations)
             or pending_response_index != len(responses) - 1
         ):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint pending response is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint pending response is invalid")
         if pending_response_index is None and len(responses) != len(observations):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint response count is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint response count is invalid")
         if pending_response_index is not None and len(responses) != len(observations) + 1:
             raise GenericMCPConfigurationError(
                 "Generic MCP checkpoint pending response count is invalid"
             )
         if completed != finished_by_model or (completed and pending_response_index is not None):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint completion state is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint completion state is invalid")
         expected_decision_round = len(responses) + (1 if completed else 0)
         if decision_round != expected_decision_round:
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint decision round is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint decision round is invalid")
         return _GenericMCPExecutionState(
             messages=deepcopy(messages),
             observations=deepcopy(observations),
@@ -1037,9 +1020,7 @@ class GenericMCPEvidenceTool:
             "request_id": call.request_id,
             "reasoning_content": call.reasoning_content,
             "usage": deepcopy(call.usage),
-            "provider_output_items": [
-                deepcopy(item) for item in call.provider_output_items
-            ],
+            "provider_output_items": [deepcopy(item) for item in call.provider_output_items],
         }
 
     def _encode_remote_response(
@@ -1063,9 +1044,7 @@ class GenericMCPEvidenceTool:
         expected_index: int,
     ) -> _DeferredRemoteResponse:
         if not isinstance(payload, dict):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint remote response is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint remote response is invalid")
         tool_name = payload.get("tool_name")
         arguments = payload.get("arguments")
         envelope = payload.get("envelope")
@@ -1083,9 +1062,7 @@ class GenericMCPEvidenceTool:
             or type(decision_round) is not int
             or decision_round != expected_index + 1
         ):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint remote response is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint remote response is invalid")
         model_call = cls._decode_model_call(
             model_call_payload,
             tool_name=tool_name,
@@ -1129,9 +1106,7 @@ class GenericMCPEvidenceTool:
             or not isinstance(output_items, list)
             or not all(isinstance(item, dict) for item in output_items)
         ):
-            raise GenericMCPConfigurationError(
-                "Generic MCP checkpoint model call is invalid"
-            )
+            raise GenericMCPConfigurationError("Generic MCP checkpoint model call is invalid")
         if protocol == "responses":
             if (
                 not output_items
@@ -1157,11 +1132,9 @@ class GenericMCPEvidenceTool:
                 raise GenericMCPConfigurationError(
                     "Generic MCP Responses function arguments are invalid"
                 ) from exc
-            if (
-                not isinstance(decoded_function_arguments, dict)
-                or _canonical_json(decoded_function_arguments)
-                != _canonical_json(call_arguments)
-            ):
+            if not isinstance(decoded_function_arguments, dict) or _canonical_json(
+                decoded_function_arguments
+            ) != _canonical_json(call_arguments):
                 raise GenericMCPConfigurationError(
                     "Generic MCP Responses function arguments are inconsistent"
                 )
@@ -1291,13 +1264,10 @@ class GenericMCPEvidenceTool:
         if self.repository is None:
             return None
         invocation_id = self._audit_invocation_id(request=request, context=context)
-        if (
-            model_call.name != tool_name
-            or _canonical_json(model_call.arguments) != _canonical_json(arguments)
+        if model_call.name != tool_name or _canonical_json(model_call.arguments) != _canonical_json(
+            arguments
         ):
-            raise GenericMCPConfigurationError(
-                "Generic MCP artifact model call is inconsistent"
-            )
+            raise GenericMCPConfigurationError("Generic MCP artifact model call is inconsistent")
         artifact_id = self._remote_response_artifact_id(
             invocation_id,
             response_index=response_index,
@@ -1333,9 +1303,7 @@ class GenericMCPEvidenceTool:
             "run_id": str(context.run_id),
             "invocation_id": str(invocation_id),
             "outer_dispatch_id": (
-                str(context.outer_dispatch_id)
-                if context.outer_dispatch_id is not None
-                else None
+                str(context.outer_dispatch_id) if context.outer_dispatch_id is not None else None
             ),
             "tool_name": tool_name,
             "arguments": deepcopy(arguments),

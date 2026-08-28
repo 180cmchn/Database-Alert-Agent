@@ -39,13 +39,19 @@ class BlockingAgent:
             raise
 
 
-class UnexpectedAgent:
+class RecordingTerminalAgent:
     def __init__(self) -> None:
         self.called = False
 
-    async def run(self, _: object) -> None:
+    async def run(self, state):  # type: ignore[no-untyped-def]
         self.called = True
-        raise AssertionError("incompatible recovery must not execute the graph")
+        return state.model_copy(
+            update={
+                "status": AlertStatus.INCONCLUSIVE,
+                "run_status": RunStatus.INCONCLUSIVE,
+                "current_stage": InvestigationStage.INCONCLUSIVE,
+            }
+        )
 
 
 def test_run_manifest_uses_harness_only_mcp_configuration(tmp_path: Path) -> None:
@@ -180,9 +186,7 @@ async def test_analysis_timeout_cancels_agent_and_persists_failed_run(
     runtime.service.agent = blocking_agent  # type: ignore[assignment]
     run_with_controls = runtime.service._run_agent_with_controls
 
-    async def run_with_short_timeout(
-        *, run_id: str, operation: Any, timeout_seconds: int
-    ) -> Any:
+    async def run_with_short_timeout(*, run_id: str, operation: Any, timeout_seconds: int) -> Any:
         del timeout_seconds
         return await run_with_controls(
             run_id=run_id,
@@ -395,7 +399,7 @@ async def test_graph_updates_are_fenced_with_the_claimed_run_identity(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_reclaimed_run_fails_closed_when_runtime_manifest_changed(
+async def test_reclaimed_run_with_changed_prompt_starts_new_attempt(
     tmp_path: Path,
 ) -> None:
     runtime = build_runtime(_settings(tmp_path))
@@ -405,7 +409,7 @@ async def test_reclaimed_run_fails_closed_when_runtime_manifest_changed(
         {
             "external_id": "incompatible-resume",
             "severity": "WARNING",
-            "title": "Reject mixed runtime recovery",
+            "title": "Restart mixed runtime recovery",
             "reason": "test",
         },
     )
@@ -438,19 +442,27 @@ async def test_reclaimed_run_fails_closed_when_runtime_manifest_changed(
         row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
 
-    unexpected_agent = UnexpectedAgent()
-    runtime.service.agent = unexpected_agent  # type: ignore[assignment]
-    runtime.service.runtime_manifest_config["code_version"] = "incompatible-version"
+    replacement_agent = RecordingTerminalAgent()
+    runtime.service.agent = replacement_agent  # type: ignore[assignment]
+    runtime.service.runtime_manifest_config["prompt_version"] = "next-prompt-version"
     try:
-        with pytest.raises(AnalysisFailedError, match="manifest is incompatible"):
-            await runtime.service.analyze_by_id(str(stored.alert.id))
+        result = await runtime.service.analyze_by_id(str(stored.alert.id))
 
-        current = await runtime.repository.get(str(stored.alert.id))
-        assert current is not None and current.latest_run is not None
-        assert str(current.latest_run.id) == str(run.id)
-        assert current.latest_run.fencing_token == run.fencing_token + 1
-        assert current.latest_run.status == RunStatus.FAILED
-        assert current.status == AlertStatus.FAILED
-        assert unexpected_agent.called is False
+        assert result.status == AlertStatus.INCONCLUSIVE
+        assert replacement_agent.called is True
+        assert result.latest_run is not None
+        assert result.latest_run.id != run.id
+        assert result.latest_run.attempt == run.attempt + 1
+        assert result.latest_run.status == RunStatus.INCONCLUSIVE
+        assert result.latest_run.config_snapshot is not None
+        assert result.latest_run.config_snapshot.prompt_version == "next-prompt-version"
+
+        prior = next(item for item in result.all_runs if item.id == run.id)
+        assert prior.status == RunStatus.FAILED
+        assert prior.fencing_token == run.fencing_token + 1
+        assert prior.error == (
+            "Superseded because frozen run manifest is incompatible with "
+            "the current runtime: configuration, prompt_version"
+        )
     finally:
         await runtime.repository.close()  # type: ignore[attr-defined]

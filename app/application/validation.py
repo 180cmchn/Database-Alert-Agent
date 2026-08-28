@@ -25,11 +25,22 @@ from app.domain.models import (
 def _evidence_units_by_id(
     evidence: list[EvidenceRecord],
 ) -> dict[str, tuple[EvidenceRecord, EvidenceUnit]]:
-    return {
-        str(unit.id): (record, unit)
-        for record in evidence
-        for unit in record.evidence_units
-    }
+    return {str(unit.id): (record, unit) for record in evidence for unit in record.evidence_units}
+
+
+def _unit_contains_sql_sample(unit: EvidenceUnit) -> bool:
+    if unit.stage.casefold() != "history":
+        return False
+    rows = unit.data.get("rows")
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key, value in row.items():
+            if str(key).casefold() == "sample" and isinstance(value, str) and value.strip():
+                return True
+    return False
 
 
 def enforce_post_evidence_root_cause_policy(
@@ -96,6 +107,7 @@ def enforce_post_evidence_root_cause_policy(
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
+                "steps": [],
                 "confidence": 0,
             }
         )
@@ -122,19 +134,32 @@ class RuleConclusionValidator:
         knowledge_warnings: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
         evidence_units_by_id = _evidence_units_by_id(evidence)
+        successful_explain_refs_by_parent = {
+            str(record.id): {
+                str(unit.id)
+                for unit in record.evidence_units
+                if unit.stage.casefold() == "explain"
+                and record.is_evidence_unit_root_cause_support_eligible(unit)
+            }
+            for record in evidence
+        }
         has_supported_cause = bool(recommendation.root_causes)
 
         if not recommendation.root_causes:
             if recommendation.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY:
-                issues.append(
-                    "无法得出根因时 summary 必须固定为“现有结果无法得出根因”"
-                )
+                issues.append("无法得出根因时 summary 必须固定为“现有结果无法得出根因”")
             if recommendation.likely_causes:
                 issues.append("无法得出根因时 likely_causes 必须为空")
+            if recommendation.steps:
+                issues.append("无法得出根因时 steps 必须为空")
+        elif not recommendation.steps:
+            issues.append("SUPPORTED 根因必须至少提供一项实际处置步骤")
 
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
             live_successful_refs: set[str] = set()
+            referenced_history_parent_ids: set[str] = set()
+            has_sql_sample = False
             if root_cause.status != RootCauseStatus.SUPPORTED:
                 issues.append(
                     f"根因 #{index}（{cause_label}）状态必须为 SUPPORTED，"
@@ -158,6 +183,9 @@ class RuleConclusionValidator:
                         continue
                     if parent.is_evidence_unit_root_cause_support_eligible(unit):
                         live_successful_refs.add(evidence_ref)
+                        if unit.stage.casefold() == "history":
+                            referenced_history_parent_ids.add(str(parent.id))
+                            has_sql_sample = has_sql_sample or _unit_contains_sql_sample(unit)
                     else:
                         issues.append(
                             f"根因 #{index}（{cause_label}）引用了不具备根因资格的"
@@ -195,15 +223,72 @@ class RuleConclusionValidator:
                         f"证据：{evidence_ref}"
                     )
 
-            if not live_successful_refs:
+            if not root_cause.analysis_process:
+                issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）必须给出分析过程与依据")
+                has_supported_cause = False
+            for step_index, step in enumerate(root_cause.analysis_process, start=1):
+                unqualified_refs = [
+                    evidence_ref
+                    for evidence_ref in dict.fromkeys(step.evidence_refs)
+                    if evidence_ref not in live_successful_refs
+                ]
+                if unqualified_refs:
+                    issues.append(
+                        f"根因 #{index} 分析步骤 #{step_index} 引用了未在该根因中验证的证据："
+                        + "、".join(unqualified_refs)
+                    )
+                    has_supported_cause = False
+
+            if has_sql_sample and root_cause.problem_sql is None:
                 issues.append(
-                    f"SUPPORTED 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据"
+                    f"SUPPORTED 根因 #{index}（{cause_label}）引用了问题 SQL sample，"
+                    "必须展示具体 SQL、SQL 结构或 sample ID"
                 )
                 has_supported_cause = False
-            if not root_cause.verified:
+            if (
+                root_cause.problem_sql is not None
+                and root_cause.problem_sql.evidence_ref not in live_successful_refs
+            ):
                 issues.append(
-                    f"SUPPORTED 根因 #{index}（{cause_label}）必须标记 verified=true"
+                    f"根因 #{index} 的问题 SQL 引用了未在该根因中验证的证据："
+                    f"{root_cause.problem_sql.evidence_ref}"
                 )
+                has_supported_cause = False
+
+            available_explain_refs = {
+                evidence_ref
+                for parent_id in referenced_history_parent_ids
+                for evidence_ref in successful_explain_refs_by_parent.get(parent_id, set())
+            }
+            if available_explain_refs and root_cause.explain_result is None:
+                issues.append(
+                    f"SUPPORTED 根因 #{index}（{cause_label}）存在成功 EXPLAIN，"
+                    "必须展示执行计划结果及解读"
+                )
+                has_supported_cause = False
+            if root_cause.explain_result is not None:
+                explain_ref = root_cause.explain_result.evidence_ref
+                if explain_ref not in live_successful_refs:
+                    issues.append(
+                        f"根因 #{index} 的 EXPLAIN 结果引用了未在该根因中验证的证据：{explain_ref}"
+                    )
+                    has_supported_cause = False
+                else:
+                    explain_entry = evidence_units_by_id.get(explain_ref)
+                    if explain_entry is None or explain_entry[1].stage.casefold() != "explain":
+                        issues.append(f"根因 #{index} 的 EXPLAIN 结果必须引用 explain 证据单元")
+                        has_supported_cause = False
+                    elif available_explain_refs and explain_ref not in available_explain_refs:
+                        issues.append(
+                            f"根因 #{index} 的 EXPLAIN 结果未引用问题 SQL 对应的成功计划证据"
+                        )
+                        has_supported_cause = False
+
+            if not live_successful_refs:
+                issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据")
+                has_supported_cause = False
+            if not root_cause.verified:
+                issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）必须标记 verified=true")
                 has_supported_cause = False
             if root_cause.next_probe is not None:
                 issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）不得提供 next_probe")
@@ -243,32 +328,24 @@ class RuleConclusionValidator:
                     f"{basis.source_ref.source}/{basis.source_ref.knowledge_id}"
                 )
             elif (basis.source_ref.title, basis.source_ref.source_uri) != expected:
-                knowledge_warnings.append(
-                    f"知识依据 #{index} 的标题或来源与检索结果不一致"
-                )
+                knowledge_warnings.append(f"知识依据 #{index} 的标题或来源与检索结果不一致")
 
         knowledge_matched = bool(knowledge_matches)
         for index, step in enumerate(recommendation.steps, start=1):
             source_ref = step.source_ref
             if not knowledge_matched:
                 if source_ref is not None:
-                    knowledge_warnings.append(
-                        f"未命中知识时处理步骤 #{index} 提供了 source_ref"
-                    )
+                    knowledge_warnings.append(f"未命中知识时处理步骤 #{index} 提供了 source_ref")
                 continue
             if source_ref is not None:
-                expected = valid_knowledge_refs.get(
-                    (source_ref.source, source_ref.knowledge_id)
-                )
+                expected = valid_knowledge_refs.get((source_ref.source, source_ref.knowledge_id))
                 if expected is None:
                     knowledge_warnings.append(
                         f"处理步骤 #{index} 引用了未知知识："
                         f"{source_ref.source}/{source_ref.knowledge_id}"
                     )
                 elif (source_ref.title, source_ref.source_uri) != expected:
-                    knowledge_warnings.append(
-                        f"处理步骤 #{index} 的知识标题或来源不一致"
-                    )
+                    knowledge_warnings.append(f"处理步骤 #{index} 的知识标题或来源不一致")
 
         source_rank = {
             AnalysisBasisSource.KNOWLEDGE: 0,
@@ -276,9 +353,7 @@ class RuleConclusionValidator:
         }
         ranks = [source_rank[source] for source in sources]
         if ranks != sorted(ranks):
-            knowledge_warnings.append(
-                "判断依据顺序提示：建议将知识依据排在 AI 依据之前"
-            )
+            knowledge_warnings.append("判断依据顺序提示：建议将知识依据排在 AI 依据之前")
 
         return ValidationRecord(
             run_id=run.id,

@@ -28,6 +28,7 @@ from app.domain.models import (
     InvestigationStage,
     Recommendation,
     RecommendationStep,
+    RootCauseAnalysisStep,
     RootCauseAssessment,
     RootCauseStatus,
     RunStatus,
@@ -82,9 +83,7 @@ async def test_flashduty_detail_precedes_knowledge_and_mcp_selection(tmp_path: P
 
         async def execute(self, request, context):  # type: ignore[no-untyped-def]
             events.append("MCP_CALL")
-            seen_hosts.append(
-                context.alert.database.host if context.alert.database else None
-            )
+            seen_hosts.append(context.alert.database.host if context.alert.database else None)
             return "detail endpoint observed", {"root_cause_eligible": False}
 
     advisor = ScriptedReActAdvisor(
@@ -272,7 +271,7 @@ async def test_knowledge_failure_does_not_block_detail_evidence_root_cause(
                     steps=[
                         RecommendationStep(
                             order=1,
-                            action="只读核对连接来源与连接池使用情况。",
+                            action="提高连接容量或扩容数据库连接资源，并限制突发连接流量。",
                         )
                     ],
                     risks=[],
@@ -280,6 +279,13 @@ async def test_knowledge_failure_does_not_block_detail_evidence_root_cause(
                     root_causes=[
                         RootCauseAssessment(
                             cause=cause,
+                            analysis_process=[
+                                RootCauseAnalysisStep(
+                                    observation="权威告警详情显示当前连接数 100，阈值为 80。",
+                                    inference="连接需求已超过配置容量并触发高连接告警。",
+                                    evidence_refs=[str(detail.id)],
+                                )
+                            ],
                             status=RootCauseStatus.SUPPORTED,
                             evidence_refs=[str(detail.id)],
                             confidence=0.9,
@@ -334,9 +340,7 @@ async def test_knowledge_failure_does_not_block_detail_evidence_root_cause(
     assert len(result.validations) == 1
     assert result.validations[0].kind == ValidationKind.RULE
     assert result.validations[0].evidence_sufficient is True
-    assert [item.tool_name for item in result.evidence_records] == [
-        "flashduty_alert_info"
-    ]
+    assert [item.tool_name for item in result.evidence_records] == ["flashduty_alert_info"]
     detail_evidence = result.evidence_records[0]
     reason_only = result.recommendation.model_copy(
         update={
@@ -452,7 +456,6 @@ class RecordingAdvisor(FakeAIAdvisor):
         )
 
 
-
 class ScriptedReActAdvisor(RecordingAdvisor):
     def __init__(
         self,
@@ -479,9 +482,7 @@ class ScriptedReActAdvisor(RecordingAdvisor):
         available_tools = kwargs["available_tools"]
         self.events.append(f"REACT:{kwargs['react_round']}")
         self.alert_hosts.append(alert.database.host if alert.database else None)
-        self.decision_evidence.append(
-            [(item.tool_name, item.status) for item in evidence]
-        )
+        self.decision_evidence.append([(item.tool_name, item.status) for item in evidence])
         self.available_tool_names.append([item.name for item in available_tools])
         return InvestigationDecisionResult(
             decision=self.decisions[index],
@@ -814,9 +815,7 @@ async def test_main_agent_executes_one_outer_tool_per_round_then_finishes(
     ]
     assert all(item.payload["scope"] == "main_agent" for item in trace)
     assert [
-        item.payload["content"]
-        for item in trace
-        if item.kind == AgentEventKind.TRACE_REASONING
+        item.payload["content"] for item in trace if item.kind == AgentEventKind.TRACE_REASONING
     ] == ["reason-one", "reason-two", "reason-finish", "final-root-cause-reasoning"]
     action_payloads = [
         json.loads(item.payload["content"])
@@ -928,9 +927,7 @@ async def test_react_structure_repairs_emit_each_provider_reasoning_immediately(
     assert result["react_decision"].action == "finish"
     assert calls == 2
     trace = await runtime.repository.list_agent_events(str(run.id))
-    reasoning_events = [
-        item for item in trace if item.kind == AgentEventKind.TRACE_REASONING
-    ]
+    reasoning_events = [item for item in trace if item.kind == AgentEventKind.TRACE_REASONING]
     assert [item.payload["content"] for item in reasoning_events] == [
         "first invalid action reasoning",
         "second repaired action reasoning",
@@ -1079,9 +1076,7 @@ async def test_react_node_supports_advisor_without_reasoning_callback(
     assert result.latest_run is not None
     events = await runtime.repository.list_agent_events(str(result.latest_run.id))
     assert [
-        item.payload["content"]
-        for item in events
-        if item.kind == AgentEventKind.TRACE_REASONING
+        item.payload["content"] for item in events if item.kind == AgentEventKind.TRACE_REASONING
     ] == ["legacy provider reasoning"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
@@ -1132,9 +1127,7 @@ async def test_stream_main_agent_reasoning_disabled_records_reasoning_once(
 ) -> None:
     advisor = _CallbackProbingAdvisor()
     runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"stream_main_agent_reasoning": False}
-        ),
+        settings_for(tmp_path).model_copy(update={"stream_main_agent_reasoning": False}),
         advisor=advisor,
         tool_registry=InvestigationToolRegistry([RecordingMCPStyleTool()]),
     )
@@ -1159,9 +1152,7 @@ async def test_stream_main_agent_reasoning_disabled_records_reasoning_once(
     assert result.latest_run.config_snapshot is not None
     assert result.latest_run.config_snapshot.stream_main_agent_reasoning is False
     events = await runtime.repository.list_agent_events(str(result.latest_run.id))
-    reasoning_events = [
-        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
-    ]
+    reasoning_events = [item for item in events if item.kind == AgentEventKind.TRACE_REASONING]
     assert [item.payload["content"] for item in reasoning_events] == [
         "round-one reasoning",
         "round-two reasoning",
@@ -1184,9 +1175,7 @@ async def test_stream_main_agent_reasoning_enabled_passes_delta_callback(
 ) -> None:
     advisor = _CallbackProbingAdvisor()
     runtime = build_runtime(
-        settings_for(tmp_path).model_copy(
-            update={"stream_main_agent_reasoning": True}
-        ),
+        settings_for(tmp_path).model_copy(update={"stream_main_agent_reasoning": True}),
         advisor=advisor,
         tool_registry=InvestigationToolRegistry([RecordingMCPStyleTool()]),
     )
@@ -1208,9 +1197,7 @@ async def test_stream_main_agent_reasoning_enabled_passes_delta_callback(
     assert all(callable(item) for item in advisor.decision_callbacks)
     assert callable(advisor.advise_callbacks[0])
     events = await runtime.repository.list_agent_events(str(result.latest_run.id))
-    reasoning_events = [
-        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
-    ]
+    reasoning_events = [item for item in events if item.kind == AgentEventKind.TRACE_REASONING]
     assert [item.payload["content"] for item in reasoning_events] == [
         "round-1 streamed reasoning",
         "round-2 streamed reasoning",
@@ -1451,9 +1438,7 @@ async def test_persisted_react_reasoning_replays_idempotently_after_interruption
     assert second["react_decision"] == decision
     events = await runtime.repository.list_agent_events(str(run.id))
     assert sum(item.kind == AgentEventKind.MODEL_DECISION for item in events) == 1
-    reasoning_events = [
-        item for item in events if item.kind == AgentEventKind.TRACE_REASONING
-    ]
+    reasoning_events = [item for item in events if item.kind == AgentEventKind.TRACE_REASONING]
     assert [item.payload["content"] for item in reasoning_events] == [reasoning]
     assert sum(item.kind == AgentEventKind.TRACE_ACTION for item in events) == 1
     await runtime.repository.close()  # type: ignore[attr-defined]

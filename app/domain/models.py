@@ -297,8 +297,36 @@ class RecommendationStep(BaseModel):
     source_ref: KnowledgeReference | None = None
 
 
+class RootCauseAnalysisStep(BaseModel):
+    observation: str = Field(min_length=1, max_length=4_000)
+    inference: str = Field(min_length=1, max_length=4_000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+
+
+class RootCauseSqlEvidence(BaseModel):
+    statement: str | None = Field(default=None, min_length=1, max_length=4_000)
+    structure: str | None = Field(default=None, min_length=1, max_length=4_000)
+    sample_id: str | None = Field(default=None, min_length=1, max_length=256)
+    evidence_ref: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_representation(self) -> RootCauseSqlEvidence:
+        if not any((self.statement, self.structure, self.sample_id)):
+            raise ValueError("problem SQL requires a statement, structure, or sample id")
+        return self
+
+
+class RootCauseExplainEvidence(BaseModel):
+    result: str = Field(min_length=1, max_length=8_000)
+    interpretation: str = Field(min_length=1, max_length=4_000)
+    evidence_ref: str = Field(min_length=1, max_length=256)
+
+
 class RootCauseAssessment(BaseModel):
     cause: str
+    analysis_process: list[RootCauseAnalysisStep] = Field(default_factory=list, max_length=20)
+    problem_sql: RootCauseSqlEvidence | None = None
+    explain_result: RootCauseExplainEvidence | None = None
     # Retained so recommendations persisted by the former hypothesis harness
     # remain readable. New analyses do not create or bind hypotheses.
     hypothesis_id: str | None = Field(default=None, min_length=1, max_length=200)
@@ -357,6 +385,7 @@ class InvestigationContext(BaseModel):
     # The outer dispatcher scopes embedded MCP checkpoints to one logical tool
     # dispatch so recovery cannot attach state from another explicit Agent action.
     outer_dispatch_id: UUID | None = None
+
     @model_validator(mode="after")
     def require_complete_lease_identity(self) -> InvestigationContext:
         if (self.lease_owner is None) != (self.fencing_token is None):
@@ -366,9 +395,7 @@ class InvestigationContext(BaseModel):
 
 class EvidenceRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)
-    contract_version: Literal["evidence-record/v1", "evidence-record/v2"] = (
-        EVIDENCE_RECORD_V1
-    )
+    contract_version: Literal["evidence-record/v1", "evidence-record/v2"] = EVIDENCE_RECORD_V1
     run_id: UUID
     tool_name: str
     source_system: str
@@ -398,10 +425,7 @@ class EvidenceRecord(BaseModel):
             raise ValueError("evidence unit identities must be unique within the parent")
         if any(item.parent_evidence_id != self.id for item in self.evidence_units):
             raise ValueError("evidence unit parent id must match its evidence record")
-        if any(
-            item.source_artifact_id != self.source_artifact_id
-            for item in self.evidence_units
-        ):
+        if any(item.source_artifact_id != self.source_artifact_id for item in self.evidence_units):
             raise ValueError("evidence unit source artifact must match its parent record")
         if any(item.root_cause_eligible for item in self.evidence_units) and (
             self.status != ToolStatus.SUCCESS

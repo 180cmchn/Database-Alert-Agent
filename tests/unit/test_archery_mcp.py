@@ -61,9 +61,9 @@ TEST_ALERT_OCCURRED_AT = datetime.fromisoformat("2026-07-23T16:00:00+08:00")
 TEST_WINDOW_START = datetime(2026, 7, 23, 7, 55, tzinfo=UTC)
 TEST_WINDOW_END = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ARCHERY_PROMPTS = load_mcp_catalog(
-    PROJECT_ROOT / "config/mcp/settings.json"
-).require("archery").prompts
+ARCHERY_PROMPTS = (
+    load_mcp_catalog(PROJECT_ROOT / "config/mcp/settings.json").require("archery").prompts
+)
 TEST_SLOW_LOG_QUERY = (
     "select * from t_slowlog_info "
     "where `f_insert_time` >= from_unixtime(1784793300) "
@@ -268,9 +268,7 @@ class PromptFollowingMCPModel:
         if name == RESULT_ASSESSMENT_TOOL_NAME:
             properties = tools[0]["function"]["parameters"]["properties"]
             arguments = {
-                key: schema["const"]
-                for key, schema in properties.items()
-                if "const" in schema
+                key: schema["const"] for key, schema in properties.items() if "const" in schema
             }
             arguments.update(
                 {
@@ -306,10 +304,11 @@ def _client(
             url="https://archery.example.test/mcp",
             headers={"X-Archery-Token": "test-archery-token"},
             prompts=ARCHERY_PROMPTS,
+            transport="streamable_http",
         ),
         model or PromptFollowingMCPModel(),
         deterministic_history_pipeline=False,
-        transport=transport,
+        http_transport=transport,
     )
 
 
@@ -438,9 +437,7 @@ def test_archery_prompt_file_update_changes_actual_model_messages(
                 "mcpServers": {
                     "archery": {
                         "url": "${ARCHERY_MCP_URL}",
-                        "headers": {
-                            "X-Archery-Token": "${ARCHERY_MCP_TOKEN}"
-                        },
+                        "headers": {"X-Archery-Token": "${ARCHERY_MCP_TOKEN}"},
                         "prompts": prompt_references,
                     }
                 }
@@ -458,7 +455,7 @@ def test_archery_prompt_file_update_changes_actual_model_messages(
             settings_path,
             PromptFollowingMCPModel(),
             environment=environment,
-            transport=_archery_call_handler(
+            http_transport=_archery_call_handler(
                 login_result={
                     "structuredContent": {"status": "ok"},
                     "isError": False,
@@ -489,10 +486,6 @@ def test_archery_prompt_file_update_changes_actual_model_messages(
     assert "archery-workflow-v1-from-file" in first_message
     assert "archery-workflow-v1-from-file" not in second_message
     assert "[workflow]\narchery-workflow-v2-from-file" in second_message
-
-
-
-
 
 
 def _archery_call_handler(
@@ -624,15 +617,12 @@ async def test_archery_mcp_returns_login_failure_as_observation_for_agent_decisi
     raw_feedback = next(
         message["content"]
         for message in model.calls[1]["messages"]
-        if message.get("role") == "tool"
-        and message.get("tool_call_id") == "model-call-1"
+        if message.get("role") == "tool" and message.get("tool_call_id") == "model-call-1"
     )
     assert isinstance(raw_feedback, str)
     decoded_feedback = json.loads(raw_feedback)
     assert decoded_feedback["isError"] is True
     assert decoded_feedback["content"][0]["text"] == "登录已过期，请重新登录后再试"
-
-
 
 
 @pytest.mark.asyncio
@@ -683,17 +673,12 @@ async def test_archery_mcp_rejects_other_slow_log_tables_before_transport() -> N
     )
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_window() -> None:
     tool_calls: list[str] = []
     query_sql_calls: list[str] = []
     member_sql = (
-        "SELECT f_instance_id FROM t_instance_member "
-        "WHERE host = 'db-1' AND port = 3306 LIMIT 1"
+        "SELECT f_instance_id FROM t_instance_member WHERE host = 'db-1' AND port = 3306 LIMIT 1"
     )
     instance_sql = "SELECT host, port FROM sql_instance WHERE id = 53 LIMIT 1"
     timed_out_sql = (
@@ -768,8 +753,7 @@ async def test_archery_mcp_recovers_from_history_timeout_with_index_aligned_wind
         "查询超时被KILL，请优化SQL后执行" in message.get("content", "")
         for call in model.calls
         for message in call["messages"]
-        if message.get("role") == "tool"
-        and isinstance(message.get("content"), str)
+        if message.get("role") == "tool" and isinstance(message.get("content"), str)
     )
 
 
@@ -791,36 +775,45 @@ def test_archery_mcp_reports_history_query_stage_after_columns_are_known() -> No
         },
     }
 
-    assert ArcheryMCPClient.metadata_resolution_stage(
-        **common,
-        query_trace=[],
-    ) == "等待 history 查询成功"
-    assert ArcheryMCPClient.metadata_resolution_stage(
-        **common,
-        query_trace=[
-            {
-                "chain_stage": "history",
-                "outcome": "tool_error",
-                "error_detail": "查询超时被KILL，请优化SQL后执行",
-            }
-        ],
-    ) == "等待优化后的 history 查询"
+    assert (
+        ArcheryMCPClient.metadata_resolution_stage(
+            **common,
+            query_trace=[],
+        )
+        == "等待 history 查询成功"
+    )
+    assert (
+        ArcheryMCPClient.metadata_resolution_stage(
+            **common,
+            query_trace=[
+                {
+                    "chain_stage": "history",
+                    "outcome": "tool_error",
+                    "error_detail": "查询超时被KILL，请优化SQL后执行",
+                }
+            ],
+        )
+        == "等待优化后的 history 查询"
+    )
 
     maximum_execution_time_error = (
         "(1028, 'Sort aborted: Query execution was interrupted, "
         "maximum statement execution time exceeded')"
     )
     assert ArcheryMCPClient._is_query_timeout_detail(maximum_execution_time_error)
-    assert ArcheryMCPClient.metadata_resolution_stage(
-        **{**common, "table_columns": {}},
-        query_trace=[
-            {
-                "chain_stage": "history",
-                "outcome": "tool_error",
-                "error_detail": maximum_execution_time_error,
-            }
-        ],
-    ) == "等待优化后的 history 查询"
+    assert (
+        ArcheryMCPClient.metadata_resolution_stage(
+            **{**common, "table_columns": {}},
+            query_trace=[
+                {
+                    "chain_stage": "history",
+                    "outcome": "tool_error",
+                    "error_detail": maximum_execution_time_error,
+                }
+            ],
+        )
+        == "等待优化后的 history 查询"
+    )
 
 
 def test_archery_mcp_classifies_history_without_host_window_sort_or_limit_checks() -> None:
@@ -869,9 +862,7 @@ def test_archery_mcp_classifies_id_listing_and_per_id_retrieval_queries() -> Non
     projection_sql = ArcheryMCPClient.history_sample_projection_sql(24413640)
     # The fixed projection that clips oversized sample text is still a per-id
     # retrieval and must keep merging into the final payload.
-    assert ArcheryMCPClient.is_history_id_retrieval_query(
-        projection_sql
-    )
+    assert ArcheryMCPClient.is_history_id_retrieval_query(projection_sql)
     assert ArcheryMCPClient.is_history_id_retrieval_query(
         projection_sql.lower()
         .replace(", ", ",\n    ")
@@ -911,10 +902,7 @@ def test_history_sample_and_chunk_retrieval_use_closed_host_shapes() -> None:
         chunk_sql.replace("AS sample_chunk", "AS sample"),
         chunk_sql.replace("WHERE id = 24413640", "WHERE id IN (24413640, 24413641)"),
     )
-    assert all(
-        ArcheryMCPClient.history_sample_chunk_retrieval(sql) is None
-        for sql in invalid
-    )
+    assert all(ArcheryMCPClient.history_sample_chunk_retrieval(sql) is None for sql in invalid)
 
 
 def test_agent_sample_structure_retains_both_ends_of_large_literal_in() -> None:
@@ -948,8 +936,7 @@ def test_non_in_oversized_sample_uses_non_executable_head_tail_display() -> None
 @pytest.mark.parametrize(
     "sql",
     (
-        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-        "ORDER BY id DESC",
+        "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 ORDER BY id DESC",
         "select * from `mysql_slow_query_review_history` where `id`=24413454 "
         "order by `id` asc limit 1",
         "SELECT h.* FROM archery.mysql_slow_query_review_history AS h "
@@ -992,8 +979,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
     ("sql", "reason_code"),
     (
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-            "AND checksum = 'x'",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 AND checksum = 'x'",
             "history_recovery_id_predicate_required",
         ),
         (
@@ -1002,8 +988,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_query_shape_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history h, other_table o "
-            "WHERE h.id = 24413454",
+            "SELECT * FROM mysql_slow_query_review_history h, other_table o WHERE h.id = 24413454",
             "history_recovery_query_shape_forbidden",
         ),
         (
@@ -1012,8 +997,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_sql_parse_failed",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history "
-            "WHERE id IN (24413454, 24413455)",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id IN (24413454, 24413455)",
             "history_recovery_id_predicate_required",
         ),
         (
@@ -1022,13 +1006,11 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_order_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-            "OFFSET 1",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 OFFSET 1",
             "history_recovery_offset_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-            "LIMIT 1 OFFSET 0",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LIMIT 1 OFFSET 0",
             "history_recovery_offset_forbidden",
         ),
         (
@@ -1051,8 +1033,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_target_forbidden",
         ),
         (
-            "SELECT * FROM other_schema.mysql_slow_query_review_history "
-            "WHERE id = 24413454",
+            "SELECT * FROM other_schema.mysql_slow_query_review_history WHERE id = 24413454",
             "history_recovery_target_forbidden",
         ),
         (
@@ -1064,18 +1045,15 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_target_forbidden",
         ),
         (
-            "SELECT evil.h.* FROM mysql_slow_query_review_history AS h "
-            "WHERE h.id = 24413454",
+            "SELECT evil.h.* FROM mysql_slow_query_review_history AS h WHERE h.id = 24413454",
             "history_recovery_projection_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-            "FOR UPDATE",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 FOR UPDATE",
             "history_recovery_query_shape_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 "
-            "LOCK IN SHARE MODE",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454 LOCK IN SHARE MODE",
             "history_recovery_query_shape_forbidden",
         ),
         (
@@ -1089,8 +1067,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_order_forbidden",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history USE INDEX (PRIMARY) "
-            "WHERE id = 24413454",
+            "SELECT * FROM mysql_slow_query_review_history USE INDEX (PRIMARY) WHERE id = 24413454",
             "history_recovery_query_shape_forbidden",
         ),
         (
@@ -1099,8 +1076,7 @@ def test_history_id_retrieval_accepts_aliased_sample_prefix_projection() -> None
             "history_recovery_sql_parse_failed",
         ),
         (
-            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454; "
-            "SELECT 1",
+            "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413454; SELECT 1",
             "history_recovery_not_single_statement",
         ),
     ),
@@ -1132,9 +1108,7 @@ def test_history_sample_projection_rejects_any_projection_drift() -> None:
         projection_sql.replace("id, hostname_max", "id, id, hostname_max"),
     )
 
-    assert all(
-        not ArcheryMCPClient.is_history_id_retrieval_query(sql) for sql in invalid
-    )
+    assert all(not ArcheryMCPClient.is_history_id_retrieval_query(sql) for sql in invalid)
 
 
 def test_accumulate_history_rows_merges_by_id_with_field_union() -> None:
@@ -1158,10 +1132,7 @@ def test_accumulate_history_rows_merges_by_id_with_field_union() -> None:
                 {"sample": "row without id cannot join the merge"},
             ]
         },
-        sql=(
-            "SELECT * FROM mysql_slow_query_review_history "
-            "WHERE id IN (24413458, 24413460)"
-        ),
+        sql=("SELECT * FROM mysql_slow_query_review_history WHERE id IN (24413458, 24413460)"),
         include_source=True,
     )
     ArcheryMCPClient.accumulate_history_rows(
@@ -1185,8 +1156,7 @@ def test_accumulate_history_rows_merges_by_id_with_field_union() -> None:
     assert "rows_recovered_from_truncated_json" not in payload
     assert payload["merged_full_sqls"] == [
         "SELECT * FROM mysql_slow_query_review_history WHERE id = 24413458",
-        "SELECT * FROM mysql_slow_query_review_history "
-        "WHERE id IN (24413458, 24413460)",
+        "SELECT * FROM mysql_slow_query_review_history WHERE id IN (24413458, 24413460)",
     ]
 
 
@@ -1332,15 +1302,12 @@ async def test_merged_history_payload_reaches_evidence_as_eligible_success() -> 
         rows_by_id,
         [
             {
-                "full_sql": (
-                    "SELECT * FROM mysql_slow_query_review_history WHERE id = 1000"
-                ),
+                "full_sql": ("SELECT * FROM mysql_slow_query_review_history WHERE id = 1000"),
                 "row_count": 1,
             },
             {
                 "full_sql": (
-                    "SELECT * FROM mysql_slow_query_review_history "
-                    "WHERE id IN (1001, 1002)"
+                    "SELECT * FROM mysql_slow_query_review_history WHERE id IN (1001, 1002)"
                 ),
                 "row_count": 2,
             },
@@ -1365,8 +1332,6 @@ async def test_merged_history_payload_reaches_evidence_as_eligible_success() -> 
     passthrough = structured_data["final_result_payload"]
     assert passthrough["rows_merged_from_per_id_queries"] is True
     assert len(passthrough["rows"]) == 3
-
-
 
 
 @pytest.mark.asyncio
@@ -1485,9 +1450,7 @@ async def test_archery_mcp_forwards_history_without_flashduty_endpoint() -> None
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
-        sequence=(
-            ARCHERY_MCP_QUERY_TOOL_NAME,
-        ),
+        sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,),
         query_sqls=(direct_history_sql,),
     )
     client = _client(
@@ -1559,9 +1522,7 @@ async def test_archery_mcp_does_not_parse_endpoint_from_title() -> None:
         f"{TEST_HISTORY_TIME_CLAUSE}LIMIT 20"
     )
     model = PromptFollowingMCPModel(
-        sequence=(
-            ARCHERY_MCP_QUERY_TOOL_NAME,
-        ),
+        sequence=(ARCHERY_MCP_QUERY_TOOL_NAME,),
         query_sqls=(direct_history_sql,),
     )
     client = _client(
@@ -1880,8 +1841,7 @@ def test_archery_mcp_parses_wrapped_positional_rows_without_post_query_checks(
 @pytest.mark.asyncio
 async def test_archery_mcp_parses_response_result_wrapped_tabular_payload() -> None:
     history_sql = (
-        "SELECT hostname_max, sample, Query_time_sum "
-        "FROM mysql_slow_query_review_history LIMIT 2"
+        "SELECT hostname_max, sample, Query_time_sum FROM mysql_slow_query_review_history LIMIT 2"
     )
     rows = [
         ["db-a.example:3306", "select 1", 1.25],
@@ -2118,8 +2078,7 @@ async def test_archery_mcp_recovers_complete_rows_from_truncated_wrapped_json() 
         + json.dumps(incomplete_row, ensure_ascii=False)[:200]
     )
     wrapped_result = (
-        f"SQL 查询已执行。\n执行的SQL：{history_sql}\n\n返回 18 行。\n结果：\n"
-        + truncated_result
+        f"SQL 查询已执行。\n执行的SQL：{history_sql}\n\n返回 18 行。\n结果：\n" + truncated_result
     )
 
     payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
@@ -2150,9 +2109,7 @@ async def test_archery_mcp_recovers_complete_rows_from_truncated_wrapped_json() 
     assert "字符截断" in summary
     assert structured_data["partial"] is True
     assert structured_data["root_cause_eligible"] is False
-    assert structured_data["root_cause_ineligible_reason"] == (
-        "remote_result_character_truncated"
-    )
+    assert structured_data["root_cause_ineligible_reason"] == ("remote_result_character_truncated")
     assert structured_data["reported_row_count"] == 18
     assert structured_data["parsed_row_count"] == 2
     assert structured_data["included_row_count"] == 2
@@ -2221,24 +2178,6 @@ async def test_archery_mcp_preserves_all_rows_returned_by_remote_service() -> No
     assert "rows_limited_to" not in result.payload
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class RecordingArcheryClient:
     slow_log_time_column = TEST_TIME_COLUMN
     window_seconds = 300
@@ -2290,9 +2229,7 @@ def _large_slow_query_row(index: int, *, sample_chars: int = 900) -> dict[str, A
         "db_max": "orders",
         "checksum": f"{index:032x}",
         "sample": (
-            f"SELECT * FROM orders WHERE shard_id = {index} /*"
-            + ("x" * sample_chars)
-            + "*/"
+            f"SELECT * FROM orders WHERE shard_id = {index} /*" + ("x" * sample_chars) + "*/"
         ),
         "ts_min": "2026-07-23T15:55:00.000000",
         "ts_max": "2026-07-23T16:00:00.000000",
@@ -2349,9 +2286,7 @@ class FailedHistoryRecordingArcheryClient(RecordingArcheryClient):
         self.calls += 1
         self.occurred_at = occurred_at
         self.alert_context = alert_context
-        error_detail = (
-            "Query execution was interrupted, maximum statement execution time exceeded"
-        )
+        error_detail = "Query execution was interrupted, maximum statement execution time exceeded"
         return ArcherySlowLogQueryResult(
             payload={"status": "evidence_insufficient"},
             requested_sql=None,
@@ -2423,6 +2358,8 @@ def test_archery_endpoint_requires_canonical_host_and_port() -> None:
         )
         == "detail-host:3306"
     )
+
+
 @pytest.mark.asyncio
 async def test_archery_evidence_tool_ignores_parameters_and_uses_alert_detail_context() -> None:
     client = RecordingArcheryClient()
@@ -2520,8 +2457,6 @@ async def test_archery_evidence_distinguishes_failed_history_from_never_executed
     assert outcome.structured_data["root_cause_ineligible_reason"] == (
         "最终慢查询 SQL 未成功；当前证据不足"
     )
-
-
 
 
 @pytest.mark.asyncio
@@ -2687,9 +2622,7 @@ async def test_archery_reported_count_without_parsed_rows_is_no_data() -> None:
     assert "MCP 报告 20 行，但日志行未能解析" in outcome.summary
     assert "返回 20 行" not in outcome.summary
     assert outcome.structured_data["root_cause_eligible"] is False
-    assert "未返回可解析的日志行" in outcome.structured_data[
-        "root_cause_ineligible_reason"
-    ]
+    assert "未返回可解析的日志行" in outcome.structured_data["root_cause_ineligible_reason"]
 
 
 def _settings(tmp_path: Path, *, real_model: bool = False) -> Settings:
@@ -2843,9 +2776,7 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
 async def test_slow_log_evidence_keys_positional_rows_by_column_list() -> None:
     client = RecordingArcheryClient(
         payload={
-            "full_sql": (
-                "SELECT id, checksum, sample FROM mysql_slow_query_review_history;"
-            ),
+            "full_sql": ("SELECT id, checksum, sample FROM mysql_slow_query_review_history;"),
             "is_execute": False,
             "rows": [
                 [24311020, "2DBE950C61C1BBB4617E83D777A3A810", "select * from orders"],
@@ -3047,9 +2978,7 @@ def test_archery_mcp_excludes_explicitly_truncated_samples_from_explain() -> Non
     selected = ArcheryMCPClient.select_explainable_history_rows(payload)
 
     assert [row["id"] for row in selected] == [11]
-    assert ArcheryMCPClient.history_row_for_explain(
-        f"EXPLAIN {truncated_prefix}", payload
-    ) is None
+    assert ArcheryMCPClient.history_row_for_explain(f"EXPLAIN {truncated_prefix}", payload) is None
 
 
 def test_archery_mcp_requires_exact_positive_sample_full_length_when_present() -> None:
@@ -3159,16 +3088,10 @@ def test_normalized_query_accepts_top_level_limit_without_provider_contract() ->
         "rows": [[3]],
         "column_list": ["f_instance_id"],
     }
-    wrapped = (
-        "SQL query executed.\n"
-        f"Executed SQL: {actual}\n\n"
-        "Result:\n" + json.dumps(embedded)
-    )
+    wrapped = f"SQL query executed.\nExecuted SQL: {actual}\n\nResult:\n" + json.dumps(embedded)
     response = {
         "response": {
-            "result": wrapped.replace("Executed SQL:", "执行的SQL：").replace(
-                "Result:", "结果："
-            )
+            "result": wrapped.replace("Executed SQL:", "执行的SQL：").replace("Result:", "结果：")
         }
     }
 
@@ -3185,8 +3108,7 @@ def test_normalized_query_accepts_top_level_limit_without_provider_contract() ->
 
 def test_normalized_explain_accepts_any_top_level_limit_value() -> None:
     requested = (
-        "EXPLAIN SELECT * FROM orders WHERE customer_id = 7\n\n"
-        "AND status = 'pending' LIMIT 1"
+        "EXPLAIN SELECT * FROM orders WHERE customer_id = 7\n\nAND status = 'pending' LIMIT 1"
     )
     actual = requested.rsplit(" LIMIT ", 1)[0] + " LIMIT 100"
     embedded = {
@@ -3195,10 +3117,7 @@ def test_normalized_explain_accepts_any_top_level_limit_value() -> None:
     }
     response = {
         "result": (
-            "SQL 查询已执行。\n"
-            f"执行的SQL：{actual}\n\n"
-            "返回 1 行。\n结果：\n"
-            + json.dumps(embedded)
+            f"SQL 查询已执行。\n执行的SQL：{actual}\n\n返回 1 行。\n结果：\n" + json.dumps(embedded)
         )
     }
 
@@ -3301,9 +3220,7 @@ def test_normalized_query_rejects_conflicting_raw_text_actual_sql_echo() -> None
     _payload, executed_sql, actual_sql_verified = ArcheryMCPClient.normalize_query_payload(
         {"full_sql": requested, "rows": [{"id": 53}]},
         requested_sql=requested,
-        supplemental_text=(
-            json.dumps({"response": {"full_sql": conflicting}}),
-        ),
+        supplemental_text=(json.dumps({"response": {"full_sql": conflicting}}),),
     )
 
     assert executed_sql == requested
@@ -3318,10 +3235,7 @@ def test_normalized_query_rejects_conflicting_sql_echoes_in_one_text_block() -> 
         {"rows": [{"id": 53}]},
         requested_sql=requested,
         supplemental_text=(
-            "SQL 查询已执行。\n"
-            f"执行的SQL：{requested}\n\n"
-            f"执行的SQL：{conflicting}\n\n"
-            "返回 1 行。",
+            f"SQL 查询已执行。\n执行的SQL：{requested}\n\n执行的SQL：{conflicting}\n\n返回 1 行。",
         ),
     )
 
@@ -3358,14 +3272,20 @@ def test_explain_sample_identity_preserves_string_literal_semantics() -> None:
         ]
     }
 
-    assert ArcheryMCPClient.history_row_for_explain(
-        " explain select * from orders where note='A  B'; ",
-        payload,
-    ) is not None
-    assert ArcheryMCPClient.history_row_for_explain(
-        "EXPLAIN SELECT * FROM orders WHERE note = 'a b'",
-        payload,
-    ) is None
+    assert (
+        ArcheryMCPClient.history_row_for_explain(
+            " explain select * from orders where note='A  B'; ",
+            payload,
+        )
+        is not None
+    )
+    assert (
+        ArcheryMCPClient.history_row_for_explain(
+            "EXPLAIN SELECT * FROM orders WHERE note = 'a b'",
+            payload,
+        )
+        is None
+    )
 
 
 def test_information_schema_classifier_rejects_additional_physical_tables() -> None:
@@ -3380,8 +3300,7 @@ def test_information_schema_classifier_rejects_additional_physical_tables() -> N
         "SELECT SLEEP(1) FROM information_schema.COLUMNS"
     )
     assert not ArcheryMCPClient.is_information_schema_columns_query(
-        "SELECT COLUMN_NAME INTO OUTFILE '/tmp/columns' "
-        "FROM information_schema.COLUMNS"
+        "SELECT COLUMN_NAME INTO OUTFILE '/tmp/columns' FROM information_schema.COLUMNS"
     )
     assert not ArcheryMCPClient.is_information_schema_columns_query(
         "SELECT TABLE_NAME AS COLUMN_NAME FROM information_schema.COLUMNS"
@@ -3421,15 +3340,9 @@ def test_allowlist_discovery_parses_strict_live_text_contracts() -> None:
         "1. [ID:3] pcm 100.84.97.100:3306 资源组:[1]\n"
         "2. [ID:17] archery 100.84.97.141:3307 资源组:[2, 9, 13]"
     )
-    databases = (
-        "实例 3 的数据库清单：\n"
-        "1. pcm_product_prod\n"
-        "2. cpn-campaign-prod"
-    )
+    databases = "实例 3 的数据库清单：\n1. pcm_product_prod\n2. cpn-campaign-prod"
 
-    assert ArcheryMCPClient.allowlisted_instance_endpoints(
-        {"result": instances}
-    ) == {
+    assert ArcheryMCPClient.allowlisted_instance_endpoints({"result": instances}) == {
         3: {"100.84.97.100:3306"},
         17: {"100.84.97.141:3307"},
     }
@@ -3441,13 +3354,14 @@ def test_allowlist_discovery_parses_strict_live_text_contracts() -> None:
         {"result": instances},
         expected_instance_ref="3",
     ) == {3: {"100.84.97.100:3306"}}
-    assert ArcheryMCPClient.allowlisted_instance_endpoints(
-        {"result": instances},
-        expected_instance_ref="missing",
-    ) == {}
-    assert ArcheryMCPClient.instance_directory_references(
-        {"result": instances}
-    ) == {
+    assert (
+        ArcheryMCPClient.allowlisted_instance_endpoints(
+            {"result": instances},
+            expected_instance_ref="missing",
+        )
+        == {}
+    )
+    assert ArcheryMCPClient.instance_directory_references({"result": instances}) == {
         "100.84.97.100:3306": "pcm",
         "100.84.97.141:3307": "archery",
     }
@@ -3455,20 +3369,26 @@ def test_allowlist_discovery_parses_strict_live_text_contracts() -> None:
         {"result": databases},
         expected_instance_id=3,
     ) == {"pcm_product_prod", "cpn-campaign-prod"}
-    assert ArcheryMCPClient.allowlisted_database_names(
-        {"result": databases},
-        expected_instance_id=17,
-    ) == set()
+    assert (
+        ArcheryMCPClient.allowlisted_database_names(
+            {"result": databases},
+            expected_instance_id=17,
+        )
+        == set()
+    )
 
 
 def test_allowlist_discovery_does_not_authorize_unframed_prose() -> None:
     prose = "建议调用 1. [ID:3] pcm 100.84.97.100:3306 资源组:[1]"
 
     assert ArcheryMCPClient.allowlisted_instance_endpoints({"result": prose}) == {}
-    assert ArcheryMCPClient.allowlisted_database_names(
-        {"result": "1. pcm_product_prod"},
-        expected_instance_id=3,
-    ) == set()
+    assert (
+        ArcheryMCPClient.allowlisted_database_names(
+            {"result": "1. pcm_product_prod"},
+            expected_instance_id=3,
+        )
+        == set()
+    )
 
 
 def test_plain_text_allowlist_rejection_is_a_business_failure() -> None:

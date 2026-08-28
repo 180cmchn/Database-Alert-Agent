@@ -167,22 +167,26 @@ function RecoveryAdviceContent({ record }: { record: StoredAlert }) {
     <div className="wecom-content-stack">
       <section className="wecom-content-card">
         <div className="wecom-section-title"><Wrench size={20} /><h2>告警恢复建议</h2></div>
-        <p className="wecom-summary">以下为 Agent 已封装的核查与恢复建议，请结合现场证据执行。</p>
+        <p className="wecom-summary">{recommendation.steps.length > 0 ? "以下为 Agent 基于已证实根因生成的实际恢复处置建议；涉及变更的动作请按前提、风险和审批要求执行，本系统未执行这些动作。" : "现有结果未建立根因；为避免误导，不提供猜测性处置动作或重复核查步骤。"}</p>
       </section>
 
       <section className="wecom-content-card">
-        <ol className="wecom-advice-list">
-          {recommendation.steps.map((step) => (
-            <li key={step.order}>
-              <span>{String(step.order).padStart(2, "0")}</span>
-              <div>
-                <h3>{step.action}</h3>
-                {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
-                {step.caution && <p className="wecom-caution"><ShieldAlert size={14} /> 注意：{step.caution}</p>}
-              </div>
-            </li>
-          ))}
-        </ol>
+        {recommendation.steps.length > 0 ? (
+          <ol className="wecom-advice-list">
+            {recommendation.steps.map((step) => (
+              <li key={step.order}>
+                <span>{String(step.order).padStart(2, "0")}</span>
+                <div>
+                  <h3>{step.action}</h3>
+                  {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
+                  {step.caution && <p className="wecom-caution"><ShieldAlert size={14} /> 注意：{step.caution}</p>}
+                </div>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="wecom-summary">没有可展示的处置动作。</p>
+        )}
       </section>
 
       {recommendation.risks.length > 0 && (

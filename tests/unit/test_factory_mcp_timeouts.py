@@ -23,9 +23,13 @@ from app.config import Settings
 def _write_mcp_catalog(tmp_path: Path, *, include_custom: bool = False) -> Path:
     catalog_dir = tmp_path / "mcp"
     prompt_references: dict[str, dict[str, str]] = {}
-    server_names = ("archery", "prometheus", "custom") if include_custom else (
-        "archery",
-        "prometheus",
+    server_names = (
+        ("archery", "prometheus", "custom")
+        if include_custom
+        else (
+            "archery",
+            "prometheus",
+        )
     )
     for server_name in server_names:
         prompt_dir = catalog_dir / "prompts" / server_name
@@ -37,21 +41,21 @@ def _write_mcp_catalog(tmp_path: Path, *, include_custom: bool = False) -> Path:
                 f"{server_name} {prompt_name} test prompt",
                 encoding="utf-8",
             )
-            prompt_references[server_name][prompt_name] = str(
-                prompt_path.relative_to(catalog_dir)
-            )
+            prompt_references[server_name][prompt_name] = str(prompt_path.relative_to(catalog_dir))
 
     catalog_path = catalog_dir / "settings.json"
     servers: dict[str, object] = {
         "archery": {
             "url": "${ARCHERY_MCP_URL}",
+            "transport": "sse",
             "headers": {
                 "X-Archery-Token": "${ARCHERY_MCP_TOKEN}",
             },
             "prompts": prompt_references["archery"],
         },
         "prometheus": {
-            "url": "${PROMETHEUS_MCP_SSE_URL}",
+            "url": "${PROMETHEUS_MCP_URL}",
+            "transport": "streamable_http",
             "prompts": prompt_references["prometheus"],
         },
     }
@@ -63,9 +67,7 @@ def _write_mcp_catalog(tmp_path: Path, *, include_custom: bool = False) -> Path:
             "prompts": prompt_references["custom"],
         }
     catalog_path.write_text(
-        json.dumps(
-            {"mcpServers": servers}
-        ),
+        json.dumps({"mcpServers": servers}),
         encoding="utf-8",
     )
     return catalog_path
@@ -88,7 +90,7 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         archery_mcp_token="test-token",
         archery_investigation_budget_seconds=123,
         archery_mcp_tool_timeout_seconds=611,
-        prometheus_mcp_sse_url="https://prometheus.example.test/sse",
+        prometheus_mcp_url="https://prometheus.example.test/mcp",
         prometheus_mcp_tool_timeout_seconds=733,
     )
     runtime = build_runtime(settings)
@@ -101,10 +103,12 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         assert archery_tool.client.investigation_budget_seconds == 123
         assert archery_tool.client.deterministic_history_pipeline is True
         assert archery_tool.default_timeout_seconds == 611
+        assert archery_tool.client.mcp_transport == "sse"
         assert runtime.service.tool_registry.spec(ARCHERY_SLOW_LOG_TOOL_NAME).timeout == 611
 
         assert isinstance(prometheus_tool, PrometheusMCPEvidenceTool)
         assert prometheus_tool.default_timeout_seconds == 733
+        assert prometheus_tool.client.mcp_transport == "streamable_http"
         assert runtime.service.tool_registry.spec(PROMETHEUS_METRICS_TOOL_NAME).timeout == 733
     finally:
         await runtime.service.close()

@@ -19,6 +19,7 @@ from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamable_http_client
 
 from app.adapters.prometheus_mcp import (
     _FINISH_TOOL_NAME,
@@ -141,9 +142,7 @@ class RepositoryPrometheusRemoteResponseStore:
                 "tool_name": tool_name,
                 "invocation_id": str(invocation_id),
                 "outer_dispatch_id": (
-                    str(self.outer_dispatch_id)
-                    if self.outer_dispatch_id is not None
-                    else None
+                    str(self.outer_dispatch_id) if self.outer_dispatch_id is not None else None
                 ),
                 "sanitized": False,
                 "raw_response_unmodified": True,
@@ -256,7 +255,7 @@ class PrometheusHarnessState:
         return PrometheusMCPClient.responses_have_monitoring_data(self.responses)
 
 
-_PROMETHEUS_SSE_TRANSPORT_ERROR_CODE = "prometheus_sse_transport_error"
+_PROMETHEUS_MCP_TRANSPORT_ERROR_CODE = "prometheus_mcp_transport_error"
 
 
 def _no_redirect_http_client(
@@ -264,7 +263,7 @@ def _no_redirect_http_client(
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
 ) -> httpx.AsyncClient:
-    """Build the SSE transport client without forwarding credentials on redirects."""
+    """Build an MCP transport client without forwarding credentials on redirects."""
 
     return httpx.AsyncClient(
         headers=headers,
@@ -274,30 +273,24 @@ def _no_redirect_http_client(
     )
 
 
-class _PrometheusSSETransportError(PrometheusMCPProtocolError):
-    code = _PROMETHEUS_SSE_TRANSPORT_ERROR_CODE
+class _PrometheusMCPTransportError(PrometheusMCPProtocolError):
+    code = _PROMETHEUS_MCP_TRANSPORT_ERROR_CODE
     retryable = True
 
     def __init__(self, *, operation: str, leaf: BaseException) -> None:
         detail = sanitize_text(str(leaf))[:500]
         suffix = f": {detail}" if detail else ""
-        super().__init__(
-            f"Prometheus SSE MCP {operation} failed ({type(leaf).__name__}){suffix}"
-        )
+        super().__init__(f"Prometheus MCP {operation} failed ({type(leaf).__name__}){suffix}")
         self.leaf_type = type(leaf).__name__
 
 
 def _exception_leaves(error: BaseException) -> list[BaseException]:
     if isinstance(error, BaseExceptionGroup):
-        return [
-            leaf
-            for nested in error.exceptions
-            for leaf in _exception_leaves(nested)
-        ]
+        return [leaf for nested in error.exceptions for leaf in _exception_leaves(nested)]
     return [error]
 
 
-def _is_sse_transport_error(error: BaseException) -> bool:
+def _is_mcp_transport_error(error: BaseException) -> bool:
     if isinstance(
         error,
         (
@@ -319,7 +312,7 @@ def _is_sse_transport_error(error: BaseException) -> bool:
     )
 
 
-def _normalized_sse_exception(
+def _normalized_transport_exception(
     error: BaseException,
     *,
     operation: str,
@@ -329,12 +322,12 @@ def _normalized_sse_exception(
         if isinstance(leaf, PrometheusMCPError):
             return leaf
     for leaf in leaves:
-        if _is_sse_transport_error(leaf):
-            return _PrometheusSSETransportError(operation=operation, leaf=leaf)
+        if _is_mcp_transport_error(leaf):
+            return _PrometheusMCPTransportError(operation=operation, leaf=leaf)
     return None
 
 
-class PrometheusSSEMCPToolSession:
+class PrometheusMCPToolSession:
     """One initialized SDK session owned by an ``AsyncExitStack``."""
 
     def __init__(
@@ -343,11 +336,12 @@ class PrometheusSSEMCPToolSession:
         client: PrometheusMCPClient,
         stack: AsyncExitStack,
         session: Any,
+        session_id: str,
     ) -> None:
         self.client = client
         self._stack = stack
         self._session = session
-        self._session_id = f"prometheus-sse-{uuid4()}"
+        self._session_id = session_id
         self._closed = False
 
     @property
@@ -382,7 +376,7 @@ class PrometheusSSEMCPToolSession:
             if not raw_tools:
                 raise PrometheusMCPProtocolError("Prometheus MCP returned no tools")
         except BaseException as exc:
-            normalized = _normalized_sse_exception(exc, operation="tool discovery")
+            normalized = _normalized_transport_exception(exc, operation="tool discovery")
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
@@ -392,7 +386,7 @@ class PrometheusSSEMCPToolSession:
         try:
             raw_result = await self._session.call_tool(name, arguments)
         except BaseException as exc:
-            normalized = _normalized_sse_exception(exc, operation="tool call")
+            normalized = _normalized_transport_exception(exc, operation="tool call")
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
@@ -408,19 +402,11 @@ class PrometheusSSEMCPToolSession:
     def _convert_tool(tool: Any) -> DiscoveredMCPTool:
         raw = tool.model_dump(mode="json") if hasattr(tool, "model_dump") else tool
         if not isinstance(raw, Mapping):
-            raise PrometheusMCPProtocolError(
-                "Prometheus MCP tool schema is not an object"
-            )
+            raise PrometheusMCPProtocolError("Prometheus MCP tool schema is not an object")
         name = raw.get("name")
         schema = raw.get("inputSchema") or raw.get("input_schema") or {"type": "object"}
-        if (
-            not isinstance(name, str)
-            or not name
-            or not isinstance(schema, dict)
-        ):
-            raise PrometheusMCPProtocolError(
-                "Prometheus MCP returned an invalid tool schema"
-            )
+        if not isinstance(name, str) or not name or not isinstance(schema, dict):
+            raise PrometheusMCPProtocolError("Prometheus MCP returned an invalid tool schema")
         return DiscoveredMCPTool(
             name=name,
             description=str(raw.get("description") or f"Prometheus MCP tool {name}"),
@@ -428,52 +414,69 @@ class PrometheusSSEMCPToolSession:
         )
 
 
-class PrometheusSSEMCPConnector:
-    """Open one SSE MCP session behind the provider-neutral connector API."""
+class PrometheusMCPConnector:
+    """Open one configured MCP session behind the provider-neutral connector API."""
 
     provider = PROMETHEUS_MCP_SERVER_NAME
 
     def __init__(self, client: PrometheusMCPClient) -> None:
         self.client = client
 
-    async def open_session(self) -> PrometheusSSEMCPToolSession:
+    async def open_session(self) -> PrometheusMCPToolSession:
         stack = AsyncExitStack()
         try:
-            read_stream, write_stream = await stack.enter_async_context(
-                sse_client(
-                    self.client.mcp_url,
-                    headers=self.client.headers,
-                    timeout=self.client.timeout_seconds,
-                    sse_read_timeout=self.client.sse_read_timeout_seconds,
-                    httpx_client_factory=_no_redirect_http_client,
+            session_id = f"prometheus-mcp-{uuid4()}"
+            get_session_id: Any = None
+            if self.client.mcp_transport == "sse":
+                read_stream, write_stream = await stack.enter_async_context(
+                    sse_client(
+                        self.client.mcp_url,
+                        headers=self.client.headers,
+                        timeout=self.client.timeout_seconds,
+                        sse_read_timeout=self.client.sse_read_timeout_seconds,
+                        httpx_client_factory=_no_redirect_http_client,
+                    )
                 )
-            )
+            else:
+                http_client = await stack.enter_async_context(
+                    _no_redirect_http_client(
+                        headers=dict(self.client.headers),
+                        timeout=httpx.Timeout(self.client.timeout_seconds),
+                    )
+                )
+                read_stream, write_stream, get_session_id = await stack.enter_async_context(
+                    streamable_http_client(
+                        self.client.mcp_url,
+                        http_client=http_client,
+                    )
+                )
             session = await stack.enter_async_context(
                 ClientSession(
                     read_stream,
                     write_stream,
-                    read_timeout_seconds=timedelta(
-                        seconds=self.client.timeout_seconds
-                    ),
+                    read_timeout_seconds=timedelta(seconds=self.client.timeout_seconds),
                     client_info=mcp_types.Implementation(
                         name="database-alert-agent", version="0.1.0"
                     ),
                 )
             )
             await session.initialize()
+            if get_session_id is not None:
+                session_id = str(get_session_id() or session_id)
         except BaseException as exc:
             try:
                 await stack.aclose()
             except BaseException:
                 pass
-            normalized = _normalized_sse_exception(exc, operation="session setup")
+            normalized = _normalized_transport_exception(exc, operation="session setup")
             if normalized is None or normalized is exc:
                 raise
             raise normalized from exc
-        return PrometheusSSEMCPToolSession(
+        return PrometheusMCPToolSession(
             client=self.client,
             stack=stack,
             session=session,
+            session_id=session_id,
         )
 
 
@@ -611,9 +614,7 @@ class PrometheusHarnessPlanner:
                 "second_error_type": (
                     latest["error_type"] if len(self.consecutive_errors) > 1 else None
                 ),
-                "second_error": (
-                    latest["error"] if len(self.consecutive_errors) > 1 else None
-                ),
+                "second_error": (latest["error"] if len(self.consecutive_errors) > 1 else None),
                 "remote_calls_used": len(state.executed_calls),
                 "available_tools": [
                     item.get("function", {}).get("name")
@@ -665,15 +666,11 @@ class PrometheusHarnessScenario:
             self._state.monitoring_scope_reason = sanitize_text(reason)
         if isinstance(engines, list):
             self._state.monitored_database_engines = [
-                sanitize_text(item)
-                for item in engines
-                if isinstance(item, str) and item.strip()
+                sanitize_text(item) for item in engines if isinstance(item, str) and item.strip()
             ]
         if isinstance(targets, list):
             self._state.monitoring_target_identifiers = [
-                sanitize_text(item)
-                for item in targets
-                if isinstance(item, str) and item.strip()
+                sanitize_text(item) for item in targets if isinstance(item, str) and item.strip()
             ]
 
     def restore_state(self, state: PrometheusHarnessState) -> None:
@@ -693,7 +690,7 @@ class PrometheusHarnessScenario:
 
     async def bootstrap(
         self,
-        session: PrometheusSSEMCPToolSession,
+        session: PrometheusMCPToolSession,
         state: PrometheusHarnessState,
     ) -> PrometheusHarnessState:
         del session
@@ -702,9 +699,7 @@ class PrometheusHarnessScenario:
 
     def build_tool_specs(self, tools: list[DiscoveredMCPTool]) -> list[ToolSpec]:
         converted = self.client.discovered_model_tools(tools)
-        self.model_tools = {
-            str(item["function"]["name"]): deepcopy(item) for item in converted
-        }
+        self.model_tools = {str(item["function"]["name"]): deepcopy(item) for item in converted}
         specs: list[ToolSpec] = []
         for name in sorted(self.model_tools):
             model_tool = self.model_tools[name]["function"]
@@ -741,9 +736,7 @@ class PrometheusHarnessScenario:
                 "call_id": call.call_id,
                 "request_id": call.request_id,
                 "capability": "remote_tool",
-                "provider_output_items": [
-                    deepcopy(item) for item in call.provider_output_items
-                ],
+                "provider_output_items": [deepcopy(item) for item in call.provider_output_items],
             },
         )
 
@@ -772,9 +765,7 @@ class PrometheusHarnessScenario:
             "model_arguments": sanitize(call.model_arguments),
             "arguments": sanitize(call.effective_arguments),
             "capability": "remote_tool",
-            "projection_kind": (
-                "alert_window_range" if qualified else "auxiliary"
-            ),
+            "projection_kind": ("alert_window_range" if qualified else "auxiliary"),
             "has_monitoring_observation": qualified,
             "root_cause_eligible": qualified,
             "root_cause_ineligible_reason": "" if qualified else "auxiliary_response",
@@ -784,11 +775,7 @@ class PrometheusHarnessScenario:
             response["projection"] = deepcopy(trace_projection)
         if result is not None:
             updated.responses.append(response)
-        status = (
-            ToolInvocationStatus.NO_DATA
-            if result is None
-            else ToolInvocationStatus.SUCCEEDED
-        )
+        status = ToolInvocationStatus.NO_DATA if result is None else ToolInvocationStatus.SUCCEEDED
         attempt = {
             "tool_name": call.tool_name,
             "model_arguments": sanitize(call.model_arguments),
@@ -922,17 +909,14 @@ class PrometheusHarnessScenario:
                 reason=sanitize_text(str(leaf))[:1000],
                 continue_run=True,
             )
-        retryable_transport = (
-            isinstance(
-                leaf,
-                (
-                    _PrometheusSSETransportError,
-                    ConnectionError,
-                    TimeoutError,
-                ),
-            )
-            or bool(getattr(leaf, "unknown_outcome", False))
-        )
+        retryable_transport = isinstance(
+            leaf,
+            (
+                _PrometheusMCPTransportError,
+                ConnectionError,
+                TimeoutError,
+            ),
+        ) or bool(getattr(leaf, "unknown_outcome", False))
         if not retryable_transport:
             return RetryDirective(
                 reason=sanitize_text(str(leaf))[:1000] or type(leaf).__name__,
@@ -988,17 +972,13 @@ class PrometheusHarnessScenario:
         provider_output_items = call.metadata.get("provider_output_items")
         return MCPModelToolCall(
             call_id=(
-                call_id
-                if isinstance(call_id, str) and call_id
-                else f"prometheus-harness-{uuid4()}"
+                call_id if isinstance(call_id, str) and call_id else f"prometheus-harness-{uuid4()}"
             ),
             name=call.tool_name,
             arguments=deepcopy(call.model_arguments),
             request_id=request_id if isinstance(request_id, str) else None,
             provider_output_items=tuple(
-                deepcopy(item)
-                for item in provider_output_items
-                if isinstance(item, dict)
+                deepcopy(item) for item in provider_output_items if isinstance(item, dict)
             )
             if isinstance(provider_output_items, list)
             else (),
@@ -1014,6 +994,7 @@ class PrometheusHarnessScenario:
             default=str,
         )
         return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
+
 
 async def collect_prometheus_with_harness(
     client: PrometheusMCPClient,
@@ -1079,7 +1060,7 @@ async def collect_prometheus_with_harness(
         PrometheusHarnessState,
         dict[str, Any],
     ](
-        connector=PrometheusSSEMCPConnector(client),
+        connector=PrometheusMCPConnector(client),
         planner=planner,
         scenario=scenario,
         dispatch_scope_id=context.outer_dispatch_id,
@@ -1092,13 +1073,11 @@ async def collect_prometheus_with_harness(
         session_timeout_seconds=client.timeout_seconds,
         # Same rationale as Archery: durable reasoning deltas dominate
         # planner wall time inside the bounded client timeout, and the
-            # MODEL_DECISION / TRACE_REASONING.
+        # MODEL_DECISION / TRACE_REASONING.
         stream_planner_reasoning=False,
     )
     checkpoint = (
-        await checkpoint_store.load(context.run_id)
-        if checkpoint_store is not None
-        else None
+        await checkpoint_store.load(context.run_id) if checkpoint_store is not None else None
     )
     if checkpoint is None:
         harness_result = await runtime.run(run_id=context.run_id)
@@ -1132,10 +1111,7 @@ async def collect_prometheus_with_harness(
     attempts.extend(state_attempts)
 
     has_monitoring_data = state.has_monitoring_data
-    finished_by_model = (
-        finish.model_requested
-        and finish.reason == RuntimeStopReason.COMPLETED
-    )
+    finished_by_model = finish.model_requested and finish.reason == RuntimeStopReason.COMPLETED
     if state.monitoring_scope_status == "out_of_scope":
         termination_reason = "database_not_monitored"
     elif state.monitoring_scope_status == "unknown" and not has_monitoring_data:
@@ -1162,14 +1138,12 @@ async def collect_prometheus_with_harness(
         termination_error_detail = state.last_error_detail
         if termination_error_type is None and state.consecutive_model_errors:
             termination_error_type = PrometheusMCPModelError.__name__
-            termination_error_detail = sanitize_text(
-                state.consecutive_model_errors[-1]["error"]
-            )[:1000]
+            termination_error_detail = sanitize_text(state.consecutive_model_errors[-1]["error"])[
+                :1000
+            ]
         if termination_error_type is None:
             failed_sessions = [
-                event
-                for event in events
-                if event.kind == AgentEventKind.MCP_SESSION_FAILED
+                event for event in events if event.kind == AgentEventKind.MCP_SESSION_FAILED
             ]
             if failed_sessions:
                 last_failure = failed_sessions[-1]
@@ -1217,8 +1191,8 @@ __all__ = [
     "PrometheusHarnessRuntimeDependencies",
     "PrometheusHarnessScenario",
     "PrometheusHarnessState",
-    "PrometheusSSEMCPConnector",
-    "PrometheusSSEMCPToolSession",
+    "PrometheusMCPConnector",
+    "PrometheusMCPToolSession",
     "RepositoryPrometheusRemoteResponseStore",
     "collect_prometheus_with_harness",
 ]

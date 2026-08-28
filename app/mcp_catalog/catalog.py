@@ -15,8 +15,17 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
+
+MCPTransport = Literal["sse", "streamable_http"]
+DEFAULT_MCP_TRANSPORT: Final[MCPTransport] = "streamable_http"
+MCP_TRANSPORTS: Final[frozenset[MCPTransport]] = frozenset(
+    {
+        "sse",
+        "streamable_http",
+    }
+)
 
 _ENV_REFERENCE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _SERVER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}")
@@ -134,6 +143,9 @@ class MCPServerDescriptor:
             if not name:
                 continue
             _add_resolved_header(headers, name, value, server_name=self.name)
+        transport = _configured_transport(
+            self.provider_options.get("transport"), server_name=self.name
+        )
         return ResolvedMCPConnection(
             url=_validate_resolved_url(
                 url,
@@ -141,6 +153,7 @@ class MCPServerDescriptor:
                 require_https=require_https,
             ),
             headers=MappingProxyType(headers),
+            transport=transport,
         )
 
 
@@ -150,6 +163,7 @@ class ResolvedMCPConnection:
 
     url: str
     headers: Mapping[str, str]
+    transport: MCPTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,9 +200,7 @@ def load_mcp_catalog(settings_path: Path | str) -> MCPCatalog:
     raw = _load_json(path)
     servers = raw.get("mcpServers") if isinstance(raw, dict) else None
     if not isinstance(servers, dict):
-        raise MCPCatalogConfigurationError(
-            "MCP settings must define an object named 'mcpServers'"
-        )
+        raise MCPCatalogConfigurationError("MCP settings must define an object named 'mcpServers'")
 
     descriptors: list[MCPServerDescriptor] = []
     for raw_name, raw_server in servers.items():
@@ -219,26 +231,18 @@ def _load_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
     except FileNotFoundError as exc:
-        raise MCPCatalogConfigurationError(
-            f"MCP settings file does not exist: {path}"
-        ) from exc
+        raise MCPCatalogConfigurationError(f"MCP settings file does not exist: {path}") from exc
     except UnicodeDecodeError as exc:
-        raise MCPCatalogConfigurationError(
-            f"MCP settings file is not valid UTF-8: {path}"
-        ) from exc
+        raise MCPCatalogConfigurationError(f"MCP settings file is not valid UTF-8: {path}") from exc
     except (OSError, json.JSONDecodeError) as exc:
-        raise MCPCatalogConfigurationError(
-            f"MCP settings file is not valid JSON: {path}"
-        ) from exc
+        raise MCPCatalogConfigurationError(f"MCP settings file is not valid JSON: {path}") from exc
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise MCPCatalogConfigurationError(
-                f"MCP settings contain duplicate JSON key {key!r}"
-            )
+            raise MCPCatalogConfigurationError(f"MCP settings contain duplicate JSON key {key!r}")
         result[key] = value
     return result
 
@@ -267,20 +271,14 @@ def _parse_server(
     raw_server: Mapping[str, Any],
     settings_directory: Path,
 ) -> MCPServerDescriptor:
-    url_template = _environment_reference(
-        raw_server.get("url"), field=f"MCP server {name!r} url"
-    )
+    url_template = _environment_reference(raw_server.get("url"), field=f"MCP server {name!r} url")
     raw_headers = raw_server.get("headers", {})
     if not isinstance(raw_headers, dict):
-        raise MCPCatalogConfigurationError(
-            f"MCP server {name!r} headers must be an object"
-        )
+        raise MCPCatalogConfigurationError(f"MCP server {name!r} headers must be an object")
     headers, header_variables = _parse_header_templates(name, raw_headers)
     raw_optional_headers = raw_server.get("optionalHeaders", {})
     if not isinstance(raw_optional_headers, dict):
-        raise MCPCatalogConfigurationError(
-            f"MCP server {name!r} optionalHeaders must be an object"
-        )
+        raise MCPCatalogConfigurationError(f"MCP server {name!r} optionalHeaders must be an object")
     optional_headers, optional_header_variables = _parse_header_templates(
         name, raw_optional_headers, field_name="optionalHeaders"
     )
@@ -296,15 +294,11 @@ def _parse_server(
         settings_directory=settings_directory,
     )
     provider_options = {
-        key: deepcopy(raw_server[key])
-        for key in _PROVIDER_OPTION_NAMES
-        if key in raw_server
+        key: deepcopy(raw_server[key]) for key in _PROVIDER_OPTION_NAMES if key in raw_server
     }
     url_variable = _ENV_REFERENCE.fullmatch(url_template)
     assert url_variable is not None
-    referenced_variables = tuple(
-        dict.fromkeys((url_variable.group(1), *header_variables))
-    )
+    referenced_variables = tuple(dict.fromkeys((url_variable.group(1), *header_variables)))
     return MCPServerDescriptor(
         name=name,
         url_template=url_template,
@@ -338,30 +332,27 @@ def _validate_server_fields(name: str, raw_server: Mapping[str, Any]) -> None:
 def _validate_provider_options(name: str, raw_server: Mapping[str, Any]) -> None:
     if "toolTimeoutSeconds" in raw_server:
         value = raw_server["toolTimeoutSeconds"]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 1 <= value <= 1200
-        ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= value <= 1200:
             raise MCPCatalogConfigurationError(
                 f"MCP server {name!r} toolTimeoutSeconds must be between 1 and 1200"
             )
-    if "transport" in raw_server and raw_server["transport"] not in {
-        "sse",
-        "streamable_http",
-    }:
-        raise MCPCatalogConfigurationError(
-            f"MCP server {name!r} transport must be sse or streamable_http"
-        )
+    if "transport" in raw_server:
+        _configured_transport(raw_server["transport"], server_name=name)
+
+
+def _configured_transport(value: Any, *, server_name: str) -> MCPTransport:
+    if isinstance(value, str) and value in MCP_TRANSPORTS:
+        return cast(MCPTransport, value)
+    if value is None:
+        return DEFAULT_MCP_TRANSPORT
+    raise MCPCatalogConfigurationError(
+        f"MCP server {server_name!r} transport must be sse or streamable_http"
+    )
 
 
 def _option_name_tokens(value: str) -> set[str]:
     separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
-    return {
-        token.casefold()
-        for token in re.split(r"[^A-Za-z0-9]+", separated)
-        if token
-    }
+    return {token.casefold() for token in re.split(r"[^A-Za-z0-9]+", separated) if token}
 
 
 def _reject_embedded_connection_values(value: Any, *, field: str) -> None:
@@ -465,9 +456,7 @@ def _resolve_header_name(
     else:
         value = template
     if value and _HEADER_NAME.fullmatch(value) is None:
-        raise MCPCatalogConfigurationError(
-            f"Resolved MCP header name {value!r} is invalid"
-        )
+        raise MCPCatalogConfigurationError(f"Resolved MCP header name {value!r} is invalid")
     return value
 
 
@@ -582,9 +571,7 @@ def _load_prompts(
         **contents,
         workflow_directives=MappingProxyType(directives),
         workflow_revision=(
-            sha256(authored_workflow.encode("utf-8")).hexdigest()
-            if directives
-            else ""
+            sha256(authored_workflow.encode("utf-8")).hexdigest() if directives else ""
         ),
     )
 

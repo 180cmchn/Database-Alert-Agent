@@ -160,12 +160,8 @@ class Settings(BaseSettings):
     flashduty_polling_enabled: bool = False
     flashduty_poll_interval_seconds: int = Field(default=300, ge=300, le=86400)
     flashduty_poll_lookback_seconds: int = Field(default=900, ge=300, le=2678400)
-    flashduty_poll_channel_ids: Annotated[list[int], NoDecode] = Field(
-        default_factory=list
-    )
-    flashduty_poll_integration_ids: Annotated[list[int], NoDecode] = Field(
-        default_factory=list
-    )
+    flashduty_poll_channel_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    flashduty_poll_integration_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     # These capability gates stay off until a read-only deployment audit shows
     # that the scoped collaboration spaces have corresponding upstream data.
     flashduty_monitors_enabled: bool = False
@@ -195,9 +191,9 @@ class Settings(BaseSettings):
     archery_investigation_budget_seconds: float = Field(default=150, gt=0, le=1200)
     archery_mcp_tool_timeout_seconds: float = Field(default=180, gt=0, le=1200)
 
-    # Prometheus is a deployment-only SSE MCP evidence source. Its endpoint and
+    # Prometheus is a deployment-only MCP evidence source. Its endpoint and
     # authentication material must not be changed through the admin API.
-    prometheus_mcp_sse_url: str = ""
+    prometheus_mcp_url: str = ""
     prometheus_mcp_api_key: str = Field(default="", repr=False)
     prometheus_mcp_api_key_header: str = ""
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
@@ -213,9 +209,7 @@ class Settings(BaseSettings):
 
     # Selectable knowledge-source names. Empty is valid: the Agent then uses the
     # alert, live evidence, and general reasoning without advisory knowledge.
-    knowledge_sources: Annotated[list[str], NoDecode] = Field(
-        default_factory=list
-    )
+    knowledge_sources: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     kafka_enabled: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
@@ -286,22 +280,10 @@ class Settings(BaseSettings):
                 raw = json.loads(stripped)
                 if not isinstance(raw, list):
                     return raw
-                return list(
-                    dict.fromkeys(
-                        str(item).strip() for item in raw if str(item).strip()
-                    )
-                )
-            return list(
-                dict.fromkeys(
-                    item.strip() for item in stripped.split(",") if item.strip()
-                )
-            )
+                return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+            return list(dict.fromkeys(item.strip() for item in stripped.split(",") if item.strip()))
         if isinstance(value, (list, tuple)):
-            return list(
-                dict.fromkeys(
-                    str(item).strip() for item in value if str(item).strip()
-                )
-            )
+            return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
         return value
 
     @model_validator(mode="after")
@@ -313,7 +295,7 @@ class Settings(BaseSettings):
             ("flashduty_base_url", True),
             ("external_knowledge_base_url", False),
             ("archery_mcp_url", False),
-            ("prometheus_mcp_sse_url", False),
+            ("prometheus_mcp_url", False),
         ):
             value = getattr(self, field_name).strip()
             if not value and not required:
@@ -338,12 +320,8 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "wecom_webhook_url must be an official HTTPS WeCom group robot URL"
                     )
-            if field_name == "wecom_page_base_url" and (
-                parsed.query or parsed.fragment
-            ):
-                raise ValueError(
-                    "wecom_page_base_url must not contain a query or fragment"
-                )
+            if field_name == "wecom_page_base_url" and (parsed.query or parsed.fragment):
+                raise ValueError("wecom_page_base_url must not contain a query or fragment")
             if field_name == "flashduty_base_url" and (
                 parsed.scheme != "https"
                 or parsed.hostname != "api.flashcat.cloud"
@@ -361,11 +339,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "archery_mcp_url must be the full MCP endpoint without query or fragment"
                 )
-            if field_name == "prometheus_mcp_sse_url" and (
+            if field_name == "prometheus_mcp_url" and (
                 parsed.query or parsed.fragment or parsed.path in {"", "/"}
             ):
                 raise ValueError(
-                    "prometheus_mcp_sse_url must be the full SSE endpoint without query or fragment"
+                    "prometheus_mcp_url must be the full MCP endpoint without query or fragment"
                 )
             if (
                 field_name != "external_knowledge_base_url"
@@ -373,29 +351,21 @@ class Settings(BaseSettings):
                 and parsed.scheme != "https"
             ):
                 raise ValueError(f"{field_name} must use HTTPS in production")
-        if (
-            self.app_env.lower() in {"production", "prod"}
-            and self.ai_provider == "fake"
-        ):
+        if self.app_env.lower() in {"production", "prod"} and self.ai_provider == "fake":
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
         if self.flashduty_logs_ds_type not in {"loki", "victorialogs"}:
             raise ValueError("FLASHDUTY_LOGS_DS_TYPE must be loki or victorialogs")
         if (
             self.flashduty_polling_enabled
-            and self.flashduty_poll_lookback_seconds
-            < self.flashduty_poll_interval_seconds
+            and self.flashduty_poll_lookback_seconds < self.flashduty_poll_interval_seconds
         ):
             raise ValueError(
                 "FLASHDUTY_POLL_LOOKBACK_SECONDS must be greater than or equal to "
                 "FLASHDUTY_POLL_INTERVAL_SECONDS when polling is enabled"
             )
-        if (
-            self.archery_mcp_tool_timeout_seconds
-            <= self.archery_investigation_budget_seconds
-        ):
+        if self.archery_mcp_tool_timeout_seconds <= self.archery_investigation_budget_seconds:
             raise ValueError(
-                "ARCHERY_MCP_TOOL_TIMEOUT_SECONDS must exceed "
-                "ARCHERY_INVESTIGATION_BUDGET_SECONDS"
+                "ARCHERY_MCP_TOOL_TIMEOUT_SECONDS must exceed ARCHERY_INVESTIGATION_BUDGET_SECONDS"
             )
         return self
 
@@ -421,17 +391,16 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def prometheus_mcp_enabled(self) -> bool:
-        """Enable Prometheus evidence when its SSE endpoint is configured."""
+        """Enable Prometheus evidence when its MCP endpoint is configured."""
 
-        return bool(self.prometheus_mcp_sse_url.strip())
+        return bool(self.prometheus_mcp_url.strip())
 
     def external_knowledge_api_key_is_current(self) -> bool:
         """Return whether the secret is bound to the active deployment URL."""
 
         return bool(self.external_knowledge_api_key) and (
             not self.external_knowledge_api_key_base_url
-            or self.external_knowledge_api_key_base_url
-            == self.external_knowledge_base_url
+            or self.external_knowledge_api_key_base_url == self.external_knowledge_base_url
         )
 
     def effective_external_knowledge_api_key(self) -> str:
@@ -452,13 +421,9 @@ class Settings(BaseSettings):
             issues.append(f"Unsupported AI_PROVIDER: {self.ai_provider}")
 
         if self.wecom_enabled and not self.wecom_webhook_url:
-            issues.append(
-                "WECOM_WEBHOOK_URL is required when WeCom notifications are enabled"
-            )
+            issues.append("WECOM_WEBHOOK_URL is required when WeCom notifications are enabled")
         if self.wecom_enabled and not self.wecom_page_base_url:
-            issues.append(
-                "WECOM_PAGE_BASE_URL is required when WeCom notifications are enabled"
-            )
+            issues.append("WECOM_PAGE_BASE_URL is required when WeCom notifications are enabled")
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.flashduty_enabled and not self.flashduty_app_key:
@@ -486,9 +451,7 @@ class Settings(BaseSettings):
                 "ARCHERY_MCP_TOKEN": self.archery_mcp_token,
             }
             missing_archery_settings = [
-                name
-                for name, value in required_archery_settings.items()
-                if not value.strip()
+                name for name, value in required_archery_settings.items() if not value.strip()
             ]
             if missing_archery_settings:
                 issues.append(
@@ -496,17 +459,11 @@ class Settings(BaseSettings):
                     + ", ".join(missing_archery_settings)
                 )
             elif not self.mcp_settings_path.is_file():
-                issues.append(
-                    f"MCP settings file does not exist: {self.mcp_settings_path}"
-                )
+                issues.append(f"MCP settings file does not exist: {self.mcp_settings_path}")
             elif self.ai_provider not in REAL_AI_PROVIDERS:
-                issues.append(
-                    "Archery MCP requires a real AI provider model with tool calling"
-                )
-        prometheus_url_configured = bool(self.prometheus_mcp_sse_url.strip())
-        prometheus_header_configured = bool(
-            self.prometheus_mcp_api_key_header.strip()
-        )
+                issues.append("Archery MCP requires a real AI provider model with tool calling")
+        prometheus_url_configured = bool(self.prometheus_mcp_url.strip())
+        prometheus_header_configured = bool(self.prometheus_mcp_api_key_header.strip())
         prometheus_key_configured = bool(self.prometheus_mcp_api_key.strip())
         if any(
             (
@@ -515,9 +472,7 @@ class Settings(BaseSettings):
                 prometheus_key_configured,
             )
         ):
-            prometheus_auth_complete = (
-                prometheus_header_configured == prometheus_key_configured
-            )
+            prometheus_auth_complete = prometheus_header_configured == prometheus_key_configured
             if not prometheus_auth_complete:
                 issues.append(
                     "Prometheus MCP authentication is incomplete; "
@@ -526,14 +481,11 @@ class Settings(BaseSettings):
                 )
             if not prometheus_url_configured:
                 issues.append(
-                    "Prometheus MCP configuration is incomplete; missing: "
-                    "PROMETHEUS_MCP_SSE_URL"
+                    "Prometheus MCP configuration is incomplete; missing: PROMETHEUS_MCP_URL"
                 )
             elif prometheus_auth_complete:
                 if not self.mcp_settings_path.is_file():
-                    issues.append(
-                        f"MCP settings file does not exist: {self.mcp_settings_path}"
-                    )
+                    issues.append(f"MCP settings file does not exist: {self.mcp_settings_path}")
                 elif self.ai_provider not in REAL_AI_PROVIDERS:
                     issues.append(
                         "Prometheus MCP requires a real AI provider model with tool calling"
@@ -547,13 +499,9 @@ class Settings(BaseSettings):
             and not self.external_knowledge_base_url.strip()
         ):
             issues.append(
-                "EXTERNAL_KNOWLEDGE_BASE_URL is required when external knowledge "
-                "is selected"
+                "EXTERNAL_KNOWLEDGE_BASE_URL is required when external knowledge is selected"
             )
-        if (
-            self.external_knowledge_api_key
-            and not self.external_knowledge_api_key_is_current()
-        ):
+        if self.external_knowledge_api_key and not self.external_knowledge_api_key_is_current():
             issues.append(
                 "EXTERNAL_KNOWLEDGE_API_KEY must be re-entered after "
                 "EXTERNAL_KNOWLEDGE_BASE_URL changes"

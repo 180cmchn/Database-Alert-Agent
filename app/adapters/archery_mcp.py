@@ -43,8 +43,10 @@ from app.domain.models import (
 )
 from app.domain.tool_calling import MCPModelToolCall, MCPToolCallingModel
 from app.mcp_catalog import (
+    MCP_TRANSPORTS,
     MCPCatalogConfigurationError,
     MCPPromptBundle,
+    MCPTransport,
     load_mcp_catalog,
 )
 
@@ -160,9 +162,7 @@ _HISTORY_COMPACT_PROJECTION_EXPRESSIONS: Final = (
 _ARCHERY_TRACE_SELECTED_ROWS: Final = 3
 _ARCHERY_TRACE_TEXT_CHARS: Final = 400
 _ARCHERY_TABULAR_ROW_KEYS: Final = ("rows", "result", "results", "data")
-_ENDPOINT_HOST_COLUMN_NAMES: Final = frozenset(
-    {"fip", "host", "hostip", "hostname", "ip"}
-)
+_ENDPOINT_HOST_COLUMN_NAMES: Final = frozenset({"fip", "host", "hostip", "hostname", "ip"})
 _ENDPOINT_PORT_COLUMN_NAMES: Final = frozenset({"fport", "hostport", "port"})
 
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
@@ -220,9 +220,7 @@ _SLOW_LOG_TABLE_TEXT: Final = re.compile(
     r"(?P<name>[A-Za-z0-9_$-]*slow(?:[_$-]*query)?(?:[_$-]*log|[_$-]*review[_$-]*history)[A-Za-z0-9_$-]*)"
     r"(?![A-Za-z0-9_$])"
 )
-_INSTANCE_LIST_HEADER_TEXT: Final = re.compile(
-    r"^\s*实例清单（第\s*\d+\s*页）[：:]\s*$"
-)
+_INSTANCE_LIST_HEADER_TEXT: Final = re.compile(r"^\s*实例清单（第\s*\d+\s*页）[：:]\s*$")
 _INSTANCE_LIST_ROW_TEXT: Final = re.compile(
     r"^\s*\d+\.\s*\[ID:(?P<instance_id>[1-9]\d*)\]\s+"
     r"(?P<instance_ref>\S+)\s+(?P<endpoint>\S+:\d{1,5})\s+"
@@ -231,9 +229,7 @@ _INSTANCE_LIST_ROW_TEXT: Final = re.compile(
 _DATABASE_LIST_HEADER_TEXT: Final = re.compile(
     r"^\s*实例\s+(?P<instance_id>[1-9]\d*)\s+的数据库清单[：:]\s*$"
 )
-_DATABASE_LIST_ROW_TEXT: Final = re.compile(
-    r"^\s*\d+\.\s+(?P<db_name>\S+)\s*$"
-)
+_DATABASE_LIST_ROW_TEXT: Final = re.compile(r"^\s*\d+\.\s+(?P<db_name>\S+)\s*$")
 _ALLOWLIST_REJECTION_TEXT: Final = re.compile(
     r"^\s*(?:"
     r"未在\s*allowlist\.json\s*中找到实例引用|"
@@ -330,6 +326,7 @@ class MCPServerSettings:
     url: str
     headers: dict[str, str]
     prompts: MCPPromptBundle
+    transport: MCPTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +368,7 @@ def load_mcp_server_settings(
         url=connection.url,
         headers=dict(connection.headers),
         prompts=descriptor.prompts,
+        transport=connection.transport,
     )
 
 
@@ -421,7 +419,7 @@ class ArcheryMCPClient:
         timeout_seconds: float = 60,
         investigation_budget_seconds: float = 150,
         deterministic_history_pipeline: bool = True,
-        transport: httpx.AsyncBaseTransport | None = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
         harness_connector: Any | None = None,
         harness_runtime_dependencies: Any | None = None,
     ) -> None:
@@ -438,6 +436,10 @@ class ArcheryMCPClient:
                 "The Archery MCP settings URL must be an absolute HTTP(S) endpoint "
                 "without embedded credentials, query, or fragment"
             )
+        if server.transport not in MCP_TRANSPORTS:
+            raise ArcheryMCPConfigurationError(
+                "Archery MCP transport must be sse or streamable_http"
+            )
         if not 60 <= window_seconds <= 86_400:
             raise ArcheryMCPConfigurationError(
                 "Archery slow-log window must be between 60 and 86400 seconds"
@@ -446,6 +448,7 @@ class ArcheryMCPClient:
             raise ArcheryMCPConfigurationError(
                 "Archery investigation budget must be greater than zero"
             )
+        self.mcp_transport = server.transport
         self.mcp_url = server.url.strip()
         self.slow_log_time_column = ARCHERY_SLOW_LOG_TIME_COLUMN
         self.window_seconds = window_seconds
@@ -455,7 +458,7 @@ class ArcheryMCPClient:
         self.model = model
         self.prompts = server.prompts
         self._headers = dict(server.headers)
-        self._transport = transport
+        self._http_transport = http_transport
         self._harness_connector = harness_connector
         self._harness_runtime_dependencies = harness_runtime_dependencies
 
@@ -466,10 +469,10 @@ class ArcheryMCPClient:
         return self._headers
 
     @property
-    def transport(self) -> httpx.AsyncBaseTransport | None:
+    def http_transport(self) -> httpx.AsyncBaseTransport | None:
         """Optional HTTP transport override used by deterministic tests."""
 
-        return self._transport
+        return self._http_transport
 
     @classmethod
     def from_settings(
@@ -482,7 +485,7 @@ class ArcheryMCPClient:
         timeout_seconds: float = 60,
         investigation_budget_seconds: float = 150,
         deterministic_history_pipeline: bool = True,
-        transport: httpx.AsyncBaseTransport | None = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
         harness_runtime_dependencies: Any | None = None,
     ) -> ArcheryMCPClient:
         server = load_mcp_server_settings(
@@ -497,7 +500,7 @@ class ArcheryMCPClient:
             timeout_seconds=timeout_seconds,
             investigation_budget_seconds=investigation_budget_seconds,
             deterministic_history_pipeline=deterministic_history_pipeline,
-            transport=transport,
+            http_transport=http_transport,
             harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
@@ -554,9 +557,7 @@ class ArcheryMCPClient:
                 "ts_column_timezone": "UTC+8",
                 "start_beijing": beijing(window_start),
                 "end_beijing": beijing(window_end),
-                "ts_min_lower_bound_beijing": beijing(
-                    window_start - timedelta(hours=1)
-                ),
+                "ts_min_lower_bound_beijing": beijing(window_start - timedelta(hours=1)),
             },
             "investigation_context": {
                 "read_only": True,
@@ -678,9 +679,7 @@ class ArcheryMCPClient:
     def is_simple_metadata_select(cls, sql: str) -> bool:
         """Recognize the closed, expression-free pre-history SELECT shape."""
 
-        return is_simple_single_table_select(sql) and cls.has_safe_direct_select_projection(
-            sql
-        )
+        return is_simple_single_table_select(sql) and cls.has_safe_direct_select_projection(sql)
 
     @classmethod
     def is_history_id_retrieval_query(cls, sql: str) -> bool:
@@ -851,16 +850,12 @@ class ArcheryMCPClient:
             (
                 candidate
                 for column, candidate in operands
-                if is_id_column(column)
-                and isinstance(candidate, exp.Literal)
-                and candidate.is_int
+                if is_id_column(column) and isinstance(candidate, exp.Literal) and candidate.is_int
             ),
             None,
         )
         row_id = (
-            cls._coerce_positive_integer(literal.this)
-            if isinstance(literal, exp.Literal)
-            else None
+            cls._coerce_positive_integer(literal.this) if isinstance(literal, exp.Literal) else None
         )
         if row_id is None:
             return None, "history_recovery_id_predicate_required"
@@ -1033,9 +1028,7 @@ class ArcheryMCPClient:
         if not isinstance(substring, exp.Substring):
             return None
         sample = substring.this
-        column_name = (
-            cls._ascii_identifier(sample.name) if isinstance(sample, exp.Column) else None
-        )
+        column_name = cls._ascii_identifier(sample.name) if isinstance(sample, exp.Column) else None
         column_table = (
             cls._ascii_identifier(sample.table)
             if isinstance(sample, exp.Column) and sample.table
@@ -1077,10 +1070,7 @@ class ArcheryMCPClient:
 
     @staticmethod
     def history_sample_sql(row_id: int) -> str:
-        return (
-            f"SELECT sample FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
-            f"WHERE id = {row_id}"
-        )
+        return f"SELECT sample FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = {row_id}"
 
     @staticmethod
     def history_sample_chunk_sql(row_id: int, offset: int, size: int) -> str:
@@ -1136,10 +1126,7 @@ class ArcheryMCPClient:
                 and cls._ascii_identifier(value.name) == expected.casefold()
                 and not value.db
                 and not value.catalog
-                and (
-                    not value.table
-                    or cls._ascii_identifier(value.table) == qualifier
-                )
+                and (not value.table or cls._ascii_identifier(value.table) == qualifier)
             )
 
         if any(
@@ -1154,8 +1141,7 @@ class ArcheryMCPClient:
         length_projection = projections[-1]
         return bool(
             isinstance(length_projection, exp.Alias)
-            and cls._ascii_identifier(length_projection.alias)
-            == "sample_full_length"
+            and cls._ascii_identifier(length_projection.alias) == "sample_full_length"
             and isinstance(length_projection.this, exp.Length)
             and length_projection.this.args.get("binary") is True
             and direct_column(length_projection.this.this, "sample")
@@ -1362,8 +1348,7 @@ class ArcheryMCPClient:
             return {
                 "sample": sample,
                 "representation": "full",
-                "structure_executable": cls.classify_explainable_statement(sample)
-                is not None,
+                "structure_executable": cls.classify_explainable_statement(sample) is not None,
                 "sample_sha256": sample_hash,
                 "in_lists": [],
             }
@@ -1473,19 +1458,15 @@ class ArcheryMCPClient:
         for source_index, row in enumerate(cls._tabular_rows(payload)):
             sample = cls._casefolded_value(row, "sample")
             row_id = cls._coerce_positive_integer(cls._casefolded_value(row, "id"))
-            reconstructed = (
-                cls._casefolded_value(row, "sample_source_reconstructed") is True
-                and isinstance(cls._casefolded_value(row, "sample_sha256"), str)
-            )
+            reconstructed = cls._casefolded_value(
+                row, "sample_source_reconstructed"
+            ) is True and isinstance(cls._casefolded_value(row, "sample_sha256"), str)
             statement_type = cls._casefolded_value(row, "sample_statement_type")
             safely_classified = cls.classify_explainable_statement(sample or "")
             if (
                 not isinstance(sample, str)
                 or row_id in blocked_ids
-                or (
-                    not reconstructed
-                    and not cls._history_sample_is_complete(row, sample)
-                )
+                or (not reconstructed and not cls._history_sample_is_complete(row, sample))
                 or (
                     safely_classified is None
                     and statement_type not in {"select", "insert", "update", "delete", "replace"}
@@ -1515,9 +1496,9 @@ class ArcheryMCPClient:
         for candidate in candidates:
             checksum_value = cls._casefolded_value(candidate, "checksum")
             checksum = str(checksum_value).strip().casefold() if checksum_value is not None else ""
-            endpoint = str(
-                cls._casefolded_value(candidate, "hostname_max") or ""
-            ).strip().casefold()
+            endpoint = (
+                str(cls._casefolded_value(candidate, "hostname_max") or "").strip().casefold()
+            )
             db_name = str(cls._casefolded_value(candidate, "db_max") or "").strip().casefold()
             sql_key = checksum or cls._canonical_sql(
                 str(cls._casefolded_value(candidate, "sample"))
@@ -1544,11 +1525,7 @@ class ArcheryMCPClient:
         """Accept an absent length marker or one exact positive byte length."""
 
         marker = next(
-            (
-                value
-                for key, value in row.items()
-                if str(key).casefold() == "sample_full_length"
-            ),
+            (value for key, value in row.items() if str(key).casefold() == "sample_full_length"),
             _MISSING,
         )
         if marker is _MISSING:
@@ -1575,15 +1552,10 @@ class ArcheryMCPClient:
                     history_payload,
                     sample_prefix_ids=sample_prefix_ids,
                 )
-                if cls._casefolded_value(row, "sample_representation")
-                != "structured"
-                and cls._canonical_sql(
-                    str(cls._casefolded_value(row, "sample") or "")
-                )
+                if cls._casefolded_value(row, "sample_representation") != "structured"
+                and cls._canonical_sql(str(cls._casefolded_value(row, "sample") or ""))
                 == canonical_inner
-                and cls.sql_equivalent(
-                    str(cls._casefolded_value(row, "sample") or ""), inner_sql
-                )
+                and cls.sql_equivalent(str(cls._casefolded_value(row, "sample") or ""), inner_sql)
             ),
             None,
         )
@@ -1678,9 +1650,7 @@ class ArcheryMCPClient:
     def explainable_table_references(cls, sql: str) -> set[str]:
         """Return traceable table references, including DML target tables."""
 
-        return {
-            reference.table for reference in cls.explainable_physical_table_references(sql)
-        }
+        return {reference.table for reference in cls.explainable_physical_table_references(sql)}
 
     @classmethod
     def explainable_qualified_table_references(cls, sql: str) -> set[str]:
@@ -1718,8 +1688,7 @@ class ArcheryMCPClient:
         return tuple(
             reference
             for reference in references
-            if reference.schema is not None
-            or reference.table.casefold() not in cte_names
+            if reference.schema is not None or reference.table.casefold() not in cte_names
         )
 
     @classmethod
@@ -1746,14 +1715,10 @@ class ArcheryMCPClient:
             if name_match is None:
                 return set()
             name = (
-                name_match.group("quoted")
-                or name_match.group("double")
-                or name_match.group("bare")
+                name_match.group("quoted") or name_match.group("double") or name_match.group("bare")
             )
             name = (
-                name.replace('""', '"')
-                if name_match.group("double")
-                else name.replace("``", "`")
+                name.replace('""', '"') if name_match.group("double") else name.replace("``", "`")
             )
             names.add(name.casefold())
             index += name_match.end()
@@ -2012,9 +1977,7 @@ class ArcheryMCPClient:
         declared_reasons = payload.get("result_incomplete_reasons")
         if isinstance(declared_reasons, list):
             reasons.extend(
-                str(reason)
-                for reason in declared_reasons
-                if isinstance(reason, str) and reason
+                str(reason) for reason in declared_reasons if isinstance(reason, str) and reason
             )
         return tuple(dict.fromkeys(reasons))
 
@@ -2070,12 +2033,9 @@ class ArcheryMCPClient:
             if projection in {"sample_prefix", "unverified_full"}:
                 incoming = dict(row)
                 existing_sample = cls._casefolded_value(merged, "sample")
-                if (
-                    isinstance(existing_sample, str)
-                    and (
-                        projection == "unverified_full"
-                        or cls._history_sample_is_complete(merged, existing_sample)
-                    )
+                if isinstance(existing_sample, str) and (
+                    projection == "unverified_full"
+                    or cls._history_sample_is_complete(merged, existing_sample)
                 ):
                     incoming = {
                         key: value
@@ -2190,9 +2150,7 @@ class ArcheryMCPClient:
             "rows": [dict(row) for row in rows_by_id.values()],
             "rows_merged_from_per_id_queries": True,
             "merged_query_count": len(merge_sources),
-            "merged_full_sqls": [
-                str(source.get("full_sql") or "") for source in merge_sources
-            ],
+            "merged_full_sqls": [str(source.get("full_sql") or "") for source in merge_sources],
         }
 
     @staticmethod
@@ -2255,7 +2213,6 @@ class ArcheryMCPClient:
             and expected_tables == actual_tables
             and expected_paths == actual_paths
         )
-
 
     @classmethod
     def matching_discovered_table(
@@ -2526,9 +2483,7 @@ class ArcheryMCPClient:
             for line in lines:
                 header = _DATABASE_LIST_HEADER_TEXT.fullmatch(line)
                 if header is not None:
-                    active_instance_id = cls._coerce_positive_integer(
-                        header.group("instance_id")
-                    )
+                    active_instance_id = cls._coerce_positive_integer(header.group("instance_id"))
                     continue
                 if active_instance_id is None:
                     continue
@@ -2537,10 +2492,7 @@ class ArcheryMCPClient:
                     if line.strip():
                         active_instance_id = None
                     continue
-                if (
-                    expected_instance_id is not None
-                    and active_instance_id != expected_instance_id
-                ):
+                if expected_instance_id is not None and active_instance_id != expected_instance_id:
                     continue
                 candidate = match.group("db_name")
                 if cls._safe_discovered_database_name(candidate):
@@ -2568,10 +2520,7 @@ class ArcheryMCPClient:
         return bool(
             candidate
             and len(candidate.encode("utf-8")) <= 64
-            and all(
-                character.isalnum() or character in {"_", "$", "-"}
-                for character in candidate
-            )
+            and all(character.isalnum() or character in {"_", "$", "-"} for character in candidate)
         )
 
     @classmethod
@@ -2650,12 +2599,11 @@ class ArcheryMCPClient:
         for candidate in payloads:
             for row in cls._tabular_rows(candidate):
                 normalized = {
-                    cls._normalized_column_name(str(key)): value
-                    for key, value in row.items()
+                    cls._normalized_column_name(str(key)): value for key, value in row.items()
                 }
                 schema = normalized.get("tableschema")
                 if isinstance(schema, str) and schema.strip():
-                    values["db_name"].add(schema.strip().strip("`\""))
+                    values["db_name"].add(schema.strip().strip('`"'))
                 table = normalized.get("tablename")
                 if isinstance(table, str) and table.strip():
                     values["table_name"].add(cls.clean_table_name(table))
@@ -2724,13 +2672,12 @@ class ArcheryMCPClient:
         step = cls._metadata_resolution_step_from_sql(sql)
         if step == "t_instance_member":
             columns = table_columns.get(target, {}).get(step, set())
-            if (
-                not cls._member_query_selects_instance_id(sql, columns)
-                or not cls.is_exact_member_endpoint_lookup(
-                    sql,
-                    alert_endpoint=alert_endpoint,
-                    discovered_columns=columns,
-                )
+            if not cls._member_query_selects_instance_id(
+                sql, columns
+            ) or not cls.is_exact_member_endpoint_lookup(
+                sql,
+                alert_endpoint=alert_endpoint,
+                discovered_columns=columns,
             ):
                 return
             instance_ids = cls._member_instance_ids_from_payload(payload)
@@ -3163,9 +3110,7 @@ class ArcheryMCPClient:
         column, kind, value = predicates[0]
         instance_id = cls._coerce_positive_integer(value)
         return bool(
-            column in id_columns
-            and kind in {"literal", "number"}
-            and instance_id in known_ids
+            column in id_columns and kind in {"literal", "number"} and instance_id in known_ids
         )
 
     @classmethod
@@ -3260,8 +3205,7 @@ class ArcheryMCPClient:
         discovered_columns: set[str],
     ) -> bool:
         selected = {
-            cls._normalized_column_name(column)
-            for column in cls._simple_select_source_columns(sql)
+            cls._normalized_column_name(column) for column in cls._simple_select_source_columns(sql)
         }
         if discovered_columns:
             return any(
@@ -3278,8 +3222,7 @@ class ArcheryMCPClient:
         discovered_columns: set[str],
     ) -> bool:
         selected = {
-            cls._normalized_column_name(column)
-            for column in cls._simple_select_source_columns(sql)
+            cls._normalized_column_name(column) for column in cls._simple_select_source_columns(sql)
         }
         normalized_columns = {cls._normalized_column_name(column) for column in discovered_columns}
         if normalized_columns:
@@ -3333,8 +3276,7 @@ class ArcheryMCPClient:
             ):
                 return "invalid_tabular_columns"
             canonical_column_sets = [
-                tuple(column.casefold() for column in columns)
-                for columns in declared_columns
+                tuple(column.casefold() for column in columns) for columns in declared_columns
             ]
             if len(set(canonical_column_sets)) != 1:
                 return "ambiguous_tabular_columns"
@@ -3624,8 +3566,7 @@ class ArcheryMCPClient:
 
         executed_sql = declared_sqls[0] if declared_sqls else None
         actual_sql_verified = bool(declared_sqls) and all(
-            cls.sql_equivalent(requested_sql, actual_sql)
-            for actual_sql in declared_sqls
+            cls.sql_equivalent(requested_sql, actual_sql) for actual_sql in declared_sqls
         )
         if actual_sql_verified:
             normalized_payload = cls._with_inferred_query_columns(
@@ -3677,16 +3618,12 @@ class ArcheryMCPClient:
     @staticmethod
     def _simple_select_columns(sql: str) -> tuple[str, ...]:
         return tuple(
-            alias or source
-            for source, alias in ArcheryMCPClient._simple_select_projection(sql)
+            alias or source for source, alias in ArcheryMCPClient._simple_select_projection(sql)
         )
 
     @staticmethod
     def _simple_select_source_columns(sql: str) -> tuple[str, ...]:
-        return tuple(
-            source
-            for source, _alias in ArcheryMCPClient._simple_select_projection(sql)
-        )
+        return tuple(source for source, _alias in ArcheryMCPClient._simple_select_projection(sql))
 
     @staticmethod
     def _simple_select_projection(sql: str) -> tuple[tuple[str, str | None], ...]:
@@ -3763,8 +3700,7 @@ class ArcheryMCPClient:
         valid_candidates = [
             rows
             for rows in row_candidates
-            if rows
-            and all(isinstance(row, (Mapping, list, tuple)) for row in rows)
+            if rows and all(isinstance(row, (Mapping, list, tuple)) for row in rows)
         ]
         if not valid_candidates:
             return None
@@ -3831,11 +3767,7 @@ class ArcheryMCPClient:
             r"(?:执行的SQL\s*[：:]|返回\s*\d+\s*行|结果\s*[：:])|$)",
             text,
         )
-        return tuple(
-            sql
-            for match in matches
-            if (sql := match.group("sql").strip())
-        )
+        return tuple(sql for match in matches if (sql := match.group("sql").strip()))
 
     @staticmethod
     def _canonical_sql(sql: str) -> str:
@@ -3926,9 +3858,7 @@ class ArcheryMCPClient:
             supplemental_text,
         ):
             if _ALLOWLIST_REJECTION_TEXT.search(text):
-                raise ArcheryMCPToolError(
-                    f"{tool_name} failed: {safe_error_detail(text)}"
-                )
+                raise ArcheryMCPToolError(f"{tool_name} failed: {safe_error_detail(text)}")
 
     @staticmethod
     def tool_text_blocks(result: Mapping[str, Any]) -> tuple[str, ...]:
@@ -4114,12 +4044,8 @@ class ArcherySlowLogEvidenceTool:
             "具体根因仍须结合日志内容和其他实时信号判断。"
         )
         if result.payload.get("enrichment_partial") is True:
-            unfinished_count = len(
-                result.payload.get("enrichment_unfinished_ids") or []
-            )
-            stop_reason = str(
-                result.payload.get("enrichment_stop_reason") or ""
-            ).upper()
+            unfinished_count = len(result.payload.get("enrichment_unfinished_ids") or [])
+            stop_reason = str(result.payload.get("enrichment_stop_reason") or "").upper()
             stop_summary = (
                 "内部调查预算到期"
                 if stop_reason in {"BUDGET_EXHAUSTED", "DEADLINE_EXCEEDED"}
@@ -4166,8 +4092,7 @@ class ArcherySlowLogEvidenceTool:
                     summary
                     if not has_log_content
                     else (
-                        partial_summary
-                        + "；已保留完整收到的原始信封和可解析行，"
+                        partial_summary + "；已保留完整收到的原始信封和可解析行，"
                         "但部分结果不能用于支持根因。"
                     )
                 ),
@@ -4197,9 +4122,7 @@ class ArcherySlowLogEvidenceTool:
 
         rows = payload.get("rows")
         if isinstance(rows, list):
-            passthrough = {
-                str(key): value for key, value in payload.items() if str(key) != "rows"
-            }
+            passthrough = {str(key): value for key, value in payload.items() if str(key) != "rows"}
             tabular = ArcheryMCPClient._tabular_rows(payload)
             if tabular:
                 passthrough["rows"] = tabular
@@ -4231,9 +4154,7 @@ class ArcherySlowLogEvidenceTool:
         partial = ArcheryMCPClient.is_result_incomplete(result.payload)
         history_scan_complete = result.payload.get("history_scan_complete") is not False
         enrichment_partial = result.payload.get("enrichment_partial") is True
-        final_result_payload, final_result_text = self._final_result_passthrough(
-            result.payload
-        )
+        final_result_payload, final_result_text = self._final_result_passthrough(result.payload)
         structured_data: dict[str, Any] = {
             "schema_version": ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
             "query_completed": result.query_completed,
@@ -4259,15 +4180,11 @@ class ArcherySlowLogEvidenceTool:
             "partial": partial,
             "history_scan_complete": history_scan_complete,
             "enrichment_partial": enrichment_partial,
-            "enrichment_stop_reason": sanitize(
-                result.payload.get("enrichment_stop_reason")
-            ),
+            "enrichment_stop_reason": sanitize(result.payload.get("enrichment_stop_reason")),
             "enrichment_unfinished_ids": sanitize(
                 result.payload.get("enrichment_unfinished_ids") or []
             ),
-            "root_cause_eligible": bool(semantic_rows)
-            and history_scan_complete
-            and not partial,
+            "root_cause_eligible": bool(semantic_rows) and history_scan_complete and not partial,
             "root_cause_ineligible_reason": root_cause_ineligible_reason,
         }
         if final_result_payload is not None:
@@ -4330,6 +4247,7 @@ class ArcherySlowLogEvidenceTool:
             if alert.database is not None
             else {}
         )
+
         def candidates(*values: Any) -> list[str]:
             unique: list[str] = []
             for value in values:

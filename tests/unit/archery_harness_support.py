@@ -30,7 +30,7 @@ from app.agent_runtime import (
 )
 from app.domain.models import InvestigationRun
 from app.domain.tool_calling import MCPModelToolCall
-from app.mcp_catalog import load_mcp_catalog
+from app.mcp_catalog import MCPTransport, load_mcp_catalog
 from app.mcp_runtime import (
     DiscoveredMCPTool,
     ReplayCallFixture,
@@ -41,9 +41,9 @@ OCCURRED_AT = datetime.fromisoformat("2026-07-23T16:00:00+08:00")
 ARCHERY_MCP_LOGIN_TOOL_NAME = "ensure_login_gymJPA"
 ARCHERY_MCP_QUERY_TOOL_NAME = "sql_query_gymJPA"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ARCHERY_PROMPTS = load_mcp_catalog(
-    PROJECT_ROOT / "config/mcp/settings.json"
-).require("archery").prompts
+ARCHERY_PROMPTS = (
+    load_mcp_catalog(PROJECT_ROOT / "config/mcp/settings.json").require("archery").prompts
+)
 ALERT_CONTEXT = {"alert_endpoint": "db-1.example:3306"}
 FINISH_TOOL_NAME = "finish_archery_investigation"
 RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
@@ -105,9 +105,7 @@ class _ScriptedModel:
                 "tool_names": [item["function"]["name"] for item in tools],
             }
         )
-        if [item["function"]["name"] for item in tools] == [
-            RESULT_ASSESSMENT_TOOL_NAME
-        ]:
+        if [item["function"]["name"] for item in tools] == [RESULT_ASSESSMENT_TOOL_NAME]:
             if (
                 self.responses
                 and isinstance(self.responses[0], MCPModelToolCall)
@@ -126,8 +124,7 @@ class _ScriptedModel:
             assert pending is not None
             program_checks = pending.get("program_checks")
             incomplete = bool(
-                isinstance(program_checks, dict)
-                and program_checks.get("result_incomplete") is True
+                isinstance(program_checks, dict) and program_checks.get("result_incomplete") is True
             )
             return MCPModelToolCall(
                 call_id=f"assessment-{len(self.requests)}",
@@ -387,8 +384,7 @@ def _response_result_success(
                 "response": {
                     "result": (
                         f"SQL 查询已执行。\n执行的SQL：{sql}\n\n"
-                        f"返回 {len(rows)} 行。\n结果：\n"
-                        + json.dumps(payload, ensure_ascii=False)
+                        f"返回 {len(rows)} 行。\n结果：\n" + json.dumps(payload, ensure_ascii=False)
                     )
                 }
             }
@@ -402,20 +398,20 @@ def _client(
     *,
     repository: SQLAlchemyAlertRepository | None = None,
     deterministic_history_pipeline: bool = False,
+    mcp_transport: MCPTransport = "streamable_http",
 ) -> ArcheryMCPClient:
     return ArcheryMCPClient(
         MCPServerSettings(
             url="https://archery.example.test/mcp",
             headers={"X-Archery-Token": "fixture-token"},
             prompts=ARCHERY_PROMPTS,
+            transport=mcp_transport,
         ),
         model,
         deterministic_history_pipeline=deterministic_history_pipeline,
         harness_connector=connector,
         harness_runtime_dependencies=(
-            ArcheryHarnessRuntimeDependencies(repository)
-            if repository is not None
-            else None
+            ArcheryHarnessRuntimeDependencies(repository) if repository is not None else None
         ),
     )
 
@@ -458,11 +454,7 @@ def _assess_pending_result(
                 "scope": pending["scope"],
                 "stage": pending["stage"],
                 "history_id": pending.get("history_id"),
-                "basis": (
-                    "appears_complete"
-                    if content_state == "complete"
-                    else "abrupt_ending"
-                ),
+                "basis": ("appears_complete" if content_state == "complete" else "abrupt_ending"),
             },
         ),
         state=state,
@@ -548,18 +540,10 @@ _MERGE_IDS_SQL = (
     "AND ts_max >= FROM_UNIXTIME(1784793300) "
     "ORDER BY id DESC"
 )
-_MERGE_ID_SQL_60 = (
-    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413460"
-)
-_MERGE_ID_SQL_58 = (
-    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413458"
-)
-_MERGE_ID_SQL_54 = (
-    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413454"
-)
-_MERGE_ID_SQL_44 = (
-    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413644"
-)
+_MERGE_ID_SQL_60 = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413460"
+_MERGE_ID_SQL_58 = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413458"
+_MERGE_ID_SQL_54 = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413454"
+_MERGE_ID_SQL_44 = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413644"
 _MERGE_RECOVERED_ROW = {
     "id": 24413458,
     "hostname_max": "db-1.example:3306",
@@ -639,9 +623,7 @@ def _truncated_window_positional_fixture() -> ReplayCallFixture:
     )
 
 
-_TRUNCATED_ID_SQL_40 = (
-    f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413640"
-)
+_TRUNCATED_ID_SQL_40 = f"SELECT * FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE id = 24413640"
 
 
 def _truncated_id_retrieval_fixture(
@@ -653,10 +635,7 @@ def _truncated_id_retrieval_fixture(
         '{"rows":[{"id":24413640,"hostname_max":"db-1.example:3306",'
         '"sample":"SELECT count(0) FROM t_device WHERE store_code IN ('
     )
-    wrapped = (
-        f"SQL 查询已执行。\n执行的SQL：{sql}\n\n返回 1 行。\n结果：\n"
-        + truncated_result
-    )
+    wrapped = f"SQL 查询已执行。\n执行的SQL：{sql}\n\n返回 1 行。\n结果：\n" + truncated_result
     expected = {**TARGET_ARGUMENTS, "sql_content": sql}
     if max_result_chars is not None:
         expected["max_result_chars"] = max_result_chars
@@ -672,7 +651,6 @@ def _truncated_id_retrieval_fixture(
 
 
 _PROJECTION_SAMPLE_PREFIX = (
-    "SELECT count(0) FROM t_device WHERE store_code IN "
-    "('1000042256', '1000042257')"
+    "SELECT count(0) FROM t_device WHERE store_code IN ('1000042256', '1000042257')"
 )
 _PROJECTION_ID_SQL_40 = ArcheryMCPClient.history_sample_projection_sql(24413640)

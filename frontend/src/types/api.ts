@@ -125,8 +125,30 @@ export interface AnalysisBasis {
   source_ref?: KnowledgeReference | null;
 }
 
+export interface RootCauseAnalysisStep {
+  observation: string;
+  inference: string;
+  evidence_refs: string[];
+}
+
+export interface RootCauseSqlEvidence {
+  statement?: string | null;
+  structure?: string | null;
+  sample_id?: string | null;
+  evidence_ref: string;
+}
+
+export interface RootCauseExplainEvidence {
+  result: string;
+  interpretation: string;
+  evidence_ref: string;
+}
+
 export interface RootCauseAssessment {
   cause: string;
+  analysis_process?: RootCauseAnalysisStep[];
+  problem_sql?: RootCauseSqlEvidence | null;
+  explain_result?: RootCauseExplainEvidence | null;
   hypothesis_id?: string | null;
   cause_id?: string | null;
   // SUPPORT is accepted only when rendering recommendations persisted by older releases.

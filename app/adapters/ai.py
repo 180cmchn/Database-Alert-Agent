@@ -46,7 +46,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v24"
+PROMPT_VERSION = "database-alert-advisor-v26"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -106,9 +106,7 @@ def _json_model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
-_RESPONSES_REPLAY_ITEM_TYPES = frozenset(
-    {"reasoning", "function_call", "function_call_output"}
-)
+_RESPONSES_REPLAY_ITEM_TYPES = frozenset({"reasoning", "function_call", "function_call_output"})
 
 
 def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -127,9 +125,7 @@ def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         role = message.get("role")
         next_message = messages[index + 1] if index + 1 < len(messages) else None
-        next_type = (
-            next_message.get("type") if isinstance(next_message, Mapping) else None
-        )
+        next_type = next_message.get("type") if isinstance(next_message, Mapping) else None
         if (
             role == "assistant"
             and not message.get("tool_calls")
@@ -746,17 +742,39 @@ supplemental 单元失败不影响已成功 history 单元的资格。evidence-r
 不得输出 instance_id 归属核验或额外端点门控结论，也不得在 summary、steps、risks 中提及
 此类比较或差异。
 
+root_causes 是前端“AI 分析结论”的唯一正文。每项 cause 只写简洁、明确的因果机制；完整的
+可审计说明写入该项自己的结构化字段：
+- analysis_process 至少包含一项按时间或因果顺序排列的公开证据推导。每项 observation 只陈述
+  tool_evidence 中可核验的原始事实和关键技术值，inference 说明该事实怎样支持下一步判断，
+  evidence_refs 只引用该步骤实际使用且同时列在根因 evidence_refs 中的合格实时证据。它是给用户
+  复核的“事实 → 推导”说明，不是内部思维链、计算草稿或自我修正过程，不得省略成“综合分析得出”。
+- 当根因涉及具体 SQL，或证据已经定位到造成问题的 SQL 时，problem_sql 必须提供。若证据中的
+  完整原始 SQL 不超过 4000 字符，statement 必须逐字展示该 SQL，不得改写；若 SQL 超过 4000
+  字符、只提供结构化 sample 或内容不完整，statement 必须为 null，并提供 evidence 中真实存在的
+  sample_id 和/或 structure。structure 应说明语句类型、涉及的表、JOIN、主要谓词、聚合/排序等
+  已知结构，但不得猜测、重建或补全缺失字面量。evidence_ref 必须指向包含该 SQL/sample 的证据。
+  仅当根因与 SQL 无关且输入没有定位到问题 SQL 时，problem_sql 才可为 null，绝不能虚构 SQL。
+- 如果该问题 SQL 对应的普通 EXPLAIN 已成功，explain_result 必须提供：result 保留执行计划中的
+  关键原始字段和值（例如 table、type、possible_keys、key、rows、filtered、Extra），interpretation
+  说明这些字段怎样支持根因，evidence_ref 指向成功的 explain 证据单元。EXPLAIN 失败、未执行、
+  不适用或没有返回可用计划时 explain_result 必须为 null，不得把失败描述成成功结果。
+
 输出只允许两种形态：
 1. 能从全部输入中得出根因：root_causes 中每项 status 必须为 SUPPORTED、verified=true、
    hypothesis_id=null、next_probe=null，并引用至少一条上述可用、可追溯的实时 evidence id；
    likely_causes 与 root_causes 的 cause 一致。cause 必须是因果机制，不能只是告警症状或告警
-   reason 的复述。
-2. 不能得出根因：root_causes=[]、likely_causes=[]、summary 必须严格等于
-   “现有结果无法得出根因”。不得输出暂定原因、可能原因或猜测。
+   reason 的复述。steps 必须给出能够直接消除根因、恢复服务或降低影响的实际处置动作，并且至少
+   包含一项；允许在证据支持时建议终止指定查询或会话、限流、切换、扩缩容、参数或配置修改等
+   非只读操作。不得把 tool_evidence 已完成的指标、日志、实例或数据库核查再次交给 DBA 重复执行。
+   证据已给出具体对象时，action 必须引用该对象；证据没有给出时不得虚构 SQL、会话 ID、进程 ID、
+   实例或参数值。涉及变更的动作仍写入 steps，并在 expected_result、caution 或 risks 中说明执行前提、
+   业务影响、审批要求、停止条件或回滚方式，不得只把真正的处置动作移入 risks。
+2. 不能得出根因：root_causes=[]、likely_causes=[]、steps=[]、summary 必须严格等于
+   “现有结果无法得出根因”。不得输出暂定原因、可能原因或猜测，也不得用重复只读核查填充 steps。
 
 不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED。root_causes 中 cause_id 必须为 null。
-steps 仅允许只读核查。返回严格符合给定 JSON Schema 的 JSON，不要使用 Markdown
-代码围栏。"""
+steps 是提供给 DBA 审核执行的处置建议，不表示本系统已经执行了其中任何动作。返回严格符合给定
+JSON Schema 的 JSON，不要使用 Markdown 代码围栏。"""
 
 REACT_PROMPT = """你是数据库告警分析的唯一主 Agent。你需要按 ReAct 方式逐轮工作：
 先在模型 API 的 reasoning_content/reasoning 字段中思考当前告警还需要什么证据，再在响应正文中
@@ -811,9 +829,7 @@ def _validate_knowledge_policy(
         if basis.source == AnalysisBasisSource.KNOWLEDGE:
             if basis.source_ref is None:
                 continue
-            matched = valid_knowledge.get(
-                (basis.source_ref.source, basis.source_ref.knowledge_id)
-            )
+            matched = valid_knowledge.get((basis.source_ref.source, basis.source_ref.knowledge_id))
             if matched is None:
                 continue
             exact_ref = KnowledgeReference(
@@ -861,9 +877,7 @@ def _validate_knowledge_policy(
     valid_steps: list[RecommendationStep] = []
     for step in recommendation.steps:
         if step.source_ref is not None:
-            matched = valid_knowledge.get(
-                (step.source_ref.source, step.source_ref.knowledge_id)
-            )
+            matched = valid_knowledge.get((step.source_ref.source, step.source_ref.knowledge_id))
             if matched is None:
                 if not knowledge:
                     valid_steps.append(step.model_copy(update={"source_ref": None}))
@@ -883,8 +897,7 @@ def _validate_knowledge_policy(
         "analysis_bases": new_bases,
         "steps": valid_steps,
         "root_causes": [
-            item.model_copy(update={"cause_id": None})
-            for item in recommendation.root_causes
+            item.model_copy(update={"cause_id": None}) for item in recommendation.root_causes
         ],
     }
     return recommendation.model_copy(update=update)
@@ -1490,9 +1503,7 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
         if isinstance(response_format, Mapping):
             format_config = deepcopy(dict(response_format))
             json_schema = format_config.pop("json_schema", None)
-            if format_config.get("type") == "json_schema" and isinstance(
-                json_schema, Mapping
-            ):
+            if format_config.get("type") == "json_schema" and isinstance(json_schema, Mapping):
                 format_config.update(deepcopy(dict(json_schema)))
             request["text"] = {"format": format_config}
         return request
@@ -1525,7 +1536,9 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
             finish_reason=(
                 incomplete_reason
                 if isinstance(incomplete_reason, str) and incomplete_reason
-                else status if isinstance(status, str) else None
+                else status
+                if isinstance(status, str)
+                else None
             ),
             had_choice=bool(output),
             output_items=_responses_replay_items(response),
@@ -1592,8 +1605,7 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
             }:
                 if event_type != "response.completed" and event_response is None:
                     raise AdvisorError(
-                        "OpenAI Responses request failed "
-                        f"({_responses_failure_diagnostic(event)})"
+                        f"OpenAI Responses request failed ({_responses_failure_diagnostic(event)})"
                     )
                 terminal_response = event_response
                 continue
@@ -1784,13 +1796,6 @@ class FakeAIAdvisor:
             for item in knowledge
         ]
         if knowledge:
-            first = knowledge[0]
-            reference = KnowledgeReference(
-                source=first.source,
-                knowledge_id=first.knowledge_id,
-                title=first.title,
-                source_uri=first.source_uri,
-            )
             recommendation = Recommendation(
                 summary=INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 knowledge_match_summary=knowledge_match_summary,
@@ -1802,16 +1807,8 @@ class FakeAIAdvisor:
                         statement="已完成知识匹配与实时证据审阅，现有结果未建立根因机制。",
                     ),
                 ],
-                steps=[
-                    RecommendationStep(
-                        order=1,
-                        action="通过只读监控核对告警指标和数据库状态。",
-                        expected_result="补充与本次告警一致的实时事实。",
-                        caution="知识依据不能替代本次事故的实时证据。",
-                        source_ref=reference,
-                    )
-                ],
-                risks=["知识依据不能单独证明本次事故根因。"],
+                steps=[],
+                risks=["知识依据不能单独证明本次事故根因；现有结果未生成有副作用的处置动作。"],
                 confidence=0.75,
                 knowledge_matches=knowledge,
                 root_causes=[],
@@ -1827,15 +1824,8 @@ class FakeAIAdvisor:
                         statement=("所选知识来源均未命中，现有实时结果也未建立根因机制。"),
                     )
                 ],
-                steps=[
-                    RecommendationStep(
-                        order=1,
-                        action="通过只读监控核对告警指标、持续时间和影响范围。",
-                        expected_result="获得进一步诊断证据。",
-                        caution="不要据此直接执行变更。",
-                    )
-                ],
-                risks=["缺少匹配的知识依据，当前结论不充分。"],
+                steps=[],
+                risks=["现有结果未建立根因，未生成有副作用的处置动作。"],
                 confidence=0.35,
                 root_causes=[],
             )
@@ -1872,11 +1862,12 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
+                "steps": [],
                 "confidence": 0,
             }
         )
         return recommendation, AdvisorMetadata(
             provider="conservative_fallback",
             model="deterministic-safety-net",
-            prompt_version=f"{PROMPT_VERSION}-fallback-v1",
+            prompt_version=f"{PROMPT_VERSION}-fallback-v2",
         )
