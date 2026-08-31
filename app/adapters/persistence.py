@@ -30,6 +30,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -291,7 +292,8 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-DATABASE_SCHEMA_REVISION = "0016"
+_UNBOUNDED_TEXT = Text().with_variant(LONGTEXT(), "mysql")
+DATABASE_SCHEMA_REVISION = "0017"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -517,7 +519,7 @@ class AgentCheckpointWriteRow(Base):
     write_index: Mapped[int] = mapped_column(Integer, nullable=False)
     channel: Mapped[str] = mapped_column(String(255), nullable=False)
     value_type: Mapped[str] = mapped_column(String(255), nullable=False)
-    value_base64: Mapped[str] = mapped_column(Text, nullable=False)
+    value_base64: Mapped[str] = mapped_column(_UNBOUNDED_TEXT, nullable=False)
     task_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
@@ -572,7 +574,7 @@ class AgentArtifactRow(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     content_encoding: Mapped[str] = mapped_column(String(16), nullable=False)
-    sanitized_content: Mapped[str] = mapped_column(Text, nullable=False)
+    sanitized_content: Mapped[str] = mapped_column(_UNBOUNDED_TEXT, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
 
 

@@ -354,6 +354,66 @@ docker compose up -d --build
 本机通常无法连接公司内网中的 Archery 和 Prometheus MCP。开发机测试出现连接超时可以忽略；真实
 Schema、鉴权和返回结果在内网工作机验证。
 
+## 将内置 SQLite 数据迁移到 MySQL 8.0
+
+项目通过 `mysql+asyncmy` 支持外部 MySQL。当前持久化数据包含超过 MySQL `TEXT` 64 KiB
+上限的 checkpoint write 和 artifact 内容；迁移 `0017` 会在 MySQL 中把这两个字段升级为
+`LONGTEXT`。目标必须满足：
+
+- MySQL 8.0.13+（早期 8.0 版本不支持本项目使用的 JSON 表达式默认值）；
+- 使用独立、空的数据库，默认字符集为 `utf8mb4`，默认排序规则为 `utf8mb4_bin`；
+- 迁移账号可创建和修改表、创建索引并读写目标数据库；
+- 启用 `STRICT_TRANS_TABLES` 或 `STRICT_ALL_TABLES`，防止迁移时静默截断数据；
+- 保持 MySQL 默认的小数秒四舍五入行为；迁移工具不接受 `TIME_TRUNCATE_FRACTIONAL` 模式；
+- `max_allowed_packet` 足以容纳最大单行。迁移工具会读取服务端值并在写入前校验；
+- API 和 Worker 已停止，SQLite 文件已通过 SQLite backup API 或存储卷快照完成一致性备份。
+
+先安装 MySQL extra，并在服务停止后把源 SQLite Schema 升到当前 head：
+
+```bash
+python -m pip install -e ".[dev,mysql]"
+alembic upgrade head
+```
+
+通过进程环境（优先）或 Git 已忽略的本地 `.env` 安全提供目标 URL。不要把密码作为命令行参数；密码中的特殊字符必须进行 URL 编码：
+
+```bash
+export MIGRATION_TARGET_DATABASE_URL='mysql+asyncmy://user:password@mysql.example:3306/database_alert_agent?charset=utf8mb4'
+python -m tools.migrate_sqlite_to_mysql --source data/alerts.db
+```
+
+PowerShell 使用：
+
+```powershell
+$env:MIGRATION_TARGET_DATABASE_URL = 'mysql+asyncmy://user:password@mysql.example:3306/database_alert_agent?charset=utf8mb4'
+python -m tools.migrate_sqlite_to_mysql --source data/alerts.db
+```
+
+若执行进程无法继承当前 Shell 的环境变量，可只在本地 `.env` 追加：
+
+```dotenv
+MIGRATION_TARGET_DATABASE_URL=mysql+asyncmy://user:password@mysql.example:3306/database_alert_agent?charset=utf8mb4
+```
+
+工具会按外键顺序创建/升级目标 Schema，持有 SQLite 写锁取得一致快照，分批提交数据，并逐表比较
+行数及规范化 SHA-256。当前 MySQL Schema 使用 `DATETIME(0)`，摘要按 MySQL 的秒级四舍五入结果比较；
+MySQL binary JSON 往返可能让 `DOUBLE` 改变一个 ULP，摘要按 12 位有效数字比较浮点值。除此以外不忽略
+字段差异。目标 URL 只以隐藏密码的形式输出。中断后保留目标中的已提交批次，使用相同源库和目标库继续：
+
+```bash
+python -m tools.migrate_sqlite_to_mysql --source data/alerts.db --resume
+```
+
+只重新校验、不写目标库：
+
+```bash
+python -m tools.migrate_sqlite_to_mysql --source data/alerts.db --verify-only
+```
+
+校验成功后，将部署环境中的 `DATABASE_URL` 改为同一个 `mysql+asyncmy` URL，确保 API、Worker 和
+Alembic 使用完全一致的值，再启动服务并检查 `/health/ready`。回滚时停止服务，把 `DATABASE_URL`
+恢复为原 SQLite URL；迁移工具不会修改或删除源 SQLite 数据。
+
 ## API
 
 - `POST /api/v1/alerts/{source}/analyze`：接收非 FlashDuty 告警并异步分析；FlashDuty 仅由轮询器接入。
