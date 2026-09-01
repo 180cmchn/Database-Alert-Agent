@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +48,7 @@ from app.mcp_catalog import MCPPromptBundle, MCPTransport
 from app.mcp_runtime import DiscoveredMCPTool, RepositoryMCPCheckpointStore
 
 _ALERT_TIME = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+_ALERT_WINDOW_START = _ALERT_TIME - timedelta(minutes=5)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROMETHEUS_PROMPTS = MCPPromptBundle(
     role="Prometheus metrics investigator",
@@ -191,7 +192,7 @@ def test_prometheus_harness_exposes_all_discovered_tools_ignoring_annotations() 
     scenario = prometheus_harness_module.PrometheusHarnessScenario(
         client=client,
         context=_context(),
-        window_start=_ALERT_TIME.replace(minute=55),
+        window_start=_ALERT_WINDOW_START,
         window_end=_ALERT_TIME,
     )
 
@@ -222,7 +223,7 @@ def test_prometheus_harness_forwards_model_arguments_unchanged() -> None:
     scenario = prometheus_harness_module.PrometheusHarnessScenario(
         client=client,
         context=_context(),
-        window_start=_ALERT_TIME.replace(minute=55),
+        window_start=_ALERT_WINDOW_START,
         window_end=_ALERT_TIME,
     )
     scenario.build_tool_specs(
@@ -240,8 +241,8 @@ def test_prometheus_harness_forwards_model_arguments_unchanged() -> None:
     )
     arguments = {
         "query": "up",
-        "start": "model-start",
-        "end": "model-end",
+        "start": int(_ALERT_WINDOW_START.timestamp()),
+        "end": int(_ALERT_TIME.timestamp()),
         "operation": "model-operation",
         "schema_extra": {"opaque": True},
     }
@@ -262,6 +263,76 @@ def test_prometheus_harness_forwards_model_arguments_unchanged() -> None:
     )
 
     assert prepared.effective_arguments == arguments
+    assert prepared.local_result is None
+
+
+def test_prometheus_harness_rejects_wrong_range_window_with_exact_correction() -> None:
+    client = _client(_SequenceModel([]))
+    scenario = prometheus_harness_module.PrometheusHarnessScenario(
+        client=client,
+        context=_context(),
+        window_start=_ALERT_WINDOW_START,
+        window_end=_ALERT_TIME,
+    )
+    scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="query_range",
+                description="Run a Prometheus range query",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "start": {"type": "number"},
+                        "end": {"type": "number"},
+                    },
+                    "required": ["query", "start", "end"],
+                    "additionalProperties": False,
+                },
+            )
+        ]
+    )
+    arguments = {
+        "query": "mysql_up",
+        "start": int(datetime(2025, 8, 7, 1, 55, tzinfo=UTC).timestamp()),
+        "end": int(datetime(2025, 8, 7, 2, 0, tzinfo=UTC).timestamp()),
+    }
+    action = type(
+        "Action",
+        (),
+        {
+            "tool_name": "query_range",
+            "objective": "query",
+            "hypothesis_ids": [],
+            "arguments": arguments,
+        },
+    )()
+    state = scenario.initial_state()
+
+    prepared = scenario.prepare_call(action, state=state)
+    transition = scenario.on_result(state, prepared, prepared.local_result)
+
+    assert prepared.effective_arguments == arguments
+    correction = prepared.local_result["host_validation"]
+    assert correction["transport_sent"] is False
+    assert correction["reason_code"] == "alert_window_mismatch"
+    assert correction["expected_arguments"] == {
+        "start": int(_ALERT_WINDOW_START.timestamp()),
+        "end": int(_ALERT_TIME.timestamp()),
+    }
+    assert correction["expected_window"]["timezone"] == "Asia/Shanghai"
+    assert correction["expected_window"]["start"] == "2026-08-07T09:55:00+08:00"
+    assert correction["expected_window"]["end"] == "2026-08-07T10:00:00+08:00"
+    assert transition.status == ToolInvocationStatus.SKIPPED
+    assert transition.state.executed_calls == []
+    assert transition.state.tool_attempts[0]["outcome"] == "rejected_locally"
+    messages = transition.message
+    assert isinstance(messages, list)
+    tool_result = json.loads(messages[-2]["content"])
+    assert tool_result == {"host_validation": correction}
+    host_control = json.loads(messages[-1]["content"])["host_control"]
+    assert host_control["remote_calls_used"] == 0
+    assert host_control["capability"] == "host_window_validation"
 
 
 def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() -> None:
@@ -269,7 +340,7 @@ def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() 
     scenario = prometheus_harness_module.PrometheusHarnessScenario(
         client=client,
         context=_context(),
-        window_start=_ALERT_TIME.replace(minute=55),
+        window_start=_ALERT_WINDOW_START,
         window_end=_ALERT_TIME,
     )
     scenario.build_tool_specs(
@@ -280,7 +351,11 @@ def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() 
             )
         ]
     )
-    arguments = {"query": "mysql_up"}
+    arguments = {
+        "query": "mysql_up",
+        "start": "2026-08-07T09:55:00+08:00",
+        "end": "2026-08-07T10:00:00+08:00",
+    }
     native_items = (
         {
             "type": "reasoning",
@@ -339,7 +414,7 @@ def test_prometheus_protocol_failure_returns_complete_raw_response_to_model() ->
     scenario = prometheus_harness_module.PrometheusHarnessScenario(
         client=client,
         context=_context(),
-        window_start=_ALERT_TIME.replace(minute=55),
+        window_start=_ALERT_WINDOW_START,
         window_end=_ALERT_TIME,
     )
     scenario.build_tool_specs(
@@ -350,7 +425,11 @@ def test_prometheus_protocol_failure_returns_complete_raw_response_to_model() ->
             )
         ]
     )
-    arguments = {"query": "up"}
+    arguments = {
+        "query": "up",
+        "start": "2026-08-07T09:55:00+08:00",
+        "end": "2026-08-07T10:00:00+08:00",
+    }
     scenario.register_model_call(
         MCPModelToolCall(
             call_id="protocol-error-call",
@@ -678,8 +757,8 @@ async def test_shared_harness_forwards_window_and_operation_arguments_unchanged(
                 name="query_range",
                 arguments={
                     "query": "rate(mysql_global_status_slow_queries[5m])",
-                    "start": "2099-01-01T00:00:00+00:00",
-                    "end": "2099-01-01T00:05:00+00:00",
+                    "start": "2026-08-07T09:55:00+08:00",
+                    "end": "2026-08-07T10:00:00+08:00",
                     "operation": "model-defined-operation",
                     "schema_extra": {"opaque": True},
                 },
@@ -699,8 +778,8 @@ async def test_shared_harness_forwards_window_and_operation_arguments_unchanged(
             "query_range",
             {
                 "query": "rate(mysql_global_status_slow_queries[5m])",
-                "start": "2099-01-01T00:00:00+00:00",
-                "end": "2099-01-01T00:05:00+00:00",
+                "start": "2026-08-07T09:55:00+08:00",
+                "end": "2026-08-07T10:00:00+08:00",
                 "operation": "model-defined-operation",
                 "schema_extra": {"opaque": True},
             },
@@ -713,7 +792,7 @@ async def test_shared_harness_forwards_window_and_operation_arguments_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_shared_harness_returns_raw_result_without_window_gate_feedback() -> None:
+async def test_shared_harness_rejects_wrong_window_before_transport() -> None:
     raw_response = {
         "_meta": {
             "trace_id": "raw-response-trace",
@@ -722,10 +801,7 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
         "structuredContent": {"data": {"result": [{"values": [[1_893_456_000, "1"]]}]}},
         "isError": False,
     }
-    _HarnessSession.results = [
-        raw_response,
-        {"structuredContent": {"series": [{"value": 1}]}},
-    ]
+    _HarnessSession.results = [raw_response]
     model = _SequenceModel(
         [
             MCPModelToolCall(
@@ -743,8 +819,8 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
                 name="query_range",
                 arguments={
                     "query": "mysql_threads_running",
-                    "start": "2026-08-07T01:55:00+00:00",
-                    "end": "2026-08-07T02:00:00+00:00",
+                    "start": "2026-08-07T09:55:00+08:00",
+                    "end": "2026-08-07T10:00:00+08:00",
                     "operation": "query",
                 },
             ),
@@ -758,24 +834,51 @@ async def test_shared_harness_returns_raw_result_without_window_gate_feedback() 
 
     result = await _client(model).collect_alert_window(_context())
 
-    tool_message = next(
+    assert _HarnessSession.calls == [
+        (
+            "query_range",
+            {
+                "query": "mysql_threads_running",
+                "start": "2026-08-07T09:55:00+08:00",
+                "end": "2026-08-07T10:00:00+08:00",
+                "operation": "query",
+            },
+        )
+    ]
+    correction_message = next(
         message for message in reversed(model.messages[1]) if message["role"] == "tool"
     )
-    feedback = json.loads(tool_message["content"])
-    assert feedback == raw_response
-    assert feedback["_meta"]["api_key"] == "mcp-owned-secret"
-    assert "1893456000" in tool_message["content"]
-    assert "host_window_verification" not in feedback
+    correction = json.loads(correction_message["content"])["host_validation"]
+    assert correction["transport_sent"] is False
+    assert correction["reason_code"] == "alert_window_mismatch"
+    assert correction["expected_arguments"] == {
+        "start": "2026-08-07T09:55:00+08:00",
+        "end": "2026-08-07T10:00:00+08:00",
+    }
     host_control = next(
-        payload
+        payload["host_control"]
         for message in model.messages[1]
         if message.get("role") == "user" and isinstance(message.get("content"), str)
         for payload in [json.loads(message["content"])]
         if "host_control" in payload
     )
-    assert host_control["host_control"]["instruction"]
+    assert host_control["remote_calls_used"] == 0
+    assert host_control["capability"] == "host_window_validation"
+
+    accepted_tool_message = next(
+        message for message in reversed(model.messages[2]) if message["role"] == "tool"
+    )
+    accepted_feedback = json.loads(accepted_tool_message["content"])
+    assert accepted_feedback == raw_response
+    assert accepted_feedback["_meta"]["api_key"] == "mcp-owned-secret"
+    assert "1893456000" in accepted_tool_message["content"]
     assert result.finished_by_model is True
-    assert len(result.responses) == 2
+    assert len(result.responses) == 1
+    assert result.model_tool_calls == ("query_range",)
+    assert [attempt["outcome"] for attempt in result.tool_attempts] == [
+        "rejected_locally",
+        "result",
+    ]
 
 
 @pytest.mark.asyncio
@@ -795,7 +898,7 @@ async def test_prometheus_planner_exposes_model_reasoning_content() -> None:
     scenario = prometheus_harness_module.PrometheusHarnessScenario(
         client=client,
         context=_context(),
-        window_start=_ALERT_TIME.replace(minute=55),
+        window_start=_ALERT_WINDOW_START,
         window_end=_ALERT_TIME,
     )
     specs = scenario.build_tool_specs(
@@ -1115,7 +1218,11 @@ async def test_raw_response_is_artifacted_when_investigation_is_cancelled(
                 return MCPModelToolCall(
                     call_id="persist-before-interrupt",
                     name="query_range",
-                    arguments={"query": "mysql_up"},
+                    arguments={
+                        "query": "mysql_up",
+                        "start": "2026-08-07T09:55:00+08:00",
+                        "end": "2026-08-07T10:00:00+08:00",
+                    },
                 )
             raise asyncio.CancelledError
 
@@ -1343,7 +1450,11 @@ async def test_is_error_response_is_persisted_after_investigation_completion(
                 MCPModelToolCall(
                     call_id="is-error-query",
                     name="query_range",
-                    arguments={"query": "invalid"},
+                    arguments={
+                        "query": "invalid",
+                        "start": "2026-08-07T09:55:00+08:00",
+                        "end": "2026-08-07T10:00:00+08:00",
+                    },
                 ),
                 MCPModelToolCall(
                     call_id="finish-after-is-error",
@@ -1399,7 +1510,11 @@ async def test_transport_failure_without_response_creates_no_response_artifact(
                 MCPModelToolCall(
                     call_id="transport-failure-query",
                     name="query_range",
-                    arguments={"query": "mysql_up"},
+                    arguments={
+                        "query": "mysql_up",
+                        "start": "2026-08-07T09:55:00+08:00",
+                        "end": "2026-08-07T10:00:00+08:00",
+                    },
                 )
             ]
         ),
@@ -1557,7 +1672,12 @@ async def test_only_target_matched_alert_window_projection_is_persisted_to_trace
                 MCPModelToolCall(
                     call_id="discover-targets",
                     name="query_range",
-                    arguments={"operation": "targets"},
+                    arguments={
+                        "query": "up",
+                        "start": "2026-08-07T09:55:00+08:00",
+                        "end": "2026-08-07T10:00:00+08:00",
+                        "operation": "targets",
+                    },
                 ),
                 MCPModelToolCall(
                     call_id="qualified-range",

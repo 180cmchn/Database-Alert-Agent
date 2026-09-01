@@ -31,9 +31,13 @@ from app.agent_runtime.events import AgentEvent, AgentEventKind
 from app.agent_runtime.persistence import RepositoryEventSink, RepositoryInvocationStore
 from app.application.sanitization import REDACTED
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     AlertStatus,
     AnalysisConfigSnapshot,
     EvidenceRecord,
+    EvidenceUnit,
+    EvidenceUnitKind,
+    EvidenceUnitStatus,
     InvestigationStage,
     ProgressRecord,
     RunStatus,
@@ -996,6 +1000,159 @@ async def test_tool_invocation_survives_reopen_and_can_resume(tmp_path: Path) ->
         )
         assert [row.status for row in invocation_rows] == [ToolInvocationStatus.FAILED.value]
     await reopened.close()
+
+
+def _mysql_datetime_zero_invocation_row() -> tuple[ToolInvocation, ToolInvocationRow]:
+    arguments = {"query": "up"}
+    invocation = ToolInvocation(
+        run_id=uuid4(),
+        tool_name="query_range",
+        provider="prometheus_mcp",
+        objective="Validate MySQL timestamp mirrors",
+        model_arguments=arguments,
+        effective_arguments=arguments,
+        fingerprint=ToolInvocation.build_fingerprint(
+            tool_name="query_range",
+            effective_arguments=arguments,
+        ),
+        status=ToolInvocationStatus.FAILED,
+        deadline=datetime(2026, 9, 1, 0, 5, 0, 500_000, tzinfo=UTC),
+        created_at=datetime(2026, 8, 31, 23, 59, 58, 499_999, tzinfo=UTC),
+        started_at=datetime(2026, 8, 31, 23, 59, 59, 500_000, tzinfo=UTC),
+        completed_at=datetime(2026, 9, 1, 0, 0, 0, 500_000, tzinfo=UTC),
+        error=InvocationError(
+            code="MCP_SESSION_CLOSED",
+            message="Stream closed before a terminal response",
+            retryable=True,
+        ),
+    )
+    row = SQLAlchemyAlertRepository._tool_invocation_row(
+        invocation.model_dump(mode="json")
+    )
+    row.created_at = datetime(2026, 8, 31, 23, 59, 58, tzinfo=UTC)
+    row.started_at = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
+    row.completed_at = datetime(2026, 9, 1, 0, 0, 1, tzinfo=UTC)
+    row.deadline = datetime(2026, 9, 1, 0, 5, 1, tzinfo=UTC)
+    return invocation, row
+
+
+def test_tool_invocation_validation_accepts_mysql_datetime_zero_rounding() -> None:
+    invocation, row = _mysql_datetime_zero_invocation_row()
+
+    assert SQLAlchemyAlertRepository._validated_tool_invocation_row(
+        row,
+        dialect_name="mysql",
+    ) == invocation
+
+
+def test_tool_invocation_validation_keeps_sqlite_datetime_comparison_exact() -> None:
+    _, row = _mysql_datetime_zero_invocation_row()
+
+    with pytest.raises(
+        ToolInvocationConflict,
+        match=(
+            "persisted invocation columns drifted: "
+            "completed_at, created_at, deadline, started_at"
+        ),
+    ):
+        SQLAlchemyAlertRepository._validated_tool_invocation_row(
+            row,
+            dialect_name="sqlite",
+        )
+
+
+def test_tool_invocation_validation_rejects_mysql_noncanonical_time_drift() -> None:
+    _, row = _mysql_datetime_zero_invocation_row()
+    assert row.deadline is not None
+    row.deadline += timedelta(seconds=1)
+
+    with pytest.raises(
+        ToolInvocationConflict,
+        match="persisted invocation columns drifted: deadline",
+    ):
+        SQLAlchemyAlertRepository._validated_tool_invocation_row(
+            row,
+            dialect_name="mysql",
+        )
+
+
+def _mysql_datetime_zero_evidence_records() -> tuple[EvidenceRecord, EvidenceRecord]:
+    evidence_id = uuid4()
+    artifact_id = uuid4()
+    unit_key = "result"
+    authoritative = EvidenceRecord(
+        id=evidence_id,
+        contract_version=EVIDENCE_RECORD_V2,
+        run_id=uuid4(),
+        tool_name="query_range",
+        source_system="prometheus_mcp",
+        status=ToolStatus.SUCCESS,
+        request={"query": "up"},
+        summary="One bounded metric result",
+        structured_data={"value": 1},
+        started_at=datetime(2026, 8, 31, 23, 59, 58, 499_999, tzinfo=UTC),
+        collected_at=datetime(2026, 8, 31, 23, 59, 59, 500_000, tzinfo=UTC),
+        duration_ms=1_000,
+        source_artifact_id=artifact_id,
+        evidence_units=[
+            EvidenceUnit(
+                id=EvidenceUnit.build_id(evidence_id, unit_key),
+                parent_evidence_id=evidence_id,
+                unit_key=unit_key,
+                kind=EvidenceUnitKind.SUPPLEMENTAL,
+                stage="query",
+                status=EvidenceUnitStatus.SUCCESS,
+                summary="Projected result",
+                data={"value": 1},
+                root_cause_eligible=False,
+                root_cause_ineligible_reason="test_fixture",
+                source_artifact_id=artifact_id,
+                source_paths=["/structured_data/value"],
+            )
+        ],
+    )
+    mirrored = authoritative.model_copy(
+        update={
+            "started_at": datetime(2026, 8, 31, 23, 59, 58, tzinfo=UTC),
+            "collected_at": datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC),
+        }
+    )
+    return authoritative, mirrored
+
+
+def test_evidence_validation_accepts_mysql_datetime_zero_rounding() -> None:
+    authoritative, mirrored = _mysql_datetime_zero_evidence_records()
+
+    assert SQLAlchemyAlertRepository._evidence_mirror_matches(
+        mirrored,
+        authoritative.model_dump(mode="json"),
+        dialect_name="mysql",
+    )
+
+
+def test_evidence_validation_keeps_sqlite_datetime_comparison_exact() -> None:
+    authoritative, mirrored = _mysql_datetime_zero_evidence_records()
+
+    assert not SQLAlchemyAlertRepository._evidence_mirror_matches(
+        mirrored,
+        authoritative.model_dump(mode="json"),
+        dialect_name="sqlite",
+    )
+
+
+def test_evidence_validation_rejects_mysql_noncanonical_drift() -> None:
+    authoritative, mirrored = _mysql_datetime_zero_evidence_records()
+    drifted_time = mirrored.model_copy(
+        update={"collected_at": mirrored.collected_at + timedelta(seconds=1)}
+    )
+    drifted_content = mirrored.model_copy(update={"summary": "Tampered evidence"})
+
+    for drifted in (drifted_time, drifted_content):
+        assert not SQLAlchemyAlertRepository._evidence_mirror_matches(
+            drifted,
+            authoritative.model_dump(mode="json"),
+            dialect_name="mysql",
+        )
 
 
 @pytest.mark.asyncio

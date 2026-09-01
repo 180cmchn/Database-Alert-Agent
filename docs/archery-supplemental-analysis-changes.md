@@ -10,7 +10,7 @@ Archery 慢查询 history 后的补充分析，并落实以下边界：
 - 与完整 history sample 严格绑定的普通 `EXPLAIN` 可以执行，支持 SELECT、WITH 以及目标
   MySQL/TiDB 能由普通 EXPLAIN 处理的 INSERT、UPDATE、DELETE、REPLACE；
 - `EXPLAIN ANALYZE`、多语句、截断 sample 前缀、DDL、CALL 和未绑定 EXPLAIN 始终禁止；
-- 本机无法连接公司内网中的 Archery MCP 和 Prometheus MCP，因此使用 replay/fake 完成离线验证。
+- 使用 replay/fake 完成离线验证。
 
 ## 修改原因
 
@@ -125,5 +125,3 @@ git diff --check: 通过
 pytest 警告来自 FastAPI、Starlette、LangGraph/LangChain、Python 3.14 和 Alembic 依赖的弃用提示，
 没有本次实现产生的测试失败。
 
-由于本机不在公司内网，本次未把 Archery MCP 或 Prometheus MCP 连接超时作为实现失败，也未使用
-live MCP 结果替代 replay/fake 测试。

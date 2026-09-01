@@ -198,6 +198,28 @@ def _datetime_value(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _mysql_datetime_zero_value(value: datetime) -> datetime:
+    normalized = value.astimezone(UTC) if value.tzinfo is not None else value
+    if normalized.microsecond >= 500_000:
+        normalized += timedelta(seconds=1)
+    return normalized.replace(microsecond=0)
+
+
+def _datetime_mirror_matches(
+    persisted: datetime | None,
+    expected: datetime | None,
+    *,
+    dialect_name: str,
+) -> bool:
+    if persisted == expected:
+        return True
+    if dialect_name != "mysql" or persisted is None or expected is None:
+        return False
+    # The deployed schema uses DATETIME(0), and the migration preflight requires
+    # MySQL's default fractional-second rounding mode.
+    return persisted == _mysql_datetime_zero_value(expected)
+
+
 def _bounded_invocation_result(result: Mapping[str, Any]) -> dict[str, Any]:
     safe = sanitize(dict(result))
     if safe.get("contract") == "outer-evidence-record/v1":
@@ -1920,7 +1942,10 @@ class SQLAlchemyAlertRepository:
             )
             existing = await session.get(ToolInvocationRow, invocation_id)
             if existing is not None:
-                self._validated_tool_invocation_row(existing)
+                self._validated_tool_invocation_row(
+                    existing,
+                    dialect_name=self.engine.dialect.name,
+                )
                 if _canonical_json_hash(existing.invocation_json) == _canonical_json_hash(payload):
                     return invocation
                 raise ToolInvocationConflict(invocation_id, "invocation id already exists")
@@ -1955,7 +1980,10 @@ class SQLAlchemyAlertRepository:
                 lease_owner=lease_owner,
                 fencing_token=fencing_token,
             )
-            stored = self._validated_tool_invocation_row(row)
+            stored = self._validated_tool_invocation_row(
+                row,
+                dialect_name=self.engine.dialect.name,
+            )
             self._validate_tool_invocation_fingerprint(payload)
             expected_value = (
                 str(getattr(expected_status, "value", expected_status))
@@ -2056,7 +2084,10 @@ class SQLAlchemyAlertRepository:
             row = await session.get(ToolInvocationRow, invocation_id)
             if row is None:
                 return None
-            return self._validated_tool_invocation_row(row)
+            return self._validated_tool_invocation_row(
+                row,
+                dialect_name=self.engine.dialect.name,
+            )
 
     async def get_tool_invocation_result(self, invocation_id: str) -> dict[str, Any] | None:
         async with self.session_factory() as session:
@@ -2234,7 +2265,11 @@ class SQLAlchemyAlertRepository:
             )
 
     @staticmethod
-    def _validated_tool_invocation_row(row: ToolInvocationRow) -> ToolInvocation:
+    def _validated_tool_invocation_row(
+        row: ToolInvocationRow,
+        *,
+        dialect_name: str,
+    ) -> ToolInvocation:
         from app.agent_runtime.contracts import ToolInvocation
 
         invocation_id = row.id
@@ -2265,10 +2300,26 @@ class SQLAlchemyAlertRepository:
             "fingerprint": row.fingerprint == stored.fingerprint,
             "status": row.status == stored.status.value,
             "attempt": row.attempt == stored.attempt,
-            "deadline": row.deadline == stored.deadline,
-            "created_at": row.created_at == stored.created_at,
-            "started_at": row.started_at == stored.started_at,
-            "completed_at": row.completed_at == stored.completed_at,
+            "deadline": _datetime_mirror_matches(
+                row.deadline,
+                stored.deadline,
+                dialect_name=dialect_name,
+            ),
+            "created_at": _datetime_mirror_matches(
+                row.created_at,
+                stored.created_at,
+                dialect_name=dialect_name,
+            ),
+            "started_at": _datetime_mirror_matches(
+                row.started_at,
+                stored.started_at,
+                dialect_name=dialect_name,
+            ),
+            "completed_at": _datetime_mirror_matches(
+                row.completed_at,
+                stored.completed_at,
+                dialect_name=dialect_name,
+            ),
             "error": _canonical_json_hash(row.error_json) == _canonical_json_hash(stored_error),
             "artifact_ref": _canonical_json_hash(row.artifact_ref_json)
             == _canonical_json_hash(stored_artifact),
@@ -2614,6 +2665,41 @@ class SQLAlchemyAlertRepository:
             truncated=bool(row.truncated),
         )
 
+    @staticmethod
+    def _evidence_mirror_matches(
+        evidence: EvidenceRecord,
+        authoritative_payload: Mapping[str, Any],
+        *,
+        dialect_name: str,
+    ) -> bool:
+        try:
+            authoritative = EvidenceRecord.model_validate(authoritative_payload)
+        except (TypeError, ValueError):
+            return False
+        if evidence == authoritative:
+            return True
+        if not (
+            _datetime_mirror_matches(
+                evidence.started_at,
+                authoritative.started_at,
+                dialect_name=dialect_name,
+            )
+            and _datetime_mirror_matches(
+                evidence.collected_at,
+                authoritative.collected_at,
+                dialect_name=dialect_name,
+            )
+        ):
+            return False
+        evidence_payload = evidence.model_dump(mode="json")
+        authoritative_payload = authoritative.model_dump(mode="json")
+        for field in ("started_at", "collected_at"):
+            evidence_payload.pop(field)
+            authoritative_payload.pop(field)
+        return _canonical_json_hash(evidence_payload) == _canonical_json_hash(
+            authoritative_payload
+        )
+
     @classmethod
     async def _require_evidence_artifact_ownership(
         cls,
@@ -2642,7 +2728,12 @@ class SQLAlchemyAlertRepository:
         invocation = await session.get(ToolInvocationRow, artifact.invocation_id)
         try:
             stored_invocation = (
-                cls._validated_tool_invocation_row(invocation) if invocation is not None else None
+                cls._validated_tool_invocation_row(
+                    invocation,
+                    dialect_name=session.get_bind().dialect.name,
+                )
+                if invocation is not None
+                else None
             )
         except (ToolInvocationConflict, TypeError, ValueError) as exc:
             raise error_factory("v2 source artifact invocation binding is invalid") from exc
@@ -2662,8 +2753,11 @@ class SQLAlchemyAlertRepository:
             or stored_invocation.artifact_ref is None
             or str(stored_invocation.artifact_ref.artifact_id) != artifact_id
             or not isinstance(stored_evidence, Mapping)
-            or _canonical_json_hash(stored_evidence)
-            != _canonical_json_hash(evidence.model_dump(mode="json"))
+            or not cls._evidence_mirror_matches(
+                evidence,
+                stored_evidence,
+                dialect_name=session.get_bind().dialect.name,
+            )
         ):
             raise error_factory("v2 source artifact invocation binding is invalid")
 

@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
@@ -40,8 +40,14 @@ from app.mcp_catalog import (
 PROMETHEUS_MCP_SERVER_NAME: Final = "prometheus"
 PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v15"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v16"
 PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v2"
+# China Standard Time has no daylight-saving transitions. A fixed offset keeps
+# model-facing timestamps stable on Windows images without an IANA tzdata package.
+PROMETHEUS_MCP_MODEL_TIMEZONE: Final = timezone(
+    timedelta(hours=8),
+    name="Asia/Shanghai",
+)
 _ENV_REFERENCE: Final = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _FINISH_TOOL_NAME: Final = "finish_prometheus_investigation"
 _OBSERVATION_KEYS: Final = {
@@ -1183,8 +1189,9 @@ class PrometheusMCPClient:
                     "instruction": (
                         "先用远端工具确认 Prometheus 配置的数据库监控范围；若告警数据库"
                         "在范围内，再查询 required_window 内对应监控指标。根据工具描述和 "
-                        "Schema 自主选择下一步，调用参数由你完整提供且 Host 原样转发。"
-                        "完成后调用结束工具声明 monitoring_scope_status 和依据。"
+                        "Schema 自主选择下一步，调用参数由你完整提供；Host 在范围调用发送前"
+                        "只校验窗口是否精确相等，校验通过后原样转发。完成后调用结束工具声明 "
+                        "monitoring_scope_status 和依据。"
                     ),
                 },
                 ensure_ascii=False,
@@ -1368,12 +1375,38 @@ class PrometheusMCPClient:
             )
         return messages
 
+    @staticmethod
+    def required_window_context(
+        window_start: datetime,
+        window_end: datetime,
+    ) -> dict[str, Any]:
+        local_start = window_start.astimezone(PROMETHEUS_MCP_MODEL_TIMEZONE)
+        local_end = window_end.astimezone(PROMETHEUS_MCP_MODEL_TIMEZONE)
+        start_unix_seconds = window_start.timestamp()
+        end_unix_seconds = window_end.timestamp()
+        return {
+            "timezone": "Asia/Shanghai",
+            "start": local_start.isoformat(),
+            "end": local_end.isoformat(),
+            "start_unix_seconds": (
+                int(start_unix_seconds) if start_unix_seconds.is_integer() else start_unix_seconds
+            ),
+            "end_unix_seconds": (
+                int(end_unix_seconds) if end_unix_seconds.is_integer() else end_unix_seconds
+            ),
+            "duration_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
+        }
+
     def agent_messages(
         self,
         context: InvestigationContext,
         window_start: datetime,
         window_end: datetime,
     ) -> list[dict[str, Any]]:
+        alert = context.alert.model_dump(mode="json", exclude={"raw_payload"})
+        alert["occurred_at"] = context.alert.occurred_at.astimezone(
+            PROMETHEUS_MCP_MODEL_TIMEZONE
+        ).isoformat()
         return [
             {
                 "role": "system",
@@ -1384,19 +1417,17 @@ class PrometheusMCPClient:
                 "content": json.dumps(
                     {
                         "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
-                        "alert": preprocess_alert_data(
-                            context.alert.model_dump(mode="json", exclude={"raw_payload"})
+                        "alert": preprocess_alert_data(alert),
+                        "required_window": self.required_window_context(
+                            window_start,
+                            window_end,
                         ),
-                        "required_window": {
-                            "start": window_start.isoformat(),
-                            "end": window_end.isoformat(),
-                            "duration_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
-                        },
                         "required_target": self.monitoring_target_context(context.alert),
                         "agent_contract": {
                             "read_only": True,
                             "one_tool_per_turn": True,
                             "arguments_forwarded_unchanged": True,
+                            "range_window_preflight": "exact_match_before_transport",
                             "finish_tool": _FINISH_TOOL_NAME,
                         },
                     },

@@ -626,7 +626,7 @@ class PrometheusHarnessPlanner:
 
 
 class PrometheusHarnessScenario:
-    """Persist Prometheus calls and deterministic observations without policy gates."""
+    """Persist Prometheus calls with exact-window preflight and deterministic observations."""
 
     provider = PROMETHEUS_MCP_SERVER_NAME
 
@@ -725,6 +725,20 @@ class PrometheusHarnessScenario:
     ) -> PreparedCall:
         self._state = state
         call = self._consume_model_call(action.tool_name, action.arguments)
+        metadata: dict[str, Any] = {
+            "call_id": call.call_id,
+            "request_id": call.request_id,
+            "capability": "remote_tool",
+            "provider_output_items": [deepcopy(item) for item in call.provider_output_items],
+        }
+        rejection = self._range_window_rejection(
+            action.tool_name,
+            action.arguments,
+            state=state,
+        )
+        if rejection is not None:
+            metadata["capability"] = "host_window_validation"
+            metadata["local_rejection"] = rejection
         return PreparedCall(
             tool_name=action.tool_name,
             objective=action.objective,
@@ -732,13 +746,80 @@ class PrometheusHarnessScenario:
             model_arguments=deepcopy(action.arguments),
             effective_arguments=deepcopy(action.arguments),
             timeout_seconds=self.client.timeout_seconds,
-            metadata={
-                "call_id": call.call_id,
-                "request_id": call.request_id,
-                "capability": "remote_tool",
-                "provider_output_items": [deepcopy(item) for item in call.provider_output_items],
-            },
+            metadata=metadata,
+            local_result=(
+                {"host_validation": deepcopy(rejection)} if rejection is not None else None
+            ),
         )
+
+    def _range_window_rejection(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        state: PrometheusHarnessState,
+    ) -> dict[str, Any] | None:
+        if not self._is_range_query_tool(tool_name):
+            return None
+        expected = (
+            state.window_start.astimezone(UTC),
+            state.window_end.astimezone(UTC),
+        )
+        if self.client._argument_window(arguments) == expected:
+            return None
+        required_window = self.client.required_window_context(
+            state.window_start,
+            state.window_end,
+        )
+        properties = self._tool_parameters(tool_name).get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        expected_arguments: dict[str, Any] = {}
+        for name in ("start", "end"):
+            field_schema = properties.get(name)
+            field_schema = field_schema if isinstance(field_schema, Mapping) else {}
+            field_type = field_schema.get("type")
+            expects_string = field_type == "string" or (
+                isinstance(field_type, list)
+                and "string" in field_type
+                and "integer" not in field_type
+                and "number" not in field_type
+            )
+            expected_arguments[name] = required_window[
+                name if expects_string else f"{name}_unix_seconds"
+            ]
+        return {
+            "status": "rejected",
+            "reason_code": "alert_window_mismatch",
+            "detail": ("Range query start/end must exactly match the authoritative alert window."),
+            "transport_sent": False,
+            "expected_arguments": expected_arguments,
+            "expected_window": required_window,
+            "received_arguments": {
+                "start": sanitize(arguments.get("start")),
+                "end": sanitize(arguments.get("end")),
+            },
+        }
+
+    def _is_range_query_tool(self, tool_name: str) -> bool:
+        model_tool = self.model_tools.get(tool_name)
+        function = model_tool.get("function") if isinstance(model_tool, Mapping) else None
+        function = function if isinstance(function, Mapping) else {}
+        description = function.get("description")
+        signature = f"{tool_name} {description if isinstance(description, str) else ''}".casefold()
+        properties = self._tool_parameters(tool_name).get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        return ("range" in signature and ("query" in signature or "promql" in signature)) or {
+            "query",
+            "start",
+            "end",
+            "step",
+        } <= set(properties)
+
+    def _tool_parameters(self, tool_name: str) -> Mapping[str, Any]:
+        model_tool = self.model_tools.get(tool_name)
+        function = model_tool.get("function") if isinstance(model_tool, Mapping) else None
+        parameters = function.get("parameters") if isinstance(function, Mapping) else None
+        return parameters if isinstance(parameters, Mapping) else {}
 
     def on_result(
         self,
@@ -746,6 +827,9 @@ class PrometheusHarnessScenario:
         call: PreparedCall,
         result: Any,
     ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
+        local_rejection = call.metadata.get("local_rejection")
+        if isinstance(local_rejection, Mapping):
+            return self._on_local_window_rejection(state, call, local_rejection)
         updated = deepcopy(state)
         decoded = self.client.call_result(result)
         result = decoded.payload
@@ -814,6 +898,54 @@ class PrometheusHarnessScenario:
                 ),
             ),
             status=status,
+        )
+
+    def _on_local_window_rejection(
+        self,
+        state: PrometheusHarnessState,
+        call: PreparedCall,
+        rejection: Mapping[str, Any],
+    ) -> ScenarioTransition[PrometheusHarnessState, dict[str, Any]]:
+        updated = deepcopy(state)
+        failure = deepcopy(dict(rejection))
+        updated.tool_attempts.append(
+            {
+                "tool_name": call.tool_name,
+                "model_arguments": sanitize(call.model_arguments),
+                "arguments": sanitize(call.effective_arguments),
+                "capability": "host_window_validation",
+                "outcome": "rejected_locally",
+                "reason_code": failure["reason_code"],
+                "evidence_disposition": "MISSING",
+                "is_contradiction": False,
+            }
+        )
+        self._state = updated
+        model_call = self._model_call_from_prepared(call)
+        return ScenarioTransition(
+            state=updated,
+            observation={
+                "tool_name": call.tool_name,
+                "outcome": "rejected_locally",
+                "reason_code": failure["reason_code"],
+                "transport_sent": False,
+                "evidence_disposition": "MISSING",
+                "is_contradiction": False,
+            },
+            message=self.client.completed_tool_messages(
+                model_call,
+                {"host_validation": failure},
+                host_control=self.client.host_control_feedback(
+                    remote_calls_used=len(updated.executed_calls),
+                    outcome="rejected_locally",
+                    capability="host_window_validation",
+                    instruction=(
+                        "范围查询未发送。直接使用 host_validation.expected_arguments 中的 "
+                        "start/end 修正参数后重试，不要自行换算年份、时区或 Unix 时间。"
+                    ),
+                ),
+            ),
+            status=ToolInvocationStatus.SKIPPED,
         )
 
     def result_error_directive(

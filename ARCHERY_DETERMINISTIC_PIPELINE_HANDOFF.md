@@ -168,7 +168,6 @@ git diff --check
 
 1. `app/adapters/archery_harness.py` 的确定性状态机后续可考虑提取为独立模块；现有 checkpoint 和 Replay 测试应作为重构保护。
 2. 部署到公司内网后观察实际 `host_executed_tool_calls`、`model_decision_count`、预算覆盖率、未完成 ID 和 Explain 成功率，确认 150 秒预算在真实 MCP 延迟下合理；调整预算属于部署配置变更，应先获得用户确认。
-3. 本机不具备公司内网连通性，本轮不要求也不执行 Archery MCP 或 Prometheus MCP 的真实请求。
 
 ## 6. 建议接手顺序
 

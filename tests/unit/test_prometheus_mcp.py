@@ -637,6 +637,24 @@ class _SequenceModel:
         )
 
 
+def test_prometheus_agent_messages_provide_shanghai_window_and_unix_seconds() -> None:
+    client = PrometheusMCPClient(_server_settings(), _SequenceModel([]))
+
+    messages = client.agent_messages(_context(), ALERT_WINDOW_START, ALERT_TIME)
+
+    request = json.loads(messages[1]["content"])
+    assert request["alert"]["occurred_at"] == "2026-08-07T10:00:00+08:00"
+    assert request["required_window"] == {
+        "timezone": "Asia/Shanghai",
+        "start": "2026-08-07T09:55:00+08:00",
+        "end": "2026-08-07T10:00:00+08:00",
+        "start_unix_seconds": int(ALERT_WINDOW_START.timestamp()),
+        "end_unix_seconds": int(ALERT_TIME.timestamp()),
+        "duration_seconds": 300,
+    }
+    assert request["agent_contract"]["range_window_preflight"] == ("exact_match_before_transport")
+
+
 class _TargetAwareTool:
     def __init__(self, name: str, schema: dict[str, Any]) -> None:
         self.name = name
