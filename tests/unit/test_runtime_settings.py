@@ -140,6 +140,46 @@ def test_openai_responses_provider_is_normalized_and_requires_credentials() -> N
     assert "Unsupported AI_PROVIDER: unknown_protocol" in unsupported.readiness_issues()
 
 
+def test_redis_scheduler_requires_enabled_backend() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        http_scheduler="redis",
+    )
+
+    assert "REDIS_ENABLED must be true when HTTP_SCHEDULER=redis" in settings.readiness_issues()
+
+
+def test_redis_connection_and_claim_settings_are_validated() -> None:
+    configured = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        redis_enabled=True,
+        redis_url=" redis://localhost:6379/0 ",
+        redis_claim_idle_seconds=660,
+        investigation_lease_seconds=600,
+    )
+
+    assert configured.redis_url == "redis://localhost:6379/0"
+    assert "redis_password" not in RUNTIME_SETTINGS_KEYS
+    assert "redis_stream_name" not in RUNTIME_SETTINGS_KEYS
+
+    with pytest.raises(ValidationError, match="must not contain embedded credentials"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            redis_url="redis://user:secret@localhost:6379/0",
+        )
+    with pytest.raises(ValidationError, match="must be greater than or equal"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            redis_enabled=True,
+            redis_claim_idle_seconds=599,
+            investigation_lease_seconds=600,
+        )
+
+
 def test_ai_max_tokens_has_reasoning_safe_default_and_bounds() -> None:
     settings = Settings(_env_file=None, ai_provider="fake")
     assert settings.ai_max_tokens == 16_384

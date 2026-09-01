@@ -211,16 +211,20 @@ class Settings(BaseSettings):
     # alert, live evidence, and general reasoning without advisory knowledge.
     knowledge_sources: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
-    kafka_enabled: bool = False
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_alert_topic: str = "database-alerts"
-    kafka_dlq_topic: str = "database-alerts.dlq"
-    kafka_consumer_group: str = "database-alert-agent"
-    kafka_max_retries: int = Field(default=3, ge=1, le=20)
+    redis_enabled: bool = False
+    redis_url: str = "redis://localhost:6379/0"
+    redis_username: str = ""
+    redis_password: str = Field(default="", repr=False)
+    redis_stream_name: str = "{database-alert-agent}:jobs"
+    redis_dlq_stream_name: str = "{database-alert-agent}:dlq"
+    redis_consumer_group: str = "database-alert-agent"
+    redis_max_retries: int = Field(default=3, ge=1, le=20)
+    redis_claim_idle_seconds: int = Field(default=660, ge=30, le=86_400)
+    redis_dlq_maxlen: int = Field(default=10_000, ge=1, le=1_000_000)
 
     http_scheduler: str = "in_memory"
     # Per-process alert-analysis concurrency. Runtime edits are applied by both
-    # the in-memory scheduler and the Kafka consumer before future work starts.
+    # the in-memory scheduler and the Redis consumer before future work starts.
     scheduler_workers: int = Field(default=1, ge=1, le=16)
     investigation_lease_seconds: int = Field(default=600, ge=30, le=3600)
     # Retention runs only at the configured weekly calendar slot; startup never
@@ -241,6 +245,24 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_mode(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator(
+        "redis_url",
+        "redis_stream_name",
+        "redis_dlq_stream_name",
+        "redis_consumer_group",
+    )
+    @classmethod
+    def normalize_required_redis_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Redis connection and stream names must not be empty")
+        return normalized
+
+    @field_validator("redis_username")
+    @classmethod
+    def normalize_redis_username(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
@@ -351,6 +373,20 @@ class Settings(BaseSettings):
                 and parsed.scheme != "https"
             ):
                 raise ValueError(f"{field_name} must use HTTPS in production")
+        redis_url = urlsplit(self.redis_url)
+        if redis_url.scheme not in {"redis", "rediss"} or not redis_url.netloc:
+            raise ValueError("redis_url must be an absolute Redis URL")
+        if redis_url.username is not None or redis_url.password is not None:
+            raise ValueError("redis_url must not contain embedded credentials")
+        if redis_url.query or redis_url.fragment:
+            raise ValueError("redis_url must not contain a query or fragment")
+        if self.redis_stream_name == self.redis_dlq_stream_name:
+            raise ValueError("REDIS_STREAM_NAME and REDIS_DLQ_STREAM_NAME must differ")
+        if self.redis_enabled and self.redis_claim_idle_seconds < self.investigation_lease_seconds:
+            raise ValueError(
+                "REDIS_CLAIM_IDLE_SECONDS must be greater than or equal to "
+                "INVESTIGATION_LEASE_SECONDS"
+            )
         if self.app_env.lower() in {"production", "prod"} and self.ai_provider == "fake":
             raise ValueError("AI_PROVIDER=fake is not allowed in production")
         if self.flashduty_logs_ds_type not in {"loki", "victorialogs"}:
@@ -490,10 +526,10 @@ class Settings(BaseSettings):
                     issues.append(
                         "Prometheus MCP requires a real AI provider model with tool calling"
                     )
-        if self.http_scheduler not in {"in_memory", "kafka", "manual"}:
+        if self.http_scheduler not in {"in_memory", "redis", "manual"}:
             issues.append(f"Unsupported HTTP_SCHEDULER: {self.http_scheduler}")
-        if self.http_scheduler == "kafka" and not self.kafka_enabled:
-            issues.append("KAFKA_ENABLED must be true when HTTP_SCHEDULER=kafka")
+        if self.http_scheduler == "redis" and not self.redis_enabled:
+            issues.append("REDIS_ENABLED must be true when HTTP_SCHEDULER=redis")
         if (
             "external_knowledge" in self.knowledge_sources
             and not self.external_knowledge_base_url.strip()

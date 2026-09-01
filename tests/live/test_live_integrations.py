@@ -219,7 +219,7 @@ async def test_live_full_flashduty_analysis_uses_real_ai_without_wecom(
             "database_url": f"sqlite+aiosqlite:///{tmp_path / 'live.db'}",
             "runtime_settings_path": tmp_path / "runtime-settings.json",
             "http_scheduler": "manual",
-            "kafka_enabled": False,
+            "redis_enabled": False,
             "wecom_webhook_url": "",
             "flashduty_context_item_limit": min(live_settings.flashduty_context_item_limit, 5),
         }

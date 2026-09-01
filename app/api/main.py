@@ -36,8 +36,8 @@ from app.application.factory import Runtime, apply_runtime_settings, build_runti
 from app.application.scheduler import (
     FlashDutyAlertPoller,
     InMemoryAnalysisScheduler,
-    KafkaAnalysisScheduler,
     ManualAnalysisScheduler,
+    RedisAnalysisScheduler,
     WeeklyAlertRetentionCleaner,
 )
 from app.config import Settings, get_deployment_settings
@@ -86,8 +86,8 @@ def create_app(
             apply_runtime_settings(runtime, settings)
     audit_logger = AdminAuditLogger(settings.runtime_settings_path)
     if scheduler is None:
-        if settings.http_scheduler == "kafka":
-            scheduler = KafkaAnalysisScheduler(settings, runtime.service)
+        if settings.http_scheduler == "redis":
+            scheduler = RedisAnalysisScheduler(settings, runtime.service)
         elif settings.http_scheduler == "manual":
             scheduler = ManualAnalysisScheduler()
         else:

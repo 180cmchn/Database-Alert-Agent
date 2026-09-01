@@ -109,9 +109,7 @@ class RuntimeSettingsManager:
     ) -> None:
         self.path = path
         self._deployment_baseline = (
-            deployment_baseline.model_copy(deep=True)
-            if deployment_baseline is not None
-            else None
+            deployment_baseline.model_copy(deep=True) if deployment_baseline is not None else None
         )
         self._lock = asyncio.Lock()
         self._overrides = load_runtime_overrides(path)
@@ -157,10 +155,8 @@ class RuntimeSettingsManager:
             self._overrides = persisted
             return candidate, revision, changed_fields
 
-    async def reload_if_changed(
-        self, current: Settings
-    ) -> tuple[Settings, bool, str]:
-        """Refresh another process (for example the Kafka worker) from disk."""
+    async def reload_if_changed(self, current: Settings) -> tuple[Settings, bool, str]:
+        """Refresh another process (for example the analysis worker) from disk."""
 
         async with self._lock:
             overrides = await asyncio.to_thread(load_runtime_overrides, self.path)
@@ -231,9 +227,7 @@ class RuntimeSettingsManager:
             current_values = effective_current.model_dump(mode="json")
             serialized = candidate.model_dump(mode="json")
             changed_fields = sorted(
-                key
-                for key in updates
-                if serialized.get(key) != current_values.get(key)
+                key for key in updates if serialized.get(key) != current_values.get(key)
             )
             # Persist every admin-editable key that the caller submitted (plus
             # any previously persisted overrides) so runtime-settings.json
@@ -294,30 +288,16 @@ class RuntimeSettingsManager:
         blocking: list[str] = []
         if settings.ai_provider in REAL_AI_PROVIDERS:
             if not settings.ai_api_key.strip():
-                blocking.append(
-                    f"AI API key is required for {settings.ai_provider} provider"
-                )
+                blocking.append(f"AI API key is required for {settings.ai_provider} provider")
             if not settings.ai_model.strip():
-                blocking.append(
-                    f"AI model is required for {settings.ai_provider} provider"
-                )
+                blocking.append(f"AI model is required for {settings.ai_provider} provider")
         if settings.wecom_enabled and not settings.wecom_webhook_url.strip():
-            blocking.append(
-                "WeCom webhook URL is required when WeCom notifications are enabled"
-            )
+            blocking.append("WeCom webhook URL is required when WeCom notifications are enabled")
         if settings.wecom_enabled and not settings.wecom_page_base_url.strip():
-            blocking.append(
-                "WeCom page base URL is required when WeCom notifications are enabled"
-            )
-        if (
-            settings.app_env.lower() in {"production", "prod"}
-            and settings.ai_provider == "fake"
-        ):
+            blocking.append("WeCom page base URL is required when WeCom notifications are enabled")
+        if settings.app_env.lower() in {"production", "prod"} and settings.ai_provider == "fake":
             blocking.append("Fake AI provider is not allowed in production")
-        if (
-            settings.external_knowledge_enabled
-            and not settings.external_knowledge_base_url.strip()
-        ):
+        if settings.external_knowledge_enabled and not settings.external_knowledge_base_url.strip():
             blocking.append(
                 "External knowledge base URL is required when external knowledge is enabled"
             )
@@ -354,9 +334,7 @@ class AdminAuditLogger:
     """Append mutation metadata without recording request values or secrets."""
 
     def __init__(self, runtime_settings_path: Path) -> None:
-        self.path = runtime_settings_path.with_name(
-            f"{runtime_settings_path.stem}.audit.jsonl"
-        )
+        self.path = runtime_settings_path.with_name(f"{runtime_settings_path.stem}.audit.jsonl")
         self._lock = asyncio.Lock()
 
     async def record(

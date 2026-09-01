@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 
-from aiokafka import AIOKafkaProducer
+from redis.asyncio import Redis
 
 from app.adapters.flashduty import FlashDutyClient
 from app.agent_runtime.leases import LeaseLostError
@@ -44,9 +44,7 @@ def next_weekly_retention_run(now: datetime | None = None) -> datetime:
     return scheduled.astimezone(UTC)
 
 
-def _remaining_poll_delay(
-    interval_seconds: int, *, started_at: float, finished_at: float
-) -> float:
+def _remaining_poll_delay(interval_seconds: int, *, started_at: float, finished_at: float) -> float:
     return max(0.0, interval_seconds - (finished_at - started_at))
 
 
@@ -105,7 +103,7 @@ class FlashDutyAlertPoller:
         self,
         settings: Settings,
         service: AlertAnalysisService,
-        scheduler: InMemoryAnalysisScheduler | KafkaAnalysisScheduler | ManualAnalysisScheduler,
+        scheduler: InMemoryAnalysisScheduler | RedisAnalysisScheduler | ManualAnalysisScheduler,
         client: FlashDutyClient | None,
     ) -> None:
         self.settings = settings
@@ -195,9 +193,7 @@ class FlashDutyAlertPoller:
                         AlertStatus.FAILED,
                     }:
                         await self.scheduler.enqueue(str(stored.alert.id))
-                    processed.append(
-                        FlashDutyPollItemResult(stored=stored, created=created)
-                    )
+                    processed.append(FlashDutyPollItemResult(stored=stored, created=created))
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -281,32 +277,22 @@ class FlashDutyAlertPoller:
             fetched_before_page = len(fetched)
             for item in items:
                 if not isinstance(item, dict):
-                    raise RuntimeError(
-                        "FlashDuty /alert/list returned a non-object alert item"
-                    )
+                    raise RuntimeError("FlashDuty /alert/list returned a non-object alert item")
                 alert_id = item.get("alert_id")
                 if not isinstance(alert_id, str) or not alert_id:
-                    raise RuntimeError(
-                        "FlashDuty /alert/list returned an invalid alert_id"
-                    )
+                    raise RuntimeError("FlashDuty /alert/list returned an invalid alert_id")
                 fetched.setdefault(alert_id, (response.request_id, item))
 
             next_cursor = data.get("search_after_ctx")
             has_next = data.get("has_next_page")
             if not isinstance(has_next, bool):
-                raise RuntimeError(
-                    "FlashDuty /alert/list returned an invalid has_next_page"
-                )
+                raise RuntimeError("FlashDuty /alert/list returned an invalid has_next_page")
             if not has_next:
                 break
             if len(fetched) == fetched_before_page:
-                raise RuntimeError(
-                    "FlashDuty /alert/list pagination made no alert progress"
-                )
+                raise RuntimeError("FlashDuty /alert/list pagination made no alert progress")
             if not isinstance(next_cursor, str) or not next_cursor:
-                raise RuntimeError(
-                    "FlashDuty /alert/list omitted the next-page cursor"
-                )
+                raise RuntimeError("FlashDuty /alert/list omitted the next-page cursor")
             if next_cursor == cursor or next_cursor in seen_cursors:
                 raise RuntimeError("FlashDuty /alert/list returned a repeated cursor")
             seen_cursors.add(next_cursor)
@@ -357,9 +343,7 @@ class WeeklyAlertRetentionCleaner:
     async def start(self) -> None:
         if not self.enabled or self._task is not None:
             return
-        self._task = asyncio.create_task(
-            self._loop(), name="weekly-alert-retention-cleaner"
-        )
+        self._task = asyncio.create_task(self._loop(), name="weekly-alert-retention-cleaner")
 
     async def stop(self) -> None:
         if self._task is None:
@@ -395,7 +379,7 @@ class WeeklyAlertRetentionCleaner:
 
 
 class InMemoryAnalysisScheduler:
-    """Development scheduler; production should use Kafka or another durable queue."""
+    """Development scheduler; production should use Redis or another durable queue."""
 
     def __init__(
         self,
@@ -492,48 +476,70 @@ class InMemoryAnalysisScheduler:
         task.add_done_callback(self._retry_tasks.discard)
 
 
-class KafkaAnalysisScheduler:
-    def __init__(self, settings: Settings, service: AlertAnalysisService) -> None:
+class RedisAnalysisScheduler:
+    def __init__(
+        self,
+        settings: Settings,
+        service: AlertAnalysisService,
+        *,
+        client: Redis | None = None,
+    ) -> None:
         self.settings = settings
         self.service = service
-        # aiokafka binds clients to the currently running event loop. FastAPI's
-        # module-level app factory runs before Uvicorn starts that loop, so defer
-        # client creation to the asynchronous lifespan hook.
-        self.producer: AIOKafkaProducer | None = None
+        # Keep network-bound client setup inside the asynchronous lifespan. The app
+        # factory is also imported by synchronous tooling and unit tests.
+        self.client = client
+        self._started = False
 
     async def start(self) -> None:
-        self.producer = AIOKafkaProducer(
-            bootstrap_servers=self.settings.kafka_bootstrap_servers,
-            value_serializer=lambda value: json.dumps(value, ensure_ascii=False).encode(),
+        if self._started:
+            return
+        client = self.client or Redis.from_url(
+            self.settings.redis_url,
+            username=self.settings.redis_username or None,
+            password=self.settings.redis_password or None,
+            protocol=2,
         )
-        await self.producer.start()
-        pending = await self.service.repository.list_by_status(
-            {AlertStatus.RECEIVED, AlertStatus.QUEUED, AlertStatus.ANALYZING}
-        )
-        for stored in pending:
-            await self.enqueue(str(stored.alert.id))
+        self.client = client
+        try:
+            await client.ping()
+            pending = await self.service.repository.list_by_status(
+                {AlertStatus.RECEIVED, AlertStatus.QUEUED, AlertStatus.ANALYZING}
+            )
+            for stored in pending:
+                await self.enqueue(str(stored.alert.id))
+        except BaseException:
+            self.client = None
+            await client.aclose()
+            raise
+        self._started = True
 
     async def stop(self) -> None:
-        if self.producer is not None:
-            await self.producer.stop()
-            self.producer = None
+        client = self.client
+        self.client = None
+        self._started = False
+        if client is not None:
+            await client.aclose()
 
     async def sync_workers(self, workers: int) -> None:
-        # Analysis concurrency is applied by the Kafka consumer process when it
-        # reloads the shared runtime settings before the next record batch.
+        # Analysis concurrency is applied by the Redis worker before it admits
+        # future messages from the consumer group.
         return None
 
     async def enqueue(self, alert_id: str) -> None:
-        if self.producer is None:
-            raise RuntimeError("Kafka analysis scheduler is not started")
-        await self.producer.send_and_wait(
-            self.settings.kafka_alert_topic,
+        client = self.client
+        if client is None:
+            raise RuntimeError("Redis analysis scheduler is not started")
+        envelope = json.dumps(
             {
                 "schema_version": 1,
                 "job_type": "investigate",
                 "alert_id": alert_id,
             },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+        await client.xadd(self.settings.redis_stream_name, {"envelope": envelope})
 
 
 class ManualAnalysisScheduler:

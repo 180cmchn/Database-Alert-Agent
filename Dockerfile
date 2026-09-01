@@ -50,13 +50,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# The internal OpenAI-compatible gateway presents a certificate signed by this
-# private CA. Register it with the Linux system trust store so the application
-# keeps strict TLS verification enabled inside the container.
-COPY certs/kiro-gw-export.crt /usr/local/share/ca-certificates/kiro-gw-export.crt
-
-RUN update-ca-certificates \
-    && chmod +x /app/entrypoint.sh \
+RUN chmod +x /app/entrypoint.sh \
     && useradd --create-home appuser \
     && mkdir -p /app/data \
     && chown -R appuser:appuser /app

@@ -52,7 +52,7 @@ def test_0017_advances_sqlite_revision_without_changing_text_storage(
 
     try:
         command.upgrade(config, "0016")
-        command.upgrade(config, "head")
+        command.upgrade(config, "0017")
 
         with sqlite3.connect(database) as connection:
             revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
@@ -88,9 +88,7 @@ def test_alembic_accepts_percent_encoded_database_url(
         command.upgrade(config, "head")
 
         with sqlite3.connect(database) as connection:
-            revision = connection.execute(
-                "SELECT version_num FROM alembic_version"
-            ).fetchone()
+            revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
 
         assert revision == (DATABASE_SCHEMA_REVISION,)
     finally:
@@ -176,24 +174,16 @@ def test_canonical_rows_normalize_mysql_json_float_rendering() -> None:
 
     assert _canonical_row_bytes(
         {"payload": {"wall_time_seconds": 25.900795000000002}}, columns
-    ) == _canonical_row_bytes(
-        {"payload": {"wall_time_seconds": 25.900795}}, columns
-    )
+    ) == _canonical_row_bytes({"payload": {"wall_time_seconds": 25.900795}}, columns)
     assert _canonical_row_bytes(
         {"payload": {"wall_time_seconds": 0.058345000000002756}}, columns
-    ) == _canonical_row_bytes(
-        {"payload": {"wall_time_seconds": 0.058345000000002749}}, columns
-    )
+    ) == _canonical_row_bytes({"payload": {"wall_time_seconds": 0.058345000000002749}}, columns)
     assert _canonical_row_bytes(
         {"payload": {"wall_time_seconds": 0.22456800000000499}}, columns
-    ) == _canonical_row_bytes(
-        {"payload": {"wall_time_seconds": 0.22456800000000501}}, columns
-    )
+    ) == _canonical_row_bytes({"payload": {"wall_time_seconds": 0.22456800000000501}}, columns)
     assert _canonical_row_bytes(
         {"payload": {"wall_time_seconds": 25.9007}}, columns
-    ) != _canonical_row_bytes(
-        {"payload": {"wall_time_seconds": 25.9008}}, columns
-    )
+    ) != _canonical_row_bytes({"payload": {"wall_time_seconds": 25.9008}}, columns)
 
 
 @pytest.mark.asyncio

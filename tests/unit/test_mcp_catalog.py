@@ -42,7 +42,9 @@ def _server_config(directory: Path, **overrides: object) -> dict[str, object]:
 
 
 def test_project_catalog_loads_secret_free_selection_and_execution_metadata() -> None:
-    catalog = load_mcp_catalog(PROJECT_ROOT / "config/mcp/settings.json")
+    settings_path = PROJECT_ROOT / "config/mcp/settings.json"
+    configured_servers = json.loads(settings_path.read_text(encoding="utf-8"))["mcpServers"]
+    catalog = load_mcp_catalog(settings_path)
 
     assert tuple(server.name for server in catalog.servers) == (
         "archery",
@@ -60,7 +62,7 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
         "ARCHERY_MCP_URL",
         "ARCHERY_MCP_TOKEN",
     )
-    assert archery.provider_options == {"transport": "streamable_http"}
+    assert archery.provider_options == {"transport": configured_servers["archery"]["transport"]}
     assert "慢查询日志" in archery.prompts.purpose
     assert "t_instance_member" in archery.prompts.workflow
     assert "mysql_slow_query_review_history" in archery.prompts.workflow
@@ -172,7 +174,9 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert "`mysql:cpu:usage` 是累计 CPU tick" in prometheus.prompts.workflow
     assert "`mysql:cpu:limit`" in prometheus.prompts.workflow
     assert "`*_execute_range_query`" in prometheus.prompts.workflow
-    assert prometheus.provider_options == {"transport": "streamable_http"}
+    assert prometheus.provider_options == {
+        "transport": configured_servers["prometheus"]["transport"]
+    }
 
 
 def test_enabled_server_needs_only_connection_and_prompt_configuration(

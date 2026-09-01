@@ -14,7 +14,7 @@ from app.adapters.persistence import (
     SQLAlchemyAlertRepository,
 )
 from app.config import get_settings
-from app.domain.models import AlertStatus
+from app.domain.models import AlertStatus, StoredAlert
 
 
 def sqlite_url(path: Path) -> str:
@@ -120,9 +120,7 @@ def test_fresh_0015_database_can_downgrade_and_upgrade(
                 "0014",
             )
             for table in ("alerts", "investigation_runs"):
-                columns = {
-                    row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
-                }
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")}
                 assert "runbooks_json" in columns
                 assert "legacy_runbooks_json" not in columns
 
@@ -132,9 +130,7 @@ def test_fresh_0015_database_can_downgrade_and_upgrade(
                 "0015",
             )
             for table in ("alerts", "investigation_runs"):
-                columns = {
-                    row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
-                }
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")}
                 assert "runbooks_json" not in columns
                 assert "legacy_runbooks_json" in columns
     finally:
@@ -383,11 +379,14 @@ def test_0014_to_0015_retires_local_pdf_without_erasing_audit_history(
                 }
                 assert migrated["steps"][0]["source_ref"]["knowledge_id"] == "external-1"
                 assert migrated["steps"][1]["source_ref"] is None
-                assert not {
-                    "external_knowledge_matches",
-                    "manual_matches",
-                    "runbook_excerpts",
-                } & migrated.keys()
+                assert (
+                    not {
+                        "external_knowledge_matches",
+                        "manual_matches",
+                        "runbook_excerpts",
+                    }
+                    & migrated.keys()
+                )
                 assert migrated["legacy_knowledge_contract_v1"] == recommendation
 
             assert run_row[0] == "KNOWLEDGE_MATCHING"
@@ -403,8 +402,7 @@ def test_0014_to_0015_retires_local_pdf_without_erasing_audit_history(
             ) == [local_match]
             assert json.loads(
                 connection.execute(
-                    "SELECT legacy_runbooks_json FROM investigation_runs "
-                    "WHERE id = 'run-1'"
+                    "SELECT legacy_runbooks_json FROM investigation_runs WHERE id = 'run-1'"
                 ).fetchone()[0]
             ) == [local_match]
 
@@ -540,8 +538,7 @@ async def test_unversioned_partial_database_is_rejected(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE alerts (id TEXT PRIMARY KEY)")
         connection.execute(
-            "CREATE TABLE alembic_version "
-            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
         )
 
     repository = SQLAlchemyAlertRepository(sqlite_url(database))
@@ -549,6 +546,27 @@ async def test_unversioned_partial_database_is_rejected(tmp_path: Path) -> None:
         await repository.initialize()
 
     await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_current_schema_rejects_blocking_unmapped_required_column(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "blocking-extra.db"))
+    try:
+        await repository.initialize()
+        async with repository.engine.begin() as connection:
+            await connection.execute(
+                text("ALTER TABLE alerts ADD COLUMN unmapped_required TEXT NOT NULL")
+            )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"blocking_unmapped_columns=alerts\.unmapped_required",
+        ):
+            await repository.ping()
+    finally:
+        await repository.close()
 
 
 @pytest.mark.asyncio
@@ -565,11 +583,115 @@ async def test_existing_non_application_database_is_not_mutated(tmp_path: Path) 
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert tables == {"user_data"}
+
+
+def test_0018_preserves_legacy_audit_and_allows_new_alerts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "nullable-legacy-runbooks.db"
+    database_url = sqlite_url(database)
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "false")
+    get_settings.cache_clear()
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+    legacy_runbooks = [{"runbook_id": "legacy-1"}]
+    now = "2026-08-31 00:00:00"
+
+    try:
+        command.upgrade(config, "0017")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO alerts "
+                "(id, source, external_id, status, alert_json, legacy_runbooks_json, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-alert",
+                    "canonical",
+                    "legacy-before-0018",
+                    "INCONCLUSIVE",
+                    "{}",
+                    json.dumps(legacy_runbooks),
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+        command.upgrade(config, "head")
+        alert = CanonicalAlertSourceAdapter().normalize(
+            {
+                "external_id": "new-after-0018",
+                "severity": "INFO",
+                "title": "Migration write contract",
+                "reason": "test",
+            }
+        )
+
+        async def persist_new_alert() -> tuple[StoredAlert, bool]:
+            repository = SQLAlchemyAlertRepository(database_url)
+            try:
+                await repository.initialize()
+                return await repository.create_or_get(alert)
+            finally:
+                await repository.close()
+
+        stored, created = asyncio.run(persist_new_alert())
+
+        with sqlite3.connect(database) as connection:
+            revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+            legacy_column = next(
+                row
+                for row in connection.execute("PRAGMA table_info('alerts')")
+                if row[1] == "legacy_runbooks_json"
+            )
+            legacy_values = {
+                external_id: json.loads(value) if value is not None else None
+                for external_id, value in connection.execute(
+                    "SELECT external_id, legacy_runbooks_json FROM alerts"
+                )
+            }
+
+        assert revision == (DATABASE_SCHEMA_REVISION,)
+        assert bool(legacy_column[3]) is False
+        assert legacy_column[4] is None
+        assert legacy_values == {
+            "legacy-before-0018": legacy_runbooks,
+            "new-after-0018": None,
+        }
+        assert created is True
+        assert stored.status == AlertStatus.QUEUED
+
+        command.downgrade(config, "0017")
+        with sqlite3.connect(database) as connection:
+            downgraded_revision = connection.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+            downgraded_column = next(
+                row
+                for row in connection.execute("PRAGMA table_info('alerts')")
+                if row[1] == "legacy_runbooks_json"
+            )
+            downgraded_values = {
+                external_id: json.loads(value)
+                for external_id, value in connection.execute(
+                    "SELECT external_id, legacy_runbooks_json FROM alerts"
+                )
+            }
+
+        assert downgraded_revision == ("0017",)
+        assert bool(downgraded_column[3]) is True
+        assert downgraded_column[4] is None
+        assert downgraded_values == {
+            "legacy-before-0018": legacy_runbooks,
+            "new-after-0018": [],
+        }
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -601,9 +723,7 @@ def test_harness_migration_fails_unrecoverable_legacy_running_run(
     monkeypatch.setenv("DATABASE_URL", database_url)
     get_settings.cache_clear()
     config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
-    config.set_main_option(
-        "script_location", str(Path(__file__).parents[2] / "migrations")
-    )
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
     try:
         command.upgrade(config, "0011")
         with sqlite3.connect(database) as connection:
@@ -669,9 +789,7 @@ def test_remove_human_data_migration_round_trip_recreates_empty_tables(
     monkeypatch.setenv("DATABASE_URL", database_url)
     get_settings.cache_clear()
     config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
-    config.set_main_option(
-        "script_location", str(Path(__file__).parents[2] / "migrations")
-    )
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
     feedback_columns = [
         "id",
         "alert_id",
@@ -848,8 +966,7 @@ def test_remove_human_data_migration_round_trip_recreates_empty_tables(
                 row[1] for row in connection.execute("PRAGMA table_info('alert_feedback')")
             ] == feedback_columns
             feedback_defaults = {
-                row[1]: row[4]
-                for row in connection.execute("PRAGMA table_info('alert_feedback')")
+                row[1]: row[4] for row in connection.execute("PRAGMA table_info('alert_feedback')")
             }
             assert feedback_defaults["runbook_match_verdict"] == "'UNKNOWN'"
             assert {
@@ -878,8 +995,7 @@ def test_remove_human_data_migration_round_trip_recreates_empty_tables(
                 row[1] for row in connection.execute("PRAGMA table_info('knowledge_cases')")
             ] == knowledge_case_columns
             knowledge_defaults = {
-                row[1]: row[4]
-                for row in connection.execute("PRAGMA table_info('knowledge_cases')")
+                row[1]: row[4] for row in connection.execute("PRAGMA table_info('knowledge_cases')")
             }
             assert knowledge_defaults["supporting_evidence_ids_json"] == "'[]'"
             assert connection.execute("SELECT COUNT(*) FROM knowledge_cases").fetchone() == (0,)

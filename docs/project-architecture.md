@@ -13,7 +13,7 @@ mindmap
       FlashDuty 轮询
       其它来源 HTTP API
       标准化 去重 入队
-      Kafka 和 Analysis Worker
+      Redis Streams 和 Analysis Worker
     Agent 分析
       FlashDuty 权威详情
       可选知识来源

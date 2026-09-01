@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,25 +11,85 @@ from app.application.factory import build_runtime
 from app.application.scheduler import (
     FlashDutyAlertPoller,
     InMemoryAnalysisScheduler,
-    KafkaAnalysisScheduler,
     ManualAnalysisScheduler,
+    RedisAnalysisScheduler,
     _remaining_poll_delay,
 )
 from app.config import Settings
 from app.domain.models import AlertStatus
 
 
-def test_kafka_scheduler_construction_does_not_require_running_event_loop() -> None:
+def test_redis_scheduler_construction_does_not_require_running_event_loop() -> None:
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
-        kafka_bootstrap_servers="kafka:9092",
+        redis_url="redis://redis:6379/0",
     )
     service = SimpleNamespace(repository=SimpleNamespace())
 
-    scheduler = KafkaAnalysisScheduler(settings, service)  # type: ignore[arg-type]
+    scheduler = RedisAnalysisScheduler(settings, service)  # type: ignore[arg-type]
 
-    assert scheduler.producer is None
+    assert scheduler.client is None
+    assert scheduler._started is False
+
+
+@pytest.mark.asyncio
+async def test_redis_scheduler_requeues_pending_alerts_on_start() -> None:
+    class Repository:
+        def __init__(self) -> None:
+            self.statuses: set[AlertStatus] | None = None
+
+        async def list_by_status(self, statuses):  # type: ignore[no-untyped-def]
+            self.statuses = statuses
+            return [SimpleNamespace(alert=SimpleNamespace(id="alert-1"))]
+
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.pings = 0
+            self.entries: list[tuple[str, dict[str, str]]] = []
+            self.closed = False
+
+        async def ping(self) -> bool:
+            self.pings += 1
+            return True
+
+        async def xadd(self, stream, fields):  # type: ignore[no-untyped-def]
+            self.entries.append((stream, fields))
+            return b"1-0"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    settings = Settings(_env_file=None, ai_provider="fake")
+    repository = Repository()
+    client = FakeRedis()
+    service = SimpleNamespace(repository=repository)
+    scheduler = RedisAnalysisScheduler(
+        settings,
+        service,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+    )
+
+    await scheduler.start()
+    await scheduler.start()
+
+    assert client.pings == 1
+    assert repository.statuses == {
+        AlertStatus.RECEIVED,
+        AlertStatus.QUEUED,
+        AlertStatus.ANALYZING,
+    }
+    assert len(client.entries) == 1
+    stream, fields = client.entries[0]
+    assert stream == settings.redis_stream_name
+    assert json.loads(fields["envelope"]) == {
+        "schema_version": 1,
+        "job_type": "investigate",
+        "alert_id": "alert-1",
+    }
+
+    await scheduler.stop()
+    assert client.closed is True
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ sequenceDiagram
     participant API as API + Poller
     participant FD as FlashDuty Open API
     participant DB as 告警数据库
-    participant Q as 调度器 / Kafka
+    participant Q as 调度器 / Redis Streams
     participant W as AI Worker
     participant WC as 企业微信群机器人
 

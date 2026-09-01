@@ -1,30 +1,30 @@
 services:
-  kafka:
-    image: apache/kafka:3.9.1
-    hostname: kafka
+  redis:
+    image: redis:7.4.2-alpine
+    hostname: redis
     restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        password_hash="$$(printf '%s' "$$REDIS_PASSWORD" | sha256sum | cut -d ' ' -f 1)"
+        umask 077
+        printf '%s\n' \
+          'user default off' \
+          "user database-alert-agent on #$$password_hash ~{database-alert-agent}:* resetchannels -@all +ping +eval +xadd +xgroup +xreadgroup +xautoclaim +xack +xdel +xpending +xinfo +del" \
+          > /data/users.acl
+        exec redis-server --appendonly yes --appendfsync everysec \
+          --maxmemory-policy noeviction --aclfile /data/users.acl
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     ports:
-      - "127.0.0.1:29092:29092"
+      - "127.0.0.1:6379:6379"
     volumes:
-      - kafka-data:/var/lib/kafka/data
+      - redis-data:/data
     healthcheck:
-      # `kafka-topics.sh` starts a JVM on every probe. A TCP connect is enough
-      # to establish that the broker is accepting client connections; aiokafka
-      # still handles the broker's normal metadata/retry sequence on startup.
-      test: ["CMD-SHELL", "bash -c '>/dev/tcp/127.0.0.1/9092'"]
+      test:
+        - CMD-SHELL
+        - 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli --no-auth-warning --user database-alert-agent ping'
       interval: 3s
       timeout: 5s
       retries: 10
@@ -34,7 +34,7 @@ services:
     restart: "no"
     env_file:
       - path: .env
-        required: false
+        required: true
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
@@ -51,12 +51,14 @@ services:
     restart: unless-stopped
     env_file:
       - path: .env
-        required: false
+        required: true
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_ENABLED: "true"
-      HTTP_SCHEDULER: kafka
+      REDIS_ENABLED: "true"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_USERNAME: database-alert-agent
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      HTTP_SCHEDULER: redis
       SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-1}
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
       MCP_SETTINGS_PATH: /app/config/mcp/settings.json
@@ -65,9 +67,6 @@ services:
       CORS_ALLOWED_ORIGINS: '["http://localhost:3000","http://localhost:5173"]'
     volumes:
       - ./data:/app/data
-    networks:
-      - default
-      - knowledge-network
     ports:
       # Keep the unauthenticated alert/read API on the local host. Route remote
       # alert platforms and operators through an authenticated gateway.
@@ -75,7 +74,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      kafka:
+      redis:
         condition: service_healthy
     healthcheck:
       test:
@@ -90,14 +89,16 @@ services:
   worker:
     image: database-alert-agent-backend:local
     restart: unless-stopped
-    command: ["python", "-m", "app.workers.kafka"]
+    command: ["python", "-m", "app.workers.redis"]
     env_file:
       - path: .env
-        required: false
+        required: true
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/alerts.db}
-      KAFKA_ENABLED: "true"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_ENABLED: "true"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_USERNAME: database-alert-agent
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-1}
       RUNTIME_SETTINGS_PATH: /app/data/runtime-settings.json
       MCP_SETTINGS_PATH: /app/config/mcp/settings.json
@@ -105,13 +106,10 @@ services:
       EXTERNAL_KNOWLEDGE_BASE_URL: ${EXTERNAL_KNOWLEDGE_BASE_URL:-http://knowledge:8000}
     volumes:
       - ./data:/app/data
-    networks:
-      - default
-      - knowledge-network
     depends_on:
       migrate:
         condition: service_completed_successfully
-      kafka:
+      redis:
         condition: service_healthy
 
   frontend:
@@ -121,13 +119,9 @@ services:
     ports:
       - "127.0.0.1:3000:80"
     # The static application can be served before the API is available. This
-    # removes the Kafka -> migrate -> API critical path from UI startup; API
+    # removes the Redis -> migrate -> API critical path from UI startup; API
     # requests become available once the backend completes its own safeguards.
 
 volumes:
-  kafka-data:
+  redis-data:
 
-networks:
-  knowledge-network:
-    name: ${KNOWLEDGE_NETWORK_NAME:-database-alert-knowledge}
-    external: true

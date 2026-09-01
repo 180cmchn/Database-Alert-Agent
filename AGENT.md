@@ -46,7 +46,7 @@ Database Alert Agent 从 FlashDuty 等来源接收数据库告警，持久化并
 | `app/mcp_catalog/` | MCP 配置与提示词目录加载、校验 |
 | `app/mcp_runtime/` | MCP 会话、调用契约、持久化与重放基础设施 |
 | `app/api/` | FastAPI 应用、鉴权、路由和请求/响应 Schema |
-| `app/workers/` | Kafka Worker 入口 |
+| `app/workers/` | Redis Streams Worker 入口 |
 | `config/mcp/` | MCP provider 声明及 `role/purpose/workflow/safety` 提示词 |
 | `migrations/` | Alembic 环境和不可变的顺序迁移 |
 | `tests/unit/` | 隔离的单元与组件行为测试，使用 fake、replay 和临时数据库 |
@@ -116,13 +116,13 @@ Vite 开发服务默认使用 `http://127.0.0.1:5173`；Compose 中的静态前�
 
 ### 5.3 Docker Compose
 
-Compose 依赖预先存在的外部网络，默认名为 `database-alert-knowledge`。确认网络存在后运行：
+Compose 强制加载项目根目录 `.env`。完成必填部署配置后运行：
 
 ```bash
 docker compose up -d --build
 ```
 
-`migrate` 服务执行 `alembic upgrade head`，API 与 Worker 只在迁移成功后启动；Kafka 和前端有各自的启动条件。不要让 API 与 Worker 使用不同的 `APP_CODE_VERSION` 或数据库迁移状态。
+`migrate` 服务执行 `alembic upgrade head`，API 与 Worker 只在迁移和 Redis 健康检查成功后启动；前端可独立启动。不要让 API 与 Worker 使用不同的 `APP_CODE_VERSION` 或数据库迁移状态。
 
 ## 6. 修改规则
 

@@ -274,7 +274,9 @@ class UTCDateTime(TypeDecorator[datetime]):
         return dialect.type_descriptor(DateTime(timezone=True))
 
     def process_bind_param(
-        self, value: datetime | None, _dialect  # type: ignore[no-untyped-def]
+        self,
+        value: datetime | None,
+        _dialect,  # type: ignore[no-untyped-def]
     ) -> datetime | None:
         if value is None:
             return None
@@ -283,7 +285,9 @@ class UTCDateTime(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
     def process_result_value(
-        self, value: datetime | None, _dialect  # type: ignore[no-untyped-def]
+        self,
+        value: datetime | None,
+        _dialect,  # type: ignore[no-untyped-def]
     ) -> datetime | None:
         if value is None:
             return None
@@ -293,7 +297,7 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 
 _UNBOUNDED_TEXT = Text().with_variant(LONGTEXT(), "mysql")
-DATABASE_SCHEMA_REVISION = "0017"
+DATABASE_SCHEMA_REVISION = "0018"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -329,9 +333,7 @@ class AlertRow(Base):
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), nullable=False, default=_utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, default=_utc_now, onupdate=_utc_now
     )
@@ -363,12 +365,8 @@ class InvestigationRunRow(Base):
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), nullable=False, default=_utc_now
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), nullable=False, default=_utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
 
 
 class ProgressRow(Base):
@@ -386,9 +384,7 @@ class ProgressRow(Base):
     stage: Mapped[str] = mapped_column(String(40), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), nullable=False, default=_utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
 
 
 class EvidenceRow(Base):
@@ -512,9 +508,7 @@ class AgentCheckpointWriteRow(Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("investigation_runs.id", ondelete="CASCADE"), nullable=False
     )
-    checkpoint_id: Mapped[str] = mapped_column(
-        String(36), nullable=False
-    )
+    checkpoint_id: Mapped[str] = mapped_column(String(36), nullable=False)
     task_id: Mapped[str] = mapped_column(String(255), nullable=False)
     write_index: Mapped[int] = mapped_column(Integer, nullable=False)
     channel: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -527,9 +521,7 @@ class AgentCheckpointWriteRow(Base):
 
 class ToolInvocationRow(Base):
     __tablename__ = "tool_invocations"
-    __table_args__ = (
-        Index("ix_tool_invocations_run_status", "run_id", "status"),
-    )
+    __table_args__ = (Index("ix_tool_invocations_run_status", "run_id", "status"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     run_id: Mapped[str] = mapped_column(
@@ -713,30 +705,71 @@ class SQLAlchemyAlertRepository:
             return int(result.rowcount or 0)
 
     @staticmethod
-    def _schema_snapshot(connection) -> dict[str, set[str]]:  # type: ignore[no-untyped-def]
+    def _schema_snapshot(
+        connection,  # type: ignore[no-untyped-def]
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
         inspector = inspect(connection)
         return {
-            table_name: {str(column["name"]) for column in inspector.get_columns(table_name)}
+            table_name: tuple(dict(column) for column in inspector.get_columns(table_name))
             for table_name in inspector.get_table_names()
         }
 
+    @staticmethod
+    def _blocking_unmapped_columns(
+        snapshot: Mapping[str, tuple[Mapping[str, Any], ...]],
+        expected_columns: Mapping[str, set[str]],
+    ) -> dict[str, list[str]]:
+        blocking: dict[str, list[str]] = {}
+        for table_name, mapped_columns in expected_columns.items():
+            columns: list[str] = []
+            for column in snapshot.get(table_name, ()):
+                name = str(column["name"])
+                generated = (
+                    column.get("default") is not None
+                    or column.get("identity") is not None
+                    or column.get("computed") is not None
+                    or column.get("autoincrement") in {True, "auto"}
+                )
+                if (
+                    name not in mapped_columns
+                    and not bool(column.get("nullable", True))
+                    and not generated
+                ):
+                    columns.append(name)
+            if columns:
+                blocking[table_name] = sorted(columns)
+        return blocking
+
     async def _assert_schema_current(self, connection) -> None:  # type: ignore[no-untyped-def]
         snapshot = await connection.run_sync(self._schema_snapshot)
+        snapshot_columns = {
+            table_name: {str(column["name"]) for column in columns}
+            for table_name, columns in snapshot.items()
+        }
         expected_columns = {
             table_name: {column.name for column in table.columns}
             for table_name, table in Base.metadata.tables.items()
         }
-        missing_tables = sorted(set(expected_columns) - set(snapshot))
+        missing_tables = sorted(set(expected_columns) - set(snapshot_columns))
         missing_columns = {
-            table_name: sorted(columns - snapshot.get(table_name, set()))
+            table_name: sorted(columns - snapshot_columns.get(table_name, set()))
             for table_name, columns in expected_columns.items()
-            if columns - snapshot.get(table_name, set())
+            if columns - snapshot_columns.get(table_name, set())
         }
+        blocking_unmapped_columns = self._blocking_unmapped_columns(
+            snapshot,
+            expected_columns,
+        )
 
         revision: str | None = None
         if "alembic_version" in snapshot:
             revision = await connection.scalar(select(_alembic_version.c.version_num))
-        if revision != DATABASE_SCHEMA_REVISION or missing_tables or missing_columns:
+        if (
+            revision != DATABASE_SCHEMA_REVISION
+            or missing_tables
+            or missing_columns
+            or blocking_unmapped_columns
+        ):
             details: list[str] = [
                 f"revision={revision or 'unversioned'}",
                 f"expected={DATABASE_SCHEMA_REVISION}",
@@ -752,6 +785,15 @@ class SQLAlchemyAlertRepository:
                         for column in columns
                     )
                 )
+            if blocking_unmapped_columns:
+                details.append(
+                    "blocking_unmapped_columns="
+                    + ",".join(
+                        f"{table}.{column}"
+                        for table, columns in sorted(blocking_unmapped_columns.items())
+                        for column in columns
+                    )
+                )
             recovery = (
                 "Back up the database and follow the unversioned SQLite recovery "
                 "instructions in README.md."
@@ -759,9 +801,7 @@ class SQLAlchemyAlertRepository:
                 else "Back up the database and run `alembic upgrade head`."
             )
             raise RuntimeError(
-                "Database schema is not current ("
-                + "; ".join(details)
-                + f"). {recovery}"
+                "Database schema is not current (" + "; ".join(details) + f"). {recovery}"
             )
 
     async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]:
@@ -813,9 +853,7 @@ class SQLAlchemyAlertRepository:
                 fencing_token=fencing_token,
             )
             if run_row.alert_id != alert_id:
-                raise RunLeaseConflict(
-                    run_id, "run does not belong to the requested alert"
-                )
+                raise RunLeaseConflict(run_id, "run does not belong to the requested alert")
             if row.source != alert.source or row.external_id != alert.external_id:
                 raise ValueError("updated alert source identity cannot change")
             row.alert_json = alert.model_dump(mode="json")
@@ -1057,9 +1095,7 @@ class SQLAlchemyAlertRepository:
             self._archive_legacy_alert_result(latest, alert_row)
             attempt = (latest.attempt + 1) if latest else 1
             run_identity = (
-                {"id": manifest_payload["run_id"]}
-                if manifest_payload is not None
-                else {}
+                {"id": manifest_payload["run_id"]} if manifest_payload is not None else {}
             )
             run = InvestigationRun(
                 **run_identity,
@@ -1154,9 +1190,7 @@ class SQLAlchemyAlertRepository:
             self._archive_legacy_alert_result(latest, alert_row)
             attempt = (latest.attempt + 1) if latest else 1
             run_identity = (
-                {"id": manifest_payload["run_id"]}
-                if manifest_payload is not None
-                else {}
+                {"id": manifest_payload["run_id"]} if manifest_payload is not None else {}
             )
             run = InvestigationRun(
                 **run_identity,
@@ -1507,9 +1541,7 @@ class SQLAlchemyAlertRepository:
             )
             actual_sequence = (await session.execute(latest_query)).scalar_one_or_none() or 0
             if actual_sequence != expected_sequence:
-                raise AgentEventSequenceConflict(
-                    run_id, expected_sequence, actual_sequence
-                )
+                raise AgentEventSequenceConflict(run_id, expected_sequence, actual_sequence)
             if not payloads:
                 return actual_sequence
 
@@ -1549,9 +1581,7 @@ class SQLAlchemyAlertRepository:
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                actual_sequence = (
-                    (await session.execute(latest_query)).scalar_one_or_none() or 0
-                )
+                actual_sequence = (await session.execute(latest_query)).scalar_one_or_none() or 0
                 raise AgentEventSequenceConflict(
                     run_id, expected_sequence, actual_sequence
                 ) from exc
@@ -1649,9 +1679,7 @@ class SQLAlchemyAlertRepository:
             )
             actual_version = (await session.execute(latest_query)).scalar_one_or_none() or 0
             if actual_version != expected_version:
-                raise AgentCheckpointVersionConflict(
-                    run_id, expected_version, actual_version
-                )
+                raise AgentCheckpointVersionConflict(run_id, expected_version, actual_version)
             state_hash = _canonical_json_hash(payload.get("state") or {})
             session.add(
                 AgentCheckpointRow(
@@ -1671,9 +1699,7 @@ class SQLAlchemyAlertRepository:
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                actual_version = (
-                    (await session.execute(latest_query)).scalar_one_or_none() or 0
-                )
+                actual_version = (await session.execute(latest_query)).scalar_one_or_none() or 0
                 raise AgentCheckpointVersionConflict(
                     run_id, expected_version, actual_version
                 ) from exc
@@ -1791,9 +1817,7 @@ class SQLAlchemyAlertRepository:
                 raise ValueError("checkpoint write payload has an invalid shape")
             if not isinstance(write["task_id"], str) or not write["task_id"]:
                 raise ValueError("checkpoint write task_id must not be empty")
-            if isinstance(write["write_index"], bool) or not isinstance(
-                write["write_index"], int
-            ):
+            if isinstance(write["write_index"], bool) or not isinstance(write["write_index"], int):
                 raise TypeError("checkpoint write_index must be an integer")
             if not isinstance(write["channel"], str) or not write["channel"]:
                 raise ValueError("checkpoint write channel must not be empty")
@@ -1897,9 +1921,7 @@ class SQLAlchemyAlertRepository:
             existing = await session.get(ToolInvocationRow, invocation_id)
             if existing is not None:
                 self._validated_tool_invocation_row(existing)
-                if _canonical_json_hash(existing.invocation_json) == _canonical_json_hash(
-                    payload
-                ):
+                if _canonical_json_hash(existing.invocation_json) == _canonical_json_hash(payload):
                     return invocation
                 raise ToolInvocationConflict(invocation_id, "invocation id already exists")
             session.add(self._tool_invocation_row(payload))
@@ -1958,9 +1980,7 @@ class SQLAlchemyAlertRepository:
                 expected_status=expected_value,
                 proposed_status=str(payload["status"]),
             ):
-                raise ToolInvocationConflict(
-                    invocation_id, "immutable invocation identity changed"
-                )
+                raise ToolInvocationConflict(invocation_id, "immutable invocation identity changed")
             if expected_value is not None and row.status != expected_value:
                 raise ToolInvocationConflict(
                     invocation_id,
@@ -2031,26 +2051,20 @@ class SQLAlchemyAlertRepository:
             proposed_without_claim
         )
 
-    async def get_tool_invocation(
-        self, invocation_id: str
-    ) -> ToolInvocation | None:
+    async def get_tool_invocation(self, invocation_id: str) -> ToolInvocation | None:
         async with self.session_factory() as session:
             row = await session.get(ToolInvocationRow, invocation_id)
             if row is None:
                 return None
             return self._validated_tool_invocation_row(row)
 
-    async def get_tool_invocation_result(
-        self, invocation_id: str
-    ) -> dict[str, Any] | None:
+    async def get_tool_invocation_result(self, invocation_id: str) -> dict[str, Any] | None:
         async with self.session_factory() as session:
             row = await session.get(ToolInvocationRow, invocation_id)
             if row is None or row.result_json is None:
                 return None
             if not isinstance(row.result_json, dict):
-                raise RuntimeError(
-                    f"Tool invocation result was not an object for {invocation_id}"
-                )
+                raise RuntimeError(f"Tool invocation result was not an object for {invocation_id}")
             return dict(row.result_json)
 
     async def save_agent_artifact(
@@ -2107,8 +2121,7 @@ class SQLAlchemyAlertRepository:
                     "metadata": existing.metadata_json or {},
                 }
                 if (
-                    _canonical_json_hash(existing_payload)
-                    != _canonical_json_hash(stored_payload)
+                    _canonical_json_hash(existing_payload) != _canonical_json_hash(stored_payload)
                     or existing.content_encoding != content_encoding
                     or existing.sanitized_content != stored_content
                 ):
@@ -2174,9 +2187,7 @@ class SQLAlchemyAlertRepository:
             id=str(payload["invocation_id"]),
             run_id=str(payload["run_id"]),
             parent_run_id=(
-                str(payload["parent_run_id"])
-                if payload.get("parent_run_id") is not None
-                else None
+                str(payload["parent_run_id"]) if payload.get("parent_run_id") is not None else None
             ),
             tool_name=str(payload["tool_name"]),
             provider=str(payload["provider"]),
@@ -2192,9 +2203,7 @@ class SQLAlchemyAlertRepository:
             deadline=_datetime_value(payload.get("deadline")),
             result_json=payload.get("result"),
             error_json=(
-                dict(payload["error"])
-                if isinstance(payload.get("error"), Mapping)
-                else None
+                dict(payload["error"]) if isinstance(payload.get("error"), Mapping) else None
             ),
             artifact_ref_json=(
                 dict(payload["artifact_ref"])
@@ -2236,13 +2245,9 @@ class SQLAlchemyAlertRepository:
                 invocation_id, "persisted invocation payload is invalid"
             ) from exc
 
-        stored_error = (
-            stored.error.model_dump(mode="json") if stored.error is not None else None
-        )
+        stored_error = stored.error.model_dump(mode="json") if stored.error is not None else None
         stored_artifact = (
-            stored.artifact_ref.model_dump(mode="json")
-            if stored.artifact_ref is not None
-            else None
+            stored.artifact_ref.model_dump(mode="json") if stored.artifact_ref is not None else None
         )
         mirrored_fields = {
             "invocation_id": row.id == str(stored.invocation_id),
@@ -2252,13 +2257,10 @@ class SQLAlchemyAlertRepository:
             "tool_name": row.tool_name == stored.tool_name,
             "provider": row.provider == stored.provider,
             "objective": row.objective == stored.objective,
-            "hypothesis_ids": list(row.hypothesis_ids_json or [])
-            == stored.hypothesis_ids,
+            "hypothesis_ids": list(row.hypothesis_ids_json or []) == stored.hypothesis_ids,
             "model_arguments": _canonical_json_hash(row.model_arguments_json or {})
             == _canonical_json_hash(stored.model_arguments),
-            "effective_arguments": _canonical_json_hash(
-                row.effective_arguments_json or {}
-            )
+            "effective_arguments": _canonical_json_hash(row.effective_arguments_json or {})
             == _canonical_json_hash(stored.effective_arguments),
             "fingerprint": row.fingerprint == stored.fingerprint,
             "status": row.status == stored.status.value,
@@ -2267,8 +2269,7 @@ class SQLAlchemyAlertRepository:
             "created_at": row.created_at == stored.created_at,
             "started_at": row.started_at == stored.started_at,
             "completed_at": row.completed_at == stored.completed_at,
-            "error": _canonical_json_hash(row.error_json)
-            == _canonical_json_hash(stored_error),
+            "error": _canonical_json_hash(row.error_json) == _canonical_json_hash(stored_error),
             "artifact_ref": _canonical_json_hash(row.artifact_ref_json)
             == _canonical_json_hash(stored_artifact),
         }
@@ -2313,9 +2314,7 @@ class SQLAlchemyAlertRepository:
         values: dict[str, Any] = {
             "status": str(payload["status"]),
             "error_json": (
-                dict(payload["error"])
-                if isinstance(payload.get("error"), Mapping)
-                else None
+                dict(payload["error"]) if isinstance(payload.get("error"), Mapping) else None
             ),
             "artifact_ref_json": (
                 dict(payload["artifact_ref"])
@@ -2458,9 +2457,7 @@ class SQLAlchemyAlertRepository:
                 .order_by(desc(ProgressRow.sequence))
                 .limit(1)
             )
-            saved_progress = progress.model_copy(
-                update={"sequence": (latest_sequence or 0) + 1}
-            )
+            saved_progress = progress.model_copy(update={"sequence": (latest_sequence or 0) + 1})
             now = _utc_now()
 
             run_row.status = run_status.value
@@ -2645,9 +2642,7 @@ class SQLAlchemyAlertRepository:
         invocation = await session.get(ToolInvocationRow, artifact.invocation_id)
         try:
             stored_invocation = (
-                cls._validated_tool_invocation_row(invocation)
-                if invocation is not None
-                else None
+                cls._validated_tool_invocation_row(invocation) if invocation is not None else None
             )
         except (ToolInvocationConflict, TypeError, ValueError) as exc:
             raise error_factory("v2 source artifact invocation binding is invalid") from exc
@@ -2708,8 +2703,7 @@ class SQLAlchemyAlertRepository:
                         f"v2 evidence-unit source path does not resolve: {source_path}"
                     ) from exc
             if unit.status.value == "SUCCESS" and not any(
-                cls._projected_value_matches_source(unit.data, source)
-                for source in resolved_values
+                cls._projected_value_matches_source(unit.data, source) for source in resolved_values
             ):
                 raise error_factory(
                     "v2 successful evidence-unit data does not match its raw source path"
@@ -2723,9 +2717,13 @@ class SQLAlchemyAlertRepository:
                 for key, value in projected.items()
             )
         if isinstance(projected, list):
-            return isinstance(source, list) and len(projected) == len(source) and all(
-                cls._projected_value_matches_source(item, raw_item)
-                for item, raw_item in zip(projected, source, strict=True)
+            return (
+                isinstance(source, list)
+                and len(projected) == len(source)
+                and all(
+                    cls._projected_value_matches_source(item, raw_item)
+                    for item, raw_item in zip(projected, source, strict=True)
+                )
             )
         return projected == source
 
@@ -2754,9 +2752,7 @@ class SQLAlchemyAlertRepository:
                     run_id=run_id,
                     kind=validation.kind.value,
                     passed=1 if validation.passed else 0,
-                    evidence_sufficient=(
-                        1 if validation.evidence_sufficient else 0
-                    ),
+                    evidence_sufficient=(1 if validation.evidence_sufficient else 0),
                     issues_json=validation.issues,
                     metadata_json=validation.metadata,
                     created_at=validation.created_at,
@@ -2979,17 +2975,13 @@ class SQLAlchemyAlertRepository:
                 recommendation_json = None
                 advisor_metadata_json = None
         else:
-            selected_result_available = bool(
-                recommendation_json or advisor_metadata_json
-            )
+            selected_result_available = bool(recommendation_json or advisor_metadata_json)
 
         return StoredAlert(
             alert=normalized_alert,
             status=selected_status,
             recommendation=(
-                Recommendation.model_validate(recommendation_json)
-                if recommendation_json
-                else None
+                Recommendation.model_validate(recommendation_json) if recommendation_json else None
             ),
             advisor_metadata=(
                 AdvisorMetadata.model_validate(advisor_metadata_json)

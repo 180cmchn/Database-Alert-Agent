@@ -9,7 +9,7 @@ description = "Extensible AI-assisted database alert analysis service"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "aiokafka>=0.12,<1",
+  "redis>=8.1,<9",
   "aiosqlite>=0.20,<1",
   "alembic>=1.14,<2",
   "fastapi>=0.115,<1",
@@ -45,7 +45,7 @@ packages = ["app"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-  "integration: requires an external service such as Kafka",
+  "integration: requires an explicitly enabled external service such as Redis",
   "live: uses explicitly enabled real AI and FlashDuty credentials",
 ]
 

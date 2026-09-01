@@ -238,9 +238,9 @@ Prometheus 的作用是查询数据库监控指标，提示词位于 `config/mcp
 4. 不在覆盖范围内时返回 `Prometheus MCP 中没有配置告警数据库对应的监控信息`，该结果表示工具
    不适用，不否决其它证据。
 
-当前 checked-in 配置使用 `streamable_http` 和 `/mcp` endpoint；若部署的服务
-仅提供 SSE，可将 `config/mcp/settings.json` 中 Prometheus 的 `transport` 改为
-`sse`，并将 URL 指向该服务的 SSE endpoint。
+Prometheus MCP 的地址通过 `PROMETHEUS_MCP_URL` 配置，连接方式通过
+`config/mcp/settings.json` 中对应服务的 `transport` 配置；支持 `sse` 和 `streamable_http`，URL 应指向
+所选连接方式对应的 endpoint。
 
 目标发现、指标目录和元数据只保存为内部审计 artifact。程序侧对目标与时间窗匹配的时序计算样本数、
 最小值、最大值、均值、最新值、变化量、缺口和异常排序，再把可追溯 observation 交给主 Agent。
@@ -257,12 +257,11 @@ PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 
 ### 外部 KnowledgePack
 
-KnowledgePack 独立部署，通过共享 Docker 网络向 Agent 提供 `POST /search`。检索失败或空响应只表示
-该知识来源缺失，分析继续。
+KnowledgePack 独立部署；`EXTERNAL_KNOWLEDGE_BASE_URL` 必须能从 API 和 Worker 所在环境访问。
+检索失败或空响应只表示该知识来源缺失，分析继续。
 
 ```dotenv
-KNOWLEDGE_NETWORK_NAME=database-alert-knowledge
-EXTERNAL_KNOWLEDGE_BASE_URL=http://knowledge:8000
+EXTERNAL_KNOWLEDGE_BASE_URL=https://knowledge.example.internal
 EXTERNAL_KNOWLEDGE_API_KEY=replace-me
 EXTERNAL_KNOWLEDGE_TIMEOUT_SECONDS=30
 EXTERNAL_KNOWLEDGE_LIMIT=5
@@ -323,6 +322,30 @@ DeepSeek 或内部兼容网关。使用 OpenAI Responses API 时设置为 `opena
 覆盖，只影响之后创建的分析运行；清空运行级覆盖后，API 和 Worker 会立即恢复环境变量中的部署基线，
 无需再次重启。
 
+### Redis 异步分析队列
+
+多进程部署使用 Redis Streams；MySQL 继续保存告警、租约、checkpoint 和分析结果。API 只向
+`REDIS_STREAM_NAME` 写入任务，独立 Worker 通过 consumer group 消费，并在业务事务完成后确认消息。
+
+```dotenv
+REDIS_ENABLED=true
+REDIS_URL=redis://localhost:6379/0
+REDIS_USERNAME=database-alert-agent
+REDIS_PASSWORD=replace-with-a-long-random-secret
+REDIS_STREAM_NAME={database-alert-agent}:jobs
+REDIS_DLQ_STREAM_NAME={database-alert-agent}:dlq
+REDIS_CONSUMER_GROUP=database-alert-agent
+REDIS_CLAIM_IDLE_SECONDS=660
+HTTP_SCHEDULER=redis
+```
+
+`REDIS_CLAIM_IDLE_SECONDS` 不得小于 `INVESTIGATION_LEASE_SECONDS`。主 stream 不自动裁剪 pending
+消息；成功或成功写入脱敏 DLQ 后才从主 stream 删除。自托管 Redis 必须启用 AOF、使用
+`appendfsync everysec` 和 `maxmemory-policy noeviction`。Compose 强制加载 `.env`，启动前先从
+`.env.example` 复制并设置 Redis 密码及其它必填部署值。
+Compose 启动时生成仅可访问 `{database-alert-agent}:*` 的 ACL 用户；托管 Redis 应授予等价的
+Stream、`EVAL`、`PING` 和只读队列观测权限。
+
 ## 本地运行
 
 需要 Python 3.12+，Node.js 20.19+ 或 22.12+。
@@ -335,6 +358,80 @@ alembic upgrade head
 uvicorn app.api.main:app --reload
 ```
 
+本地未启动 Redis 时使用进程内调度器；`.env` 中应保持 `REDIS_ENABLED=false` 和
+`HTTP_SCHEDULER=in_memory`。若当前终端加载了 Redis 部署配置，可在 PowerShell 中临时覆盖：
+
+```powershell
+$env:REDIS_ENABLED="false"
+$env:HTTP_SCHEDULER="in_memory"
+uvicorn app.api.main:app --reload
+```
+
+使用 `HTTP_SCHEDULER=redis` 时，API 会在启动阶段执行 Redis `PING` 并在连接失败时退出；此模式必须
+先启动 Redis，并另外运行 `python -m app.workers.redis`。
+
+### 使用项目 Compose 在本地启动 Redis
+
+Docker 不是硬性依赖；API 和 Worker 只要求能访问支持 Streams、consumer group、`XAUTOCLAIM` 和
+Lua `EVAL` 的 Redis 7.x。Windows 项目目录不包含原生 `redis-server`，可选择由 Docker Desktop 或
+Rancher Desktop（Moby 引擎）提供的 Docker Compose、WSL 中的 Redis，或外部托管 Redis。使用项目
+自带的 Redis 7.4、AOF 和 ACL 配置时，若根目录尚无 `.env`，先执行：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+若已安装 Rancher Desktop 但 PowerShell 找不到 `docker`，可把其 bundled CLI 加到当前终端 PATH：
+
+```powershell
+$rdBin="C:\Program Files\Rancher Desktop\resources\resources\win32\bin"
+$env:Path="$rdBin;$env:Path"
+docker compose version
+docker version
+```
+
+`docker version` 必须同时显示 Client 和 Server；只有 Client 或出现 backend 连接错误时，先重启
+Rancher Desktop，等待 Moby 引擎就绪后再运行 Compose。
+
+在 `.env` 中替换示例密码，并启用 Redis 调度器：
+
+```dotenv
+REDIS_ENABLED=true
+REDIS_URL=redis://localhost:6379/0
+REDIS_USERNAME=database-alert-agent
+REDIS_PASSWORD=replace-with-a-long-random-secret
+HTTP_SCHEDULER=redis
+```
+
+先只启动 Redis，并等待状态变为 `healthy`：
+
+```powershell
+docker compose up -d redis
+docker compose ps redis
+```
+
+Redis 未变为健康状态时使用 `docker compose logs redis` 检查启动日志，不要先启动 API 或 Worker。
+Redis 健康后，在两个 PowerShell 终端分别启动 Worker 和 API：
+
+```powershell
+# 终端 1
+python -m app.workers.redis
+
+# 终端 2
+uvicorn app.api.main:app --reload
+```
+
+如果之前在 PowerShell 中临时覆盖过进程内调度配置，先执行
+`Remove-Item Env:REDIS_ENABLED, Env:HTTP_SCHEDULER -ErrorAction SilentlyContinue`，否则终端环境会覆盖
+`.env`。开发结束后可执行 `docker compose stop redis`；持久化 stream 数据仍保留在 `redis-data` volume。
+
+### 不使用 Docker 运行 Redis
+
+在 WSL 或其它本机服务中启动 Redis 7.x 后，保持 `REDIS_URL=redis://localhost:6379/0`。若该实例仅在
+loopback 上提供无认证的本地开发服务，将 `.env` 中 `REDIS_USERNAME` 和 `REDIS_PASSWORD` 留空；若已
+配置 ACL，则填写服务端创建的用户名和密码。外部 Redis 则把 `REDIS_URL` 改为其可达地址。用于故障恢复
+验证的实例仍应启用 `appendonly yes`、`appendfsync everysec` 和 `maxmemory-policy noeviction`。
+
 前端：
 
 ```bash
@@ -343,22 +440,25 @@ npm install
 npm run dev
 ```
 
-也可使用 Docker Compose：
+也可使用 Docker Compose 一次启动 Redis、数据库迁移、Worker、API 和前端：
 
-```bash
-docker network inspect database-alert-knowledge >/dev/null 2>&1 \
-  || docker network create database-alert-knowledge
+```powershell
 docker compose up -d --build
 ```
 
-本机通常无法连接公司内网中的 Archery 和 Prometheus MCP。开发机测试出现连接超时可以忽略；真实
-Schema、鉴权和返回结果在内网工作机验证。
 
 ## 将内置 SQLite 数据迁移到 MySQL 8.0
 
 项目通过 `mysql+asyncmy` 支持外部 MySQL。当前持久化数据包含超过 MySQL `TEXT` 64 KiB
 上限的 checkpoint write 和 artifact 内容；迁移 `0017` 会在 MySQL 中把这两个字段升级为
-`LONGTEXT`。目标必须满足：
+`LONGTEXT`。
+
+迁移 `0018` 将仅供历史审计的 `alerts.legacy_runbooks_json` 改为可空：旧行的审计内容保持不变，当前
+ORM 插入的新告警使用 `NULL` 表示“不适用”，不依赖 MySQL 对 JSON 默认值的支持。已有 MySQL 部署
+必须先停止 API 和 Worker、完成备份，再运行 `alembic upgrade head` 后重启；只重启应用不会修复
+数据库约束。
+
+目标必须满足：
 
 - MySQL 8.0.13+（早期 8.0 版本不支持本项目使用的 JSON 表达式默认值）；
 - 使用独立、空的数据库，默认字符集为 `utf8mb4`，默认排序规则为 `utf8mb4_bin`；
