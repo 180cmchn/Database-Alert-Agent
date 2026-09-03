@@ -518,6 +518,7 @@ Alembic 使用完全一致的值，再启动服务并检查 `/health/ready`。�
 
 - `POST /api/v1/alerts/{source}/analyze`：接收非 FlashDuty 告警并异步分析；FlashDuty 仅由轮询器接入。
 - `GET /api/v1/alerts`、`GET /api/v1/alerts/{alert_id}`：查询告警与指定运行结果。
+- `GET /api/v1/alerts/{alert_id}/flashduty-handling`：读取 FlashDuty 关联故障的当前处理状态和已认领人员；当前快照不随历史分析运行回放。
 - `GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace`：增量读取 thought/action/observation。
 - `POST /api/v1/alerts/{alert_id}/runs/{run_id}/cancel`：管理员 Bearer 认证，幂等取消运行，返回 202。
 - `POST /api/v1/alerts/{alert_id}/reanalyze`：使用当前配置创建新的分析运行。

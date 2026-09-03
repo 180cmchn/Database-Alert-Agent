@@ -82,6 +82,7 @@ FLASHDUTY_OPERATIONS: Final[Mapping[str, _ReadOperation]] = {
     "alert_event_list": _ReadOperation("POST", "/alert/event/list"),
     "alert_feed": _ReadOperation("POST", "/alert/feed"),
     "raw_alert_event_list": _ReadOperation("POST", "/alert-event/list"),
+    "member_list": _ReadOperation("POST", "/member/list"),
     "change_list": _ReadOperation("POST", "/change/list"),
     "monit_query_rows": _ReadOperation("POST", "/monit/query/rows"),
     "monit_query_diagnose": _ReadOperation("POST", "/monit/query/diagnose"),
@@ -208,9 +209,7 @@ class FlashDutyClient:
     ) -> FlashDutyResponse:
         spec = FLASHDUTY_OPERATIONS.get(operation)
         if spec is None:
-            raise FlashDutyConfigurationError(
-                f"Unsupported FlashDuty operation: {operation!r}"
-            )
+            raise FlashDutyConfigurationError(f"Unsupported FlashDuty operation: {operation!r}")
         request_payload = dict(payload or {})
 
         async with httpx.AsyncClient(
@@ -312,9 +311,18 @@ class FlashDutyClient:
             status_code=200,
         )
 
-    async def alert_info(self, alert_id: str) -> FlashDutyResponse:
+    async def alert_info(
+        self,
+        alert_id: str,
+        *,
+        retry_until_cancelled: bool = True,
+    ) -> FlashDutyResponse:
         _require_object_id(alert_id, "alert_id")
-        return await self.call("alert_info", {"alert_id": alert_id})
+        return await self.call(
+            "alert_info",
+            {"alert_id": alert_id},
+            retry_until_cancelled=retry_until_cancelled,
+        )
 
     async def list_alerts(
         self,
@@ -359,6 +367,21 @@ class FlashDutyClient:
         # owning run reaches its timeout or receives a cancellation request.
         return await self.call("alert_list", payload, retry_until_cancelled=False)
 
+    async def list_members(
+        self,
+        *,
+        page: int = 1,
+        limit: int = 100,
+        retry_until_cancelled: bool = False,
+    ) -> FlashDutyResponse:
+        if page < 1:
+            raise FlashDutyConfigurationError("FlashDuty member page must be positive")
+        return await self.call(
+            "member_list",
+            {"p": page, "limit": min(max(limit, 1), 100)},
+            retry_until_cancelled=retry_until_cancelled,
+        )
+
     async def alert_events(self, alert_id: str, *, limit: int = 20) -> FlashDutyResponse:
         _require_object_id(alert_id, "alert_id")
         return await self.call(
@@ -373,9 +396,18 @@ class FlashDutyClient:
             {"alert_id": alert_id, "p": 1, "limit": min(max(limit, 1), 100), "asc": False},
         )
 
-    async def incident_info(self, incident_id: str) -> FlashDutyResponse:
+    async def incident_info(
+        self,
+        incident_id: str,
+        *,
+        retry_until_cancelled: bool = True,
+    ) -> FlashDutyResponse:
         _require_object_id(incident_id, "incident_id")
-        return await self.call("incident_info", {"incident_id": incident_id})
+        return await self.call(
+            "incident_info",
+            {"incident_id": incident_id},
+            retry_until_cancelled=retry_until_cancelled,
+        )
 
     async def incident_feed(self, incident_id: str, *, limit: int = 20) -> FlashDutyResponse:
         _require_object_id(incident_id, "incident_id")
@@ -493,9 +525,7 @@ class FlashDutyAlertSourceAdapter:
             raise InvalidAlertPayloadError("FlashDuty labels must be an object")
         labels = {str(key): str(value) for key, value in raw_labels.items()}
         canonical_labels = {
-            key: value
-            for key, value in labels.items()
-            if key not in _ENDPOINT_LABEL_KEYS
+            key: value for key, value in labels.items() if key not in _ENDPOINT_LABEL_KEYS
         }
         incident = item.get("incident") if isinstance(item.get("incident"), dict) else {}
         incident_id = incident.get("incident_id") or item.get("incident_id")
@@ -561,10 +591,8 @@ class FlashDutyAlertSourceAdapter:
             "flashduty_incident_id": incident_id,
             "flashduty_request_id": request_id,
             "integration_id": item.get("integration_id") or item.get("data_source_id"),
-            "integration_name": item.get("integration_name")
-            or item.get("data_source_name"),
-            "integration_type": item.get("integration_type")
-            or item.get("data_source_type"),
+            "integration_name": item.get("integration_name") or item.get("data_source_name"),
+            "integration_type": item.get("integration_type") or item.get("data_source_type"),
             "channel_id": item.get("channel_id"),
             "channel_name": item.get("channel_name"),
         }
@@ -630,9 +658,7 @@ class FlashDutyAlertSourceAdapter:
             "attributes": attributes,
         }
         normalized = self._canonical.normalize(mapped)
-        analysis_mapped = {
-            key: preprocess_alert_data(value) for key, value in mapped.items()
-        }
+        analysis_mapped = {key: preprocess_alert_data(value) for key, value in mapped.items()}
         analysis_mapped.update(title=normalized.title, reason=normalized.reason)
         parsed = CanonicalAlertPayload.model_validate(analysis_mapped)
         fingerprint = incident_fingerprint(
@@ -825,9 +851,7 @@ class FlashDutySimilarIncidentsTool:
         limit = int(limit) if isinstance(limit, (int, str)) else 5
         response = await self.client.similar_incidents(incident_id, limit=limit)
         items = response.data.get("items", []) if isinstance(response.data, dict) else []
-        summary = (
-            f"FlashDuty 返回 {len(items)} 条历史相似故障；历史记录仅作为调查线索。"
-        )
+        summary = f"FlashDuty 返回 {len(items)} 条历史相似故障；历史记录仅作为调查线索。"
         structured_data = {"request_id": response.request_id, "items": items}
         if not items:
             return ToolExecutionResult(
@@ -861,9 +885,7 @@ class FlashDutyChangesTool:
         if not self.channel_ids:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "未执行 FlashDuty 变更查询：没有配置协作空间范围。"
-                ),
+                summary=("未执行 FlashDuty 变更查询：没有配置协作空间范围。"),
                 structured_data={"reason_code": "channel_scope_missing"},
             )
         parameters = request.parameters
@@ -1043,9 +1065,7 @@ class FlashDutyDataSourceTool:
                 request_id=response.request_id,
             )
         row_count = len(response.data)
-        summary = (
-            f"FlashDuty Monitors 已通过只读接口返回 {row_count} 行原始查询结果。"
-        )
+        summary = f"FlashDuty Monitors 已通过只读接口返回 {row_count} 行原始查询结果。"
         structured_data = {"request_id": response.request_id, "rows": response.data}
         if not response.data:
             return ToolExecutionResult(
@@ -1064,6 +1084,8 @@ _DIAGNOSTIC_TERMS: Final[Mapping[str, set[str]]] = {
     "overview": {"overview", "health", "status"},
 }
 _TARGET_LOCATOR = re.compile(r"^(?!.*\|)[\x21-\x7e]{1,256}$")
+
+
 class FlashDutyDatabaseDiagnosticsTool:
     name = "query_database_diagnostics"
     source_system = "flashduty_monitors"
@@ -1099,9 +1121,7 @@ class FlashDutyDatabaseDiagnosticsTool:
         if not target_candidates:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "未执行 FlashDuty 数据库诊断：告警中没有可解析的监控对象标识。"
-                ),
+                summary=("未执行 FlashDuty 数据库诊断：告警中没有可解析的监控对象标识。"),
                 structured_data={"reason_code": "target_locator_missing"},
             )
         target_kind = parameters.get("target_kind") or alert.attributes.get("flashduty_target_kind")
@@ -1127,10 +1147,7 @@ class FlashDutyDatabaseDiagnosticsTool:
                 raise
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "未执行 FlashDuty 数据库诊断：目标当前没有可用的 "
-                    "monit-agent 工具能力。"
-                ),
+                summary=("未执行 FlashDuty 数据库诊断：目标当前没有可用的 monit-agent 工具能力。"),
                 structured_data={
                     "reason_code": "monitor_target_unavailable",
                     "vendor_error_code": exc.code,
@@ -1141,9 +1158,7 @@ class FlashDutyDatabaseDiagnosticsTool:
         if not tools:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "未执行 FlashDuty 数据库诊断：监控对象没有暴露任何工具。"
-                ),
+                summary=("未执行 FlashDuty 数据库诊断：监控对象没有暴露任何工具。"),
                 structured_data={
                     "reason_code": "monitor_tool_catalog_empty",
                     "catalog_request_id": catalog.request_id,
@@ -1155,9 +1170,7 @@ class FlashDutyDatabaseDiagnosticsTool:
         if not calls:
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=(
-                    "未执行 FlashDuty 数据库诊断：工具目录中没有匹配的工具。"
-                ),
+                summary=("未执行 FlashDuty 数据库诊断：工具目录中没有匹配的工具。"),
                 structured_data={
                     "reason_code": "no_compatible_tool",
                     "catalog_request_id": catalog.request_id,
@@ -1236,9 +1249,7 @@ class FlashDutyDatabaseDiagnosticsTool:
         list[str],
     ]:
         requested_kind = (
-            target_kind.strip()
-            if isinstance(target_kind, str) and target_kind.strip()
-            else None
+            target_kind.strip() if isinstance(target_kind, str) and target_kind.strip() else None
         )
         target_request_ids: list[str] = []
         last_error: FlashDutyError | None = None
@@ -1247,13 +1258,9 @@ class FlashDutyDatabaseDiagnosticsTool:
             resolved_locator = candidate
             resolved_kind = requested_kind
             try:
-                target_response = await self.client.targets(
-                    {"keyword": candidate, "limit": 50}
-                )
+                target_response = await self.client.targets({"keyword": candidate, "limit": 50})
                 target_request_ids.append(target_response.request_id)
-                selected = self._select_target(
-                    target_response.data, candidate, requested_kind
-                )
+                selected = self._select_target(target_response.data, candidate, requested_kind)
                 if selected is not None:
                     resolved_locator, selected_kind = selected
                     resolved_kind = selected_kind or resolved_kind
@@ -1313,25 +1320,14 @@ class FlashDutyDatabaseDiagnosticsTool:
             for item in items
             if isinstance(item, dict)
             and isinstance(item.get("target_locator"), str)
-            and (
-                not target_kind
-                or item.get("target_kind") == target_kind
-            )
+            and (not target_kind or item.get("target_kind") == target_kind)
         ]
-        exact = [
-            item
-            for item in candidates
-            if item["target_locator"] == locator
-        ]
+        exact = [item for item in candidates if item["target_locator"] == locator]
         total = data.get("total")
         selected = (
             exact[0]
             if len(exact) == 1
-            else (
-                candidates[0]
-                if len(candidates) == 1 and total == 1
-                else None
-            )
+            else (candidates[0] if len(candidates) == 1 and total == 1 else None)
         )
         if selected is None:
             return None

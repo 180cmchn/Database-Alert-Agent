@@ -68,6 +68,87 @@ async def test_client_uses_query_app_key_and_reports_unsupported_operations() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("method_name", "object_id", "expected_path"),
+    [
+        ("alert_info", ALERT_ID, "/alert/info"),
+        ("incident_info", INCIDENT_ID, "/incident/info"),
+    ],
+)
+async def test_interactive_info_calls_honor_finite_retry(
+    method_name: str,
+    object_id: str,
+    expected_path: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"request_id": "req-error", "error": {}})
+
+    client = FlashDutyClient(
+        "test-app-key",
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    with pytest.raises(FlashDutyAPIError):
+        await getattr(client, method_name)(object_id, retry_until_cancelled=False)
+
+    assert len(requests) == 1
+    assert requests[0].url.path == expected_path
+
+
+@pytest.mark.asyncio
+async def test_member_list_uses_documented_read_route_and_bounded_pagination() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"request_id": "req-members", "data": {"items": [], "total": 0}},
+        )
+
+    client = FlashDutyClient(
+        "test-app-key",
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    response = await client.list_members(page=2, limit=500)
+
+    assert response.request_id == "req-members"
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/member/list"
+    assert json.loads(requests[0].content) == {"p": 2, "limit": 100}
+    with pytest.raises(FlashDutyConfigurationError, match="page must be positive"):
+        await client.list_members(page=0)
+
+
+@pytest.mark.asyncio
+async def test_member_list_defaults_to_finite_retry() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"request_id": "req-error", "error": {}})
+
+    client = FlashDutyClient(
+        "test-app-key",
+        max_retries=1,
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+
+    with pytest.raises(FlashDutyAPIError):
+        await client.list_members(page=1)
+
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "tool_name",
     [
         "mysql.killSession",
@@ -268,9 +349,7 @@ async def test_client_alert_list_uses_documented_updated_at_cursor_shape() -> No
             },
         )
 
-    client = FlashDutyClient(
-        "test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep
-    )
+    client = FlashDutyClient("test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep)
     await client.list_alerts(
         start_time=1712650000,
         end_time=1712650300,
@@ -306,9 +385,7 @@ async def test_client_alert_list_uses_stable_created_at_order_for_start_time_win
             },
         )
 
-    client = FlashDutyClient(
-        "test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep
-    )
+    client = FlashDutyClient("test-app-key", transport=httpx.MockTransport(handler), sleep=no_sleep)
     await client.list_alerts(
         start_time=1712650000,
         end_time=1712650300,
@@ -424,12 +501,8 @@ def test_flashduty_alert_detail_prefers_label_endpoint_and_normalizes_queries() 
     assert "alarm_port" not in alert.labels
     assert alert.attributes["flashduty_target_locator"] == "ignored-label-host"
     assert alert.attributes["flashduty_target_kind"] == "postgres"
-    assert alert.attributes["flashduty_metrics"] == {
-        "expr": "pg_stat_activity_count"
-    }
-    assert alert.attributes["flashduty_logs"] == {
-        "expr": '{service="postgres"} |= "deadlock"'
-    }
+    assert alert.attributes["flashduty_metrics"] == {"expr": "pg_stat_activity_count"}
+    assert alert.attributes["flashduty_logs"] == {"expr": '{service="postgres"} |= "deadlock"'}
     assert alert.features["observed_value"] == "95"
     assert alert.features["threshold"] == "90"
 
@@ -466,8 +539,7 @@ def test_flashduty_alert_detail_falls_back_to_legacy_top_level_endpoint() -> Non
     assert alert.database.port == 3308
 
 
-def test_flashduty_alert_detail_does_not_replace_invalid_label_port_with_legacy_value(
-) -> None:
+def test_flashduty_alert_detail_does_not_replace_invalid_label_port_with_legacy_value() -> None:
     payload = flashduty_alert_payload()
     payload["data"]["alarm_port"] = "3308"
     payload["data"]["labels"]["alarm_port"] = "70000"
@@ -502,9 +574,7 @@ def test_flashduty_poll_item_cannot_define_database_endpoint() -> None:
 async def test_flashduty_detail_enricher_preserves_identity_and_detail_endpoint() -> None:
     polled = flashduty_alert_payload()
     polled["data"]["title"] = "MySQL/mysql_slow_query/list-host:3307"
-    polled["data"]["labels"].update(
-        {"alarm_host": "list-host", "alarm_port": "3307"}
-    )
+    polled["data"]["labels"].update({"alarm_host": "list-host", "alarm_port": "3307"})
     adapter = FlashDutyAlertSourceAdapter()
     alert = adapter.normalize(polled)
     local_id = alert.id
@@ -513,9 +583,7 @@ async def test_flashduty_detail_enricher_preserves_identity_and_detail_endpoint(
         async def alert_info(self, alert_id: str) -> FlashDutyResponse:
             assert alert_id == ALERT_ID
             detail = flashduty_alert_payload()["data"]
-            detail["labels"].update(
-                {"alarm_host": "detail-host", "alarm_port": "3306"}
-            )
+            detail["labels"].update({"alarm_host": "detail-host", "alarm_port": "3306"})
             return FlashDutyResponse(request_id="req-detail", data=detail)
 
     enriched = await FlashDutyAlertDetailEnricher(  # type: ignore[arg-type]
@@ -553,9 +621,7 @@ def test_flashduty_alert_adapter_removes_slow_query_filter_note() -> None:
     raw_text = f"{signal}{filter_note}"
     payload["data"]["title"] = "MySQL slow_query threshold"
     payload["data"]["description"] = raw_text
-    payload["data"]["labels"].update(
-        {"check": raw_text, "alarm_content": raw_text}
-    )
+    payload["data"]["labels"].update({"check": raw_text, "alarm_content": raw_text})
 
     alert = FlashDutyAlertSourceAdapter().normalize(payload)
 
@@ -639,9 +705,7 @@ async def test_alert_context_keeps_partial_data_when_auxiliary_feed_fails() -> N
             data = {"incident_id": INCIDENT_ID, "title": "Database incident"}
         else:
             data = {"items": [], "has_next_page": False}
-        return httpx.Response(
-            200, json={"request_id": f"req-{request.url.path}", "data": data}
-        )
+        return httpx.Response(200, json={"request_id": f"req-{request.url.path}", "data": data})
 
     client = FlashDutyClient(
         "test-app-key",
@@ -661,9 +725,7 @@ async def test_alert_context_keeps_partial_data_when_auxiliary_feed_fails() -> N
         "has_next_page": False,
     }
     assert structured_data["flashduty"]["feed"] is None
-    assert structured_data["flashduty"]["partial_errors"] == {
-        "alert_feed": "FlashDutyAPIError"
-    }
+    assert structured_data["flashduty"]["partial_errors"] == {"alert_feed": "FlashDutyAPIError"}
     assert structured_data["flashduty"]["incident"]["info"]["incident_id"] == INCIDENT_ID
 
 
@@ -863,9 +925,7 @@ async def test_database_tool_discovers_and_invokes_catalog_tools() -> None:
             make_context(),
         )
         assert client.invoke_payload is not None
-        assert client.invoke_payload["tools"] == [
-            {"tool": tool_name, "params": {"session_id": 1}}
-        ]
+        assert client.invoke_payload["tools"] == [{"tool": tool_name, "params": {"session_id": 1}}]
 
 
 @pytest.mark.asyncio
@@ -939,9 +999,7 @@ def test_factory_registers_flashduty_source_and_tools(tmp_path: Path) -> None:
     assert normalized.source == "flashduty"
     assert isinstance(runtime.service.tool_registry.get("query_metrics"), FlashDutyDataSourceTool)
     assert isinstance(runtime.service.tool_registry.get("query_changes"), FlashDutyChangesTool)
-    visible_specs = {
-        spec.name: spec for spec in runtime.service.tool_registry.available_specs()
-    }
+    visible_specs = {spec.name: spec for spec in runtime.service.tool_registry.available_specs()}
     assert not hasattr(visible_specs["query_metrics"], "read_only")
     assert not hasattr(visible_specs["query_changes"], "read_only")
     alert_spec = visible_specs["alert_context"]

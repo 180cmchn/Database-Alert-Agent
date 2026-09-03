@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent_runtime.trace import AgentTraceEntry
 from app.application.admin import runtime_configuration_issues
+from app.application.flashduty_handling import FlashDutyHandlingResult, FlashDutyProgress
 from app.config import Settings
 from app.domain.models import (
     AlertStatus,
@@ -61,6 +62,43 @@ class CancelRunResponse(BaseModel):
     status: RunStatus
     cancel_requested_at: datetime
     message: str
+
+
+class FlashDutyHandler(BaseModel):
+    person_id: int = Field(gt=0)
+    person_name: str | None = None
+    assigned_at: datetime | None = None
+    acknowledged_at: datetime
+
+
+class FlashDutyHandlingResponse(BaseModel):
+    linked_incident: bool
+    incident_id: str | None = None
+    progress: FlashDutyProgress | None = None
+    handlers: list[FlashDutyHandler] = Field(default_factory=list)
+    handlers_complete: bool
+    refreshed_at: datetime
+    warning_code: Literal["INCIDENT_DETAILS_UNAVAILABLE"] | None = None
+
+    @classmethod
+    def from_result(cls, result: FlashDutyHandlingResult) -> FlashDutyHandlingResponse:
+        return cls(
+            linked_incident=result.linked_incident,
+            incident_id=result.incident_id,
+            progress=result.progress,
+            handlers=[
+                FlashDutyHandler(
+                    person_id=handler.person_id,
+                    person_name=handler.person_name,
+                    assigned_at=handler.assigned_at,
+                    acknowledged_at=handler.acknowledged_at,
+                )
+                for handler in result.handlers
+            ],
+            handlers_complete=result.handlers_complete,
+            refreshed_at=result.refreshed_at,
+            warning_code=result.warning_code,
+        )
 
 
 class FlashDutyPollAlertItem(BaseModel):

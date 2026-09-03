@@ -1,4 +1,4 @@
-import type { AlertStatus, InvestigationStage, Severity } from "../types/api";
+import type { AlertStatus, FlashDutyProgress, InvestigationStage, Severity } from "../types/api";
 
 export const severityLabel: Record<Severity, string> = {
   CRITICAL: "紧急",
@@ -14,6 +14,12 @@ export const statusLabel: Record<AlertStatus, string> = {
   INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",
   CANCELLED: "已取消",
+};
+
+export const flashDutyProgressLabel: Record<FlashDutyProgress, string> = {
+  Triggered: "待处理",
+  Processing: "处理中",
+  Closed: "已关闭",
 };
 
 export const stageLabel: Record<InvestigationStage, string> = {

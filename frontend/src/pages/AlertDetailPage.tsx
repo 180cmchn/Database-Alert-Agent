@@ -21,15 +21,18 @@ import {
   RefreshCw,
   Siren,
   TerminalSquare,
+  Users,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
 import { AgentTrace } from "../components/AgentTrace";
 import {
   EmptyState,
   ErrorState,
+  FlashDutyProgressBadge,
+  InlineLoading,
   LoadingState,
   PageHeader,
   SectionCard,
@@ -50,6 +53,7 @@ import type {
   AnalysisBasis,
   AlertStatus,
   EvidenceUnit,
+  FlashDutyHandlingResponse,
   InvestigationRun,
   RootCauseAssessment,
   StoredAlert,
@@ -123,6 +127,108 @@ function RootCauseContent({ rootCause }: { rootCause: RootCauseAssessment }) {
       <p className="root-evidence-summary">{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>
       {rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}
     </div>
+  );
+}
+
+function FlashDutyHandlingCard({
+  handling,
+  loading,
+  refreshing,
+  error,
+  onRetry,
+}: {
+  handling: FlashDutyHandlingResponse | null;
+  loading: boolean;
+  refreshing: boolean;
+  error: string;
+  onRetry: () => void;
+}) {
+  const action = handling?.progress || refreshing
+    ? (
+      <div className="flashduty-handling-actions">
+        {handling?.progress && <FlashDutyProgressBadge progress={handling.progress} />}
+        {refreshing && <InlineLoading label="刷新中" />}
+      </div>
+    )
+    : undefined;
+
+  return (
+    <SectionCard
+      eyebrow="FLASHDUTY"
+      title="当前处理状态"
+      description="来自 FlashDuty 关联故障的当前只读快照，不随所选分析运行回放。"
+      action={action}
+      className="flashduty-handling-card"
+    >
+      {loading && !handling ? (
+        <div className="flashduty-handling-loading"><InlineLoading label="正在读取处理状态" /></div>
+      ) : error && !handling ? (
+        <ErrorState compact message={error} onRetry={onRetry} />
+      ) : handling && !handling.linked_incident ? (
+        <div className="flashduty-handling-empty">
+          <CircleAlert size={19} />
+          <div>
+            <strong>暂未关联故障</strong>
+            <span>FlashDuty 当前未返回关联 incident，无法推断处理状态。</span>
+          </div>
+          <div className="flashduty-handling-footer">
+            <span>刷新于 {formatDateTime(handling.refreshed_at)}</span>
+            <button className="button secondary small" type="button" onClick={onRetry} disabled={refreshing}>
+              <RefreshCw size={14} className={refreshing ? "spin" : ""} /> 刷新
+            </button>
+          </div>
+        </div>
+      ) : handling ? (
+        <div className="flashduty-handling-body">
+          <div className="flashduty-handling-meta">
+            <span>关联故障</span>
+            <strong title={handling.incident_id || undefined}>{handling.incident_id || "—"}</strong>
+          </div>
+          <div className="flashduty-handler-section">
+            <div className="flashduty-handler-heading">
+              <Users size={16} />
+              <strong>{handling.progress === "Closed" ? "参与处理人" : "当前处理人"}</strong>
+            </div>
+            {!handling.handlers_complete ? (
+              <div className="flashduty-handling-warning" role="status">
+                处理人暂时无法完整读取，请稍后重试。
+              </div>
+            ) : handling.handlers.length > 0 ? (
+              <div className="flashduty-handler-list">
+                {handling.handlers.map((handler) => (
+                  <div className="flashduty-handler" key={`${handler.person_id}-${handler.acknowledged_at}`}>
+                    <strong>{handler.person_name || `成员 #${handler.person_id}`}</strong>
+                    <span>
+                      {handler.assigned_at && `分派于 ${formatDateTime(handler.assigned_at)} · `}
+                      认领于 {formatDateTime(handler.acknowledged_at)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <span className="flashduty-handler-empty">
+                {handling.progress === "Processing"
+                  ? "FlashDuty 未返回已认领人员"
+                  : handling.progress === "Closed"
+                    ? "未记录参与处理人"
+                    : "暂无认领人"}
+              </span>
+            )}
+          </div>
+          {error && (
+            <div className="flashduty-handling-warning" role="status">
+              刷新失败，当前显示上次成功读取的结果：{error}
+            </div>
+          )}
+          <div className="flashduty-handling-footer">
+            <span>刷新于 {formatDateTime(handling.refreshed_at)}</span>
+            <button className="button secondary small" type="button" onClick={onRetry} disabled={refreshing}>
+              <RefreshCw size={14} className={refreshing ? "spin" : ""} /> 刷新
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </SectionCard>
   );
 }
 
@@ -229,6 +335,11 @@ export function AlertDetailPage() {
   const [reanalyzeError, setReanalyzeError] = useState("");
   const [cancelling, setCancelling] = useState(false);
   const [cancelNotice, setCancelNotice] = useState("");
+  const [handling, setHandling] = useState<FlashDutyHandlingResponse | null>(null);
+  const [handlingLoading, setHandlingLoading] = useState(false);
+  const [handlingRefreshing, setHandlingRefreshing] = useState(false);
+  const [handlingError, setHandlingError] = useState("");
+  const handlingRequestSequence = useRef(0);
 
   const load = useCallback(async (silent = false) => {
     if (silent) setRefreshing(true);
@@ -245,7 +356,43 @@ export function AlertDetailPage() {
     }
   }, [alertId, selectedRunId]);
 
+  const loadFlashDutyHandling = useCallback(async (silent = false) => {
+    const requestSequence = ++handlingRequestSequence.current;
+    if (silent) setHandlingRefreshing(true);
+    else setHandlingLoading(true);
+    setHandlingError("");
+    try {
+      const result = await api.getFlashDutyHandling(alertId);
+      if (requestSequence !== handlingRequestSequence.current) return;
+      setHandling(result);
+    } catch (requestError) {
+      if (requestSequence !== handlingRequestSequence.current) return;
+      setHandlingError(
+        requestError instanceof Error ? requestError.message : "FlashDuty 处理状态加载失败",
+      );
+    } finally {
+      if (requestSequence === handlingRequestSequence.current) {
+        setHandlingLoading(false);
+        setHandlingRefreshing(false);
+      }
+    }
+  }, [alertId]);
+
+  const isFlashDutyAlert = Boolean(
+    record
+    && record.alert.id === alertId
+    && record.alert.source.toLowerCase() === "flashduty",
+  );
+
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    handlingRequestSequence.current += 1;
+    setHandling(null);
+    setHandlingError("");
+    setHandlingLoading(false);
+    setHandlingRefreshing(false);
+    if (isFlashDutyAlert) void loadFlashDutyHandling();
+  }, [alertId, isFlashDutyAlert, loadFlashDutyHandling]);
   useEffect(() => {
     if (!record || !window.location.hash) return;
     const targetId = decodeURIComponent(window.location.hash.slice(1));
@@ -287,6 +434,11 @@ export function AlertDetailPage() {
     }, 2_500);
     return () => window.clearInterval(timer);
   }, [load, shouldPollDetail]);
+
+  function refreshDetail() {
+    void load(true);
+    if (isFlashDutyAlert) void loadFlashDutyHandling(true);
+  }
   function unlockReanalysis(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nextToken = unlockToken.trim();
@@ -368,8 +520,13 @@ export function AlertDetailPage() {
         <Link to="/alerts" className="back-link"><ArrowLeft size={15} /> 返回告警中心</Link>
         <span className="detail-refresh">
           {isActive && <><Radio size={14} className="pulse" /> 每 2.5 秒自动跟踪</>}
-          <button type="button" onClick={() => void load(true)} aria-label="刷新详情" disabled={refreshing}>
-            <RefreshCw size={15} className={refreshing ? "spin" : ""} />
+          <button
+            type="button"
+            onClick={refreshDetail}
+            aria-label="刷新详情与处理状态"
+            disabled={refreshing || handlingLoading || handlingRefreshing}
+          >
+            <RefreshCw size={15} className={refreshing || handlingRefreshing ? "spin" : ""} />
           </button>
         </span>
       </div>
@@ -392,6 +549,16 @@ export function AlertDetailPage() {
         <div><span><Gauge size={15} /> 环境 / 服务</span><strong>{alert.environment} · {alert.service_name}</strong></div>
         <div><span><Clock3 size={15} /> 发生时间</span><strong>{formatDateTime(alert.occurred_at)}</strong></div>
       </section>
+
+      {isFlashDutyAlert && (
+        <FlashDutyHandlingCard
+          handling={handling}
+          loading={handlingLoading}
+          refreshing={handlingRefreshing}
+          error={handlingError}
+          onRetry={() => void loadFlashDutyHandling(true)}
+        />
+      )}
 
       {!isViewingLatest && selectedRun && (
         <div className="historical-run-banner">

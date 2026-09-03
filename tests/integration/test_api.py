@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.adapters.flashduty import FlashDutyResponse
+from app.adapters.flashduty import FlashDutyAPIError, FlashDutyResponse
 from app.api.main import create_app
 from app.application.factory import Runtime, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
@@ -183,3 +183,232 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
     assert response.json()["end_time"] - response.json()["start_time"] == 1200
     assert len(scheduler.jobs) == 1
     assert requests[0]["by_updated_at"] is False
+
+
+def flashduty_ingest_payload() -> dict[str, object]:
+    return {
+        "data": {
+            "alert_id": "663a1b2c3d4e5f6789abcdef",
+            "title": "Database latency",
+            "alert_severity": "Warning",
+            "start_time": 1_712_650_000,
+            "labels": {"env": "test", "service": "orders-db"},
+        }
+    }
+
+
+class HandlingFlashDutyClient:
+    def __init__(
+        self,
+        *,
+        fail_alert: bool = False,
+        fail_incident: bool = False,
+        fail_members: bool = False,
+    ) -> None:
+        self.fail_alert = fail_alert
+        self.fail_incident = fail_incident
+        self.fail_members = fail_members
+        self.calls: list[tuple[str, str, bool]] = []
+        self.member_calls: list[tuple[int, int, bool]] = []
+
+    async def alert_info(
+        self,
+        alert_id: str,
+        *,
+        retry_until_cancelled: bool = True,
+    ) -> FlashDutyResponse:
+        self.calls.append(("alert", alert_id, retry_until_cancelled))
+        if self.fail_alert:
+            raise FlashDutyAPIError("alert unavailable", code="UpstreamError")
+        return FlashDutyResponse(
+            "alert-request",
+            {
+                "alert_id": alert_id,
+                "incident": {
+                    "incident_id": "69da451ef77b1b51f40e83ee",
+                    "progress": "Triggered",
+                },
+            },
+        )
+
+    async def incident_info(
+        self,
+        incident_id: str,
+        *,
+        retry_until_cancelled: bool = True,
+    ) -> FlashDutyResponse:
+        self.calls.append(("incident", incident_id, retry_until_cancelled))
+        if self.fail_incident:
+            raise FlashDutyAPIError("incident unavailable", code="UpstreamError")
+        return FlashDutyResponse(
+            "incident-request",
+            {
+                "incident_id": incident_id,
+                "progress": "Processing",
+                "responders": [
+                    {
+                        "person_id": 11,
+                        "person_name": "Database Owner",
+                        "assigned_at": 1_712_650_010,
+                        "acknowledged_at": 1_712_650_030,
+                    },
+                    {
+                        "person_id": 12,
+                        "person_name": "Assigned Only",
+                        "assigned_at": 1_712_650_020,
+                        "acknowledged_at": 0,
+                    },
+                ],
+            },
+        )
+
+    async def list_members(
+        self,
+        *,
+        page: int,
+        limit: int = 100,
+        retry_until_cancelled: bool = True,
+    ) -> FlashDutyResponse:
+        self.member_calls.append((page, limit, retry_until_cancelled))
+        if self.fail_members:
+            raise FlashDutyAPIError("member directory unavailable", code="UpstreamError")
+        return FlashDutyResponse(
+            "member-request",
+            {
+                "total": 2,
+                "items": [
+                    {
+                        "member_id": 11,
+                        "member_name": "dylan.du",
+                        "email": "must-not-leak@example.com",
+                        "ref_id": "private-sso-reference",
+                    },
+                    {"member_id": 12, "member_name": "assigned.only"},
+                ],
+            },
+        )
+
+
+def test_get_flashduty_handling_projects_current_incident(tmp_path: Path) -> None:
+    client, runtime, _ = create_test_client(
+        tmp_path,
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+    )
+    flashduty = HandlingFlashDutyClient()
+    runtime.flashduty_client = flashduty  # type: ignore[assignment]
+
+    with client:
+        assert client.portal is not None
+        stored, _created = client.portal.call(
+            runtime.service.ingest,
+            "flashduty",
+            flashduty_ingest_payload(),
+        )
+        response = client.get(f"/api/v1/alerts/{stored.alert.id}/flashduty-handling")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["linked_incident"] is True
+    assert body["progress"] == "Processing"
+    assert body["handlers_complete"] is True
+    assert [(item["person_id"], item["person_name"]) for item in body["handlers"]] == [
+        (11, "dylan.du")
+    ]
+    assert body["warning_code"] is None
+    assert flashduty.calls == [
+        ("alert", "663a1b2c3d4e5f6789abcdef", False),
+        ("incident", "69da451ef77b1b51f40e83ee", False),
+    ]
+    assert flashduty.member_calls == [(1, 100, False)]
+
+
+def test_get_flashduty_handling_keeps_partial_alert_progress(tmp_path: Path) -> None:
+    client, runtime, _ = create_test_client(
+        tmp_path,
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+    )
+    runtime.flashduty_client = HandlingFlashDutyClient(  # type: ignore[assignment]
+        fail_incident=True
+    )
+
+    with client:
+        assert client.portal is not None
+        stored, _created = client.portal.call(
+            runtime.service.ingest,
+            "flashduty",
+            flashduty_ingest_payload(),
+        )
+        response = client.get(f"/api/v1/alerts/{stored.alert.id}/flashduty-handling")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["linked_incident"] is True
+    assert body["progress"] == "Triggered"
+    assert body["handlers"] == []
+    assert body["handlers_complete"] is False
+    assert body["warning_code"] == "INCIDENT_DETAILS_UNAVAILABLE"
+
+
+def test_flashduty_handling_failure_does_not_break_stored_detail(tmp_path: Path) -> None:
+    client, runtime, _ = create_test_client(
+        tmp_path,
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+    )
+    runtime.flashduty_client = HandlingFlashDutyClient(  # type: ignore[assignment]
+        fail_alert=True
+    )
+
+    with client:
+        assert client.portal is not None
+        stored, _created = client.portal.call(
+            runtime.service.ingest,
+            "flashduty",
+            flashduty_ingest_payload(),
+        )
+        handling = client.get(f"/api/v1/alerts/{stored.alert.id}/flashduty-handling")
+        detail = client.get(f"/api/v1/alerts/{stored.alert.id}")
+
+    assert handling.status_code == 502
+    assert handling.json()["detail"]["code"] == "FLASHDUTY_HANDLING_UNAVAILABLE"
+    assert detail.status_code == 200
+
+
+def test_flashduty_handling_rejects_non_flashduty_alert_without_upstream_call(
+    tmp_path: Path,
+) -> None:
+    client, _, _ = create_test_client(tmp_path)
+
+    with client:
+        accepted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "canonical-1",
+                "severity": "WARNING",
+                "title": "Database latency",
+                "reason": "latency",
+            },
+        )
+        response = client.get(f"/api/v1/alerts/{accepted.json()['alert_id']}/flashduty-handling")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "FLASHDUTY_HANDLING_NOT_APPLICABLE"
+
+
+def test_flashduty_handling_reports_missing_configuration(tmp_path: Path) -> None:
+    client, runtime, _ = create_test_client(tmp_path)
+
+    with client:
+        assert client.portal is not None
+        stored, _created = client.portal.call(
+            runtime.service.ingest,
+            "flashduty",
+            flashduty_ingest_payload(),
+        )
+        response = client.get(f"/api/v1/alerts/{stored.alert.id}/flashduty-handling")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "FLASHDUTY_NOT_CONFIGURED"

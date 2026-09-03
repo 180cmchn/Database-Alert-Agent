@@ -9,6 +9,7 @@ import type {
   CancelRunResponse,
   CanonicalAlertPayload,
   DashboardSummary,
+  FlashDutyHandlingResponse,
   ReanalyzeRequest,
   ReanalyzeResponse,
   Severity,
@@ -103,6 +104,11 @@ export const api = {
   getAlert: (alertId: string, runId?: string | null) =>
     request<StoredAlert>(
       `/api/v1/alerts/${encodeURIComponent(alertId)}${queryString({ run_id: runId || undefined })}`,
+    ),
+
+  getFlashDutyHandling: (alertId: string) =>
+    request<FlashDutyHandlingResponse>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}/flashduty-handling`,
     ),
 
   getAgentTrace: (alertId: string, runId: string, afterSequence = 0) =>

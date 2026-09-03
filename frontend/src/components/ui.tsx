@@ -11,8 +11,8 @@ import {
 import type { FormEvent, ReactNode } from "react";
 import { useState } from "react";
 import { useAdminAuth } from "../context/AdminAuthContext";
-import { severityLabel, statusLabel, toolStatusLabel } from "../lib/format";
-import type { AlertStatus, Severity, ToolStatus } from "../types/api";
+import { flashDutyProgressLabel, severityLabel, statusLabel, toolStatusLabel } from "../lib/format";
+import type { AlertStatus, FlashDutyProgress, Severity, ToolStatus } from "../types/api";
 
 export function SeverityBadge({ severity }: { severity: Severity }) {
   return (
@@ -25,6 +25,15 @@ export function SeverityBadge({ severity }: { severity: Severity }) {
 
 export function StatusBadge({ status }: { status: AlertStatus }) {
   return <span className={`badge status status-${status.toLowerCase()}`}>{statusLabel[status]}</span>;
+}
+
+export function FlashDutyProgressBadge({ progress }: { progress: FlashDutyProgress }) {
+  return (
+    <span className={`badge flashduty-progress flashduty-progress-${progress.toLowerCase()}`}>
+      <span className="badge-dot" aria-hidden="true" />
+      {flashDutyProgressLabel[progress]}
+    </span>
+  );
 }
 
 export function ToolStatusBadge({ status }: { status: ToolStatus }) {

@@ -14,12 +14,14 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
+from app.adapters.flashduty import FlashDutyError
 from app.adapters.persistence import SQLAlchemyAlertRepository
 from app.agent_runtime.trace import trace_entry_from_event
 from app.api.schemas import (
     AgentTraceResponse,
     AlertAccepted,
     CancelRunResponse,
+    FlashDutyHandlingResponse,
     FlashDutyPollAlertItem,
     FlashDutyPollResponse,
     ReanalyzeRequest,
@@ -33,6 +35,12 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.application.factory import Runtime, apply_runtime_settings, build_runtime
+from app.application.flashduty_handling import (
+    FlashDutyHandlingInvalidResponseError,
+    FlashDutyHandlingTimeoutError,
+    FlashDutyMemberNameResolver,
+    read_flashduty_handling,
+)
 from app.application.scheduler import (
     FlashDutyAlertPoller,
     InMemoryAnalysisScheduler,
@@ -98,6 +106,7 @@ def create_app(
         settings, runtime.service, scheduler, runtime.flashduty_client
     )
     retention_cleaner = WeeklyAlertRetentionCleaner(settings, runtime.repository)
+    flashduty_member_names = FlashDutyMemberNameResolver()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -309,6 +318,81 @@ def create_app(
         run_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     ) -> StoredAlert:
         return await runtime.service.get(alert_id, run_id=run_id)
+
+    @app.get(
+        "/api/v1/alerts/{alert_id}/flashduty-handling",
+        response_model=FlashDutyHandlingResponse,
+        tags=["alerts"],
+    )
+    async def get_flashduty_handling(
+        alert_id: str,
+        response: Response,
+    ) -> FlashDutyHandlingResponse:
+        stored = await runtime.service.get(alert_id)
+        if stored.alert.source.casefold() != "flashduty":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "FLASHDUTY_HANDLING_NOT_APPLICABLE",
+                    "message": "Current FlashDuty handling is available only for FlashDuty alerts",
+                },
+            )
+        client = runtime.flashduty_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "FLASHDUTY_NOT_CONFIGURED",
+                    "message": "FlashDuty is not enabled or app key is not configured",
+                },
+            )
+
+        try:
+            result = await read_flashduty_handling(
+                client,
+                stored.alert,
+                member_name_resolver=flashduty_member_names,
+            )
+        except FlashDutyHandlingTimeoutError as exc:
+            logger.warning("flashduty_handling_timeout alert_id=%s", alert_id)
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "code": "FLASHDUTY_HANDLING_TIMEOUT",
+                    "message": "FlashDuty handling lookup timed out",
+                },
+            ) from exc
+        except FlashDutyHandlingInvalidResponseError as exc:
+            logger.warning(
+                "flashduty_handling_invalid_response alert_id=%s error=%s",
+                alert_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "FLASHDUTY_INVALID_RESPONSE",
+                    "message": "FlashDuty returned invalid handling data",
+                },
+            ) from exc
+        except FlashDutyError as exc:
+            logger.warning(
+                "flashduty_handling_unavailable alert_id=%s code=%s request_id=%s http_status=%s",
+                alert_id,
+                getattr(exc, "code", type(exc).__name__),
+                getattr(exc, "request_id", None),
+                getattr(exc, "status_code", None),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "FLASHDUTY_HANDLING_UNAVAILABLE",
+                    "message": "FlashDuty handling is temporarily unavailable",
+                },
+            ) from exc
+
+        response.headers["Cache-Control"] = "no-store"
+        return FlashDutyHandlingResponse.from_result(result)
 
     @app.get(
         "/api/v1/alerts/{alert_id}/runs/{run_id}/trace",
