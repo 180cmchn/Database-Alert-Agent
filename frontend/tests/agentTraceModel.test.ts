@@ -5,6 +5,7 @@ import {
   advanceTraceSequence,
   countMcpTraceItems,
   filterAgentTraceItems,
+  INITIAL_TRACE_VISIBILITY,
   mergeAgentTraceItems,
   resolveTraceVisibility,
   shouldShowReasoningFallback,
@@ -154,7 +155,7 @@ test("reasoning streams with the same id remain isolated by scope", () => {
   assert.deepEqual(merged.map((item) => item.scope), ["main_agent", "mcp_internal"]);
 });
 
-test("default trace visibility keeps every entry untouched", () => {
+test("fully expanded trace visibility keeps every entry untouched", () => {
   const items = [
     traceEntry("main-1", 1, "REASONING", "main_agent"),
     traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
@@ -164,6 +165,16 @@ test("default trace visibility keeps every entry untouched", () => {
     filterAgentTraceItems(items, { hideMainAgent: false, hideMcp: false }),
     items,
   );
+});
+
+test("trace visibility starts with both chains collapsed", () => {
+  const items = [
+    traceEntry("main-1", 1, "REASONING", "main_agent"),
+    traceEntry("mcp-1", 2, "ACTION", "mcp_internal"),
+  ];
+
+  assert.deepEqual(INITIAL_TRACE_VISIBILITY, { hideMainAgent: true, hideMcp: true });
+  assert.deepEqual(filterAgentTraceItems(items, INITIAL_TRACE_VISIBILITY), []);
 });
 
 test("hiding only the MCP chain keeps main agent entries", () => {

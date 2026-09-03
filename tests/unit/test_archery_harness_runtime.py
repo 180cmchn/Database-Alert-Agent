@@ -79,7 +79,11 @@ def _terminal_auth_failure() -> ReplayCallFixture:
 
 def test_archery_harness_does_not_require_or_hide_a_fixed_login_tool() -> None:
     specs_without_login = _scenario().build_tool_specs(_tools()[1:])
-    assert [spec.name for spec in specs_without_login] == [ARCHERY_MCP_QUERY_TOOL_NAME]
+    assert [spec.name for spec in specs_without_login[:-2]] == [ARCHERY_MCP_QUERY_TOOL_NAME]
+    assert [spec.name for spec in specs_without_login[-2:]] == [
+        RESULT_ASSESSMENT_TOOL_NAME,
+        FINISH_TOOL_NAME,
+    ]
 
     specs = _scenario().build_tool_specs(
         [
@@ -90,7 +94,11 @@ def test_archery_harness_does_not_require_or_hide_a_fixed_login_tool() -> None:
         ]
     )
 
-    assert [spec.name for spec in specs] == ["new_archery_tool"]
+    assert [spec.name for spec in specs[:-2]] == ["new_archery_tool"]
+    assert [spec.name for spec in specs[-2:]] == [
+        RESULT_ASSESSMENT_TOOL_NAME,
+        FINISH_TOOL_NAME,
+    ]
 
 
 @pytest.mark.asyncio
@@ -289,12 +297,12 @@ async def test_auxiliary_raw_payload_is_replayed_to_internal_model() -> None:
                         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
                         expected_arguments={**TARGET_ARGUMENTS, "sql_content": MEMBER_SQL},
                         result=raw_member_result,
-                        ),
-                        _success(
-                            INSTANCE_SQL,
-                            rows=[{"host": "db-1.example", "port": 3306}],
-                        ),
-                        _success(
+                    ),
+                    _success(
+                        INSTANCE_SQL,
+                        rows=[{"host": "db-1.example", "port": 3306}],
+                    ),
+                    _success(
                         FINAL_SQL,
                         rows=[
                             {
@@ -320,16 +328,12 @@ async def test_auxiliary_raw_payload_is_replayed_to_internal_model() -> None:
         message
         for message in reversed(feedback_messages)
         if message.get("role") == "assistant"
-        and any(
-            call.get("id") == "member"
-            for call in message.get("tool_calls", [])
-        )
+        and any(call.get("id") == "member" for call in message.get("tool_calls", []))
     )
     tool_message = next(
         message
         for message in reversed(feedback_messages)
-        if message.get("role") == "tool"
-        and message.get("tool_call_id") == "member"
+        if message.get("role") == "tool" and message.get("tool_call_id") == "member"
     )
     assert assistant_message["role"] == "assistant"
     assert assistant_message["tool_calls"] == [
@@ -591,8 +595,7 @@ async def test_business_error_raw_payload_is_replayed_to_internal_model() -> Non
     tool_message = next(
         message
         for message in reversed(model.requests[1]["messages"])
-        if message.get("role") == "tool"
-        and message.get("tool_call_id") == "member-error"
+        if message.get("role") == "tool" and message.get("tool_call_id") == "member-error"
     )
     raw_feedback = tool_message["content"]
     assert isinstance(raw_feedback, str)
@@ -668,9 +671,7 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
                     "tools": deepcopy(tools),
                 }
             )
-            available_names = {
-                item["function"]["name"] for item in tools
-            }
+            available_names = {item["function"]["name"] for item in tools}
             if available_names == {RESULT_ASSESSMENT_TOOL_NAME}:
                 pending = json.loads(str(messages[-1]["content"]))
                 return _result_assessment(
@@ -682,10 +683,7 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
                     basis="appears_complete",
                 )
             turn = sum(
-                {
-                    item["function"]["name"]
-                    for item in request["tools"]
-                }
+                {item["function"]["name"] for item in request["tools"]}
                 != {RESULT_ASSESSMENT_TOOL_NAME}
                 for request in self.requests
             )
@@ -697,9 +695,7 @@ async def test_instance_discovery_raw_response_drives_followup_queries(
                     request_id="request-discover-instance",
                 )
             if turn > 4:
-                return _finish(
-                    reason="Raw-response-driven Archery investigation completed"
-                )
+                return _finish(reason="Raw-response-driven Archery investigation completed")
 
             raw_response = self.raw_response(messages)
             structured = self.structured_payload(raw_response)
@@ -925,20 +921,13 @@ async def test_shared_archery_harness_replays_responses_items_for_next_tool_call
 
     second_input = model.requests[1]["messages"]
     reasoning_item = next(
-        item
-        for item in second_input
-        if item.get("id") == "responses-reasoning-member"
+        item for item in second_input if item.get("id") == "responses-reasoning-member"
     )
-    function_item = next(
-        item
-        for item in second_input
-        if item.get("id") == "responses-item-member"
-    )
+    function_item = next(item for item in second_input if item.get("id") == "responses-item-member")
     output_item = next(
         item
         for item in reversed(second_input)
-        if item.get("type") == "function_call_output"
-        and item.get("call_id") == base_call.call_id
+        if item.get("type") == "function_call_output" and item.get("call_id") == base_call.call_id
     )
     assert reasoning_item["type"] == "reasoning"
     assert reasoning_item["encrypted_content"] == "encrypted-member"
@@ -1089,17 +1078,15 @@ async def test_archery_resume_replays_prepared_state_and_responses_items() -> No
     assert result.state.query_trace[0]["outcome"] == "ok"
     assert result.state.last_query_target == (17, "archery")
     resumed_messages = resumed_model.requests[0]["messages"]
-    assert sum(
-        item.get("id") == "durable-archery-reasoning" for item in resumed_messages
-    ) == 1
-    assert sum(
-        item.get("id") == "durable-archery-function" for item in resumed_messages
-    ) == 1
-    assert sum(
-        item.get("type") == "function_call_output"
-        and item.get("call_id") == base_call.call_id
-        for item in resumed_messages
-    ) == 1
+    assert sum(item.get("id") == "durable-archery-reasoning" for item in resumed_messages) == 1
+    assert sum(item.get("id") == "durable-archery-function" for item in resumed_messages) == 1
+    assert (
+        sum(
+            item.get("type") == "function_call_output" and item.get("call_id") == base_call.call_id
+            for item in resumed_messages
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize(

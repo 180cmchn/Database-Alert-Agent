@@ -49,8 +49,17 @@ _PROJECTED_STATUS_FIELDS = (
     "termination_reason",
     "termination_error_type",
     "reason_code",
+    "query_completed",
+    "range_query_completed",
+    "range_query_attempt_count",
+    "range_query_success_count",
+    "range_query_empty_count",
     "monitoring_scope_status",
     "monitoring_scope_reason",
+    "model_declared_scope_status",
+    "scope_declaration_verified",
+    "unverified_scope_declaration",
+    "target_binding_count",
 )
 
 
@@ -217,12 +226,8 @@ class DurableOuterToolDispatcher:
             model_arguments=request.parameters,
             effective_arguments=request.parameters,
             fingerprint=fingerprint,
-            tool_policy_version=(
-                tool_spec.policy_version if tool_spec is not None else ""
-            ),
-            tool_schema_version=(
-                tool_spec.schema_version if tool_spec is not None else ""
-            ),
+            tool_policy_version=(tool_spec.policy_version if tool_spec is not None else ""),
+            tool_schema_version=(tool_spec.schema_version if tool_spec is not None else ""),
             request_timeout_seconds=request.timeout_seconds,
             attempt=attempt,
             deadline=now + timedelta(seconds=request.timeout_seconds),
@@ -306,9 +311,7 @@ class DurableOuterToolDispatcher:
             source_system=invocation.provider,
             status=ToolStatus.TIMEOUT,
             request=request.parameters,
-            summary=(
-                f"调查工具 {request.tool_name} 在恢复前已超过持久化调用期限，未执行。"
-            ),
+            summary=(f"调查工具 {request.tool_name} 在恢复前已超过持久化调用期限，未执行。"),
             structured_data={
                 "reason_code": "invocation_deadline_exceeded_before_dispatch",
                 "root_cause_eligible": False,
@@ -338,9 +341,7 @@ class DurableOuterToolDispatcher:
                 fencing_token=fencing_token,
             )
         except ToolInvocationConflict:
-            current = await self.repository.get_tool_invocation(
-                str(invocation.invocation_id)
-            )
+            current = await self.repository.get_tool_invocation(str(invocation.invocation_id))
             if current is None:
                 raise
             return await self._resolve_attempt(
@@ -553,12 +554,8 @@ class DurableOuterToolDispatcher:
                     lease_owner=lease_owner,
                     fencing_token=fencing_token,
                 )
-            await asyncio.sleep(
-                min(_INFLIGHT_POLL_INTERVAL_SECONDS, remaining_seconds)
-            )
-            persisted = await self.repository.get_tool_invocation(
-                str(current.invocation_id)
-            )
+            await asyncio.sleep(min(_INFLIGHT_POLL_INTERVAL_SECONDS, remaining_seconds))
+            persisted = await self.repository.get_tool_invocation(str(current.invocation_id))
             if persisted is None:
                 raise OuterDispatchError(
                     f"in-flight outer invocation {current.invocation_id} disappeared"
@@ -582,9 +579,7 @@ class DurableOuterToolDispatcher:
             source_system=invocation.provider,
             status=ToolStatus.FAILED,
             request=request.parameters,
-            summary=(
-                f"调查工具 {request.tool_name} 的进程在调用期间中断，远端结果未知。"
-            ),
+            summary=(f"调查工具 {request.tool_name} 的进程在调用期间中断，远端结果未知。"),
             structured_data={
                 "reason_code": "unknown_outcome",
                 "invocation_status": ToolInvocationStatus.UNKNOWN_OUTCOME.value,
@@ -663,9 +658,7 @@ class DurableOuterToolDispatcher:
             or evidence.request != invocation.effective_arguments
             or evidence.source_system != invocation.provider
         ):
-            raise OuterDispatchError(
-                "terminal outer invocation evidence provenance does not match"
-            )
+            raise OuterDispatchError("terminal outer invocation evidence provenance does not match")
         self._validate_evidence_status(invocation, evidence)
         if invocation.artifact_ref is not None:
             stored = await self.repository.get_agent_artifact(
@@ -713,9 +706,7 @@ class DurableOuterToolDispatcher:
                     artifact_id=invocation.artifact_ref.artifact_id,
                 )
         elif evidence.evidence_units or evidence.source_artifact_id is not None:
-            raise OuterDispatchError(
-                "terminal evidence provenance requires a raw-result artifact"
-            )
+            raise OuterDispatchError("terminal evidence provenance requires a raw-result artifact")
         return evidence
 
     async def _persist_raw_result(
@@ -778,9 +769,7 @@ class DurableOuterToolDispatcher:
                 {
                     "processing_status": "unavailable",
                     "root_cause_eligible": False,
-                    "root_cause_ineligible_reason": (
-                        "program_fact_projection_not_configured"
-                    ),
+                    "root_cause_ineligible_reason": ("program_fact_projection_not_configured"),
                 }
             )
             return evidence.model_copy(
@@ -872,9 +861,7 @@ class DurableOuterToolDispatcher:
                     "contract_version": (
                         EVIDENCE_RECORD_V2 if evidence_units else evidence.contract_version
                     ),
-                    "source_artifact_id": (
-                        artifact_ref.artifact_id if evidence_units else None
-                    ),
+                    "source_artifact_id": (artifact_ref.artifact_id if evidence_units else None),
                     "evidence_units": evidence_units,
                 }
             )
@@ -886,9 +873,7 @@ class DurableOuterToolDispatcher:
                 "processing_status": "failed",
                 "processing_error_type": type(exc).__name__,
                 "root_cause_eligible": False,
-                "root_cause_ineligible_reason": (
-                    "program_fact_projection_failed"
-                ),
+                "root_cause_ineligible_reason": ("program_fact_projection_failed"),
             }
             if isinstance(request_id, str) and request_id:
                 error_data["processing_request_id"] = sanitize_text(request_id)[:512]
@@ -1121,8 +1106,7 @@ class DurableOuterToolDispatcher:
                 if not recovered:
                     failure_stages.add(stage)
                 not_applicable = (
-                    str(failure.get("reason_code") or "").casefold()
-                    == "no_safe_explainable_sample"
+                    str(failure.get("reason_code") or "").casefold() == "no_safe_explainable_sample"
                 )
                 status = (
                     EvidenceUnitStatus.RECOVERED
@@ -1168,9 +1152,7 @@ class DurableOuterToolDispatcher:
                 if stage in failure_stages:
                     continue
                 stage_state = str(stage_states.get(stage) or "").upper()
-                partially_covered = (
-                    stage_state == "SUCCEEDED" and stage in successful_result_stages
-                )
+                partially_covered = stage_state == "SUCCEEDED" and stage in successful_result_stages
                 status = (
                     EvidenceUnitStatus.UNAVAILABLE
                     if stage_state == "UNAVAILABLE"
@@ -1200,9 +1182,7 @@ class DurableOuterToolDispatcher:
                     if status == EvidenceUnitStatus.PARTIAL
                     else "supplemental_result_missing"
                 )
-                source_paths = [
-                    f"/structured_data/slow_query_analysis/missing_stages/{index}"
-                ]
+                source_paths = [f"/structured_data/slow_query_analysis/missing_stages/{index}"]
                 missing_data = {"stage": stage, "overall_status": overall_status}
                 if stage_state:
                     escaped_stage = stage.replace("~", "~0").replace("/", "~1")
@@ -1247,8 +1227,7 @@ class DurableOuterToolDispatcher:
                         f"evidence-unit source path does not resolve: {source_path}"
                     ) from exc
             if unit.status == EvidenceUnitStatus.SUCCESS and not any(
-                cls._projected_value_matches_source(unit.data, source)
-                for source in resolved_values
+                cls._projected_value_matches_source(unit.data, source) for source in resolved_values
             ):
                 raise OuterDispatchError(
                     "successful evidence-unit data does not match its raw source path"
@@ -1264,9 +1243,13 @@ class DurableOuterToolDispatcher:
                 for key, value in projected.items()
             )
         if isinstance(projected, list):
-            return isinstance(source, list) and len(projected) == len(source) and all(
-                cls._projected_value_matches_source(item, raw_item)
-                for item, raw_item in zip(projected, source, strict=True)
+            return (
+                isinstance(source, list)
+                and len(projected) == len(source)
+                and all(
+                    cls._projected_value_matches_source(item, raw_item)
+                    for item, raw_item in zip(projected, source, strict=True)
+                )
             )
         return projected == source
 
@@ -1295,8 +1278,7 @@ class DurableOuterToolDispatcher:
         prior_ids = {
             evidence.id
             for evidence in prior_evidence
-            if evidence.tool_name == request.tool_name
-            and evidence.request == request.parameters
+            if evidence.tool_name == request.tool_name and evidence.request == request.parameters
         }
         return len(prior_ids) + 1
 
@@ -1316,12 +1298,8 @@ class DurableOuterToolDispatcher:
         expected_objective = sanitize_text(request.objective).strip() or (
             f"Execute approved investigation tool {request.tool_name}"
         )
-        expected_hypothesis_ids = [
-            str(sanitize(item))[:200] for item in request.hypothesis_ids
-        ]
-        expected_deadline = invocation.created_at + timedelta(
-            seconds=request.timeout_seconds
-        )
+        expected_hypothesis_ids = [str(sanitize(item))[:200] for item in request.hypothesis_ids]
+        expected_deadline = invocation.created_at + timedelta(seconds=request.timeout_seconds)
         if (
             invocation.run_id != context.run_id
             or invocation.tool_name != request.tool_name
@@ -1355,9 +1333,7 @@ class DurableOuterToolDispatcher:
             return cls._host_processing_failure_evidence(
                 invocation=invocation,
                 request=request,
-                detail=(
-                    "tool executor returned evidence for another run, tool, or provider"
-                ),
+                detail=("tool executor returned evidence for another run, tool, or provider"),
             )
         payload = sanitize(evidence.model_dump(mode="json"))
         payload.update(

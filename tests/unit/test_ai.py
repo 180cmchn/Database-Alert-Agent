@@ -1374,7 +1374,7 @@ async def test_advisor_rejects_non_call_tool_text_actions(content: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_advisor_preserves_unlisted_tool_in_text_action() -> None:
+async def test_advisor_rejects_unlisted_tool_in_text_action() -> None:
     content = json.dumps(
         {
             "action": "call_tool",
@@ -1404,25 +1404,25 @@ async def test_advisor_preserves_unlisted_tool_in_text_action() -> None:
     advisor._max_tokens = 16_384
     advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=UnknownToolCompletions()))
 
-    result = await advisor.request_mcp_tool_call(
-        messages=[],
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "monitoring_query",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ],
-    )
-
-    assert result.name == "write_database"
-    assert result.arguments == {}
+    with pytest.raises(AdvisorError, match="not advertised"):
+        await advisor.request_mcp_tool_call(
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "monitoring_query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
 
 
 @pytest.mark.asyncio
-async def test_advisor_preserves_unlisted_native_tool_call() -> None:
+async def test_advisor_rejects_markup_polluted_native_tool_name() -> None:
+    polluted_name = 'initially_advertised_tool</function>\n<parameter name="datasource">mcdchina'
+
     class UnknownNativeToolCompletions:
         async def create(self, **kwargs: object) -> SimpleNamespace:
             del kwargs
@@ -1436,7 +1436,7 @@ async def test_advisor_preserves_unlisted_native_tool_call() -> None:
                                 SimpleNamespace(
                                     id="unknown-native-tool-call",
                                     function=SimpleNamespace(
-                                        name="server_discovered_tool",
+                                        name=polluted_name,
                                         arguments='{"opaque":true}',
                                     ),
                                 )
@@ -1454,21 +1454,19 @@ async def test_advisor_preserves_unlisted_native_tool_call() -> None:
         chat=SimpleNamespace(completions=UnknownNativeToolCompletions())
     )
 
-    result = await advisor.request_mcp_tool_call(
-        messages=[],
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "initially_advertised_tool",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ],
-    )
-
-    assert result.name == "server_discovered_tool"
-    assert result.arguments == {"opaque": True}
+    with pytest.raises(AdvisorError, match="not advertised"):
+        await advisor.request_mcp_tool_call(
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "initially_advertised_tool",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
 
 
 @pytest.mark.asyncio

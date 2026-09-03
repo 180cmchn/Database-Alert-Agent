@@ -69,6 +69,11 @@ export interface TraceVisibilityFlags {
   hideMcp: boolean;
 }
 
+export const INITIAL_TRACE_VISIBILITY: TraceVisibilityFlags = {
+  hideMainAgent: true,
+  hideMcp: true,
+};
+
 export function resolveTraceVisibility(
   flags: TraceVisibilityFlags,
 ): TraceVisibilityFlags {

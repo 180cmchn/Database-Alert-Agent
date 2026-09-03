@@ -530,6 +530,9 @@ class AnalysisConfigSnapshot(BaseModel):
     external_knowledge_min_relevance: float = 0.60
     react_max_rounds: int = Field(default=8, ge=1, le=100)
     analysis_timeout_seconds: int = Field(default=1800, ge=30, le=86_400)
+    prometheus_mcp_timeout_seconds: float = 60
+    prometheus_investigation_budget_seconds: float = 180
+    prometheus_mcp_tool_timeout_seconds: float = 780
     # Retained in run snapshots so historical independent-validator settings deserialize.
     validation_enabled: bool = True
     ai_fallback_enabled: bool = True

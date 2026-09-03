@@ -640,9 +640,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             if recovered is None:
                 await self._debit(ctx, planner_requests=1)
                 try:
-                    reasoning_stream_id = (
-                        f"{self.scenario.provider}-agent:decision:{decision_key}"
-                    )
+                    reasoning_stream_id = f"{self.scenario.provider}-agent:decision:{decision_key}"
 
                     async def emit_reasoning_delta(
                         content: str,
@@ -657,17 +655,14 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                             content=content,
                             stream_id=_stream_id,
                             delta_index=delta_index,
-                            trace_key=(
-                                f"decision:{_decision_key}:reasoning:delta:{delta_index}"
-                            ),
+                            trace_key=(f"decision:{_decision_key}:reasoning:delta:{delta_index}"),
                         )
                         streamed_reasoning = streamed_reasoning or emitted is not None
 
                     planner_kwargs = {
                         "messages": deepcopy(ctx.messages),
                         "tools": [
-                            ctx.catalog[name].model_copy(deep=True)
-                            for name in sorted(ctx.catalog)
+                            ctx.catalog[name].model_copy(deep=True) for name in sorted(ctx.catalog)
                         ],
                     }
                     # Streaming every reasoning delta durably (one event
@@ -677,12 +672,9 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                     # Providers that disable streaming still record the
                     # complete reasoning once per decision through
                     # MODEL_DECISION and TRACE_REASONING.
-                    if (
-                        self.stream_planner_reasoning
-                        and self._accepts_keyword_argument(
-                            self.planner.plan,
-                            "reasoning_callback",
-                        )
+                    if self.stream_planner_reasoning and self._accepts_keyword_argument(
+                        self.planner.plan,
+                        "reasoning_callback",
                     ):
                         planner_kwargs["reasoning_callback"] = emit_reasoning_delta
                     raw = await self._await_bounded(
@@ -719,9 +711,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                             "reasoning": reasoning,
                             "decision_key": decision_key,
                             "prepared_call": (
-                                prepared.model_dump(mode="json")
-                                if prepared is not None
-                                else None
+                                prepared.model_dump(mode="json") if prepared is not None else None
                             ),
                         },
                         idempotency_key=f"decision:{decision_key}",
@@ -1861,9 +1851,7 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             ),
             "messages": ctx.messages,
             "provider": self.scenario.provider,
-            "tools": [
-                ctx.catalog[name].model_dump(mode="json") for name in sorted(ctx.catalog)
-            ],
+            "tools": [ctx.catalog[name].model_dump(mode="json") for name in sorted(ctx.catalog)],
         }
         canonical = json.dumps(
             payload,
@@ -1908,14 +1896,10 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
             try:
                 action = parse_agent_action(raw_decision)
             except Exception as exc:
-                raise HarnessInfrastructureError(
-                    "durable MCP decision payload is invalid"
-                ) from exc
+                raise HarnessInfrastructureError("durable MCP decision payload is invalid") from exc
             raw_reasoning = event.payload.get("reasoning")
             reasoning = (
-                raw_reasoning
-                if isinstance(raw_reasoning, str) and raw_reasoning.strip()
-                else None
+                raw_reasoning if isinstance(raw_reasoning, str) and raw_reasoning.strip() else None
             )
             raw_prepared = event.payload.get("prepared_call")
             if isinstance(action, CallToolAction):
@@ -2565,17 +2549,11 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
         call: PreparedCall,
     ) -> ToolSpec:
         discovered = ctx.catalog.get(call.tool_name)
-        if discovered is not None:
-            return discovered
-        return ToolSpec(
-            name=call.tool_name,
-            provider=self.scenario.provider,
-            capability=call.tool_name,
-            input_schema={"type": "object", "additionalProperties": True},
-            policy_version="mcp-server-key-v1",
-            schema_version="dynamic-mcp-schema-v1",
-            timeout=call.timeout_seconds or self.session_timeout_seconds,
-        )
+        if discovered is None:
+            raise HarnessInfrastructureError(
+                f"MCP tool {call.tool_name!r} was not present in the discovered catalog"
+            )
+        return discovered
 
     @staticmethod
     def _transition_invocation(invocation: ToolInvocation, **updates: Any) -> ToolInvocation:

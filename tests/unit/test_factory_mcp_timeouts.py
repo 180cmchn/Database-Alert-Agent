@@ -91,6 +91,7 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         archery_investigation_budget_seconds=123,
         archery_mcp_tool_timeout_seconds=611,
         prometheus_mcp_url="https://prometheus.example.test/mcp",
+        prometheus_investigation_budget_seconds=321,
         prometheus_mcp_tool_timeout_seconds=733,
     )
     runtime = build_runtime(settings)
@@ -107,9 +108,18 @@ async def test_special_mcp_tools_use_configured_outer_timeouts(
         assert runtime.service.tool_registry.spec(ARCHERY_SLOW_LOG_TOOL_NAME).timeout == 611
 
         assert isinstance(prometheus_tool, PrometheusMCPEvidenceTool)
+        assert prometheus_tool.client.investigation_budget_seconds == 321
         assert prometheus_tool.default_timeout_seconds == 733
         assert prometheus_tool.client.mcp_transport == "streamable_http"
         assert runtime.service.tool_registry.spec(PROMETHEUS_METRICS_TOOL_NAME).timeout == 733
+        prometheus_spec = runtime.service.tool_registry.spec(PROMETHEUS_METRICS_TOOL_NAME)
+        assert prometheus_spec.policy_version.startswith("prometheus-mcp-agent-v18:sha256:")
+        assert len(prometheus_spec.policy_version.rsplit(":", 1)[-1]) == 64
+
+        snapshot = runtime.service._create_config_snapshot()
+        assert snapshot.prometheus_mcp_timeout_seconds == 60
+        assert snapshot.prometheus_investigation_budget_seconds == 321
+        assert snapshot.prometheus_mcp_tool_timeout_seconds == 733
     finally:
         await runtime.service.close()
 

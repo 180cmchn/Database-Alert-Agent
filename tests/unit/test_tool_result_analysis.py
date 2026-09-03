@@ -176,9 +176,7 @@ async def test_archery_passes_final_result_json_through_without_modification() -
     # the slower row stays first because the program never filters or re-sorts.
     assert result.passthrough_payload == payload
     assert result.passthrough_payload["rows"][0]["checksum"] == "sql-a"
-    assert result.passthrough_payload["rows"][0]["sample"] == (
-        "select * from orders where id = 1"
-    )
+    assert result.passthrough_payload["rows"][0]["sample"] == ("select * from orders where id = 1")
     assert result.passthrough_payload["affected_rows"] == 2
     assert result.passthrough_payload["column_list"] == list(ARCHERY_COLUMN_LIST)
     serialized = json.dumps(result.passthrough_payload, ensure_ascii=False)
@@ -186,9 +184,7 @@ async def test_archery_passes_final_result_json_through_without_modification() -
     assert "INSTANCE-SECRET" not in serialized
     assert "CATALOG-SECRET" not in serialized
     assert len(result.observations) == 1
-    assert result.observations[0].source_paths == [
-        "/structured_data/final_result_payload"
-    ]
+    assert result.observations[0].source_paths == ["/structured_data/final_result_payload"]
     assert "不判断因果" in result.observations[0].statement
     assert result.limitations == []
 
@@ -330,7 +326,7 @@ async def test_flashduty_alert_context_uses_api_projection_without_mcp_wording()
         [result.summary, *(item.statement for item in result.observations), *result.limitations]
     )
     assert result.analysis_usable is True
-    assert result.prompt_version == "program-fact-projection-v7"
+    assert result.prompt_version == "program-fact-projection-v8"
     assert "FlashDuty API" in projected
     assert "MCP" not in projected
     assert "must-not-enter-model" not in projected
@@ -433,10 +429,13 @@ async def test_flashduty_compatibility_aliases_route_as_api_not_mcp(
     assert result.analysis_usable is True
     assert "FlashDuty API" in projected
     assert "MCP" not in projected
-    assert is_context_only_tool_result(
-        tool_name=tool_name,
-        source_system=source_system,
-    ) is context_only
+    assert (
+        is_context_only_tool_result(
+            tool_name=tool_name,
+            source_system=source_system,
+        )
+        is context_only
+    )
 
 
 @pytest.mark.parametrize(
@@ -730,9 +729,7 @@ async def test_prometheus_consumes_only_valid_bounded_range_projection() -> None
         artifact=_artifact(),
     )
 
-    projected = "\n".join(
-        [*(item.statement for item in result.observations), *result.limitations]
-    )
+    projected = "\n".join([*(item.statement for item in result.observations), *result.limitations])
     assert result.analysis_usable is True
     assert "通过协议校验的时序 1 条" in projected
     assert '"sample_count":3' in projected
@@ -801,9 +798,7 @@ async def test_prometheus_range_projection_requires_alarm_host_match() -> None:
         artifact=_artifact(),
     )
 
-    projected = "\n".join(
-        [*(item.statement for item in result.observations), *result.limitations]
-    )
+    projected = "\n".join([*(item.statement for item in result.observations), *result.limitations])
     assert result.analysis_usable is False
     assert '"target_match_invalid":1' in projected
     assert not any("时序聚合" in item.statement for item in result.observations[1:])
@@ -861,6 +856,36 @@ async def test_prometheus_empty_series_is_recorded_as_no_sample_without_causalit
     ]
     assert all("根因判断" in item.statement for item in result.observations[1:])
     assert any("已记录为无样本" in item for item in result.limitations)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_v4_empty_range_uses_execution_counts_not_zero_over_zero() -> None:
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result={
+            "status": "NO_DATA",
+            "structured_data": {
+                "schema_version": "prometheus-evidence-v4",
+                "window_start": (window_end - timedelta(minutes=5)).isoformat(),
+                "window_end": window_end.isoformat(),
+                "required_target": {"database_engine": "mysql", "host": "mysql-17"},
+                "monitoring_results": [],
+                "range_query_attempt_count": 2,
+                "range_query_success_count": 1,
+                "range_query_empty_count": 1,
+            },
+        },
+        artifact=_artifact(),
+    )
+
+    assert result.prompt_version == "program-fact-projection-v8"
+    assert result.analysis_usable is False
+    assert "成功范围查询 1 次" in result.summary
+    assert "匹配 0/0" not in result.summary
+    assert any("空结果不证明目标未被监控" in item for item in result.limitations)
 
 
 @pytest.mark.asyncio

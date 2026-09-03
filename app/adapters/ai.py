@@ -305,6 +305,10 @@ _MODEL_EVIDENCE_UNIT_FIELDS = (
 _MODEL_STATUS_FIELDS = (
     "partial",
     "query_completed",
+    "range_query_completed",
+    "range_query_attempt_count",
+    "range_query_success_count",
+    "range_query_empty_count",
     "processing_status",
     "processing_error_type",
     "root_cause_eligible",
@@ -314,6 +318,10 @@ _MODEL_STATUS_FIELDS = (
     "reason_code",
     "monitoring_scope_status",
     "monitoring_scope_reason",
+    "model_declared_scope_status",
+    "scope_declaration_verified",
+    "unverified_scope_declaration",
+    "target_binding_count",
 )
 _MODEL_TOOL_ANALYSIS_FIELDS = (
     "summary",
@@ -1315,6 +1323,17 @@ class OpenAICompatibleAdvisor:
             raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
         if not tools:
             raise AdvisorError("MCP model tool definitions cannot be empty")
+        allowed_tool_names = {
+            name
+            for tool in tools
+            if isinstance(tool, Mapping)
+            for function in [tool.get("function")]
+            if isinstance(function, Mapping)
+            for name in [function.get("name")]
+            if isinstance(name, str) and name
+        }
+        if not allowed_tool_names:
+            raise AdvisorError("MCP model tool definitions contain no valid names")
         mcp_model = getattr(self, "_mcp_model", "") or self._model
         mcp_effort = getattr(self, "_mcp_reasoning_effort", "")
         mcp_request_kwargs: dict[str, Any] = {
@@ -1353,6 +1372,12 @@ class OpenAICompatibleAdvisor:
                 reasoning_content=reasoning_content,
             )
             if content_call is not None:
+                if content_call.name not in allowed_tool_names:
+                    raise AdvisorError(
+                        "AI provider selected an MCP tool that was not advertised in the "
+                        f"current turn (request_id={request_id}, "
+                        f"name={sanitize_text(content_call.name)[:200]!r})"
+                    )
                 return content_call
         if len(tool_calls) != 1:
             raise AdvisorError(
@@ -1369,6 +1394,11 @@ class OpenAICompatibleAdvisor:
             raise AdvisorError(f"AI provider MCP tool call has no id (request_id={request_id})")
         if not isinstance(selected_name, str) or not selected_name:
             raise AdvisorError(f"AI provider MCP tool call has no name (request_id={request_id})")
+        if selected_name not in allowed_tool_names:
+            raise AdvisorError(
+                "AI provider selected an MCP tool that was not advertised in the current "
+                f"turn (request_id={request_id}, name={sanitize_text(selected_name)[:200]!r})"
+            )
         if isinstance(raw_arguments, str):
             try:
                 arguments = json.loads(raw_arguments)

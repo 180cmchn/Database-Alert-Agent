@@ -37,6 +37,7 @@ from tests.unit.archery_harness_support import (
     INSTANCE_SQL,
     MEMBER_SQL,
     OCCURRED_AT,
+    RESULT_ASSESSMENT_TOOL_NAME,
     TARGET_ARGUMENTS,
     _call,
     _client,
@@ -470,11 +471,15 @@ def test_archery_harness_ignores_all_remote_annotations(
 
     specs = _scenario().build_tool_specs(tools)
 
-    assert [spec.name for spec in specs] == [
+    assert [spec.name for spec in specs[:-2]] == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
     ]
-    assert specs[-1].input_schema == tools[-1].input_schema
+    assert [spec.name for spec in specs[-2:]] == [
+        RESULT_ASSESSMENT_TOOL_NAME,
+        FINISH_TOOL_NAME,
+    ]
+    assert specs[1].input_schema == tools[-1].input_schema
 
 
 def test_archery_harness_exposes_unknown_dynamic_tool_with_original_contract() -> None:
@@ -495,13 +500,17 @@ def test_archery_harness_exposes_unknown_dynamic_tool_with_original_contract() -
 
     specs = _scenario().build_tool_specs(tools)
 
-    assert [spec.name for spec in specs] == [
+    assert [spec.name for spec in specs[:-2]] == [
         ARCHERY_MCP_LOGIN_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
         "request_query_permission_gymJPA",
     ]
-    assert specs[-1].capability == "Dynamically discovered Archery capability"
-    assert specs[-1].input_schema == schema
+    assert [spec.name for spec in specs[-2:]] == [
+        RESULT_ASSESSMENT_TOOL_NAME,
+        FINISH_TOOL_NAME,
+    ]
+    assert specs[2].capability == "Dynamically discovered Archery capability"
+    assert specs[2].input_schema == schema
 
 
 @pytest.mark.parametrize(

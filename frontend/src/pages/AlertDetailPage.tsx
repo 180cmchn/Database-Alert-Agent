@@ -667,14 +667,12 @@ export function AlertDetailPage() {
       </section>
 
       {selectedRun && (
-        <SectionCard
-          eyebrow="AGENT TRACE"
-          title="实时思考与调用轨迹"
-          description="按实际发生顺序追加展示模型返回、工具动作与观察结果"
-          action={isActive ? <span className="live-trace-indicator"><Radio size={13} className="pulse" /> LIVE</span> : undefined}
-        >
-          <AgentTrace alertId={alertId} runId={selectedRun.id} active={isActive} />
-        </SectionCard>
+        <AgentTrace
+          key={`${alertId}:${selectedRun.id}`}
+          alertId={alertId}
+          runId={selectedRun.id}
+          active={isActive}
+        />
       )}
 
       <SectionCard

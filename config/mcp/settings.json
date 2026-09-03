@@ -15,8 +15,8 @@
     },
     "prometheus": {
       "url": "${PROMETHEUS_MCP_URL}",
-      "transport": "sse",
-      "optionalHeaders": {
+      "transport": "streamable_http",
+      "headers": {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
       },
       "prompts": {

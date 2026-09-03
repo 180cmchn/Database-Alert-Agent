@@ -92,6 +92,11 @@ def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
         "ai_timeout_seconds": settings.ai_timeout_seconds,
         "ai_max_tokens": settings.ai_max_tokens,
         "analysis_timeout_seconds": settings.analysis_timeout_seconds,
+        "prometheus_mcp_timeout_seconds": settings.prometheus_mcp_timeout_seconds,
+        "prometheus_investigation_budget_seconds": (
+            settings.prometheus_investigation_budget_seconds
+        ),
+        "prometheus_mcp_tool_timeout_seconds": settings.prometheus_mcp_tool_timeout_seconds,
     }
 
 
@@ -225,6 +230,7 @@ def _build_prometheus_mcp_tool(
                 "PROMETHEUS_MCP_API_KEY": settings.prometheus_mcp_api_key,
             },
             timeout_seconds=settings.prometheus_mcp_timeout_seconds,
+            investigation_budget_seconds=settings.prometheus_investigation_budget_seconds,
             sse_read_timeout_seconds=settings.prometheus_mcp_tool_timeout_seconds,
             harness_runtime_dependencies=(
                 PrometheusHarnessRuntimeDependencies(repository) if repository is not None else None

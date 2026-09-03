@@ -109,71 +109,47 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
 
     prometheus = catalog.require("prometheus")
     assert prometheus.url_template == "${PROMETHEUS_MCP_URL}"
-    assert prometheus.header_templates == {}
-    assert prometheus.optional_header_templates == {
+    assert prometheus.header_templates == {
         "${PROMETHEUS_MCP_API_KEY_HEADER}": "${PROMETHEUS_MCP_API_KEY}"
     }
-    assert prometheus.referenced_environment_variables == ("PROMETHEUS_MCP_URL",)
-    assert prometheus.optional_environment_variables == (
+    assert prometheus.optional_header_templates == {}
+    assert prometheus.referenced_environment_variables == (
+        "PROMETHEUS_MCP_URL",
         "PROMETHEUS_MCP_API_KEY_HEADER",
         "PROMETHEUS_MCP_API_KEY",
     )
-    assert "occurred_at - 5 分钟" in prometheus.prompts.workflow
-    assert "database_not_monitored" in prometheus.prompts.workflow
-    assert all(
-        tool_suffix in prometheus.prompts.workflow
-        for tool_suffix in (
-            "*_execute_query",
-            "*_execute_range_query",
-            "*_list_metrics",
-            "*_get_targets",
-        )
-    )
-    assert all(
-        routing_rule in prometheus.prompts.workflow
-        for routing_rule in (
-            "MySQL 优先 `mysql_*`",
-            "MongoDB/Mongo 优先 `mongo_*`",
-            "OceanBase/OB 优先 `prod_ob4_*`",
-            "TiDB 优先 `mcd_tidb_*`",
-        )
-    )
-    assert all(
-        instance_prefix in prometheus.prompts.workflow
-        for instance_prefix in (
-            "mcd_tidb_coupon_*",
-            "mcd_tidb_oms_*",
-            "mcd_tidb_analytics_*",
-            "mcd_tidb_crm_mbr_3az_*",
-            "mcd_tidb_crm_pnt_*",
-            "mcd_tidb_oms_cold_*",
-            "mcd_tidb_payment_*",
-            "mcd_tidb_stld_*",
-        )
-    )
-    assert all(
-        prometheus_usage in prometheus.prompts.workflow
-        for prometheus_usage in (
-            'node_cpu_seconds_total{mode="idle"}',
-            "node_memory_MemAvailable_bytes",
-            "node_filesystem_avail_bytes",
-            'ALERTS{alertstate="firing"}',
-            "mysql_global_status_slow_queries",
-            "tidb_server_uptime",
-        )
-    )
-    assert "动态 Schema 为参数契约" in prometheus.prompts.workflow
-    assert "不得执行手册中的 Docker、配置、重启、健康检查等运维命令" in (
+    assert prometheus.optional_environment_variables == ()
+    assert "`query_request`" in prometheus.prompts.workflow
+    assert "五分钟范围" in prometheus.prompts.workflow
+    assert "当前回合暴露的工具说明和 JSON Schema 是唯一调用契约" in (prometheus.prompts.workflow)
+    assert "监控目标目录" in prometheus.prompts.workflow
+    assert "不是范围查询的硬前置条件" in prometheus.prompts.workflow
+    assert "序列发现" in prometheus.prompts.workflow
+    assert "`instance` 可能是 exporter 或代理地址" in prometheus.prompts.workflow
+    assert "`metric_candidates` 和 `promql_candidates` 仅作为语义提示" in (
         prometheus.prompts.workflow
     )
-    assert "`*_get_targets` 是可选的目标发现手段" in prometheus.prompts.workflow
-    assert "返回 404" in prometheus.prompts.workflow
-    assert "不设固定的 provider 调用顺序、重试次数上限" in prometheus.prompts.workflow
-    assert '`target="<alarm_host>:<alarm_port>"`' in prometheus.prompts.workflow
-    assert "`instance` 可能是同主机的采集端口" in prometheus.prompts.workflow
-    assert "`mysql:cpu:usage` 是累计 CPU tick" in prometheus.prompts.workflow
-    assert "`mysql:cpu:limit`" in prometheus.prompts.workflow
-    assert "`*_execute_range_query`" in prometheus.prompts.workflow
+    assert "范围调用严格复制 `required_window` 的边界" in prometheus.prompts.workflow
+    assert "`start_time/end_time`" in prometheus.prompts.workflow
+    assert "不得用工作流中的示例覆盖动态 Schema" in prometheus.prompts.workflow
+    assert "一次成功空结果只说明当前“指标 + 标签 + 时间”组合没有匹配" in (
+        prometheus.prompts.workflow
+    )
+    assert "同一调用再次失败或超时时，不再原样重试" in prometheus.prompts.workflow
+    assert "成功执行范围查询且结果为空才可报告无数据" in prometheus.prompts.workflow
+    assert "deadline、协议或传输失败必须按原错误结束" in prometheus.prompts.workflow
+    assert "不执行 Docker、配置修改、重启、重新授权或任何写操作" in (prometheus.prompts.workflow)
+    assert "agent_contract.finish_tool" in prometheus.prompts.workflow
+    assert "finish_prometheus_investigation" not in prometheus.prompts.workflow
+    assert all(
+        section in prometheus.prompts.workflow
+        for section in (
+            "## 目标与事实边界",
+            "## 查询决策",
+            "## 空结果与错误恢复",
+            "## 结束",
+        )
+    )
     assert prometheus.provider_options == {
         "transport": configured_servers["prometheus"]["transport"]
     }

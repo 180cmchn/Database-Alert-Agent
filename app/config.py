@@ -197,6 +197,8 @@ class Settings(BaseSettings):
     prometheus_mcp_api_key: str = Field(default="", repr=False)
     prometheus_mcp_api_key_header: str = ""
     prometheus_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
+    # Keep the inner Agent's recovery loop independent from one transport call.
+    prometheus_investigation_budget_seconds: float = Field(default=180, gt=0, le=1200)
     prometheus_mcp_tool_timeout_seconds: float = Field(default=780, gt=0, le=1200)
 
     # External knowledge deployment coordinates are intentionally not runtime editable.
@@ -402,6 +404,21 @@ class Settings(BaseSettings):
         if self.archery_mcp_tool_timeout_seconds <= self.archery_investigation_budget_seconds:
             raise ValueError(
                 "ARCHERY_MCP_TOOL_TIMEOUT_SECONDS must exceed ARCHERY_INVESTIGATION_BUDGET_SECONDS"
+            )
+        if (
+            "prometheus_investigation_budget_seconds" not in self.model_fields_set
+            and self.prometheus_mcp_tool_timeout_seconds
+            <= self.prometheus_investigation_budget_seconds
+        ):
+            self.prometheus_investigation_budget_seconds = (
+                self.prometheus_mcp_tool_timeout_seconds * 0.9
+            )
+        if self.prometheus_mcp_tool_timeout_seconds <= (
+            self.prometheus_investigation_budget_seconds
+        ):
+            raise ValueError(
+                "PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS must exceed "
+                "PROMETHEUS_INVESTIGATION_BUDGET_SECONDS"
             )
         return self
 

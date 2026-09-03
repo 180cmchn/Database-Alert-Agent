@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -40,8 +40,8 @@ from app.mcp_catalog import (
 PROMETHEUS_MCP_SERVER_NAME: Final = "prometheus"
 PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
-PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v16"
-PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v2"
+PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v18"
+PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v4"
 # China Standard Time has no daylight-saving transitions. A fixed offset keeps
 # model-facing timestamps stable on Windows images without an IANA tzdata package.
 PROMETHEUS_MCP_MODEL_TIMEZONE: Final = timezone(
@@ -69,6 +69,12 @@ _ALERT_THRESHOLD_SUFFIX: Final = re.compile(
     r"(?i)_(?:more|less|greater|higher|lower)_than_\d+(?:\.\d+)?%?$"
 )
 _UNKNOWN_METRIC_IDENTIFIERS: Final = {"n/a", "none", "null", "unknown"}
+_PROJECTED_METRIC_LABEL_KEYS: Final = ("__name__", "metric")
+_RANGE_WINDOW_FIELD_PAIRS: Final = (
+    ("start_time", "end_time"),
+    ("start", "end"),
+    ("start_unix_seconds", "end_unix_seconds"),
+)
 _TARGET_HOST_LABEL_KEYS: Final = {
     "addr",
     "address",
@@ -136,6 +142,27 @@ _CATALOG_METADATA_KEYS: Final = {
     "metadata",
     "type",
     "unit",
+}
+_BINDING_LABEL_KEYS: Final = {
+    "__name__",
+    "addr",
+    "address",
+    "bi",
+    "cluster",
+    "endpoint",
+    "group",
+    "host",
+    "hostname",
+    "id",
+    "instance",
+    "job",
+    "kube_cluster_alias",
+    "metric",
+    "port",
+    "server",
+    "service",
+    "target",
+    "umon_id",
 }
 _METRIC_TERM_STOPWORDS: Final = {
     "alert",
@@ -244,6 +271,15 @@ class PrometheusMCPQueryResult:
     monitoring_scope_reason: str | None = None
     monitored_database_engines: tuple[str, ...] = ()
     monitoring_target_identifiers: tuple[str, ...] = ()
+    tool_catalog_names: tuple[str, ...] = ()
+    tool_catalog_digest: str = ""
+    prompt_revision: str = ""
+    model_declared_scope_status: Literal[
+        "not_checked", "investigating", "in_scope", "out_of_scope", "unknown"
+    ] = "not_checked"
+    model_declared_scope_reason: str | None = None
+    scope_declaration_verified: bool = False
+    target_bindings: tuple[dict[str, Any], ...] = ()
 
     @property
     def has_monitoring_data(self) -> bool:
@@ -315,6 +351,7 @@ class PrometheusMCPClient:
         model: MCPToolCallingModel,
         *,
         timeout_seconds: float = 60,
+        investigation_budget_seconds: float = 180,
         sse_read_timeout_seconds: float | None = None,
         harness_runtime_dependencies: Any | None = None,
     ) -> None:
@@ -341,12 +378,20 @@ class PrometheusMCPClient:
             raise PrometheusMCPConfigurationError(
                 "Prometheus MCP SSE read timeout must be positive"
             )
+        if investigation_budget_seconds <= 0:
+            raise PrometheusMCPConfigurationError(
+                "Prometheus investigation budget must be positive"
+            )
         self.mcp_transport = server.transport
         self.mcp_url = server.url.strip()
         self._headers = dict(server.headers)
         self.model = model
         self.prompts = server.prompts
+        self.prompt_revision = hashlib.sha256(
+            server.prompts.execution_instructions.encode("utf-8")
+        ).hexdigest()
         self.timeout_seconds = timeout_seconds
+        self.investigation_budget_seconds = investigation_budget_seconds
         self.sse_read_timeout_seconds = (
             sse_read_timeout_seconds if sse_read_timeout_seconds is not None else timeout_seconds
         )
@@ -366,6 +411,7 @@ class PrometheusMCPClient:
         *,
         environment: Mapping[str, str],
         timeout_seconds: float = 60,
+        investigation_budget_seconds: float = 180,
         sse_read_timeout_seconds: float | None = None,
         harness_runtime_dependencies: Any | None = None,
     ) -> PrometheusMCPClient:
@@ -373,14 +419,20 @@ class PrometheusMCPClient:
             load_prometheus_mcp_server_settings(settings_path, environment=environment),
             model,
             timeout_seconds=timeout_seconds,
+            investigation_budget_seconds=investigation_budget_seconds,
             sse_read_timeout_seconds=sse_read_timeout_seconds,
             harness_runtime_dependencies=harness_runtime_dependencies,
         )
 
-    async def collect_alert_window(self, context: InvestigationContext) -> PrometheusMCPQueryResult:
+    async def collect_alert_window(
+        self,
+        context: InvestigationContext,
+        *,
+        request: ToolExecutionRequest | None = None,
+    ) -> PrometheusMCPQueryResult:
         from app.adapters.prometheus_harness import collect_prometheus_with_harness
 
-        return await collect_prometheus_with_harness(self, context)
+        return await collect_prometheus_with_harness(self, context, request=request)
 
     def model_tools_for_state(
         self,
@@ -515,6 +567,109 @@ class PrometheusMCPClient:
         }
 
     @classmethod
+    def target_series_bindings(
+        cls,
+        payload: Any,
+        *,
+        alert: NormalizedAlert,
+    ) -> list[dict[str, Any]]:
+        """Project bounded target/metric bindings from positively matched series labels."""
+
+        bindings: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for labels in cls._series_metric_labels(payload):
+            matched_fields = cls._metric_alert_target_fields(labels, alert=alert)
+            if not matched_fields:
+                continue
+            physical_metric = labels.get("__name__")
+            if not isinstance(physical_metric, str) or not _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(
+                physical_metric
+            ):
+                continue
+            projected_labels = {
+                str(key): sanitize_text(str(value))[:200]
+                for key, value in sorted(labels.items(), key=lambda item: str(item[0]))
+                if str(key).casefold() in _BINDING_LABEL_KEYS
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            }
+            binding = {
+                "physical_metric": physical_metric,
+                "semantic_metric": (
+                    labels.get("metric") if isinstance(labels.get("metric"), str) else None
+                ),
+                "matched_fields": list(matched_fields),
+                "labels": projected_labels,
+            }
+            identity = json.dumps(binding, ensure_ascii=True, sort_keys=True)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            bindings.append(binding)
+            if len(bindings) == 20:
+                break
+        return bindings
+
+    @classmethod
+    def _series_metric_labels(cls, value: Any) -> list[Mapping[str, Any]]:
+        found: list[Mapping[str, Any]] = []
+        if isinstance(value, Mapping):
+            metric = value.get("metric")
+            if isinstance(metric, Mapping):
+                found.append(metric)
+            if isinstance(value.get("__name__"), str):
+                found.append(value)
+            for key, nested in value.items():
+                if key == "metric":
+                    continue
+                if isinstance(nested, (Mapping, list)):
+                    found.extend(cls._series_metric_labels(nested))
+        elif isinstance(value, list):
+            for nested in value:
+                if isinstance(nested, (Mapping, list)):
+                    found.extend(cls._series_metric_labels(nested))
+        return found
+
+    @classmethod
+    def range_query_is_empty(cls, payload: Any) -> bool:
+        """Return true only when a complete successful payload explicitly reports zero series."""
+
+        counts: list[int] = []
+        incomplete = False
+
+        def collect(value: Any) -> None:
+            nonlocal incomplete
+            if isinstance(value, Mapping):
+                if value.get("partial") is True or value.get("truncated") is True:
+                    incomplete = True
+                result_type = value.get("resultType") or value.get("result_type")
+                result = value.get("result")
+                if (
+                    isinstance(result_type, str)
+                    and result_type.casefold()
+                    in {
+                        "matrix",
+                        "vector",
+                    }
+                    and isinstance(result, list)
+                ):
+                    counts.append(len(result))
+                for field_name in ("returned_series", "total_series"):
+                    series_count = value.get(field_name)
+                    if isinstance(series_count, int) and not isinstance(series_count, bool):
+                        counts.append(max(series_count, 0))
+                for nested in value.values():
+                    if isinstance(nested, (Mapping, list)):
+                        collect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    if isinstance(nested, (Mapping, list)):
+                        collect(nested)
+
+        collect(payload)
+        return not incomplete and bool(counts) and all(count == 0 for count in counts)
+
+    @classmethod
     def _range_series(
         cls,
         value: Any,
@@ -541,21 +696,29 @@ class PrometheusMCPClient:
     def _project_metric_labels(cls, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             return {}
-        metric_name = value.get("__name__")
-        if isinstance(metric_name, str) and _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(metric_name):
-            return {"__name__": metric_name}
-        return {}
+        projected: dict[str, Any] = {}
+        for key in _PROJECTED_METRIC_LABEL_KEYS:
+            label = value.get(key)
+            if not isinstance(label, str) or not label.strip():
+                continue
+            if key == "__name__" and not _PROMETHEUS_METRIC_IDENTIFIER.fullmatch(label):
+                continue
+            projected[key] = sanitize_text(label)[:200]
+        return projected
 
     @classmethod
     def _argument_window(
         cls,
         arguments: Mapping[str, Any],
     ) -> tuple[datetime, datetime] | None:
-        start = cls._timestamp(arguments.get("start"))
-        end = cls._timestamp(arguments.get("end"))
-        if start is None or end is None:
-            return None
-        return start, end
+        for start_name, end_name in _RANGE_WINDOW_FIELD_PAIRS:
+            if start_name not in arguments or end_name not in arguments:
+                continue
+            start = cls._timestamp(arguments.get(start_name))
+            end = cls._timestamp(arguments.get(end_name))
+            if start is not None and end is not None:
+                return start, end
+        return None
 
     @classmethod
     def _samples_within_window(
@@ -1112,6 +1275,7 @@ class PrometheusMCPClient:
             )
             if isinstance(value, str) and value.strip()
         ]
+        metric_term_groups = PrometheusMCPClient._alert_metric_term_groups(alert)
         return {
             "database_engine": database.engine if database else None,
             "database": database.database if database else None,
@@ -1138,7 +1302,9 @@ class PrometheusMCPClient:
             ),
             "cluster": alert.cluster,
             "instance_candidates": list(dict.fromkeys(candidates)),
+            "target_label_candidates": ["target", "endpoint", "host", "instance"],
             "metric_candidates": PrometheusMCPClient.alert_metric_candidates(alert),
+            "metric_semantic_term_groups": [sorted(group) for group in metric_term_groups],
         }
 
     @staticmethod
@@ -1175,8 +1341,12 @@ class PrometheusMCPClient:
         self,
         *,
         remote_calls_used: int,
-        monitoring_scope_status: str = "not_checked",
+        monitoring_scope_status: str = "unknown",
         monitoring_scope_reason: str | None = None,
+        model_declared_scope_status: str = "not_checked",
+        scope_declaration_verified: bool = False,
+        target_bindings: Sequence[Mapping[str, Any]] = (),
+        range_query_success_count: int = 0,
     ) -> dict[str, Any]:
         return {
             "role": "user",
@@ -1184,14 +1354,20 @@ class PrometheusMCPClient:
                 {
                     "host_event": "prometheus_investigation_state",
                     "remote_calls_used": remote_calls_used,
-                    "monitoring_scope_status": monitoring_scope_status,
-                    "monitoring_scope_reason": monitoring_scope_reason,
+                    "host_verified_monitoring_scope_status": monitoring_scope_status,
+                    "host_verified_monitoring_scope_reason": monitoring_scope_reason,
+                    "model_declared_scope_status": model_declared_scope_status,
+                    "scope_declaration_verified": scope_declaration_verified,
+                    "host_verified_target_bindings": list(target_bindings),
+                    "successful_range_query_count": range_query_success_count,
                     "instruction": (
-                        "先用远端工具确认 Prometheus 配置的数据库监控范围；若告警数据库"
-                        "在范围内，再查询 required_window 内对应监控指标。根据工具描述和 "
-                        "Schema 自主选择下一步，调用参数由你完整提供；Host 在范围调用发送前"
-                        "只校验窗口是否精确相等，校验通过后原样转发。完成后调用结束工具声明 "
-                        "monitoring_scope_status 和依据。"
+                        "先以权威数据库 endpoint 做目标优先的序列发现；若工具支持标签匹配，"
+                        "在首次发现时不要限定 __name__，并优先尝试 target/endpoint，再按真实返回"
+                        "建立物理指标、语义标签、目标标签和 scope 标签绑定。metric_candidates 和 "
+                        "promql_candidates 仅是语义提示，不能直接视为物理指标。使用同一目标序列"
+                        "返回的 scope 值构造严格窗口范围查询。空查询、错误、单一指标缺失、"
+                        "裁剪目录或全局标签值均不能证明 out_of_scope。只有 Host 明确标记 scope "
+                        "declaration verified 时才能作该结论。"
                     ),
                 },
                 ensure_ascii=False,
@@ -1205,8 +1381,9 @@ class PrometheusMCPClient:
             "function": {
                 "name": _FINISH_TOOL_NAME,
                 "description": (
-                    "结束 Prometheus MCP 调查并记录监控范围结论。in_scope 表示告警数据库"
-                    "在配置范围内；out_of_scope 表示未配置对应监控；证据不足时用 unknown。"
+                    "结束 Prometheus MCP 调查并记录模型建议的监控范围结论。Host 会独立验证；"
+                    "in_scope 需要目标匹配的真实序列，out_of_scope 需要完整权威范围明确排除"
+                    "告警数据库，空查询、错误或裁剪目录只能声明 unknown。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -1269,12 +1446,51 @@ class PrometheusMCPClient:
             )
         structured = raw.get("structuredContent")
         if structured not in (None, "", [], {}):
-            return sanitize(structured)
-        content = raw.get("content")
-        if content in (None, "", [], {}):
-            return None
-        payload = sanitize(content)
-        return PrometheusMCPClient._normalize_content_payload(payload)
+            payload = sanitize(structured)
+        else:
+            content = raw.get("content")
+            if content in (None, "", [], {}):
+                return None
+            payload = PrometheusMCPClient._normalize_content_payload(sanitize(content))
+        business_error = PrometheusMCPClient._business_error_detail(payload)
+        if business_error is not None:
+            raise PrometheusMCPToolError(business_error)
+        return payload
+
+    @staticmethod
+    def _business_error_detail(payload: Any) -> str | None:
+        candidates = payload if isinstance(payload, list) else [payload]
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            status = candidate.get("status")
+            if not isinstance(status, str) or status.casefold() not in {
+                "error",
+                "failed",
+                "failure",
+            }:
+                continue
+            parts: list[str] = []
+            errors = candidate.get("errors")
+            errors = errors if isinstance(errors, list) else [errors]
+            for error in errors:
+                if isinstance(error, Mapping):
+                    code = error.get("code")
+                    message = error.get("message") or error.get("detail")
+                    if isinstance(code, str) and code:
+                        parts.append(code)
+                    if isinstance(message, str) and message:
+                        parts.append(message)
+                elif isinstance(error, str) and error:
+                    parts.append(error)
+            for field_name in ("error", "message", "detail"):
+                direct_error = candidate.get(field_name)
+                if isinstance(direct_error, str) and direct_error:
+                    parts.append(direct_error)
+            if not parts:
+                parts.append(f"Prometheus MCP business status was {status}")
+            return sanitize_text(": ".join(parts))[:500]
+        return None
 
     @staticmethod
     def _normalize_content_payload(payload: Any) -> Any:
@@ -1397,16 +1613,67 @@ class PrometheusMCPClient:
             "duration_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
         }
 
+    @staticmethod
+    def query_request_context(request: ToolExecutionRequest) -> dict[str, Any]:
+        """Project the outer Agent's bounded query intent into the inner loop."""
+
+        parameters: dict[str, Any] = {}
+        focus = request.parameters.get("investigation_focus")
+        if isinstance(focus, str) and focus.strip():
+            parameters["investigation_focus"] = sanitize_text(focus)[:2000]
+        for key, limit, item_limit in (
+            ("metric_candidates", 20, 300),
+            ("promql_candidates", 10, 4000),
+        ):
+            values = request.parameters.get(key)
+            if isinstance(values, list):
+                parameters[key] = [
+                    sanitize_text(value)[:item_limit]
+                    for value in values[:limit]
+                    if isinstance(value, str) and value.strip()
+                ]
+        return {
+            "objective": sanitize_text(request.objective)[:2000],
+            "parameters": parameters,
+            "hypothesis_ids": [
+                sanitize_text(value)[:200]
+                for value in request.hypothesis_ids[:20]
+                if isinstance(value, str) and value.strip()
+            ],
+        }
+
     def agent_messages(
         self,
         context: InvestigationContext,
         window_start: datetime,
         window_end: datetime,
+        *,
+        request: ToolExecutionRequest | None = None,
     ) -> list[dict[str, Any]]:
         alert = context.alert.model_dump(mode="json", exclude={"raw_payload"})
         alert["occurred_at"] = context.alert.occurred_at.astimezone(
             PROMETHEUS_MCP_MODEL_TIMEZONE
         ).isoformat()
+        task = {
+            "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
+            "prompt_revision": self.prompt_revision,
+            "alert": preprocess_alert_data(alert),
+            "required_window": self.required_window_context(window_start, window_end),
+            "required_target": self.monitoring_target_context(context.alert),
+            "agent_contract": {
+                "read_only": True,
+                "one_tool_per_turn": True,
+                "arguments_forwarded_unchanged": True,
+                "range_window_preflight": "exact_match_before_transport",
+                "target_first_discovery_before_negative_scope": True,
+                "candidate_metrics_are_semantic_hints": True,
+                "negative_scope_requires_complete_authoritative_inventory": True,
+                "finish_scope_is_host_verified": True,
+                "finish_tool": _FINISH_TOOL_NAME,
+            },
+        }
+        if request is not None:
+            task["query_request"] = self.query_request_context(request)
         return [
             {
                 "role": "system",
@@ -1414,25 +1681,7 @@ class PrometheusMCPClient:
             },
             {
                 "role": "user",
-                "content": json.dumps(
-                    {
-                        "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
-                        "alert": preprocess_alert_data(alert),
-                        "required_window": self.required_window_context(
-                            window_start,
-                            window_end,
-                        ),
-                        "required_target": self.monitoring_target_context(context.alert),
-                        "agent_contract": {
-                            "read_only": True,
-                            "one_tool_per_turn": True,
-                            "arguments_forwarded_unchanged": True,
-                            "range_window_preflight": "exact_match_before_transport",
-                            "finish_tool": _FINISH_TOOL_NAME,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
+                "content": json.dumps(task, ensure_ascii=False),
             },
         ]
 
@@ -1445,8 +1694,20 @@ class PrometheusMCPEvidenceTool:
     read_only = True
     input_schema = {
         "type": "object",
-        "properties": {},
-        "additionalProperties": True,
+        "properties": {
+            "investigation_focus": {"type": "string", "maxLength": 2000},
+            "metric_candidates": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": 300},
+                "maxItems": 20,
+            },
+            "promql_candidates": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": 4000},
+                "maxItems": 10,
+            },
+        },
+        "additionalProperties": False,
     }
 
     def __init__(
@@ -1461,17 +1722,38 @@ class PrometheusMCPEvidenceTool:
         self.capability = client.prompts.purpose
         self.workflow = client.prompts.workflow
         self.safety = client.prompts.safety
+        prompt_revision = (
+            getattr(client, "prompt_revision", None)
+            or hashlib.sha256(client.prompts.execution_instructions.encode("utf-8")).hexdigest()
+        )
+        self.prompt_revision = prompt_revision
+        self.policy_version = f"{PROMETHEUS_MCP_PROMPT_VERSION}:sha256:{prompt_revision}"
+        self.schema_version = PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION
 
     async def execute(
         self, request: ToolExecutionRequest, context: InvestigationContext
     ) -> ToolExecutionResult:
-        del request
-        result = await self.client.collect_alert_window(context)
+        result = await self.client.collect_alert_window(context, request=request)
         required_target = PrometheusMCPClient.monitoring_target_context(context.alert)
         monitoring_results = self._public_monitoring_results(result)
         has_monitoring_data = bool(monitoring_results)
+        range_query_attempt_count, range_query_success_count, range_query_empty_count = (
+            self._range_query_counts(result)
+        )
+        range_query_completed = range_query_success_count > 0
+        unverified_scope_declaration = (
+            result.model_declared_scope_status == "out_of_scope"
+            and not result.scope_declaration_verified
+        )
         structured_data = {
             "schema_version": PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION,
+            "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
+            "prompt_revision": result.prompt_revision or self.prompt_revision,
+            "tool_catalog_names": list(result.tool_catalog_names),
+            "tool_catalog_digest": result.tool_catalog_digest,
+            "investigation_budget_seconds": getattr(
+                self.client, "investigation_budget_seconds", None
+            ),
             "window_start": result.window_start.isoformat(),
             "window_end": result.window_end.isoformat(),
             "window_seconds": PROMETHEUS_ALERT_WINDOW_SECONDS,
@@ -1488,69 +1770,122 @@ class PrometheusMCPEvidenceTool:
             "required_target": required_target,
             "monitoring_scope_status": result.monitoring_scope_status,
             "monitoring_scope_reason": self._public_scope_reason(result),
+            "model_declared_scope_status": result.model_declared_scope_status,
+            "scope_declaration_verified": result.scope_declaration_verified,
+            "unverified_scope_declaration": unverified_scope_declaration,
+            "target_binding_count": len(result.target_bindings),
             "monitoring_result_count": len(monitoring_results),
             "monitoring_results": monitoring_results,
-            "query_completed": has_monitoring_data,
+            "range_query_attempt_count": range_query_attempt_count,
+            "range_query_success_count": range_query_success_count,
+            "range_query_empty_count": range_query_empty_count,
+            "range_query_completed": range_query_completed,
+            "query_completed": range_query_completed,
             "root_cause_eligible": has_monitoring_data and not result.partial,
         }
         if result.partial:
             structured_data["root_cause_ineligible_reason"] = "partial_evidence"
+        if has_monitoring_data:
+            suffix = "；后续调查未完整结束，已保留此前取得的可用监控返回" if result.partial else ""
+            return ToolExecutionResult(
+                status=ToolStatus.SUCCESS,
+                summary=(
+                    "Prometheus MCP 已由 Host 确认告警数据库在监控范围内，并取得告警发生前"
+                    f"五分钟的实时监控证据（{len(monitoring_results)} 条合格范围投影）{suffix}。"
+                ),
+                structured_data=structured_data,
+            )
+
+        structured_data["root_cause_eligible"] = False
+        if result.termination_reason in {"deadline_exceeded", "budget_exhausted"}:
+            structured_data["reason_code"] = "prometheus_investigation_timeout"
+            structured_data["root_cause_ineligible_reason"] = "prometheus_investigation_timeout"
+            structured_data = self._with_missing_evidence_inventory(structured_data, result)
+            return ToolExecutionResult(
+                status=ToolStatus.TIMEOUT,
+                summary=("Prometheus MCP 调查在取得合格告警窗口范围时序前达到时间预算。"),
+                structured_data=structured_data,
+            )
+
+        if range_query_completed:
+            explicitly_empty = range_query_empty_count > 0
+            structured_data["reason_code"] = (
+                "prometheus_range_query_empty"
+                if explicitly_empty
+                else "prometheus_range_query_unusable"
+            )
+            structured_data["root_cause_ineligible_reason"] = "no_usable_monitoring_result"
+            structured_data = self._with_missing_evidence_inventory(structured_data, result)
+            summary = (
+                "Prometheus MCP 已完成告警窗口范围查询"
+                f"（业务成功 {range_query_success_count} 次，其中明确空结果 "
+                f"{range_query_empty_count} 次），但没有取得严格归属于告警目标的数值时序；"
+                "空结果不证明目标未被监控。"
+                if explicitly_empty
+                else "Prometheus MCP 已成功完成告警窗口范围查询，但返回未形成严格归属于"
+                "告警目标和窗口的数值投影；该返回不能证明目标未被监控。"
+            )
+            return ToolExecutionResult(
+                status=ToolStatus.NO_DATA,
+                summary=summary,
+                structured_data=structured_data,
+            )
+
+        failed_attempt = any(
+            attempt.get("outcome") in {"tool_error", "transport_error"}
+            for attempt in result.tool_attempts
+        )
+        if failed_attempt or result.termination_error_type is not None:
+            structured_data["reason_code"] = "prometheus_investigation_failed"
+            structured_data["root_cause_ineligible_reason"] = "prometheus_investigation_failed"
+            structured_data = self._with_missing_evidence_inventory(structured_data, result)
+            return ToolExecutionResult(
+                status=ToolStatus.FAILED,
+                summary=("Prometheus MCP 未成功执行严格匹配告警目标和窗口的范围查询。"),
+                structured_data=structured_data,
+            )
+
         if result.monitoring_scope_status == "out_of_scope":
             structured_data["reason_code"] = "database_not_monitored"
-            structured_data["root_cause_eligible"] = False
             structured_data["root_cause_ineligible_reason"] = "database_not_monitored"
             structured_data = self._with_missing_evidence_inventory(structured_data, result)
             return ToolExecutionResult(
                 status=ToolStatus.SKIPPED,
-                summary=("Prometheus MCP 中没有配置告警数据库对应的监控信息，已跳过后续指标查询。"),
-                structured_data=structured_data,
-            )
-        if has_monitoring_data:
-            if result.partial:
-                suffix = "；后续调查未完整结束，已保留此前取得的可用监控返回"
-            else:
-                suffix = ""
-            coverage_prefix = (
-                "Prometheus MCP 已确认告警数据库在监控范围内，并"
-                if result.monitoring_scope_status == "in_scope"
-                else "Prometheus MCP "
-            )
-            return ToolExecutionResult(
-                status=ToolStatus.SUCCESS,
                 summary=(
-                    f"{coverage_prefix}已取得告警发生前五分钟的实时监控证据"
-                    f"（{len(monitoring_results)} 条合格范围投影）{suffix}。"
+                    "Host 已通过完整监控范围证据确认告警数据库未被当前 Prometheus 覆盖，"
+                    "已跳过后续指标查询。"
                 ),
                 structured_data=structured_data,
             )
-        if result.monitoring_scope_status == "unknown":
-            reason = (
-                "Prometheus MCP 无法确认告警数据库是否在当前监控范围内，"
-                "未取得合格的告警窗口范围投影。"
-            )
-        elif result.termination_reason == "no_discriminating_evidence":
-            reason = (
-                "Prometheus MCP 已停止无效探测，未取得完整的告警信号事实："
-                "没有可归属的告警窗口监控样本"
-            )
-        else:
-            reason = "Prometheus MCP 未返回可用监控结果，实时证据不足。"
-        structured_data["root_cause_eligible"] = False
-        structured_data["root_cause_ineligible_reason"] = (
-            "monitoring_scope_unknown"
-            if result.monitoring_scope_status == "unknown"
-            else (
-                "no_discriminating_evidence"
-                if result.termination_reason == "no_discriminating_evidence"
-                else "no_usable_monitoring_result"
-            )
-        )
+
+        structured_data["reason_code"] = "prometheus_range_query_not_executed"
+        structured_data["root_cause_ineligible_reason"] = "prometheus_range_query_not_executed"
         structured_data = self._with_missing_evidence_inventory(structured_data, result)
         return ToolExecutionResult(
-            status=ToolStatus.NO_DATA,
-            summary=reason,
+            status=ToolStatus.FAILED,
+            summary=("Prometheus MCP 未成功执行严格匹配告警目标和窗口的范围查询。"),
             structured_data=structured_data,
         )
+
+    @staticmethod
+    def _range_query_counts(result: PrometheusMCPQueryResult) -> tuple[int, int, int]:
+        attempts = [
+            attempt
+            for attempt in result.tool_attempts
+            if attempt.get("capability") == "range_query"
+        ]
+        successful = [
+            attempt for attempt in attempts if attempt.get("outcome") in {"result", "no_data"}
+        ]
+        return (
+            len(attempts),
+            len(successful),
+            sum(attempt.get("outcome") == "no_data" for attempt in successful),
+        )
+
+    @classmethod
+    def _range_query_completed(cls, result: PrometheusMCPQueryResult) -> bool:
+        return cls._range_query_counts(result)[1] > 0
 
     def _with_missing_evidence_inventory(
         self,

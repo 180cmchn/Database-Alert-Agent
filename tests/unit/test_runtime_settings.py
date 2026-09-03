@@ -300,6 +300,37 @@ def test_archery_default_timeouts_leave_budget_finalization_margin() -> None:
     assert settings.archery_mcp_tool_timeout_seconds == 180
 
 
+def test_prometheus_default_timeouts_leave_budget_finalization_margin() -> None:
+    settings = Settings(_env_file=None, ai_provider="fake")
+
+    assert settings.prometheus_mcp_timeout_seconds == 60
+    assert settings.prometheus_investigation_budget_seconds == 180
+    assert settings.prometheus_mcp_tool_timeout_seconds == 780
+
+
+def test_prometheus_default_budget_adapts_to_legacy_outer_timeout() -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        prometheus_mcp_tool_timeout_seconds=180,
+    )
+
+    assert settings.prometheus_investigation_budget_seconds == 162
+
+
+def test_prometheus_outer_timeout_must_leave_budget_finalization_margin() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS must exceed",
+    ):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            prometheus_investigation_budget_seconds=180,
+            prometheus_mcp_tool_timeout_seconds=180,
+        )
+
+
 def test_archery_outer_timeout_must_leave_budget_finalization_margin() -> None:
     with pytest.raises(
         ValidationError,

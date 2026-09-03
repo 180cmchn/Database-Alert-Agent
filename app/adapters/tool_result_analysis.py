@@ -15,7 +15,7 @@ from app.application.sanitization import sanitize
 from app.domain.errors import AdvisorError
 from app.domain.models import ToolResultAnalysis, ToolResultObservation
 
-TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v7"
+TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v8"
 _MAX_SNIPPET_CHARS = 800
 _MAX_SELECTED_ITEMS = 20
 _PROMETHEUS_WINDOW_SECONDS = 300
@@ -65,12 +65,8 @@ _FLASHDUTY_API_SOURCES = frozenset(
         *_FLASHDUTY_SIMILAR_SOURCES,
     }
 )
-_FLASHDUTY_ALERT_TOOLS = frozenset(
-    {"alert_context", "flashduty_alert", "flashduty_alert_info"}
-)
-_FLASHDUTY_SIMILAR_TOOLS = frozenset(
-    {"flashduty_similar", "query_similar_incidents"}
-)
+_FLASHDUTY_ALERT_TOOLS = frozenset({"alert_context", "flashduty_alert", "flashduty_alert_info"})
+_FLASHDUTY_SIMILAR_TOOLS = frozenset({"flashduty_similar", "query_similar_incidents"})
 
 
 def is_context_only_tool_result(*, tool_name: str, source_system: str) -> bool:
@@ -327,8 +323,7 @@ class DeterministicToolResultProcessor:
         return all(
             isinstance(item, Mapping)
             and isinstance(item.get("projection"), Mapping)
-            and item["projection"].get("projection_type")
-            == "deterministic_fact_projection"
+            and item["projection"].get("projection_type") == "deterministic_fact_projection"
             and isinstance(item.get("has_data"), bool)
             and isinstance(item.get("is_error"), bool)
             for item in observations
@@ -394,11 +389,7 @@ class DeterministicToolResultProcessor:
         payload = data.get("final_result_payload")
         if isinstance(payload, Mapping):
             rows = payload.get("rows")
-            row_text = (
-                f"rows 共 {len(rows)} 行"
-                if isinstance(rows, list)
-                else "rows 行数未知"
-            )
+            row_text = f"rows 共 {len(rows)} 行" if isinstance(rows, list) else "rows 行数未知"
             limitations: list[str] = []
             if not (isinstance(rows, list) and rows):
                 limitations.append("Archery 最终查询结果没有数据行。")
@@ -444,9 +435,9 @@ class DeterministicToolResultProcessor:
         data = self._structured_data(raw_result)
         results = data.get("monitoring_results")
         results = results if isinstance(results, list) else []
-        if any(
-            isinstance(item, Mapping) and "projection_kind" in item
-            for item in results
+        schema_version = data.get("schema_version")
+        if schema_version in {"prometheus-evidence-v3", "prometheus-evidence-v4"} or any(
+            isinstance(item, Mapping) and "projection_kind" in item for item in results
         ):
             return self._process_prometheus_range_projections(
                 data,
@@ -655,6 +646,22 @@ class DeterministicToolResultProcessor:
         artifact: ArtifactRef,
     ) -> ToolResultAnalysis:
         """Validate and expose only the bounded alert-window projection contract."""
+        raw_range_query_success_count = data.get("range_query_success_count")
+        range_query_success_count = (
+            raw_range_query_success_count
+            if isinstance(raw_range_query_success_count, int)
+            and not isinstance(raw_range_query_success_count, bool)
+            and raw_range_query_success_count >= 0
+            else 0
+        )
+        raw_range_query_empty_count = data.get("range_query_empty_count")
+        range_query_empty_count = (
+            raw_range_query_empty_count
+            if isinstance(raw_range_query_empty_count, int)
+            and not isinstance(raw_range_query_empty_count, bool)
+            and raw_range_query_empty_count >= 0
+            else 0
+        )
 
         required_window, window_error = self._prometheus_required_window(data)
         required_target = data.get("required_target")
@@ -695,8 +702,7 @@ class DeterministicToolResultProcessor:
             target_match = projection.get("target_match")
             matched_fields = (
                 target_match.get("authoritative_fields")
-                if isinstance(target_match, Mapping)
-                and target_match.get("matched") is True
+                if isinstance(target_match, Mapping) and target_match.get("matched") is True
                 else None
             )
             if (
@@ -799,14 +805,11 @@ class DeterministicToolResultProcessor:
                 "latest": summary.get("latest"),
                 "delta": summary.get("delta"),
             }
-            base = (
-                f"/structured_data/monitoring_results/{result_index}/projection"
-            )
+            base = f"/structured_data/monitoring_results/{result_index}/projection"
             observations.append(
                 ToolResultObservation(
                     statement=(
-                        "Prometheus 告警目标五分钟窗口内时序聚合："
-                        f"{_bounded_json(statement)}"
+                        f"Prometheus 告警目标五分钟窗口内时序聚合：{_bounded_json(statement)}"
                     ),
                     source_paths=[
                         f"{base}/timeseries/series/{series_index}",
@@ -834,14 +837,24 @@ class DeterministicToolResultProcessor:
                 f"另有 {omitted} 条合格投影保留在源工件。"
             )
         if not results:
-            limitations.append("Prometheus MCP 没有返回合格的告警窗口范围投影。")
+            if range_query_success_count:
+                limitations.append(
+                    "Prometheus MCP 已成功执行范围查询，但没有生成合格的告警窗口数值投影。"
+                )
+                if range_query_empty_count:
+                    limitations.append("空结果不证明目标未被监控。")
+            else:
+                limitations.append("Prometheus MCP 没有返回合格的告警窗口范围投影。")
         elif not selected:
             limitations.append("Prometheus 公开返回中没有通过协议校验的范围时序投影。")
+        query_summary = (
+            f"成功范围查询 {range_query_success_count} 次；" if range_query_success_count else ""
+        )
         return _analysis(
             artifact=artifact,
             summary=(
                 "Prometheus 告警目标五分钟窗口程序事实投影："
-                f"通过校验 {len(selected)} 条时序；向主 Agent 展示 "
+                f"{query_summary}通过校验 {len(selected)} 条时序；向主 Agent 展示 "
                 f"{min(len(selected), _MAX_SELECTED_ITEMS)} 条时序、"
                 f"{exposed_samples} 个数值样本。"
             ),
@@ -1130,10 +1143,7 @@ class DeterministicToolResultProcessor:
         observations = (
             [
                 ToolResultObservation(
-                    statement=(
-                        "告警事件随附的本地上下文="
-                        f"{_bounded_json(visible)}"
-                    ),
+                    statement=(f"告警事件随附的本地上下文={_bounded_json(visible)}"),
                     source_paths=["/structured_data"],
                 )
             ]
@@ -1206,10 +1216,7 @@ class DeterministicToolResultProcessor:
 
         limitations: list[str] = []
         if partial_errors is not None:
-            limitations.append(
-                "FlashDuty API 部分辅助查询不可用="
-                f"{_bounded_json(partial_errors)}"
-            )
+            limitations.append(f"FlashDuty API 部分辅助查询不可用={_bounded_json(partial_errors)}")
         if not observations:
             limitations.append("FlashDuty API 没有返回可投影的告警上下文。")
         return _analysis(
@@ -1237,17 +1244,12 @@ class DeterministicToolResultProcessor:
                 continue
             observations.append(
                 ToolResultObservation(
-                    statement=(
-                        "FlashDuty API 历史相似告警上下文="
-                        f"{_bounded_json(visible)}"
-                    ),
+                    statement=(f"FlashDuty API 历史相似告警上下文={_bounded_json(visible)}"),
                     source_paths=[f"/structured_data/items/{index}"],
                 )
             )
 
-        limitations = [
-            "FlashDuty API 历史相似告警仅作为调查上下文，不能作为当前告警的根因证据。"
-        ]
+        limitations = ["FlashDuty API 历史相似告警仅作为调查上下文，不能作为当前告警的根因证据。"]
         if len(items) > _MAX_SELECTED_ITEMS:
             limitations.append(
                 f"主 Agent 仅展示前 {_MAX_SELECTED_ITEMS} 条历史相似告警；"
@@ -1285,8 +1287,7 @@ class DeterministicToolResultProcessor:
         observations = [
             ToolResultObservation(
                 statement=(
-                    f"FlashDuty API tool_name={tool_name} 字段 {field}="
-                    f"{_bounded_json(value)}"
+                    f"FlashDuty API tool_name={tool_name} 字段 {field}={_bounded_json(value)}"
                 ),
                 source_paths=[f"/structured_data/{_pointer_token(str(field))}"],
             )
@@ -1299,9 +1300,7 @@ class DeterministicToolResultProcessor:
                 "完整响应保留在审计工件中。"
             )
         if not observations:
-            limitations.append(
-                f"FlashDuty API 工具 {tool_name} 没有返回可投影的事实字段。"
-            )
+            limitations.append(f"FlashDuty API 工具 {tool_name} 没有返回可投影的事实字段。")
         return _analysis(
             artifact=artifact,
             summary=(

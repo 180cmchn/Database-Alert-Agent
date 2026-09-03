@@ -85,6 +85,7 @@ ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v6"
 ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v6"
 _FINISH_TOOL_NAME = "finish_archery_investigation"
 _RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
+_LOCAL_ACTION_TOOL_NAMES = frozenset({_FINISH_TOOL_NAME, _RESULT_ASSESSMENT_TOOL_NAME})
 _RESULT_CONTENT_STATES = ("complete", "content_too_long", "uncertain")
 _RESULT_ASSESSMENT_BASES = (
     "appears_complete",
@@ -727,6 +728,7 @@ class ArcheryHarnessPlanner:
                     },
                 }
                 for item in tools
+                if item.name not in _LOCAL_ACTION_TOOL_NAMES
             ]
             model_tools.append(deepcopy(_FINISH_TOOL))
         self.last_reasoning_content = None
@@ -1942,6 +1944,28 @@ class ArcheryHarnessScenario:
                     timeout=self.client.timeout_seconds,
                 )
             )
+        specs.extend(
+            [
+                ToolSpec(
+                    name=_RESULT_ASSESSMENT_TOOL_NAME,
+                    provider=self.provider,
+                    capability="Classify one Archery response using local Host control",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    policy_version=ARCHERY_HARNESS_POLICY_VERSION,
+                    schema_version=ARCHERY_HARNESS_SCHEMA_VERSION,
+                    timeout=self.client.timeout_seconds,
+                ),
+                ToolSpec(
+                    name=_FINISH_TOOL_NAME,
+                    provider=self.provider,
+                    capability="Finish the Archery investigation using local Host control",
+                    input_schema=deepcopy(_FINISH_TOOL["function"]["parameters"]),
+                    policy_version=ARCHERY_HARNESS_POLICY_VERSION,
+                    schema_version=ARCHERY_HARNESS_SCHEMA_VERSION,
+                    timeout=self.client.timeout_seconds,
+                ),
+            ]
+        )
         return specs
 
     def _is_allowed_non_sql_followup_tool(self, tool_name: str) -> bool:

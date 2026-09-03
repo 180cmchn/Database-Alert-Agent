@@ -36,6 +36,7 @@ from app.mcp_runtime import (
     ScenarioTransition,
     ScriptedPlanner,
 )
+from app.mcp_runtime.harness import HarnessInfrastructureError
 
 
 @dataclass
@@ -157,6 +158,7 @@ class _Scenario:
         del state, observations
         return None
 
+
 class _InterruptAfterDecisionSink(InMemoryEventSink):
     def __init__(self) -> None:
         super().__init__()
@@ -205,23 +207,6 @@ class _ResultErrorDirectiveFailureScenario(_ResultProcessingFailureScenario):
     ) -> RetryDirective | None:
         del state, call, error
         raise RuntimeError("fixture result-error classifier failed")
-
-
-class _RewritingScenario(_Scenario):
-    def prepare_call(
-        self,
-        action: Any,
-        *,
-        state: _ScenarioState,
-    ) -> PreparedCall:
-        prepared = super().prepare_call(action, state=state)
-        return prepared.model_copy(
-            update={
-                "tool_name": "fixture.rewritten",
-                "model_arguments": {"query": "rewritten"},
-                "effective_arguments": {"query": "rewritten"},
-            }
-        )
 
 
 class _NativePreparedScenario(_Scenario):
@@ -600,10 +585,7 @@ async def test_local_prepared_result_never_crosses_transport_or_remote_budget() 
         "rejected": True,
         "reason": "unsafe",
     }
-    assert any(
-        snapshot.remote_responses and not snapshot.observations
-        for snapshot in checkpoints
-    )
+    assert any(snapshot.remote_responses and not snapshot.observations for snapshot in checkpoints)
     assert response_store.responses == []
 
 
@@ -732,10 +714,7 @@ async def test_pending_local_result_adopts_durable_started_without_remote_debit(
     invocation_store = _InterruptAfterStartedInvocationStore()
 
     async def capture_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
 
     first_session = _TrackingSession()
@@ -812,10 +791,7 @@ async def test_pending_checkpoint_reapplies_current_local_policy_before_transpor
     pending_checkpoints: list[Any] = []
 
     async def interrupt_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
             raise asyncio.CancelledError
 
@@ -877,10 +853,7 @@ async def test_refreshed_pending_local_policy_resumes_without_opening_session() 
     pending_checkpoints: list[Any] = []
 
     async def interrupt_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
             raise asyncio.CancelledError
 
@@ -953,10 +926,7 @@ async def test_expired_checkpoint_settles_pending_local_policy_before_deadline()
     pending_checkpoints: list[Any] = []
 
     async def interrupt_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
             raise asyncio.CancelledError
 
@@ -1012,10 +982,7 @@ async def test_pending_policy_refresh_preserves_committed_remote_debit_reservati
     pending_checkpoints: list[Any] = []
 
     async def capture_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
 
     first_session = _TrackingSession()
@@ -1084,10 +1051,7 @@ async def test_pending_policy_refresh_restores_scenario_state_when_prepare_fails
     pending_checkpoints: list[Any] = []
 
     async def interrupt_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
             raise asyncio.CancelledError
 
@@ -1127,10 +1091,7 @@ async def test_pending_checkpoint_never_relaxes_durable_local_policy_to_transpor
     pending_checkpoints: list[Any] = []
 
     async def interrupt_pending_checkpoint(snapshot: Any) -> None:
-        if (
-            snapshot.invocations
-            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
-        ):
+        if snapshot.invocations and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING:
             pending_checkpoints.append(snapshot)
             raise asyncio.CancelledError
 
@@ -1244,8 +1205,7 @@ async def test_provider_remote_usage_cas_records_both_concurrent_sibling_scopes(
         str(second_scope),
     }
     assert sorted(
-        event.payload["provider_remote_tool_calls"]["consumed"]
-        for event in remote_debits
+        event.payload["provider_remote_tool_calls"]["consumed"] for event in remote_debits
     ) == [1, 2]
     assert all(
         not isinstance(outcome, Exception)
@@ -1436,18 +1396,16 @@ async def test_no_tool_call_gets_exactly_one_repair_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_forwards_unknown_tool_and_arguments_without_host_rewrite() -> None:
-    raw_arguments = {"query": "unrestricted", "custom_parameter": True}
+async def test_runtime_rejects_unknown_tool_before_transport() -> None:
     planner = ScriptedPlanner(
         [
             {
                 "action": "call_tool",
-                "tool_name": "fixture.dynamic",
-                "objective": "Exercise a deployment-specific MCP capability",
+                "tool_name": "fixture.dynamic</function>",
+                "objective": "Exercise an unadvertised MCP capability",
                 "hypothesis_ids": [],
-                "arguments": raw_arguments,
-            },
-            _finish(),
+                "arguments": {"query": "unrestricted"},
+            }
         ]
     )
     connector = ReplayMCPConnector(
@@ -1456,8 +1414,8 @@ async def test_runtime_forwards_unknown_tool_and_arguments_without_host_rewrite(
             _session(
                 "session-1",
                 ReplayCallFixture(
-                    tool_name="fixture.dynamic",
-                    expected_arguments=raw_arguments,
+                    tool_name="fixture.dynamic</function>",
+                    expected_arguments={"query": "unrestricted"},
                     result={"rows": [1]},
                 ),
             )
@@ -1467,20 +1425,17 @@ async def test_runtime_forwards_unknown_tool_and_arguments_without_host_rewrite(
     runtime = MCPAgentHarnessRuntime(
         connector=connector,
         planner=planner,
-        scenario=_RewritingScenario(),
+        scenario=_Scenario(),
         event_sink=sink,
         budget=_budget(),
     )
 
-    result = await runtime.run(run_id=uuid4())
+    run_id = uuid4()
+    with pytest.raises(HarnessInfrastructureError, match="not present in the discovered catalog"):
+        await runtime.run(run_id=run_id)
 
-    assert result.budget.consumed.accepted_decisions == 2
-    assert result.budget.consumed.remote_tool_calls == 1
-    assert len(result.invocations) == 1
-    assert result.invocations[0].status == ToolInvocationStatus.SUCCEEDED
-    assert result.invocations[0].tool_name == "fixture.dynamic"
-    assert result.invocations[0].model_arguments == raw_arguments
-    assert result.invocations[0].effective_arguments == raw_arguments
+    events = await sink.read(run_id)
+    assert all(event.kind != AgentEventKind.TOOL_INVOCATION_STARTED for event in events)
 
 
 @pytest.mark.asyncio
@@ -1597,9 +1552,7 @@ async def test_unknown_outcome_is_not_replayed_without_new_agent_action() -> Non
     result = await runtime.run(run_id=uuid4())
 
     assert connector.opened_session_ids == ["session-1", "session-2"]
-    assert [item.status for item in result.invocations] == [
-        ToolInvocationStatus.UNKNOWN_OUTCOME
-    ]
+    assert [item.status for item in result.invocations] == [ToolInvocationStatus.UNKNOWN_OUTCOME]
     assert result.state.successful_queries == []
     assert result.budget.consumed.remote_tool_calls == 1
 
@@ -1747,9 +1700,7 @@ async def test_second_explicit_action_uses_refreshed_tool_catalog(
     sink = InMemoryEventSink()
     result = await MCPAgentHarnessRuntime(
         connector=connector,
-        planner=ScriptedPlanner(
-            [_call("catalog-drift"), _call("catalog-drift"), _finish()]
-        ),
+        planner=ScriptedPlanner([_call("catalog-drift"), _call("catalog-drift"), _finish()]),
         scenario=_CatalogAwareScenario(),
         event_sink=sink,
         budget=_budget(),
@@ -2476,21 +2427,21 @@ async def test_resume_reuses_durable_decision_and_emits_one_trace_sequence() -> 
     resumed_messages = second_planner.requests[0].messages
     assert sum(item.get("id") == "durable-reasoning-item" for item in resumed_messages) == 1
     assert sum(item.get("id") == "durable-function-item" for item in resumed_messages) == 1
-    assert sum(
-        item.get("type") == "function_call_output"
-        and item.get("call_id") == "durable-function-call"
-        for item in resumed_messages
-    ) == 1
+    assert (
+        sum(
+            item.get("type") == "function_call_output"
+            and item.get("call_id") == "durable-function-call"
+            for item in resumed_messages
+        )
+        == 1
+    )
     events = await sink.read(run_id)
     durable_decisions = [
         event
         for event in events
-        if event.kind == AgentEventKind.MODEL_DECISION
-        and event.payload.get("decision_key")
+        if event.kind == AgentEventKind.MODEL_DECISION and event.payload.get("decision_key")
     ]
-    action_traces = [
-        event for event in events if event.kind == AgentEventKind.TRACE_ACTION
-    ]
+    action_traces = [event for event in events if event.kind == AgentEventKind.TRACE_ACTION]
     observation_traces = [
         event for event in events if event.kind == AgentEventKind.TRACE_OBSERVATION
     ]
@@ -2581,9 +2532,7 @@ async def test_resume_reapplies_current_local_policy_to_legacy_durable_decision(
         ).run(run_id=run_id)
 
     durable_decision = next(
-        event
-        for event in await sink.read(run_id)
-        if event.kind == AgentEventKind.MODEL_DECISION
+        event for event in await sink.read(run_id) if event.kind == AgentEventKind.MODEL_DECISION
     )
     assert "local_result" not in durable_decision.payload["prepared_call"]
     snapshot = checkpoints[-1]
@@ -2616,11 +2565,14 @@ async def test_resume_reapplies_current_local_policy_to_legacy_durable_decision(
     resumed_messages = resumed_planner.requests[0].messages
     assert sum(item.get("id") == "legacy-reasoning-item" for item in resumed_messages) == 1
     assert sum(item.get("id") == "legacy-function-item" for item in resumed_messages) == 1
-    assert sum(
-        item.get("type") == "function_call_output"
-        and item.get("call_id") == "legacy-function-call"
-        for item in resumed_messages
-    ) == 1
+    assert (
+        sum(
+            item.get("type") == "function_call_output"
+            and item.get("call_id") == "legacy-function-call"
+            for item in resumed_messages
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -2967,8 +2919,7 @@ async def test_unknown_outcome_checkpoint_survives_interruption_without_replay()
     async def interrupt_after_unknown_outcome(snapshot: Any) -> None:
         if (
             snapshot.invocations
-            and snapshot.invocations[-1].status
-            == ToolInvocationStatus.UNKNOWN_OUTCOME
+            and snapshot.invocations[-1].status == ToolInvocationStatus.UNKNOWN_OUTCOME
         ):
             captured.append(snapshot)
             raise asyncio.CancelledError
@@ -3002,9 +2953,7 @@ async def test_unknown_outcome_checkpoint_survives_interruption_without_replay()
     result = await MCPAgentHarnessRuntime(
         connector=ReplayMCPConnector(
             "fixture-mcp",
-            [
-                _session("session-2")
-            ],
+            [_session("session-2")],
         ),
         planner=ScriptedPlanner([_finish()]),
         scenario=_Scenario(),
@@ -3012,9 +2961,7 @@ async def test_unknown_outcome_checkpoint_survives_interruption_without_replay()
         budget=_budget(),
     ).resume(snapshot, restored_budget=first_runtime.budget)
 
-    assert [item.status for item in result.invocations] == [
-        ToolInvocationStatus.UNKNOWN_OUTCOME
-    ]
+    assert [item.status for item in result.invocations] == [ToolInvocationStatus.UNKNOWN_OUTCOME]
     assert result.budget.consumed.remote_tool_calls == 1
     assert result.pending_retry is None
 
@@ -3262,9 +3209,7 @@ async def test_staged_remote_response_is_persisted_after_external_termination(
 
 
 @pytest.mark.asyncio
-async def test_staged_remote_response_is_persisted_before_infrastructure_error_propagates() -> (
-    None
-):
+async def test_staged_remote_response_is_persisted_before_infrastructure_error_propagates() -> None:
     session = _TrackingSession()
     response_store = _RecordingRemoteResponseStore()
 
@@ -3325,9 +3270,7 @@ async def test_terminal_checkpoint_failure_still_persists_response_after_session
 
 
 @pytest.mark.asyncio
-async def test_terminal_checkpoint_error_remains_primary_when_response_persistence_fails() -> (
-    None
-):
+async def test_terminal_checkpoint_error_remains_primary_when_response_persistence_fails() -> None:
     session = _TrackingSession()
 
     class FailingResponseStore(_RecordingRemoteResponseStore):
@@ -3371,9 +3314,7 @@ async def test_terminal_checkpoint_error_remains_primary_when_response_persisten
 
 
 @pytest.mark.asyncio
-async def test_partial_remote_response_artifact_flush_is_idempotently_completed_on_resume() -> (
-    None
-):
+async def test_partial_remote_response_artifact_flush_is_idempotently_completed_on_resume() -> None:
     class PartiallyFailingResponseStore:
         def __init__(self) -> None:
             self.records: dict[Any, dict[str, Any]] = {}
@@ -3426,9 +3367,7 @@ async def test_partial_remote_response_artifact_flush_is_idempotently_completed_
     with pytest.raises(RuntimeError, match="failed to persist remote MCP responses"):
         await MCPAgentHarnessRuntime(
             connector=first_connector,
-            planner=ScriptedPlanner(
-                [_call("first-raw"), _call("second-raw"), _finish()]
-            ),
+            planner=ScriptedPlanner([_call("first-raw"), _call("second-raw"), _finish()]),
             scenario=_Scenario(),
             event_sink=sink,
             budget=_budget(),
@@ -3458,9 +3397,10 @@ async def test_partial_remote_response_artifact_flush_is_idempotently_completed_
     assert resumed.finish == terminal_snapshot.finish
     assert second_connector.opened_session_ids == []
     assert len(response_store.records) == 2
-    assert sorted(
-        record["response"]["rows"][0] for record in response_store.records.values()
-    ) == [1, 2]
+    assert sorted(record["response"]["rows"][0] for record in response_store.records.values()) == [
+        1,
+        2,
+    ]
 
 
 @pytest.mark.asyncio

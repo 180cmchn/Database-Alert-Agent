@@ -26,6 +26,7 @@ from app.adapters.prometheus_harness import (
 from app.adapters.prometheus_mcp import (
     PROMETHEUS_MCP_SERVER_NAME,
     PrometheusMCPClient,
+    PrometheusMCPModelError,
     PrometheusMCPServerSettings,
 )
 from app.agent_runtime import (
@@ -41,6 +42,7 @@ from app.domain.models import (
     InvestigationRun,
     NormalizedAlert,
     Severity,
+    ToolExecutionRequest,
 )
 from app.domain.ports import RunLeaseConflict
 from app.domain.tool_calling import MCPModelToolCall
@@ -170,6 +172,7 @@ def _client(
     *,
     repository: SQLAlchemyAlertRepository | None = None,
     timeout_seconds: float = 60,
+    investigation_budget_seconds: float = 180,
     mcp_transport: MCPTransport = "sse",
 ) -> PrometheusMCPClient:
     return PrometheusMCPClient(
@@ -181,6 +184,7 @@ def _client(
         ),
         model,
         timeout_seconds=timeout_seconds,
+        investigation_budget_seconds=investigation_budget_seconds,
         harness_runtime_dependencies=(
             PrometheusHarnessRuntimeDependencies(repository) if repository is not None else None
         ),
@@ -215,6 +219,11 @@ def test_prometheus_harness_exposes_all_discovered_tools_ignoring_annotations() 
         "missing_annotations",
     ]
     assert all(spec.capability == "prometheus.remote_tool" for spec in specs)
+    assert all(
+        spec.policy_version.startswith("prometheus-mcp-agent-v18:sha256:")
+        and len(spec.policy_version) <= 128
+        for spec in specs
+    )
     assert all("annotations" not in item["function"] for item in scenario.model_tools.values())
 
 
@@ -333,6 +342,95 @@ def test_prometheus_harness_rejects_wrong_range_window_with_exact_correction() -
     host_control = json.loads(messages[-1]["content"])["host_control"]
     assert host_control["remote_calls_used"] == 0
     assert host_control["capability"] == "host_window_validation"
+
+
+def test_prometheus_harness_uses_dynamic_start_time_end_time_fields() -> None:
+    client = _client(_SequenceModel([]))
+    scenario = prometheus_harness_module.PrometheusHarnessScenario(
+        client=client,
+        context=_context(),
+        window_start=_ALERT_WINDOW_START,
+        window_end=_ALERT_TIME,
+    )
+    scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="historical_range",
+                description="Run a PromQL range query",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "promql": {"type": "string"},
+                        "start_time": {"type": "string"},
+                        "end_time": {"type": "string"},
+                        "step_seconds": {"type": "number"},
+                    },
+                    "required": ["promql", "start_time", "end_time", "step_seconds"],
+                    "additionalProperties": False,
+                },
+            )
+        ]
+    )
+    wrong_arguments = {
+        "promql": "mysql_up",
+        "start_time": "2025-08-07T01:55:00Z",
+        "end_time": "2025-08-07T02:00:00Z",
+        "step_seconds": 30,
+    }
+    wrong_action = type(
+        "Action",
+        (),
+        {
+            "tool_name": "historical_range",
+            "objective": "query",
+            "hypothesis_ids": [],
+            "arguments": wrong_arguments,
+        },
+    )()
+
+    rejected = scenario.prepare_call(wrong_action, state=scenario.initial_state())
+
+    assert rejected.local_result == {
+        "host_validation": {
+            "status": "rejected",
+            "reason_code": "alert_window_mismatch",
+            "detail": (
+                "Range query time fields must exactly match the authoritative alert window."
+            ),
+            "transport_sent": False,
+            "expected_arguments": {
+                "start_time": "2026-08-07T09:55:00+08:00",
+                "end_time": "2026-08-07T10:00:00+08:00",
+            },
+            "expected_window": client.required_window_context(_ALERT_WINDOW_START, _ALERT_TIME),
+            "received_arguments": {
+                "start_time": "2025-08-07T01:55:00Z",
+                "end_time": "2025-08-07T02:00:00Z",
+            },
+        }
+    }
+
+    exact_arguments = {
+        **wrong_arguments,
+        "start_time": "2026-08-07T01:55:00Z",
+        "end_time": "2026-08-07T02:00:00Z",
+    }
+    exact_action = type(
+        "Action",
+        (),
+        {
+            "tool_name": "historical_range",
+            "objective": "query",
+            "hypothesis_ids": [],
+            "arguments": exact_arguments,
+        },
+    )()
+
+    prepared = scenario.prepare_call(exact_action, state=scenario.initial_state())
+
+    assert prepared.local_result is None
+    assert prepared.effective_arguments == exact_arguments
+    assert prepared.metadata["capability"] == "range_query"
 
 
 def test_prometheus_harness_preserves_responses_output_items_in_prepared_call() -> None:
@@ -676,7 +774,11 @@ async def test_prometheus_whole_run_timeout_bounds_repeated_model_failures() -> 
             raise RuntimeError("temporary model failure")
 
     result = await asyncio.wait_for(
-        _client(AlwaysFailingModel([]), timeout_seconds=0.03).collect_alert_window(_context()),
+        _client(
+            AlwaysFailingModel([]),
+            timeout_seconds=0.03,
+            investigation_budget_seconds=0.03,
+        ).collect_alert_window(_context()),
         timeout=0.5,
     )
 
@@ -832,7 +934,8 @@ async def test_shared_harness_rejects_wrong_window_before_transport() -> None:
         ]
     )
 
-    result = await _client(model).collect_alert_window(_context())
+    client = _client(model)
+    result = await client.collect_alert_window(_context())
 
     assert _HarnessSession.calls == [
         (
@@ -879,6 +982,10 @@ async def test_shared_harness_rejects_wrong_window_before_transport() -> None:
         "rejected_locally",
         "result",
     ]
+    assert result.tool_catalog_names == ("query_range",)
+    assert len(result.tool_catalog_digest) == 64
+    int(result.tool_catalog_digest, 16)
+    assert result.prompt_revision == client.prompt_revision
 
 
 @pytest.mark.asyncio
@@ -921,6 +1028,48 @@ async def test_prometheus_planner_exposes_model_reasoning_content() -> None:
 
     assert action["action"] == "call_tool"
     assert planner.last_reasoning_content == "先确认目标监控范围，再查询窗口指标。"
+
+
+@pytest.mark.asyncio
+async def test_prometheus_planner_rejects_unadvertised_tool_before_transport() -> None:
+    polluted_name = 'query_range</function>\n<parameter name="datasource">mcdchina'
+    client = _client(
+        _SequenceModel(
+            [
+                MCPModelToolCall(
+                    call_id="polluted-call",
+                    name=polluted_name,
+                    arguments={},
+                )
+            ]
+        )
+    )
+    scenario = prometheus_harness_module.PrometheusHarnessScenario(
+        client=client,
+        context=_context(),
+        window_start=_ALERT_WINDOW_START,
+        window_end=_ALERT_TIME,
+    )
+    specs = scenario.build_tool_specs(
+        [
+            DiscoveredMCPTool(
+                name="query_range",
+                input_schema={"type": "object", "additionalProperties": True},
+            )
+        ]
+    )
+    planner = prometheus_harness_module.PrometheusHarnessPlanner(
+        client=client,
+        scenario=scenario,
+    )
+
+    with pytest.raises(PrometheusMCPModelError, match="unadvertised tool"):
+        await planner.plan(
+            messages=scenario.initial_messages(scenario.initial_state()),
+            tools=specs,
+        )
+
+    assert scenario.current_state.executed_calls == []
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1175,114 @@ async def test_shared_harness_preserves_results_across_transport_interruption(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_repeated_transport_failure_returns_planner_control_for_new_query() -> None:
+    first_arguments = {
+        "query": "mysql_up",
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+        "operation": "query",
+    }
+    fallback_arguments = {
+        "query": "mysql_threads_running",
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+        "operation": "query",
+    }
+    _HarnessSession.results = [
+        ConnectionError("stream closed"),
+        ConnectionError("stream closed"),
+        {"structuredContent": {"series": [{"value": 7}]}},
+    ]
+    model = _SequenceModel(
+        [
+            MCPModelToolCall(
+                call_id="primary-query",
+                name="query_range",
+                arguments=first_arguments,
+            ),
+            MCPModelToolCall(
+                call_id="fallback-query",
+                name="query_range",
+                arguments=fallback_arguments,
+            ),
+            MCPModelToolCall(
+                call_id="finish",
+                name="finish_prometheus_investigation",
+                arguments={},
+            ),
+        ]
+    )
+
+    result = await _client(model).collect_alert_window(_context())
+
+    assert [arguments for _, arguments in _HarnessSession.calls] == [
+        first_arguments,
+        first_arguments,
+        fallback_arguments,
+    ]
+    assert [attempt["outcome"] for attempt in result.tool_attempts] == [
+        "transport_error",
+        "transport_error",
+        "result",
+    ]
+    planner_feedback = json.dumps(model.messages[1], ensure_ascii=False)
+    assert "同一调用再次失败" in planner_feedback
+    assert "其它只读能力" in planner_feedback
+    assert result.finished_by_model is True
+
+
+@pytest.mark.asyncio
+async def test_transport_timeout_returns_planner_control_without_same_call_retry() -> None:
+    timed_out_arguments = {
+        "query": "mysql_up",
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+        "operation": "query",
+    }
+    fallback_arguments = {
+        "query": "mysql_threads_connected",
+        "start": "2026-08-07T01:55:00+00:00",
+        "end": "2026-08-07T02:00:00+00:00",
+        "operation": "query",
+    }
+    _HarnessSession.results = [
+        TimeoutError("range query deadline"),
+        {"structuredContent": {"series": [{"value": 11}]}},
+    ]
+    model = _SequenceModel(
+        [
+            MCPModelToolCall(
+                call_id="timed-out-query",
+                name="query_range",
+                arguments=timed_out_arguments,
+            ),
+            MCPModelToolCall(
+                call_id="fallback-query",
+                name="query_range",
+                arguments=fallback_arguments,
+            ),
+            MCPModelToolCall(
+                call_id="finish",
+                name="finish_prometheus_investigation",
+                arguments={},
+            ),
+        ]
+    )
+
+    result = await _client(model).collect_alert_window(_context())
+
+    assert [arguments for _, arguments in _HarnessSession.calls] == [
+        timed_out_arguments,
+        fallback_arguments,
+    ]
+    assert [attempt["outcome"] for attempt in result.tool_attempts] == [
+        "transport_error",
+        "result",
+    ]
+    assert result.finished_by_model is True
 
 
 @pytest.mark.asyncio
@@ -1331,6 +1588,11 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
             ),
         }
     )
+    outer_request = ToolExecutionRequest(
+        tool_name="prometheus_metrics",
+        objective="Test the queue saturation hypothesis",
+        hypothesis_ids=["hypothesis-saturation"],
+    )
     raw_response = {
         "structuredContent": {
             "series": [
@@ -1351,7 +1613,7 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
         await _client(
             InterruptAfterQueryModel([]),
             repository=repository,
-        ).collect_alert_window(scoped_context)
+        ).collect_alert_window(scoped_context, request=outer_request)
 
     assert len(_HarnessSession.calls) == 1
     async with repository.session_factory() as session:
@@ -1386,7 +1648,7 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
     result = await _client(
         resumed_model,
         repository=repository,
-    ).collect_alert_window(scoped_context)
+    ).collect_alert_window(scoped_context, request=outer_request)
 
     assert len(_HarnessSession.calls) == 1
     assert result.finished_by_model is True
@@ -1417,6 +1679,8 @@ async def test_recovery_replays_checkpointed_response_without_remote_recall(
     assert len(artifacts) == 1
     assert len(invocations) == 1
     assert invocations[0].status == ToolInvocationStatus.SUCCEEDED.value
+    assert invocations[0].objective == "Test the queue saturation hypothesis"
+    assert invocations[0].hypothesis_ids_json == ["hypothesis-saturation"]
     stored = await repository.get_agent_artifact(artifacts[0].id)
     assert stored is not None
     artifact, content = stored
@@ -1520,6 +1784,7 @@ async def test_transport_failure_without_response_creates_no_response_artifact(
         ),
         repository=repository,
         timeout_seconds=0.05,
+        investigation_budget_seconds=0.05,
     ).collect_alert_window(context)
 
     async with repository.session_factory() as session:
@@ -1823,8 +2088,8 @@ async def test_semantically_empty_range_result_is_preserved_until_model_finishes
         assert len(result.responses) == 2
         assert result.responses[0]["has_monitoring_observation"] is False
         assert [attempt["outcome"] for attempt in result.tool_attempts] == [
-            "result",
-            "result",
+            "no_data",
+            "no_data",
         ]
         assert result.tool_attempts[0]["arguments"] == result.tool_attempts[0]["model_arguments"]
         events = await repository.list_agent_events(str(run.id))
@@ -1834,7 +2099,7 @@ async def test_semantically_empty_range_result_is_preserved_until_model_finishes
             if event.kind == AgentEventKind.TOOL_INVOCATION_NO_DATA
             and event.payload.get("provider") == PROMETHEUS_MCP_SERVER_NAME
         ]
-        assert no_data_events == []
+        assert len(no_data_events) == 2
         async with repository.session_factory() as session:
             invocations = (
                 (
@@ -1847,7 +2112,7 @@ async def test_semantically_empty_range_result_is_preserved_until_model_finishes
             )
         assert len(invocations) == 2
         assert {invocation.status for invocation in invocations} == {
-            ToolInvocationStatus.SUCCEEDED.value
+            ToolInvocationStatus.NO_DATA.value
         }
     finally:
         await repository.close()

@@ -720,6 +720,15 @@ class AlertAnalysisService:
             external_knowledge_min_relevance=(self.external_knowledge_min_relevance),
             react_max_rounds=self.react_max_rounds,
             analysis_timeout_seconds=self.analysis_timeout_seconds,
+            prometheus_mcp_timeout_seconds=float(
+                self.runtime_manifest_config.get("prometheus_mcp_timeout_seconds", 60)
+            ),
+            prometheus_investigation_budget_seconds=float(
+                self.runtime_manifest_config.get("prometheus_investigation_budget_seconds", 180)
+            ),
+            prometheus_mcp_tool_timeout_seconds=float(
+                self.runtime_manifest_config.get("prometheus_mcp_tool_timeout_seconds", 780)
+            ),
             validation_enabled=True,
             ai_fallback_enabled=self.ai_fallback_enabled,
             stream_main_agent_reasoning=self.stream_main_agent_reasoning,

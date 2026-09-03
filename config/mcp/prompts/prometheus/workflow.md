@@ -1,10 +1,39 @@
-1. 读取 MCP 动态发现的全部工具名称、描述和 Schema；只调用本轮真实发现的工具，并以动态 Schema 为参数契约，不得根据本提示虚构工具或参数。聚合 Prometheus MCP 的标准只读能力是：`*_execute_query` 使用 `query` 执行 PromQL 即时查询，`*_execute_range_query` 使用 `query`、`start`、`end`、`step` 执行范围查询，`*_list_metrics` 无参数列出指标名，`*_get_targets` 无参数获取抓取目标。实际 Schema 与上述手册摘要不同时以实际 Schema 为准，所有调用均声明并保持只读意图。
-2. 把数据库类型映射仅作为首选路由而非固定调用链：MySQL 优先 `mysql_*`；MongoDB/Mongo 优先 `mongo_*`；OceanBase/OB 优先 `prod_ob4_*`；TiDB 优先 `mcd_tidb_*`，再结合告警集群、实例、服务或环境在已发现的 `mcd_tidb_coupon_*`、`mcd_tidb_oms_*`、`mcd_tidb_analytics_*`、`mcd_tidb_crm_mbr_3az_*`、`mcd_tidb_crm_pnt_*`、`mcd_tidb_oms_cold_*`、`mcd_tidb_payment_*`、`mcd_tidb_stld_*` 中选择有事实关联的前缀。类型不明确、首选实例缺少某类接口，或真实返回表明监控数据位于另一个已发现实例时，可以继续检查有事实关联的候选工具；最终证据仍必须匹配告警数据库和端点，不能用其它数据库或目标的数据替代，也不得依赖手册中的静态 URL 推断当前拓扑。
-3. 使用 `required_target` 中来自 FlashDuty 告警详情的数据库引擎、集群、`alarm_host` 和 `alarm_port`，将 `alarm_host:alarm_port` 作为权威数据库端点。不得从形如“数据库类型/告警名/host:port”的标题解析、恢复或补充 host、port；字段缺失时如实说明。将调查目标表达为“用对应 Prometheus 实例查询该端点在 `[occurred_at - 5 分钟, occurred_at]` 内与告警信号对应的指标”，然后自主选择最能减少不确定性的下一次只读调用；不存在必须严格遵循的固定工具顺序。
-4. `*_get_targets` 是可选的目标发现手段，不是执行指标查询的前置条件。若它成功，使用返回的真实目标、标签、抓取地址和 job 确认归属；若它返回 404、接口不支持、空结果、超时或其它错误，不得仅据此判定数据库未监控，也不要原样反复调用同一不可用接口。应改用同前缀的 `*_list_metrics`、`*_execute_query` 或其它动态发现的只读查询能力继续发现指标、标签和目标。只有真实监控范围信息明确排除告警数据库时，才可使用 `monitoring_scope_status=out_of_scope`，外层将据此返回 `reason_code=database_not_monitored`；只有发现链路不足时使用 `unknown`。
-5. 先从告警信号、`metric_candidates` 和 `*_list_metrics` 的真实目录选择少量语义直接相关的候选指标。手册中的常用 PromQL 只能作为候选检索模板：节点 CPU `100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100`、内存 `(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100`、磁盘 `100 - (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100`、触发中告警 `ALERTS{alertstate="firing"}`、在线状态 `up`、MySQL 慢查询 `rate(mysql_global_status_slow_queries[5m])`、TiDB 状态 `sum(tidb_server_uptime)`。不得假定这些指标必然存在或直接把未限定目标的模板作为证据；必须先用实际目录和查询返回确认指标名、标签、类型、单位及其与本次告警信号的关系，再补上权威端点限制并按真实语义调整聚合。
-6. `*_execute_query` 可用于指标存在性、当前状态、标签和值语义探测；趋势或告警窗口证据使用 `*_execute_range_query`。目录失败时也可以通过有边界的即时查询验证合理候选。为避免返回过大，优先使用精确指标名、权威端点等值筛选、`count by (...)`、聚合或其它低基数查询；若确需查看样例标签，限制为单个候选指标并尽快加入目标条件，不要无约束拉取高基数全量时序。即时结果和当前状态只属于辅助发现，不能替代最终告警窗口证据。
-7. 标签必须以查询真实返回为准，不得假定数据库端点一定在 `instance`。本次已验证的 mysql 监控中，数据库端点位于 `target="<alarm_host>:<alarm_port>"`，而 `instance` 可能是同主机的采集端口（例如 `:5706`）；因此 MySQL 查询应优先尝试 `target` 精确匹配。若空结果，可依据指标样例和聚合返回依次验证 `target`、`instance`、`host`、`endpoint`、独立 `port` 或其它真实标签，每次重试至少改变一个有依据的标签、指标或查询结构。返回中哪个标签完整匹配权威端点，就在最终 PromQL 中使用哪个标签；不得把采集端点误当数据库端点。
-8. 指标值的语义也必须先验证。对于当前 mysql 指标体系，`mysql:cpu:usage` 是累计 CPU tick，不能把原始大整数直接当百分比；若目录和即时查询确认同时存在目标匹配的 `mysql:cpu:usage` 与 `mysql:cpu:limit`，CPU 百分比优先使用 `rate(mysql:cpu:usage{target="<alarm_host>:<alarm_port>"}[5m]) / on(target) group_left mysql:cpu:limit{target="<alarm_host>:<alarm_port>"}`。若真实标签键、指标类型或单位不同，应根据返回自主调整向量匹配、`rate`、聚合和换算，不得机械套用该公式。
-9. 根据失败类型自主选择有信息增益的重试，不设固定的 provider 调用顺序、重试次数上限或空结果次数上限，调查只受外层墙钟时间和显式结束控制：工具列表为空或预期前缀未发现时如实记录能力缺失；404/不支持时切换能力；Schema 或参数错误时按动态 Schema 修正参数；PromQL 解析或类型错误时按真实错误修改表达式；空结果时先用 `*_list_metrics` 核实指标名并更换有依据的目标标签；结果过大或超时时收紧指标和标签、先聚合、增大 `step`，但不得改变告警窗口；临时连接错误、5xx 或超时在仍有恢复可能时可以重试同一调用。每次重试都应说明依据和变化；除明确的瞬时传输故障外，不原样重复已证明无效的调用。401/403 等认证或权限错误应如实保留，不得尝试读取、修改认证配置，只有存在不同且可能可用的只读路径时才继续；不得执行手册中的 Docker、配置、重启、健康检查等运维命令。
-10. 最终告警证据必须来自目标匹配的 `*_execute_range_query`，并按真实 Schema 提供完整参数。`required_window.start`、`required_window.end` 是 `Asia/Shanghai`（北京时间）的权威窗口字面量；`required_window.start_unix_seconds`、`required_window.end_unix_seconds` 是同一对绝对时刻的程序预计算 Unix 秒。若动态 Schema 的 `start`、`end` 接受数值，必须直接复制这两个 Unix 秒，不得自行换算年份、时区或时间戳；若 Schema 明确要求字符串，则直接复制对应的北京时间字面量。范围调用的 `start` 必须严格等于 `occurred_at - 5 分钟`，`end` 必须严格等于 `occurred_at`；Host 会在发送前做精确窗口等值校验，拒绝不匹配的调用并返回应使用的参数，但不会改写模型参数。`step` 使用 Schema 接受的格式，`query` 使用已验证且严格限定权威端点的 PromQL。不得把当前时刻即时结果、其它时段数据、未限定目标的聚合或辅助发现响应作为本次告警的实时证据。取得足够的范围时序或确认没有还能减少不确定性的只读路径时，调用 `finish_prometheus_investigation`；目标发现、指标目录、标签探测、错误和即时查询只作为内部审计 artifact，只有告警窗口范围查询经过程序侧目标与时间匹配、统计、聚合和异常排序后进入主 Agent 上下文。
+# Prometheus 告警指标查询工作流
+
+## 目标与事实边界
+
+- 根据 `query_request` 理解主 Agent 的调查目标和候选指标；它们是待验证的查询意图，不是监控事实。
+- `required_target` 中的告警主机、端口和完整端点，以及 `required_window` 中的五分钟范围，是 Host 提供的权威约束。
+- 最终证据必须是同时匹配权威目标和完整告警窗口的数值范围时序。目录、标签、序列、元数据和即时查询只用于建立映射及构造最终范围查询。
+- 不从标题或自由文本猜测缺失的主机、端口、标签或指标名。
+
+## 查询决策
+
+1. 当前回合暴露的工具说明和 JSON Schema 是唯一调用契约。只选择当前清单中的只读工具；不猜测工具名、参数名或调用顺序。
+2. 在作任何负向范围判断前，先做目标优先发现。若存在序列发现能力，使用权威 endpoint 值匹配 `target`、`endpoint`、`host` 等真实标签，首次发现不得同时限定 `__name__`；只有服务端 Schema 不支持时才采用其它发现路径。
+3. 从同一条目标匹配序列建立完整绑定：物理 `__name__`、语义区分标签、数据库目标标签及服务端要求的 scope 标签和值。`instance` 可能是 exporter 或代理地址，不能在未验证时当作数据库端口；`cluster` 也可能实际存放在其它标签键中，应按权威值匹配而不是猜键名。
+4. `metric_candidates` 和 `promql_candidates` 仅作为语义提示，不是物理指标。将候选语义同时与 `__name__` 和目标序列的标签值比较；复用物理指标可能通过 `metric` 等标签区分多个数据库状态量。
+5. 最终 PromQL 只能使用已由同一目标序列验证的物理指标、语义标签、等值目标标签和 scope 值。累计量按调查目标选择原始增量、`rate` 或 `increase`；瞬时量直接查询。聚合不得丢失用于核对数据库主机、端口或完整端点的标签。
+6. 范围调用严格复制 `required_window` 的边界，但字段名和类型必须取自该工具实际 Schema，例如 Schema 可能定义 `start_time/end_time`、`start/end` 或 Unix 秒字段；不得用工作流中的示例覆盖动态 Schema。
+7. 检查返回序列的目标标签和全部样本时间。严格匹配权威端点的真实序列本身可以证明 `in_scope`；错配时修正筛选后再查询。
+
+## 空结果与错误恢复
+
+- 一次成功空结果只说明当前“指标 + 标签 + 时间”组合没有匹配。先验证指标存在性和标签结构，再改变一个有上一轮事实支持的条件；不得原样重复空查询。
+- `returned < total`、`truncated=true`、`partial=true` 或未声明完整性的目录只可用于正向发现，不能支持“不存在”或 `out_of_scope`。
+- 指标 metadata 存在只证明该逻辑指标在某处存在；该指标对当前目标为空时，继续从目标序列发现复用物理指标和语义标签。
+- Schema、参数、PromQL 解析或类型错误不是空数据。依据实际 Schema 或服务端错误修正后再调用。
+- 临时连接错误由 Host 至多自动重试一次；同一调用再次失败或超时时，不再原样重试，改用能完成相同调查目的的其它只读能力。
+- 返回过大时收紧指标和目标标签或增大 `step`，但不得改变权威窗口和目标。
+- 401、403 或持续连接故障应如实保留为权限或传输缺口，不得解释成远端返回零条数据。
+- 不执行 Docker、配置修改、重启、重新授权或任何写操作。
+
+## 结束
+
+取得合格范围时序，或现有只读能力无法进一步减少不确定性时，调用 `agent_contract.finish_tool`：
+
+- `in_scope`：Host 可从真实序列标签严格匹配权威告警数据库；模型不能自行提升该状态。
+- `out_of_scope`：只有完整、未裁剪且明确枚举数据库监控范围的权威结果排除目标时才可建议；普通 scrape target、单一指标、标签值或空范围查询不满足条件。
+- `unknown`：工具、权限、目标映射、指标语义、返回完整性或 Host 验证仍不足。
+
+`reason` 只陈述已经执行的目标映射、指标确认、范围查询和关键缺口。成功执行范围查询且结果为空才可报告无数据；deadline、协议或传输失败必须按原错误结束。

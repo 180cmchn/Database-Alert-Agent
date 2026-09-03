@@ -231,25 +231,26 @@ ARCHERY_MCP_TOOL_TIMEOUT_SECONDS=180
 
 Prometheus 的作用是查询数据库监控指标，提示词位于 `config/mcp/prompts/prometheus/`：
 
-1. 先发现 MCP 实际配置了哪些数据库、目标、标签和指标；
-2. 用 FlashDuty 详情中的数据库、`alarm_host`、`alarm_port` 匹配目标；
-3. 告警数据库在覆盖范围内时，查询与告警相关的指标在
-   `[occurred_at - 5 分钟, occurred_at]` 的时序；
-4. 不在覆盖范围内时返回 `Prometheus MCP 中没有配置告警数据库对应的监控信息`，该结果表示工具
-   不适用，不否决其它证据。
+1. 将主 Agent 的调查目标和候选指标作为待验证意图传入子 Agent；
+2. 先按告警数据库目标发现序列，从同一条序列动态取得物理指标名、语义指标标签、目标标签和作用域标签；`target`/`endpoint` 等数据库端点标签优先于 exporter 的 `instance`，复用物理指标可由 `metric` 等标签区分；
+3. 对严格匹配告警数据库的指标查询 `[occurred_at - 5 分钟, occurred_at]` 完整时序；
+4. 目标目录不可用时切换到其它只读发现能力。模型声明的 `out_of_scope` 仅供审计，不直接成为程序事实；只有 Host 基于完整、未裁剪的覆盖证据排除目标后才返回 `SKIPPED`；
+5. 成功执行且明确返回零序列的范围查询返回 `NO_DATA`，空结果不证明目标未被监控；业务错误、超时、协议和传输失败保留各自失败状态。
 
 Prometheus MCP 的地址通过 `PROMETHEUS_MCP_URL` 配置，连接方式通过
 `config/mcp/settings.json` 中对应服务的 `transport` 配置；支持 `sse` 和 `streamable_http`，URL 应指向
 所选连接方式对应的 endpoint。
 
-目标发现、指标目录和元数据只保存为内部审计 artifact。程序侧对目标与时间窗匹配的时序计算样本数、
-最小值、最大值、均值、最新值、变化量、缺口和异常排序，再把可追溯 observation 交给主 Agent。
+目标发现、指标目录、元数据、动态目标绑定和模型范围声明只保存为内部审计 artifact。程序侧仅对
+Host 已验证目标与时间窗匹配的时序计算样本数、最小值、最大值、均值、最新值、变化量、缺口和异常排序，
+再把可追溯 observation 交给主 Agent。
 
 ```dotenv
 PROMETHEUS_MCP_URL=https://prometheus-mcp.example.internal/mcp
 PROMETHEUS_MCP_API_KEY_HEADER=
 PROMETHEUS_MCP_API_KEY=
 PROMETHEUS_MCP_TIMEOUT_SECONDS=60
+PROMETHEUS_INVESTIGATION_BUDGET_SECONDS=180
 PROMETHEUS_MCP_TOOL_TIMEOUT_SECONDS=780
 ```
 
