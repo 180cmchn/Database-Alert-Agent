@@ -123,7 +123,7 @@ function RootCauseContent({ record }: { record: StoredAlert }) {
   return (
     <div className="wecom-content-stack">
       <section className="wecom-content-card">
-        <div className="wecom-section-title"><BrainCircuit size={20} /><h2>告警根因分析</h2></div>
+        <div className="wecom-section-title"><BrainCircuit size={20} /><h2>AI 分析结论</h2></div>
         <p className="wecom-summary">{recommendation.summary}</p>
         <div className="wecom-confidence">
           <span>分析置信度</span><strong>{formatPercent(recommendation.confidence)}</strong>

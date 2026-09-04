@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from collections import deque
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
@@ -19,12 +20,19 @@ logger = logging.getLogger(__name__)
 WECOM_RATE_LIMIT_PER_MINUTE = 20
 WECOM_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _WHITESPACE = re.compile(r"\s+")
+_SHANGHAI_TIME_ZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def _safe_text(value: Any, *, limit: int, fallback: str = "未提供") -> str:
     raw = "" if value is None else str(value)
     cleaned = _WHITESPACE.sub(" ", sanitize_text(raw)).strip()
     return cleaned[:limit] or fallback
+
+
+def _format_wecom_alert_time(value: datetime) -> str:
+    aware_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    local_value = aware_value.astimezone(_SHANGHAI_TIME_ZONE)
+    return f"{local_value:%Y-%m-%d %H:%M:%S}（北京时间）"
 
 
 def _action_urls(
@@ -80,7 +88,7 @@ def build_wecom_template_card(
         },
         "main_title": {
             "title": _safe_text(alert.title, limit=26),
-            "desc": _safe_text(alert.occurred_at.isoformat(), limit=30),
+            "desc": _safe_text(_format_wecom_alert_time(alert.occurred_at), limit=30),
         },
         "emphasis_content": {
             "title": _safe_text(severity, limit=10),
@@ -110,7 +118,7 @@ def build_wecom_template_card(
         "jump_list": [
             {
                 "type": 1,
-                "title": "告警根因分析",
+                "title": "AI 分析结论",
                 "url": urls["root_cause"],
             },
             {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
@@ -56,6 +57,7 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
             title=title,
             reason="connection_exhausted",
             description="password=must-not-appear",
+            occurred_at=datetime(2026, 9, 3, 20, 15, 30, tzinfo=UTC),
             database=DatabaseTarget(
                 engine="postgresql",
                 instance="orders-primary",
@@ -103,6 +105,7 @@ def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
 
     assert card["card_type"] == "text_notice"
     assert card["main_title"]["title"] == "数据库连接数接近上限"
+    assert card["main_title"]["desc"] == "2026-09-04 04:15:30（北京时间）"
     facts = {item["keyname"]: item["value"] for item in card["horizontal_content_list"]}
     assert facts["告警级别"] == "严重 / CRITICAL"
     assert facts["告警主机"] == "db-orders.internal"
@@ -110,7 +113,7 @@ def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
 
     actions = card["jump_list"]
     assert [item["title"] for item in actions] == [
-        "告警根因分析",
+        "AI 分析结论",
         "告警恢复建议",
     ]
     assert actions[0]["url"] == (
