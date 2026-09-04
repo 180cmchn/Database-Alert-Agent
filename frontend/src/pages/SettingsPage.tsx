@@ -23,6 +23,7 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
+import { severityLabel } from "../lib/format";
 import { knowledgeSourcesForSave } from "../lib/knowledgeSources";
 import type {
   AdminSettings,
@@ -34,6 +35,14 @@ import type {
 import { REASONING_EFFORT_OPTIONS } from "../types/api";
 
 const AI_PROVIDERS = new Set<AIProvider>(["openai_compatible", "openai_responses", "fake"]);
+const ALERT_FILTER_SEVERITIES: readonly Severity[] = ["CRITICAL", "WARNING", "INFO"];
+
+function severitySelectionLabel(severities: readonly Severity[]): string {
+  return severities.length
+    ? severities.map((severity) => `${severity}（${severityLabel[severity]}）`).join("、")
+    : "无";
+}
+
 
 function isAIProvider(value: string): value is AIProvider {
   return AI_PROVIDERS.has(value as AIProvider);
@@ -74,7 +83,8 @@ export function SettingsPage() {
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
   const [flashdutyPollingEnabled, setFlashdutyPollingEnabled] = useState(false);
   const [alertAnalysisFilterEnabled, setAlertAnalysisFilterEnabled] = useState(false);
-  const [alertAnalysisFilterMaxSeverity, setAlertAnalysisFilterMaxSeverity] = useState<Severity>("INFO");
+  const [alertAnalysisFilterSeverities, setAlertAnalysisFilterSeverities] =
+    useState<Severity[]>(["INFO"]);
   const [wecomEnabled, setWecomEnabled] = useState(false);
   const [externalKnowledgeSelected, setExternalKnowledgeSelected] = useState(false);
 
@@ -103,11 +113,20 @@ export function SettingsPage() {
       setSelectedProvider(settings.ai_provider);
       setFlashdutyPollingEnabled(settings.flashduty_polling_enabled);
       setAlertAnalysisFilterEnabled(settings.alert_analysis_filter_enabled);
-      setAlertAnalysisFilterMaxSeverity(settings.alert_analysis_filter_max_severity);
+      setAlertAnalysisFilterSeverities([...settings.alert_analysis_filter_severities]);
       setWecomEnabled(settings.wecom_enabled);
       setExternalKnowledgeSelected(settings.knowledge_sources.includes("external_knowledge"));
     }
   }, [settings]);
+
+  function toggleAlertAnalysisFilterSeverity(severity: Severity) {
+    setAlertAnalysisFilterSeverities((current) => {
+      const selected = new Set(current);
+      if (selected.has(severity)) selected.delete(severity);
+      else selected.add(severity);
+      return ALERT_FILTER_SEVERITIES.filter((candidate) => selected.has(candidate));
+    });
+  }
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -124,6 +143,9 @@ export function SettingsPage() {
       );
       if (!isAIProvider(selectedProvider)) {
         throw new Error("请选择受支持的 AI Provider。");
+      }
+      if (alertAnalysisFilterEnabled && alertAnalysisFilterSeverities.length === 0) {
+        throw new Error("启用告警等级过滤时，请至少选择一个仅入库等级。");
       }
       const patch: AdminSettingsPatch = {
         expected_revision: settings.revision,
@@ -143,7 +165,7 @@ export function SettingsPage() {
         analysis_timeout_seconds: numberField(form, "analysis_timeout_seconds"),
         scheduler_workers: numberField(form, "scheduler_workers"),
         alert_analysis_filter_enabled: alertAnalysisFilterEnabled,
-        alert_analysis_filter_max_severity: alertAnalysisFilterMaxSeverity,
+        alert_analysis_filter_severities: alertAnalysisFilterSeverities,
         knowledge_sources: knowledgeSources,
         flashduty_polling_enabled: form.get("flashduty_polling_enabled") === "on",
         flashduty_poll_interval_seconds: numberField(
@@ -195,6 +217,9 @@ export function SettingsPage() {
   );
   const selectedKnowledgeSourceCount = extensionKnowledgeSources.length
     + (externalKnowledgeSelected ? 1 : 0);
+  const automaticallyAnalyzedSeverities = ALERT_FILTER_SEVERITIES.filter(
+    (severity) => !alertAnalysisFilterSeverities.includes(severity),
+  );
 
   return (
     <div className="page-stack settings-page">
@@ -259,7 +284,9 @@ export function SettingsPage() {
           action={
             <span className={`configured-chip ${alertAnalysisFilterEnabled ? "yes" : "no"}`}>
               <Filter size={13} />
-              {alertAnalysisFilterEnabled ? "等级过滤已开启" : "等级过滤未开启"}
+              {alertAnalysisFilterEnabled
+                ? `已选择 ${alertAnalysisFilterSeverities.length} 个仅入库等级`
+                : "等级过滤未开启"}
             </span>
           }
         >
@@ -269,39 +296,75 @@ export function SettingsPage() {
                 <Filter size={17} />
                 <span>
                   <strong>启用告警等级过滤</strong>
-                  <small>开启后，指定等级及以下的新告警只入库，不分析且不发送企微通知</small>
+                  <small>开启后，选中的新告警等级只入库，不分析且不发送企微通知</small>
                 </span>
               </span>
               <input
                 name="alert_analysis_filter_enabled"
                 type="checkbox"
                 checked={alertAnalysisFilterEnabled}
-                onChange={(event) => setAlertAnalysisFilterEnabled(event.target.checked)}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  setAlertAnalysisFilterEnabled(enabled);
+                  if (enabled && alertAnalysisFilterSeverities.length === 0) {
+                    setAlertAnalysisFilterSeverities(["INFO"]);
+                  }
+                }}
               />
               <i />
             </label>
           </div>
-          <div className="form-grid two-cols settings-inline-fields">
-            <label className="field">
-              <span>仅入库等级上限</span>
-              <select
-                name="alert_analysis_filter_max_severity"
-                value={alertAnalysisFilterMaxSeverity}
-                onChange={(event) => setAlertAnalysisFilterMaxSeverity(event.target.value as Severity)}
-                disabled={!alertAnalysisFilterEnabled}
-              >
-                <option value="INFO">INFO（仅 INFO 只入库）</option>
-                <option value="WARNING">WARNING（INFO、WARNING 只入库）</option>
-                <option value="CRITICAL">CRITICAL（全部等级只入库）</option>
-              </select>
-              <small>只分析严格高于该等级的告警；关闭开关时仍保留此选择。</small>
-            </label>
-            <div className="field">
-              <span>生效范围</span>
-              <input value="之后首次接入的新告警" readOnly />
-              <small>不会取消已排队或分析中的任务，也不会自动补跑历史仅入库告警。</small>
+          <div
+            className="severity-filter-grid"
+            role="group"
+            aria-label="选择仅入库的告警等级"
+          >
+            {ALERT_FILTER_SEVERITIES.map((severity) => {
+              const selected = alertAnalysisFilterSeverities.includes(severity);
+              return (
+                <label
+                  className={`severity-filter-option ${selected ? "selected" : ""} ${!alertAnalysisFilterEnabled ? "disabled" : ""}`}
+                  key={severity}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected}
+                    onChange={() => toggleAlertAnalysisFilterSeverity(severity)}
+                    disabled={
+                      !alertAnalysisFilterEnabled
+                      || (selected && alertAnalysisFilterSeverities.length === 1)
+                    }
+                  />
+                  <span className={`badge severity-${severity.toLowerCase()}`}>
+                    <span className="badge-dot" />
+                    {severity} · {severityLabel[severity]}
+                  </span>
+                  <small>{selected ? "仅入库" : "自动分析"}</small>
+                </label>
+              );
+            })}
+          </div>
+          <div className="admission-policy-summary">
+            <div>
+              <span>仅入库</span>
+              <strong>
+                {alertAnalysisFilterEnabled
+                  ? severitySelectionLabel(alertAnalysisFilterSeverities)
+                  : "未启用"}
+              </strong>
+            </div>
+            <div>
+              <span>自动分析</span>
+              <strong>
+                {alertAnalysisFilterEnabled
+                  ? severitySelectionLabel(automaticallyAnalyzedSeverities)
+                  : "全部等级"}
+              </strong>
             </div>
           </div>
+          <p className="muted-copy">
+            只影响之后首次接入的新告警；不会取消现有任务或自动补跑历史仅入库告警。关闭开关时保留等级选择。
+          </p>
         </SectionCard>
 
         <SectionCard eyebrow="KNOWLEDGE SOURCE" title="Agent 参考依据" description="外部知识库是可选的参考来源；不可用、未命中或未选择都不会阻止实时证据分析。" action={<span className={`configured-chip ${selectedKnowledgeSourceCount > 0 ? "yes" : "no"}`}><ShieldCheck size={13} />{selectedKnowledgeSourceCount > 0 ? `已选择 ${selectedKnowledgeSourceCount} 个知识来源` : "未选择知识来源"}</span>}>

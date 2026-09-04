@@ -19,12 +19,6 @@ class Severity(StrEnum):
     WARNING = "WARNING"
     INFO = "INFO"
 
-    def is_higher_than(self, other: Severity) -> bool:
-        if self is Severity.INFO:
-            return False
-        if self is Severity.WARNING:
-            return other is Severity.INFO
-        return other is not Severity.CRITICAL
 
 
 class AlertStatus(StrEnum):

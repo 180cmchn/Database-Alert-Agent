@@ -633,82 +633,96 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("enabled", "max_severity", "severity", "filtered"),
+    "filtered_severities",
     [
-        pytest.param(False, Severity.CRITICAL, Severity.INFO, False, id="disabled"),
-        pytest.param(True, Severity.INFO, Severity.INFO, True, id="info-filters-info"),
-        pytest.param(True, Severity.INFO, Severity.WARNING, False, id="info-admits-warning"),
-        pytest.param(True, Severity.INFO, Severity.CRITICAL, False, id="info-admits-critical"),
-        pytest.param(True, Severity.WARNING, Severity.INFO, True, id="warning-filters-info"),
-        pytest.param(True, Severity.WARNING, Severity.WARNING, True, id="warning-filters-warning"),
-        pytest.param(
-            True,
-            Severity.WARNING,
-            Severity.CRITICAL,
-            False,
-            id="warning-admits-critical",
-        ),
-        pytest.param(True, Severity.CRITICAL, Severity.INFO, True, id="critical-filters-info"),
-        pytest.param(
-            True,
-            Severity.CRITICAL,
-            Severity.WARNING,
-            True,
-            id="critical-filters-warning",
-        ),
-        pytest.param(
-            True,
-            Severity.CRITICAL,
-            Severity.CRITICAL,
-            True,
-            id="critical-filters-critical",
-        ),
+        [],
+        [Severity.CRITICAL],
+        [Severity.WARNING],
+        [Severity.INFO],
+        [Severity.CRITICAL, Severity.WARNING],
+        [Severity.CRITICAL, Severity.INFO],
+        [Severity.WARNING, Severity.INFO],
+        [Severity.CRITICAL, Severity.WARNING, Severity.INFO],
     ],
 )
-async def test_analysis_filter_applies_normalized_severity_matrix(
+async def test_analysis_filter_supports_every_severity_subset(
     tmp_path: Path,
-    enabled: bool,
-    max_severity: Severity,
-    severity: Severity,
-    filtered: bool,
+    filtered_severities: list[Severity],
 ) -> None:
-    events: list[str] = []
-    advisor = RecordingAdvisor(events)
     settings = settings_for(tmp_path).model_copy(
         update={
-            "alert_analysis_filter_enabled": enabled,
-            "alert_analysis_filter_max_severity": max_severity,
+            "alert_analysis_filter_enabled": bool(filtered_severities),
+            "alert_analysis_filter_severities": filtered_severities,
         }
     )
-    runtime = build_runtime(settings, advisor=advisor, notifier=RecordingNotifier(events))
+    runtime = build_runtime(settings)
     await runtime.repository.initialize()
 
-    result = await runtime.service.analyze(
-        "canonical",
-        {
-            "external_id": f"filter-{enabled}-{max_severity.value}-{severity.value}",
-            "severity": severity.value,
-            "title": "Severity admission test",
-            "reason": "test",
-        },
+    for severity in Severity:
+        stored, created = await runtime.service.ingest(
+            "canonical",
+            {
+                "external_id": (
+                    f"filter-{'-'.join(item.value for item in filtered_severities) or 'none'}-"
+                    f"{severity.value}"
+                ),
+                "severity": severity.value,
+                "title": "Severity admission test",
+                "reason": "test",
+            },
+        )
+        assert created is True
+        assert stored.status == (
+            AlertStatus.FILTERED
+            if severity in filtered_severities
+            else AlertStatus.QUEUED
+        )
+
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_non_contiguous_filter_only_analyzes_unselected_severity(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    settings = settings_for(tmp_path).model_copy(
+        update={
+            "alert_analysis_filter_enabled": True,
+            "alert_analysis_filter_severities": [Severity.CRITICAL, Severity.INFO],
+        }
     )
+    runtime = build_runtime(
+        settings,
+        advisor=RecordingAdvisor(events),
+        notifier=RecordingNotifier(events),
+    )
+    await runtime.repository.initialize()
 
-    if filtered:
-        assert result.status == AlertStatus.FILTERED
-        assert result.latest_run is None
-        assert result.all_runs == []
-        assert result.recommendation is None
-        assert result.progress == []
-        assert result.evidence_records == []
-        assert result.validations == []
-        assert events == []
-        retried = await runtime.service.analyze_by_id(str(result.alert.id))
-        assert retried.status == AlertStatus.FILTERED
-        assert events == []
-    else:
-        assert result.status == AlertStatus.INCONCLUSIVE
-        assert events == ["ADVISOR", f"RESULT:{severity.value}"]
+    results = {}
+    for severity in Severity:
+        results[severity] = await runtime.service.analyze(
+            "canonical",
+            {
+                "external_id": f"non-contiguous-{severity.value}",
+                "severity": severity.value,
+                "title": "Non-contiguous severity admission test",
+                "reason": "test",
+            },
+        )
 
+    assert results[Severity.CRITICAL].status == AlertStatus.FILTERED
+    assert results[Severity.CRITICAL].latest_run is None
+    assert results[Severity.WARNING].status == AlertStatus.INCONCLUSIVE
+    assert results[Severity.INFO].status == AlertStatus.FILTERED
+    assert results[Severity.INFO].latest_run is None
+    assert events == ["ADVISOR", "RESULT:WARNING"]
+
+    retried = await runtime.service.analyze_by_id(
+        str(results[Severity.CRITICAL].alert.id)
+    )
+    assert retried.status == AlertStatus.FILTERED
+    assert events == ["ADVISOR", "RESULT:WARNING"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -718,7 +732,11 @@ async def test_explicit_reanalysis_overrides_filtered_admission(tmp_path: Path) 
     settings = settings_for(tmp_path).model_copy(
         update={
             "alert_analysis_filter_enabled": True,
-            "alert_analysis_filter_max_severity": Severity.CRITICAL,
+            "alert_analysis_filter_severities": [
+                Severity.CRITICAL,
+                Severity.WARNING,
+                Severity.INFO,
+            ],
         }
     )
     runtime = build_runtime(

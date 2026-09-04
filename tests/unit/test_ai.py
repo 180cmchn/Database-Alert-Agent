@@ -13,6 +13,8 @@ from app.adapters.ai import (
     _validate_knowledge_policy,
 )
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
+from app.adapters.tool_result_analysis import DeterministicToolResultProcessor
+from app.agent_runtime.contracts import ArtifactRef
 from app.domain.errors import AdvisorError
 from app.domain.models import (
     EVIDENCE_RECORD_V2,
@@ -89,6 +91,120 @@ def test_v2_model_evidence_dto_exposes_units_without_internal_artifact_identity(
     assert str(artifact_id) not in json.dumps(payload)
 
 
+@pytest.mark.asyncio
+async def test_prometheus_model_evidence_dto_preserves_public_metric_identity_only() -> None:
+    artifact_id = uuid4()
+    artifact = ArtifactRef(
+        artifact_id=artifact_id,
+        kind="raw_tool_result",
+        uri=f"agent-artifact://{artifact_id}",
+        sha256="b" * 64,
+        size_bytes=10_000,
+    )
+    secret = "raw-prometheus-secret"
+    window_end = "2026-08-13T08:00:00+00:00"
+    analysis = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result={
+            "status": "SUCCESS",
+            "structured_data": {
+                "schema_version": "prometheus-evidence-v5",
+                "window_start": "2026-08-13T07:55:00+00:00",
+                "window_end": window_end,
+                "required_target": {
+                    "database_engine": "mysql",
+                    "host": "mysql-17",
+                    "port": 3306,
+                },
+                "monitoring_results": [
+                    {
+                        "tool_name": "query_range",
+                        "projection_kind": "alert_window_range",
+                        "projection": {
+                            "projection_kind": "alert_window_range",
+                            "window": {
+                                "start": "2026-08-13T07:55:00+00:00",
+                                "end": window_end,
+                            },
+                            "target_match": {
+                                "matched": True,
+                                "authoritative_fields": [
+                                    "database.host",
+                                    "database.endpoint",
+                                ],
+                            },
+                            "timeseries": {
+                                "has_numeric_samples": True,
+                                "series_count": 1,
+                                "sample_count": 2,
+                                "series": [
+                                    {
+                                        "metric": {
+                                            "__name__": "mysql:all_server_status:all",
+                                            "metric": "threads_connected",
+                                            "artifact_uri": f"agent-artifact://{secret}",
+                                        },
+                                        "value_semantics": "raw",
+                                        "sample_count": 2,
+                                        "min": 3,
+                                        "max": 5,
+                                        "avg": 4,
+                                        "latest": 5,
+                                        "delta": 2,
+                                    }
+                                ],
+                                "omitted_series_count": 0,
+                                "excluded_metric_identity_missing_count": 0,
+                                "excluded_metric_identity_collision_count": 0,
+                            },
+                        },
+                    },
+                    {
+                        "tool_name": "list_targets",
+                        "projection_kind": "auxiliary",
+                        "raw_response": {"authorization": secret},
+                    },
+                ],
+                "range_query_success_count": 1,
+                "range_query_empty_count": 0,
+            },
+        },
+        artifact=artifact,
+    )
+    evidence = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        status=ToolStatus.SUCCESS,
+        summary=analysis.summary,
+        structured_data={
+            "root_cause_eligible": True,
+            "tool_result_analysis": analysis.model_dump(
+                mode="json",
+                exclude={"source_artifact_id", "source_sha256"},
+            ),
+        },
+    )
+
+    payload = ai_module._model_evidence_payload(evidence)
+    tool_analysis = payload["structured_data"]["tool_result_analysis"]
+    metric_statement = next(
+        item["statement"]
+        for item in tool_analysis["observations"]
+        if "时序聚合" in item["statement"]
+    )
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert '"__name__":"mysql:all_server_status:all"' in metric_statement
+    assert '"metric":"threads_connected"' in metric_statement
+    assert '"value_semantics":"raw"' in metric_statement
+    assert secret not in serialized
+    assert "agent-artifact://" not in serialized
+    assert str(artifact_id) not in serialized
+
+
 def make_alert():
     return CanonicalAlertSourceAdapter().normalize(
         {"severity": "WARNING", "title": "Unclassified issue", "reason": "unclassified_reason"}
@@ -99,7 +215,7 @@ def test_prompts_use_successful_archery_logs_without_endpoint_comparison() -> No
     assert "程序只把 result 文本内嵌 JSON 按" in ai_module.SYSTEM_PROMPT
     assert "column_list 更改格式为 JSON" in ai_module.SYSTEM_PROMPT
     assert "不删改内容、不过滤、不聚合、不排序、不设大小限制" in ai_module.SYSTEM_PROMPT
-    assert "过滤、聚合和排序" in ai_module.SYSTEM_PROMPT
+    assert "后续只按完整时序项做机械限量" in ai_module.SYSTEM_PROMPT
     assert "不得输出 instance_id 归属核验" in ai_module.SYSTEM_PROMPT
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
     assert "证据与告警实例的归属已由程序保障" in prompt
@@ -139,7 +255,7 @@ def test_final_recommendations_are_actionable_without_repeating_mcp_checks() -> 
 def test_final_conclusion_requires_auditable_sql_and_explain_details() -> None:
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
 
-    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v26"
+    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v27"
     assert "root_causes 是前端“AI 分析结论”的唯一正文" in prompt
     assert "analysis_process 至少包含一项" in prompt
     assert "事实 → 推导" in prompt
@@ -147,6 +263,8 @@ def test_final_conclusion_requires_auditable_sql_and_explain_details() -> None:
     assert "sample_id 和/或 structure" in prompt
     assert "该问题 SQL 对应的普通 EXPLAIN 已成功" in prompt
     assert "关键原始字段和值" in prompt
+    assert "后续只按完整时序项做机械限量" in prompt
+    assert "expression 或 unknown不得被擅自解释为速率、窗口增量或计数器类型" in prompt
 
     root_cause_schema = Recommendation.model_json_schema()["$defs"]["RootCauseAssessment"]
     assert {

@@ -911,6 +911,7 @@ def test_prometheus_model_observation_is_bounded_deterministic_projection() -> N
     assert projection["series"][0]["avg"] == 85
     assert projection["series"][0]["latest"] == 90
     assert projection["series"][0]["delta"] == 10
+    assert projection["series"][0]["value_semantics"] == "unknown"
     assert projection["series"][0]["metric"] == {
         "__name__": "ob_cpu_usage",
         "metric": "cpu_usage",
@@ -1018,6 +1019,7 @@ def test_prometheus_range_projection_prefers_database_target_over_collector_inst
     assert projection["timeseries"]["sample_count"] == 2
     assert projection["timeseries"]["series"][0] == {
         "metric": {"__name__": "mysql:cpu:usage", "metric": "cpu_usage"},
+        "value_semantics": "raw",
         "sample_count": 2,
         "min": 10191762286,
         "max": 10191964447,
@@ -1025,6 +1027,199 @@ def test_prometheus_range_projection_prefers_database_target_over_collector_inst
         "latest": 10191964447,
         "delta": 202161,
     }
+
+
+@pytest.mark.parametrize(
+    ("promql", "expected_semantics"),
+    [
+        (None, "unknown"),
+        ('mysql:all_server_status:all{target="100.84.97.124:3311"}', "raw"),
+        ('rate(mysql:all_server_status:all{target="100.84.97.124:3311"}[5m])', "rate"),
+        (
+            'increase(mysql:all_server_status:all{target="100.84.97.124:3311"}[5m])',
+            "increase",
+        ),
+        (
+            'sum by (state) (mysql:all_server_status:all{target="100.84.97.124:3311"})',
+            "aggregate",
+        ),
+        ('delta(mysql:all_server_status:all{target="100.84.97.124:3311"}[5m])', "expression"),
+    ],
+)
+def test_prometheus_range_projection_preserves_public_identity_and_value_semantics(
+    promql: str | None,
+    expected_semantics: str,
+) -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(
+                update={"host": "100.84.97.124", "port": 3311}
+            )
+        }
+    )
+    arguments = {
+        "start_time": ALERT_WINDOW_START.isoformat(),
+        "end_time": ALERT_TIME.isoformat(),
+    }
+    if promql is not None:
+        arguments["promql"] = promql
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                        "command": "connect",
+                        "operation": "current",
+                        "pool": "primary",
+                        "quantile": "0.95",
+                        "state": "active",
+                        "type": "gauge",
+                        "target": "100.84.97.124:3311",
+                        "api_key": "must-not-enter-public-projection",
+                    },
+                    "values": [[1786067700, "3"], [1786068000, "5"]],
+                }
+            ],
+        },
+        arguments=arguments,
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is not None
+    series = projection["timeseries"]["series"][0]
+    assert series["metric"] == {
+        "__name__": "mysql:all_server_status:all",
+        "metric": "threads_connected",
+        "command": "connect",
+        "operation": "current",
+        "pool": "primary",
+        "quantile": "0.95",
+        "state": "active",
+        "type": "gauge",
+    }
+    assert series["value_semantics"] == expected_semantics
+    serialized = json.dumps(projection, ensure_ascii=False)
+    assert "must-not-enter-public-projection" not in serialized
+    assert "100.84.97.124:3311" not in serialized
+
+
+def test_prometheus_range_projection_excludes_missing_and_colliding_identities() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(
+                update={"host": "100.84.97.124", "port": 3311}
+            )
+        }
+    )
+
+    def series(metric: dict[str, str], value: str) -> dict[str, object]:
+        return {
+            "metric": {**metric, "target": "100.84.97.124:3311"},
+            "values": [[1786067700, value], [1786068000, value]],
+        }
+
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "resultType": "matrix",
+            "result": [
+                series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    "5",
+                ),
+                series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "innodb_buffer_pool_pages_free",
+                    },
+                    "7",
+                ),
+                series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "reused_metric",
+                        "shard": "a",
+                    },
+                    "9",
+                ),
+                series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "reused_metric",
+                        "shard": "b",
+                    },
+                    "11",
+                ),
+                series({}, "13"),
+            ],
+        },
+        arguments={
+            "query": 'mysql:all_server_status:all{target="100.84.97.124:3311"}',
+            "start": ALERT_WINDOW_START.isoformat(),
+            "end": ALERT_TIME.isoformat(),
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is not None
+    timeseries = projection["timeseries"]
+    assert timeseries["series_count"] == 2
+    assert timeseries["excluded_metric_identity_missing_count"] == 1
+    assert timeseries["excluded_metric_identity_collision_count"] == 2
+    assert projection["excluded_series_count"] == 3
+    assert {item["metric"]["metric"] for item in timeseries["series"]} == {
+        "threads_connected",
+        "innodb_buffer_pool_pages_free",
+    }
+
+
+def test_prometheus_range_projection_rejects_only_ambiguous_identities() -> None:
+    context = _mysql_context()
+    alert = context.alert.model_copy(
+        update={
+            "database": context.alert.database.model_copy(
+                update={"host": "100.84.97.124", "port": 3311}
+            )
+        }
+    )
+    projection = PrometheusMCPClient.project_alert_window_range(
+        {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                        "target": "100.84.97.124:3311",
+                        "shard": shard,
+                    },
+                    "values": [[1786067700, "1"], [1786068000, "2"]],
+                }
+                for shard in ("a", "b")
+            ],
+        },
+        arguments={
+            "promql": 'mysql:all_server_status:all{target="100.84.97.124:3311"}',
+            "start_time": ALERT_WINDOW_START.isoformat(),
+            "end_time": ALERT_TIME.isoformat(),
+        },
+        alert=alert,
+        window_start=ALERT_WINDOW_START,
+        window_end=ALERT_TIME,
+    )
+
+    assert projection is None
 
 
 def test_prometheus_discovers_physical_metric_from_target_series_labels() -> None:
@@ -2483,6 +2678,7 @@ def _qualified_projection_response(
                 "series": [
                     {
                         "metric": {"__name__": "mysql_up"},
+                        "value_semantics": "raw",
                         "sample_count": 1,
                         "min": 1,
                         "max": 1,
@@ -2717,10 +2913,10 @@ async def test_prometheus_no_data_output_excludes_auxiliary_response_values() ->
     assert record.status == ToolStatus.NO_DATA
     assert record.truncated is False
     assert len(serialized) < 5_000
-    assert record.structured_data["schema_version"] == "prometheus-evidence-v4"
+    assert record.structured_data["schema_version"] == "prometheus-evidence-v5"
     assert record.structured_data["root_cause_eligible"] is False
     assert record.structured_data["root_cause_ineligible_reason"] != ("evidence_payload_truncated")
-    assert record.structured_data["schema_version"] == "prometheus-evidence-v4"
+    assert record.structured_data["schema_version"] == "prometheus-evidence-v5"
     assert record.structured_data["tool_attempt_count"] == 8
     assert record.structured_data["monitoring_results"] == []
     assert record.structured_data["tool_catalog_names"] == [

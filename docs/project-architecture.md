@@ -13,7 +13,7 @@ mindmap
       FlashDuty 轮询
       其它来源 HTTP API
       标准化 去重 等级准入 入库
-      符合策略才进入 Redis Streams 和 Analysis Worker
+      未选中的等级才进入 Redis Streams 和 Analysis Worker
     Agent 分析
       FlashDuty 权威详情
       可选知识来源
@@ -50,7 +50,7 @@ mindmap
 
 图上的七个一级主题，可以归并成三条讲解线：
 
-1. **事件线**：FlashDuty 轮询或其它来源接入，经标准化、去重和等级准入后持久化；只有符合策略的告警才交给 Worker，过滤告警保持 `FILTERED` 且不发送通知。
+1. **事件线**：FlashDuty 轮询或其它来源接入，经标准化、去重和等级准入后持久化；多选配置中被选中的等级保持 `FILTERED` 且不发送通知，未选中的等级才交给 Worker。
 2. **分析线**：LangGraph 先补齐详情和知识，再由主 Agent 循环选择工具并形成结论。
 3. **审计线**：运行状态、模型事件、工具调用、原始结果和 checkpoint 全部持久化，前端只展示适合用户查看的轨迹和投影结果。
 
@@ -144,7 +144,7 @@ START -> enrich_alert -> fingerprint -> knowledge -> react_decide
 | FlashDuty `/alert/info` | 提供告警语义、目标和发生时间 | 否，仅是告警事实 |
 | 可选知识来源 | 提供可能机制、排查方法和处置知识 | 否，知识不能证明本次事故 |
 | MCP 内部调查 Agent | 在单个 provider 内发现并调用远端工具 | 否，不做跨证据因果判断 |
-| 程序事实投影器 | 过滤、聚合、排序、统计和标注来源路径 | 否，不提出、支持或反驳根因 |
+| 程序事实投影器 | 生成 provider 公开投影、校验结构，并按完整事实项机械限量 | 否，不提出、支持或反驳根因 |
 | **唯一主 Agent** | 结合告警、知识和合格实时证据 | **是** |
 | `validate` 节点 | 检查 JSON 结构、引用、证据状态和来源资格 | 否，不调用第二个模型复核结论 |
 
@@ -235,6 +235,9 @@ mindmap
 - 完整原始响应保存在内部 artifact，供审计和恢复使用；它不会直接进入主 Agent 的根因分析上下文或用户轨迹。
 - 主 Agent 接收的是确定性投影，包括真实数值聚合、事实、异常、限制和 JSON source path。Archery
   history 只做格式转换，补充分析与它相互独立；所有投影器都不做因果判断。
+- Prometheus Adapter 先生成已净化公开投影，保留 `__name__`、`metric` 和有限语义标签，并用
+  `value_semantics` 标明数值是原始样本、速率、增量、聚合还是其它表达式；下游只校验结构、身份
+  完整性和碰撞，并按完整时序项限量，不再维护第二套业务字段白名单。
 
 ### 3.3 新增一个 MCP 的最小改动
 

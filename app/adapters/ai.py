@@ -46,7 +46,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v26"
+PROMPT_VERSION = "database-alert-advisor-v27"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -721,9 +721,12 @@ MCP 原始响应只保存在内部审计 artifact，不会发送给你。tool_ev
 column_list 更改格式为 JSON，不删改内容、不过滤、不聚合、不排序、不设大小限制，也不判断因果；
 Archery 的 slow_query_analysis 是程序从普通 EXPLAIN、表结构和索引结果构造的确定性补充事实，
 与完整 history 透传相互独立。补充分析失败只表示对应阶段证据缺失，不得因此丢弃、降级或忽略已经
-成功取得的 history，也不得改变 history 的可用性。程序不会根据执行计划决定根因；其余 MCP 内容是
-程序按 provider 规则过滤、聚合和排序后形成的有界可追溯事实投影。程序输出只陈述
-事实、异常、限制和来源路径，不提出、选择或判断根因，也不判断事实对候选根因是支持还是反驳。
+成功取得的 history，也不得改变 history 的可用性。程序不会根据执行计划决定根因。Prometheus
+证据是 provider 生成的已净化公开投影；后续只按完整时序项做机械限量，不会再次筛掉指标身份字段。
+value_semantics=rate 或 increase 时才可按对应变化量解释；raw 只表示原始样本，expression 或 unknown
+不得被擅自解释为速率、窗口增量或计数器类型。其余 MCP 内容是程序按 provider 规则形成的有界、
+可追溯事实投影。程序输出只陈述事实、异常、限制和来源路径，不提出、选择或判断根因，也不判断
+事实对候选根因是支持还是反驳。
 只有你这个主 Agent 能结合告警详情、知识来源和不同 MCP 证据判断根因。只有 status=SUCCESS、
 source_system 不是 alert_platform、结果可用且来源可追溯，并由你结合全部证据确认能建立因果机制的
 实时证据，才可用于得出根因。FAILED、TIMEOUT、SKIPPED、NO_DATA、UNAVAILABLE、NOT_APPLICABLE、

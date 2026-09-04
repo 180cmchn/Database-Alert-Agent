@@ -15,10 +15,20 @@ from app.application.sanitization import sanitize
 from app.domain.errors import AdvisorError
 from app.domain.models import ToolResultAnalysis, ToolResultObservation
 
-TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v8"
+TOOL_RESULT_ANALYSIS_PROMPT_VERSION = "program-fact-projection-v9"
 _MAX_SNIPPET_CHARS = 800
 _MAX_SELECTED_ITEMS = 20
 _PROMETHEUS_WINDOW_SECONDS = 300
+_PROMETHEUS_PUBLIC_METRIC_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROMETHEUS_PUBLIC_METRIC_NAME = re.compile(r"^[A-Za-z_:][A-Za-z0-9_:]*$")
+_PROMETHEUS_PUBLIC_METRIC_MAX_KEYS = 8
+_PROMETHEUS_PUBLIC_METRIC_MAX_JSON_CHARS = 2_000
+_PROMETHEUS_VALUE_SEMANTICS = frozenset(
+    {"aggregate", "expression", "increase", "rate", "raw", "unknown"}
+)
+_LEGACY_PROMETHEUS_SEMANTIC_LABEL_KEYS = frozenset(
+    {"command", "metric", "operation", "pool", "quantile", "state", "type"}
+)
 _HOST_LABEL_KEYS = frozenset(
     {"address", "addr", "endpoint", "host", "hostname", "instance", "ip", "server", "target"}
 )
@@ -436,9 +446,11 @@ class DeterministicToolResultProcessor:
         results = data.get("monitoring_results")
         results = results if isinstance(results, list) else []
         schema_version = data.get("schema_version")
-        if schema_version in {"prometheus-evidence-v3", "prometheus-evidence-v4"} or any(
-            isinstance(item, Mapping) and "projection_kind" in item for item in results
-        ):
+        if schema_version in {
+            "prometheus-evidence-v3",
+            "prometheus-evidence-v4",
+            "prometheus-evidence-v5",
+        } or any(isinstance(item, Mapping) and "projection_kind" in item for item in results):
             return self._process_prometheus_range_projections(
                 data,
                 results,
@@ -645,7 +657,8 @@ class DeterministicToolResultProcessor:
         results: list[Any],
         artifact: ArtifactRef,
     ) -> ToolResultAnalysis:
-        """Validate and expose only the bounded alert-window projection contract."""
+        """Validate public projections without reinterpreting their semantic fields."""
+
         raw_range_query_success_count = data.get("range_query_success_count")
         range_query_success_count = (
             raw_range_query_success_count
@@ -668,9 +681,19 @@ class DeterministicToolResultProcessor:
         required_target = required_target if isinstance(required_target, Mapping) else {}
         has_required_target = self._prometheus_has_required_target(required_target)
         required_host = self._normalized_identity(required_target.get("host"))
+        requires_value_semantics = data.get("schema_version") == "prometheus-evidence-v5"
         excluded: Counter[str] = Counter()
-        selected: list[tuple[int, int, Mapping[str, Any], Mapping[str, Any]]] = []
-        total_projected_samples = 0
+        selected: list[
+            tuple[
+                int,
+                int,
+                Mapping[str, Any],
+                Mapping[str, Any],
+                dict[str, Any],
+                str,
+            ]
+        ] = []
+        provider_omitted_series_count = 0
 
         for result_index, item in enumerate(results):
             if not isinstance(item, Mapping):
@@ -730,7 +753,8 @@ class DeterministicToolResultProcessor:
             if not isinstance(series, list):
                 excluded["series_missing"] += 1
                 continue
-            accepted_for_result = 0
+
+            selected_start = len(selected)
             accepted_samples = 0
             for series_index, summary in enumerate(series):
                 if not isinstance(summary, Mapping):
@@ -751,30 +775,97 @@ class DeterministicToolResultProcessor:
                 ):
                     excluded["invalid_series_summary"] += 1
                     continue
-                selected.append((result_index, series_index, item, summary))
-                accepted_for_result += 1
+                metric_identity = self._prometheus_public_metric_identity(summary.get("metric"))
+                if metric_identity is None:
+                    excluded["metric_identity_missing_or_invalid_series"] += 1
+                    continue
+                raw_value_semantics = summary.get("value_semantics")
+                if raw_value_semantics is None and not requires_value_semantics:
+                    value_semantics = "unknown"
+                elif (
+                    isinstance(raw_value_semantics, str)
+                    and raw_value_semantics in _PROMETHEUS_VALUE_SEMANTICS
+                ):
+                    value_semantics = raw_value_semantics
+                else:
+                    excluded["invalid_value_semantics_series"] += 1
+                    continue
+                selected.append(
+                    (
+                        result_index,
+                        series_index,
+                        item,
+                        summary,
+                        metric_identity,
+                        value_semantics,
+                    )
+                )
                 accepted_samples += sample_count
+
             declared_series_count = timeseries.get("series_count")
             declared_sample_count = timeseries.get("sample_count")
             omitted_series_count = timeseries.get("omitted_series_count", 0)
+            identity_missing_count = timeseries.get("excluded_metric_identity_missing_count", 0)
+            identity_collision_count = timeseries.get("excluded_metric_identity_collision_count", 0)
             if (
                 not isinstance(declared_series_count, int)
                 or isinstance(declared_series_count, bool)
-                or declared_series_count < accepted_for_result
                 or not isinstance(declared_sample_count, int)
                 or isinstance(declared_sample_count, bool)
                 or declared_sample_count < accepted_samples
                 or not isinstance(omitted_series_count, int)
                 or isinstance(omitted_series_count, bool)
                 or omitted_series_count < 0
-                or declared_series_count != accepted_for_result + omitted_series_count
+                or declared_series_count != len(series) + omitted_series_count
+                or not isinstance(identity_missing_count, int)
+                or isinstance(identity_missing_count, bool)
+                or identity_missing_count < 0
+                or not isinstance(identity_collision_count, int)
+                or isinstance(identity_collision_count, bool)
+                or identity_collision_count < 0
             ):
-                if accepted_for_result:
-                    del selected[-accepted_for_result:]
+                del selected[selected_start:]
                 excluded["inconsistent_projection_counts"] += 1
                 continue
-            total_projected_samples += accepted_samples
+            provider_omitted_series_count += omitted_series_count
+            if identity_missing_count:
+                excluded["metric_identity_missing_series"] += identity_missing_count
+            if identity_collision_count:
+                excluded["metric_identity_collision_series"] += identity_collision_count
 
+        identity_counts = Counter(
+            json.dumps(
+                {"metric": metric_identity, "value_semantics": value_semantics},
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+            for (
+                _result_index,
+                _series_index,
+                _item,
+                _summary,
+                metric_identity,
+                value_semantics,
+            ) in selected
+        )
+        colliding_identities = {
+            identity for identity, count in identity_counts.items() if count > 1
+        }
+        if colliding_identities:
+            retained = []
+            for candidate in selected:
+                identity = json.dumps(
+                    {"metric": candidate[4], "value_semantics": candidate[5]},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                if identity in colliding_identities:
+                    excluded["metric_identity_collision_series"] += 1
+                else:
+                    retained.append(candidate)
+            selected = retained
+
+        total_projected_samples = sum(int(candidate[3]["sample_count"]) for candidate in selected)
         observations: list[ToolResultObservation] = []
         if results:
             observations.append(
@@ -788,16 +879,24 @@ class DeterministicToolResultProcessor:
                     source_paths=self._prometheus_context_paths(data),
                 )
             )
-        omitted = max(len(selected) - _MAX_SELECTED_ITEMS, 0)
+        globally_omitted = max(len(selected) - _MAX_SELECTED_ITEMS, 0)
         exposed_samples = 0
-        for result_index, series_index, item, summary in selected[:_MAX_SELECTED_ITEMS]:
+        for (
+            result_index,
+            series_index,
+            item,
+            summary,
+            metric_identity,
+            value_semantics,
+        ) in selected[:_MAX_SELECTED_ITEMS]:
             sample_count = int(summary["sample_count"])
             exposed_samples += sample_count
-            metric = summary.get("metric")
-            metric = metric if isinstance(metric, Mapping) else {}
+            raw_tool_name = item.get("tool_name")
+            tool_name = sanitize(str(raw_tool_name or "prometheus_range"))[:200]
             statement = {
-                "tool_name": item.get("tool_name"),
-                "metric": self._prometheus_metric_identity(metric),
+                "tool_name": tool_name,
+                "metric": metric_identity,
+                "value_semantics": value_semantics,
                 "sample_count": sample_count,
                 "min": summary.get("min"),
                 "max": summary.get("max"),
@@ -805,12 +904,17 @@ class DeterministicToolResultProcessor:
                 "latest": summary.get("latest"),
                 "delta": summary.get("delta"),
             }
+            statement_json = json.dumps(
+                sanitize(statement),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
             base = f"/structured_data/monitoring_results/{result_index}/projection"
             observations.append(
                 ToolResultObservation(
-                    statement=(
-                        f"Prometheus 告警目标五分钟窗口内时序聚合：{_bounded_json(statement)}"
-                    ),
+                    statement=(f"Prometheus 告警目标五分钟窗口内时序聚合：{statement_json}"),
                     source_paths=[
                         f"{base}/timeseries/series/{series_index}",
                         f"{base}/window",
@@ -831,10 +935,15 @@ class DeterministicToolResultProcessor:
                 "已排除未通过公开投影协议校验的 Prometheus 项："
                 f"{_bounded_json(dict(sorted(excluded.items())))}。"
             )
-        if omitted:
+        if provider_omitted_series_count:
+            limitations.append(
+                f"Provider 公开投影按完整时序项省略 {provider_omitted_series_count} 条；"
+                "完整响应仅保存在源工件。"
+            )
+        if globally_omitted:
             limitations.append(
                 f"主 Agent 仅展示稳定顺序中的前 {_MAX_SELECTED_ITEMS} 条时序；"
-                f"另有 {omitted} 条合格投影保留在源工件。"
+                f"另有 {globally_omitted} 条合格投影保留在源工件。"
             )
         if not results:
             if range_query_success_count:
@@ -1016,12 +1125,48 @@ class DeterministicToolResultProcessor:
         return None
 
     @staticmethod
+    def _prometheus_public_metric_identity(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        visible = _model_visible_projection(value)
+        if not isinstance(visible, Mapping) or not visible:
+            return None
+        if len(visible) > _PROMETHEUS_PUBLIC_METRIC_MAX_KEYS:
+            return None
+
+        identity: dict[str, Any] = {}
+        for raw_key, raw_value in sorted(visible.items(), key=lambda item: str(item[0])):
+            if not isinstance(raw_key, str) or not _PROMETHEUS_PUBLIC_METRIC_KEY.fullmatch(raw_key):
+                return None
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                return None
+            projected_value = sanitize(raw_value)
+            if not isinstance(projected_value, str) or len(projected_value) > 200:
+                return None
+            if raw_key == "__name__" and not _PROMETHEUS_PUBLIC_METRIC_NAME.fullmatch(
+                projected_value
+            ):
+                return None
+            identity[raw_key] = projected_value
+
+        serialized = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(serialized) > _PROMETHEUS_PUBLIC_METRIC_MAX_JSON_CHARS:
+            return None
+        return identity
+
+    @staticmethod
     def _prometheus_metric_identity(metric: Mapping[str, Any]) -> dict[str, Any]:
         visible_keys = (
             _HOST_LABEL_KEYS
             | _PORT_LABEL_KEYS
             | _DATABASE_LABEL_KEYS
             | _ENGINE_LABEL_KEYS
+            | _LEGACY_PROMETHEUS_SEMANTIC_LABEL_KEYS
             | frozenset({"cluster", "namespace"})
         )
         return {

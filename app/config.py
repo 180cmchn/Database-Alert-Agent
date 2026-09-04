@@ -27,6 +27,35 @@ SUPPORTED_AI_PROVIDERS = REAL_AI_PROVIDERS | {"fake"}
 # the provider default applies.
 SUPPORTED_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
+_FILTER_SEVERITY_ORDER = tuple(Severity)
+_FILTER_SEVERITIES_KEY = "alert_analysis_filter_severities"
+_LEGACY_FILTER_MAX_SEVERITY_KEY = "alert_analysis_filter_max_severity"
+
+
+def _parse_filter_severities(value: Any) -> list[Severity]:
+    raw: Any = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        raw = json.loads(stripped) if stripped.startswith("[") else stripped.split(",")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        raise ValueError("alert analysis filter severities must be a list")
+
+    selected = {
+        item if isinstance(item, Severity) else Severity(str(item).strip().upper())
+        for item in raw
+    }
+    return [severity for severity in _FILTER_SEVERITY_ORDER if severity in selected]
+
+
+def _legacy_filter_severities(value: Any) -> list[Severity]:
+    max_severity = (
+        value if isinstance(value, Severity) else Severity(str(value).strip().upper())
+    )
+    start = _FILTER_SEVERITY_ORDER.index(max_severity)
+    return list(_FILTER_SEVERITY_ORDER[start:])
+
 # Only these settings may be changed through the administrative API. Bootstrap
 # controls such as the database URL, scheduler backend and admin credential
 # intentionally remain environment/file-deployment concerns.
@@ -46,7 +75,7 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_mcp_reasoning_effort",
         "stream_main_agent_reasoning",
         "alert_analysis_filter_enabled",
-        "alert_analysis_filter_max_severity",
+        "alert_analysis_filter_severities",
         "wecom_webhook_url",
         "wecom_page_base_url",
         "wecom_enabled",
@@ -61,6 +90,23 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "external_knowledge_api_key_base_url",
     }
 )
+
+
+def _normalize_runtime_overrides(payload: dict[str, Any]) -> dict[str, Any]:
+    overrides = {key: value for key, value in payload.items() if key in RUNTIME_SETTINGS_KEYS}
+    if _FILTER_SEVERITIES_KEY in overrides:
+        overrides[_FILTER_SEVERITIES_KEY] = [
+            severity.value
+            for severity in _parse_filter_severities(overrides[_FILTER_SEVERITIES_KEY])
+        ]
+    elif _LEGACY_FILTER_MAX_SEVERITY_KEY in payload:
+        overrides[_FILTER_SEVERITIES_KEY] = [
+            severity.value
+            for severity in _legacy_filter_severities(
+                payload[_LEGACY_FILTER_MAX_SEVERITY_KEY]
+            )
+        ]
+    return overrides
 
 
 class Settings(BaseSettings):
@@ -143,10 +189,18 @@ class Settings(BaseSettings):
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
-    # When enabled, alerts at or below this normalized severity are persisted
+    # When enabled, alerts with one of these normalized severities are persisted
     # without creating an automatic investigation run.
     alert_analysis_filter_enabled: bool = False
-    alert_analysis_filter_max_severity: Severity = Severity.INFO
+    alert_analysis_filter_severities: Annotated[list[Severity], NoDecode] = Field(
+        default_factory=lambda: [Severity.INFO]
+    )
+    legacy_alert_analysis_filter_max_severity: Severity | None = Field(
+        default=None,
+        validation_alias="alert_analysis_filter_max_severity",
+        exclude=True,
+        repr=False,
+    )
     wecom_webhook_url: str = Field(default="", repr=False)
     # Public/intranet frontend origin used by WeCom's in-app browser. Root-cause
     # and recovery actions open dedicated lightweight pages under this origin.
@@ -274,6 +328,11 @@ class Settings(BaseSettings):
     def normalize_redis_username(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("alert_analysis_filter_severities", mode="before")
+    @classmethod
+    def normalize_alert_analysis_filter_severities(cls, value: Any) -> list[Severity]:
+        return _parse_filter_severities(value)
+
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def normalize_cors_origins(cls, value: Any) -> Any:
@@ -320,6 +379,18 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_admin_editable_urls(self) -> Settings:
+        if (
+            self.legacy_alert_analysis_filter_max_severity is not None
+            and "alert_analysis_filter_severities" not in self.model_fields_set
+        ):
+            self.alert_analysis_filter_severities = _legacy_filter_severities(
+                self.legacy_alert_analysis_filter_max_severity
+            )
+        if self.alert_analysis_filter_enabled and not self.alert_analysis_filter_severities:
+            raise ValueError(
+                "ALERT_ANALYSIS_FILTER_SEVERITIES must contain at least one severity "
+                "when alert analysis filtering is enabled"
+            )
         for field_name, required in (
             ("ai_base_url", True),
             ("wecom_webhook_url", False),
@@ -581,7 +652,7 @@ def load_runtime_overrides(path: Path) -> dict[str, Any]:
         raise ValueError(f"Invalid runtime settings file: {path}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Runtime settings file must contain an object: {path}")
-    return {key: value for key, value in payload.items() if key in RUNTIME_SETTINGS_KEYS}
+    return _normalize_runtime_overrides(payload)
 
 
 def resolve_runtime_settings(
@@ -590,7 +661,7 @@ def resolve_runtime_settings(
 ) -> Settings:
     """Layer persisted runtime overrides on an immutable deployment baseline."""
 
-    effective_overrides = (
+    effective_overrides = _normalize_runtime_overrides(
         load_runtime_overrides(deployment_baseline.runtime_settings_path)
         if overrides is None
         else overrides

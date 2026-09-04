@@ -14,7 +14,7 @@ from app.application.admin import (
     RuntimeSettingsManager,
 )
 from app.application.factory import _mcp_environment
-from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings
+from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings, load_runtime_overrides
 from app.domain.models import Severity
 
 
@@ -571,30 +571,149 @@ def test_alert_analysis_filter_settings_are_runtime_editable(tmp_path: Path) -> 
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
+        stream_main_agent_reasoning=False,
         alert_analysis_filter_enabled=True,
-        alert_analysis_filter_max_severity="WARNING",
+        alert_analysis_filter_severities=["INFO", "CRITICAL", "INFO"],
         runtime_settings_path=tmp_path / "runtime-settings.json",
     )
 
     assert settings.alert_analysis_filter_enabled is True
-    assert settings.alert_analysis_filter_max_severity == Severity.WARNING
+    assert settings.alert_analysis_filter_severities == [Severity.CRITICAL, Severity.INFO]
     assert "alert_analysis_filter_enabled" in RUNTIME_SETTINGS_KEYS
-    assert "alert_analysis_filter_max_severity" in RUNTIME_SETTINGS_KEYS
+    assert "alert_analysis_filter_severities" in RUNTIME_SETTINGS_KEYS
+    assert "alert_analysis_filter_max_severity" not in RUNTIME_SETTINGS_KEYS
+
+    comma_separated = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        stream_main_agent_reasoning=False,
+        alert_analysis_filter_severities="INFO,WARNING",  # type: ignore[arg-type]
+    )
+    assert comma_separated.alert_analysis_filter_severities == [
+        Severity.WARNING,
+        Severity.INFO,
+    ]
 
     patch = RuntimeSettingsPatch(
         expected_revision="0123456789abcdef",
         alert_analysis_filter_enabled=True,
-        alert_analysis_filter_max_severity="CRITICAL",
+        alert_analysis_filter_severities=["CRITICAL", "INFO"],
     )
     assert patch.updates() == {
         "alert_analysis_filter_enabled": True,
-        "alert_analysis_filter_max_severity": "CRITICAL",
+        "alert_analysis_filter_severities": ["CRITICAL", "INFO"],
     }
     with pytest.raises(ValidationError):
         RuntimeSettingsPatch(
             expected_revision="0123456789abcdef",
-            alert_analysis_filter_max_severity="DEBUG",  # type: ignore[arg-type]
+            alert_analysis_filter_severities=["DEBUG"],  # type: ignore[list-item]
         )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            alert_analysis_filter_max_severity="WARNING",  # type: ignore[call-arg]
+        )
+    with pytest.raises(ValidationError, match="must contain at least one severity"):
+        Settings(
+            _env_file=None,
+            ai_provider="fake",
+            stream_main_agent_reasoning=False,
+            alert_analysis_filter_enabled=True,
+            alert_analysis_filter_severities=[],
+        )
+
+
+def test_legacy_filter_threshold_migrates_to_canonical_severity_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        stream_main_agent_reasoning=False,
+        alert_analysis_filter_enabled=True,
+        alert_analysis_filter_max_severity="WARNING",
+    )
+    assert settings.alert_analysis_filter_severities == [Severity.WARNING, Severity.INFO]
+
+    monkeypatch.delenv("ALERT_ANALYSIS_FILTER_SEVERITIES", raising=False)
+    monkeypatch.setenv("ALERT_ANALYSIS_FILTER_MAX_SEVERITY", "CRITICAL")
+    legacy_environment = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        stream_main_agent_reasoning=False,
+    )
+    assert legacy_environment.alert_analysis_filter_severities == list(Severity)
+
+    monkeypatch.setenv("ALERT_ANALYSIS_FILTER_SEVERITIES", '["WARNING"]')
+    new_environment = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        stream_main_agent_reasoning=False,
+    )
+    assert new_environment.alert_analysis_filter_severities == [Severity.WARNING]
+
+    path = tmp_path / "runtime-settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "alert_analysis_filter_enabled": True,
+                "alert_analysis_filter_max_severity": "WARNING",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_runtime_overrides(path) == {
+        "alert_analysis_filter_enabled": True,
+        "alert_analysis_filter_severities": ["WARNING", "INFO"],
+    }
+
+    path.write_text(
+        json.dumps(
+            {
+                "alert_analysis_filter_max_severity": "WARNING",
+                "alert_analysis_filter_severities": ["INFO", "CRITICAL", "INFO"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_runtime_overrides(path) == {
+        "alert_analysis_filter_severities": ["CRITICAL", "INFO"]
+    }
+
+@pytest.mark.asyncio
+async def test_legacy_filter_override_is_rewritten_on_next_admin_save(
+    tmp_path: Path,
+) -> None:
+    baseline = runtime_test_settings(tmp_path)
+    baseline.runtime_settings_path.write_text(
+        json.dumps(
+            {
+                "alert_analysis_filter_enabled": True,
+                "alert_analysis_filter_max_severity": "WARNING",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = RuntimeSettingsManager(
+        baseline.runtime_settings_path,
+        deployment_baseline=baseline,
+    )
+    current = manager.effective_settings()
+    assert current.alert_analysis_filter_severities == [Severity.WARNING, Severity.INFO]
+
+    updated, _, changed_fields = await manager.patch(
+        current,
+        {"alert_analysis_filter_enabled": False},
+        expected_revision=manager.revision,
+    )
+
+    assert updated.alert_analysis_filter_enabled is False
+    assert changed_fields == ["alert_analysis_filter_enabled"]
+    assert json.loads(baseline.runtime_settings_path.read_text(encoding="utf-8")) == {
+        "alert_analysis_filter_enabled": False,
+        "alert_analysis_filter_severities": ["WARNING", "INFO"],
+    }
 
 
 def test_stream_main_agent_reasoning_requires_valid_deployment_baseline(
@@ -801,7 +920,7 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["analysis_timeout_seconds"] == 1800
     assert body["alert_analysis_filter_enabled"] is False
-    assert body["alert_analysis_filter_max_severity"] == "INFO"
+    assert body["alert_analysis_filter_severities"] == ["INFO"]
     assert "archery_mcp_max_agent_steps" not in body
     assert "shadow_enabled" not in body
     assert "production_gate_approved" not in body

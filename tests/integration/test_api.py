@@ -72,7 +72,7 @@ def test_analysis_filter_persists_without_scheduling_or_run(tmp_path: Path) -> N
     client, _, scheduler = create_test_client(
         tmp_path,
         alert_analysis_filter_enabled=True,
-        alert_analysis_filter_max_severity="INFO",
+        alert_analysis_filter_severities=["INFO"],
     )
     with client:
         filtered = client.post(
@@ -204,22 +204,22 @@ def test_readiness_does_not_probe_external_knowledge_service(tmp_path: Path) -> 
     (
         "filter_enabled",
         "raw_severity",
-        "max_severity",
+        "filtered_severities",
         "expected_status",
         "expected_job_count",
     ),
     [
-        (False, "Warning", "INFO", "QUEUED", 1),
-        (True, "Warning", "WARNING", "FILTERED", 0),
-        (True, "Ok", "INFO", "FILTERED", 0),
-        (True, "Warning", "INFO", "QUEUED", 1),
+        (False, "Warning", ["INFO"], "QUEUED", 1),
+        (True, "Warning", ["WARNING"], "FILTERED", 0),
+        (True, "Ok", ["INFO"], "FILTERED", 0),
+        (True, "Warning", ["CRITICAL", "INFO"], "QUEUED", 1),
     ],
 )
 def test_manual_flashduty_poll_applies_analysis_filter(
     tmp_path: Path,
     filter_enabled: bool,
     raw_severity: str,
-    max_severity: str,
+    filtered_severities: list[str],
     expected_status: str,
     expected_job_count: int,
 ) -> None:
@@ -232,7 +232,7 @@ def test_manual_flashduty_poll_applies_analysis_filter(
         flashduty_poll_lookback_seconds=1200,
         flashduty_poll_channel_ids=[7],
         alert_analysis_filter_enabled=filter_enabled,
-        alert_analysis_filter_max_severity=max_severity,
+        alert_analysis_filter_severities=filtered_severities,
     )
     requests: list[dict] = []
 

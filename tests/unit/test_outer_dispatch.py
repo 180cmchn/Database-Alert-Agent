@@ -375,10 +375,14 @@ async def test_pending_dispatch_resumes_without_replaying_completed_handler(
     assert len(executor.calls) == 1
     async with repository.session_factory() as session:
         evidence_rows = (
-            await session.execute(
-                select(EvidenceRow).where(EvidenceRow.run_id == str(context.run_id))
+            (
+                await session.execute(
+                    select(EvidenceRow).where(EvidenceRow.run_id == str(context.run_id))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(evidence_rows) == 1
     await repository.close()
 
@@ -415,10 +419,7 @@ async def test_expired_pending_dispatch_becomes_timeout_without_handler_call(
 
     assert executor.calls == []
     assert evidence.status == ToolStatus.TIMEOUT
-    assert (
-        evidence.structured_data["reason_code"]
-        == "invocation_deadline_exceeded_before_dispatch"
-    )
+    assert evidence.structured_data["reason_code"] == "invocation_deadline_exceeded_before_dispatch"
     rows = await _invocation_rows(repository, str(context.run_id))
     assert [item.status for item in rows] == [ToolInvocationStatus.TIMED_OUT.value]
     await repository.close()
@@ -668,15 +669,10 @@ async def test_frozen_outer_deadline_bounds_handler_execution(tmp_path: Path) ->
     assert processor.calls == []
     assert evidence.status == ToolStatus.TIMEOUT
     assert evidence.summary == "调查工具 test_probe 已达到持久化调用期限。"
-    assert (
-        evidence.structured_data["reason_code"]
-        == "outer_invocation_deadline_exceeded"
-    )
+    assert evidence.structured_data["reason_code"] == "outer_invocation_deadline_exceeded"
     assert evidence.structured_data["processing_status"] == "unavailable"
     assert evidence.structured_data["root_cause_eligible"] is False
-    assert evidence.structured_data["root_cause_ineligible_reason"] == (
-        "tool_status_not_success"
-    )
+    assert evidence.structured_data["root_cause_ineligible_reason"] == ("tool_status_not_success")
     assert evidence.duration_ms > 0
     assert evidence.duration_ms == max(
         0,
@@ -792,9 +788,7 @@ async def test_terminal_recovery_rejects_tampered_evidence_provenance(
 async def test_unregistered_started_action_recovers_unknown_without_replay(
     tmp_path: Path,
 ) -> None:
-    repository = SQLAlchemyAlertRepository(
-        _sqlite_url(tmp_path / "unregistered-unknown.db")
-    )
+    repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "unregistered-unknown.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="unregistered-unknown")
     executor = RecordingExecutor()
@@ -848,9 +842,7 @@ async def test_recovery_fails_closed_when_frozen_tool_contract_drifts(tmp_path: 
             context=context,
             tool_spec=_spec(),
         )
-    drifted = _spec().model_copy(
-        update={"policy_version": "test-policy-v2"}
-    )
+    drifted = _spec().model_copy(update={"policy_version": "test-policy-v2"})
 
     with pytest.raises(OuterDispatchError, match="identity does not match"):
         await DurableOuterToolDispatcher(repository, executor).execute(
@@ -959,9 +951,7 @@ async def test_terminal_result_backfills_evidence_without_handler_replay(
     assert "payload" not in result["evidence_record"]["structured_data"]
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     assert stored[1]["structured_data"]["payload"] == "x" * 13_000
     await repository.close()
@@ -1009,9 +999,7 @@ async def test_result_is_artifacted_and_projected_by_program_processor(
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
     assert invocation.artifact_ref.metadata["internal_only"] is True
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     assert stored[1]["structured_data"]["payload"] == "x" * 20_000
     await repository.close()
@@ -1042,9 +1030,7 @@ async def test_small_result_is_always_projected_when_processor_is_configured(
     rows = await _invocation_rows(repository, str(context.run_id))
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     assert stored[1]["structured_data"]["payload"] == "small"
     await repository.close()
@@ -1111,13 +1097,171 @@ async def test_dispatcher_keeps_complete_raw_generic_result_out_of_main_context(
     rows = await _invocation_rows(repository, str(context.run_id))
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     stored_text = str(stored[1])
     assert raw_text not in stored_text
     assert "result" not in stored[1]["structured_data"]["observations"][0]
+    await repository.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_id", "series", "expected_eligible"),
+    [
+        (
+            "valid",
+            [
+                {
+                    "metric": {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    "value_semantics": "raw",
+                    "sample_count": 2,
+                    "min": 3,
+                    "max": 5,
+                    "avg": 4,
+                    "latest": 5,
+                    "delta": 2,
+                }
+            ],
+            True,
+        ),
+        (
+            "anonymous",
+            [
+                {
+                    "metric": {},
+                    "value_semantics": "raw",
+                    "sample_count": 2,
+                    "min": 3,
+                    "max": 5,
+                    "avg": 4,
+                    "latest": 5,
+                    "delta": 2,
+                }
+            ],
+            False,
+        ),
+        (
+            "collision",
+            [
+                {
+                    "metric": {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    "value_semantics": "raw",
+                    "sample_count": 2,
+                    "min": 3,
+                    "max": 5,
+                    "avg": 4,
+                    "latest": 5,
+                    "delta": 2,
+                },
+                {
+                    "metric": {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    "value_semantics": "raw",
+                    "sample_count": 2,
+                    "min": 6,
+                    "max": 8,
+                    "avg": 7,
+                    "latest": 8,
+                    "delta": 2,
+                },
+            ],
+            False,
+        ),
+    ],
+)
+async def test_prometheus_identity_gate_controls_outer_root_cause_eligibility(
+    tmp_path: Path,
+    case_id: str,
+    series: list[dict[str, object]],
+    expected_eligible: bool,
+) -> None:
+    repository = SQLAlchemyAlertRepository(
+        _sqlite_url(tmp_path / f"prometheus-identity-{case_id}.db")
+    )
+    await repository.initialize()
+    alert_id, context = await _context(
+        repository,
+        external_id=f"outer-prometheus-identity-{case_id}",
+    )
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    outcome = {
+        "schema_version": "prometheus-evidence-v5",
+        "window_start": (window_end - timedelta(minutes=5)).isoformat(),
+        "window_end": window_end.isoformat(),
+        "required_target": {"database_engine": "mysql"},
+        "monitoring_results": [
+            {
+                "tool_name": "query_range",
+                "projection_kind": "alert_window_range",
+                "projection": {
+                    "projection_kind": "alert_window_range",
+                    "window": {
+                        "start": (window_end - timedelta(minutes=5)).isoformat(),
+                        "end": window_end.isoformat(),
+                    },
+                    "target_match": {
+                        "matched": True,
+                        "authoritative_fields": ["cluster"],
+                    },
+                    "timeseries": {
+                        "has_numeric_samples": True,
+                        "series_count": len(series),
+                        "sample_count": sum(int(item["sample_count"]) for item in series),
+                        "series": series,
+                        "omitted_series_count": 0,
+                        "excluded_metric_identity_missing_count": 0,
+                        "excluded_metric_identity_collision_count": 0,
+                    },
+                },
+            }
+        ],
+        "range_query_success_count": 1,
+        "range_query_empty_count": 0,
+    }
+    request = ToolExecutionRequest(
+        tool_name="query_mcp_prometheus",
+        parameters={"case": case_id},
+        objective="collect prometheus evidence",
+        timeout_seconds=30,
+    )
+    spec = ToolSpec(
+        name="query_mcp_prometheus",
+        provider="prometheus_mcp",
+        capability="monitoring.query",
+        input_schema={"type": "object", "additionalProperties": True},
+        policy_version="prometheus-test-policy-v1",
+        schema_version="prometheus-evidence-v5",
+    )
+
+    evidence = await DurableOuterToolDispatcher(
+        repository,
+        RecordingExecutor([outcome], source_system="prometheus_mcp"),
+        result_analyzer=DeterministicToolResultProcessor(),
+    ).execute(
+        alert_id=alert_id,
+        request=request,
+        context=context,
+        tool_spec=spec,
+    )
+
+    assert evidence.structured_data["processing_status"] == "completed"
+    assert evidence.structured_data["root_cause_eligible"] is expected_eligible
+    assert evidence.is_root_cause_support_eligible() is expected_eligible
+    if expected_eligible:
+        assert "threads_connected" in evidence.model_dump_json()
+    else:
+        assert evidence.structured_data["root_cause_ineligible_reason"] == (
+            "program_fact_projection_unusable"
+        )
     await repository.close()
 
 
@@ -1141,9 +1285,7 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
                     "table_structure_results": [],
                     "index_results": [],
                     "missing_stages": ["indexes"],
-                    "failures": [
-                        {"stage": "indexes", "reason_code": "permission_denied"}
-                    ],
+                    "failures": [{"stage": "indexes", "reason_code": "permission_denied"}],
                 },
             }
         ],
@@ -1198,24 +1340,19 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
     assert history.source_paths == ["/structured_data/final_result_payload"]
     assert explain.status == EvidenceUnitStatus.SUCCESS
     assert explain.root_cause_eligible is True
-    assert explain.source_paths == [
-        "/structured_data/slow_query_analysis/explain_results/0"
-    ]
+    assert explain.source_paths == ["/structured_data/slow_query_analysis/explain_results/0"]
     assert indexes.status == EvidenceUnitStatus.FAILED
     assert indexes.root_cause_eligible is False
-    assert indexes.source_paths == [
-        "/structured_data/slow_query_analysis/failures/0"
-    ]
+    assert indexes.source_paths == ["/structured_data/slow_query_analysis/failures/0"]
     stored_artifact = await repository.get_agent_artifact(str(history.source_artifact_id))
     assert stored_artifact is not None
     artifact_payload = stored_artifact[1]
     assert isinstance(artifact_payload, dict)
-    assert artifact_payload["structured_data"]["final_result_payload"]["rows"] == [
-        {"id": 41}
-    ]
-    assert artifact_payload["structured_data"]["slow_query_analysis"]["failures"][
-        0
-    ]["stage"] == "indexes"
+    assert artifact_payload["structured_data"]["final_result_payload"]["rows"] == [{"id": 41}]
+    assert (
+        artifact_payload["structured_data"]["slow_query_analysis"]["failures"][0]["stage"]
+        == "indexes"
+    )
 
     assert context.lease_owner is not None and context.fencing_token is not None
     with pytest.raises(EvidenceRecordConflict, match="invocation binding is invalid"):
@@ -1262,9 +1399,7 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
         await session.commit()
 
     history_index = next(
-        index
-        for index, unit in enumerate(evidence.evidence_units)
-        if unit.unit_key == "history"
+        index for index, unit in enumerate(evidence.evidence_units) if unit.unit_key == "history"
     )
     async with repository.session_factory() as session:
         evidence_row = await session.get(EvidenceRow, str(evidence.id))
@@ -1425,11 +1560,7 @@ def test_missing_stage_with_successful_results_is_partial() -> None:
     )
 
     units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
-    completed = next(
-        unit
-        for unit in units
-        if unit.stage == "indexes" and unit.result_index == 0
-    )
+    completed = next(unit for unit in units if unit.stage == "indexes" and unit.result_index == 0)
     partial = next(unit for unit in units if unit.unit_key == "supplemental:indexes:missing")
 
     assert completed.status == EvidenceUnitStatus.SUCCESS
@@ -1508,15 +1639,9 @@ def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -
 
     units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
     by_reason = {
-        str(unit.data.get("reason_code")): unit
-        for unit in units
-        if unit.data.get("reason_code")
+        str(unit.data.get("reason_code")): unit for unit in units if unit.data.get("reason_code")
     }
-    by_stage = {
-        unit.stage: unit
-        for unit in units
-        if unit.unit_key.endswith(":missing")
-    }
+    by_stage = {unit.stage: unit for unit in units if unit.unit_key.endswith(":missing")}
 
     recovered = by_reason["history_recovery_result_size_forbidden"]
     assert recovered.status == EvidenceUnitStatus.RECOVERED
@@ -1524,12 +1649,8 @@ def test_recovered_history_failures_and_unavailable_stages_keep_final_status() -
     assert by_reason["history_recovery_incomplete"].status == EvidenceUnitStatus.FAILED
     assert by_reason["instance_not_allowlisted"].status == EvidenceUnitStatus.FAILED
     assert set(by_stage) == {"explain", "table_structure", "indexes"}
-    assert all(
-        unit.status == EvidenceUnitStatus.UNAVAILABLE for unit in by_stage.values()
-    )
-    assert all(
-        unit.data["stage_state"] == "UNAVAILABLE" for unit in by_stage.values()
-    )
+    assert all(unit.status == EvidenceUnitStatus.UNAVAILABLE for unit in by_stage.values())
+    assert all(unit.data["stage_state"] == "UNAVAILABLE" for unit in by_stage.values())
     DurableOuterToolDispatcher._validate_evidence_unit_sources(
         parent.model_dump(mode="json"),
         units,
@@ -1584,9 +1705,7 @@ def test_nonterminal_history_failure_stays_failed_while_recovery_is_incomplete()
     )
 
     units = DurableOuterToolDispatcher._archery_evidence_units(parent, analysis=analysis)
-    recovery_failure = next(
-        unit for unit in units if unit.stage == "history_recovery"
-    )
+    recovery_failure = next(unit for unit in units if unit.stage == "history_recovery")
 
     assert recovery_failure.status == EvidenceUnitStatus.FAILED
     assert recovery_failure.root_cause_ineligible_reason == "supplemental_failed"
@@ -1686,9 +1805,7 @@ def test_supplemental_unit_ids_do_not_depend_on_result_order() -> None:
         if unit.stage == "explain"
     }
     reversed_order = {
-        unit.data["marker"]: unit.id
-        for unit in project([second, first])
-        if unit.stage == "explain"
+        unit.data["marker"]: unit.id for unit in project([second, first]) if unit.stage == "explain"
     }
 
     assert forward == reversed_order
@@ -1849,9 +1966,7 @@ async def test_program_projection_failure_keeps_artifact_and_fails_closed(
     rows = await _invocation_rows(repository, str(context.run_id))
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     assert stored[1]["structured_data"]["payload"] == "x" * 20_000
     await repository.close()
@@ -1891,10 +2006,7 @@ async def test_program_projection_ignores_provider_partial_sentinels(
     assert "partial" not in evidence.structured_data
     assert "allow_followup_dispatch" not in evidence.structured_data
     assert evidence.structured_data["root_cause_eligible"] is True
-    assert (
-        evidence.structured_data["tool_result_analysis"]["source_coverage_complete"]
-        is True
-    )
+    assert evidence.structured_data["tool_result_analysis"]["source_coverage_complete"] is True
     assert "root_cause_ineligible_reason" not in evidence.structured_data
     assert evidence.is_root_cause_support_eligible() is True
     await repository.close()
@@ -1947,9 +2059,7 @@ async def test_failed_or_timed_out_result_bypasses_projection(
     assert evidence.structured_data["processing_status"] == "unavailable"
     assert evidence.structured_data["reason_code"] == "database_not_monitored"
     assert evidence.structured_data["root_cause_eligible"] is False
-    assert evidence.structured_data["root_cause_ineligible_reason"] == (
-        "tool_status_not_success"
-    )
+    assert evidence.structured_data["root_cause_ineligible_reason"] == ("tool_status_not_success")
     assert "tool_result_analysis" not in evidence.structured_data
     assert "payload" not in evidence.structured_data
     assert evidence.is_root_cause_support_eligible() is False
@@ -1957,9 +2067,7 @@ async def test_failed_or_timed_out_result_bypasses_projection(
     rows = await _invocation_rows(repository, str(context.run_id))
     invocation = await repository.get_tool_invocation(rows[0].id)
     assert invocation is not None and invocation.artifact_ref is not None
-    stored = await repository.get_agent_artifact(
-        str(invocation.artifact_ref.artifact_id)
-    )
+    stored = await repository.get_agent_artifact(str(invocation.artifact_ref.artifact_id))
     assert stored is not None
     assert stored[1]["structured_data"]["payload"] == "x" * 20_000
     await repository.close()
@@ -2011,9 +2119,7 @@ async def test_provider_followup_hint_does_not_block_second_explicit_action(
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "partial-terminal.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-partial-terminal")
-    executor = RecordingExecutor(
-        [{"partial": True, "allow_followup_dispatch": False}]
-    )
+    executor = RecordingExecutor([{"partial": True, "allow_followup_dispatch": False}])
     dispatcher = DurableOuterToolDispatcher(repository, executor)
 
     first = await dispatcher.execute(

@@ -419,7 +419,7 @@ export interface AdminSettings {
   react_max_rounds: number;
   analysis_timeout_seconds: number;
   alert_analysis_filter_enabled: boolean;
-  alert_analysis_filter_max_severity: Severity;
+  alert_analysis_filter_severities: Severity[];
   ai_api_key_configured: boolean;
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
@@ -464,7 +464,7 @@ export interface AdminSettingsPatch {
   react_max_rounds?: number;
   analysis_timeout_seconds?: number;
   alert_analysis_filter_enabled?: boolean;
-  alert_analysis_filter_max_severity?: Severity;
+  alert_analysis_filter_severities?: Severity[];
   ai_api_key?: string;
   knowledge_sources?: string[];
   flashduty_polling_enabled?: boolean;

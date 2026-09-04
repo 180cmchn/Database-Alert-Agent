@@ -41,7 +41,7 @@ PROMETHEUS_MCP_SERVER_NAME: Final = "prometheus"
 PROMETHEUS_METRICS_TOOL_NAME: Final = "query_prometheus_metrics"
 PROMETHEUS_ALERT_WINDOW_SECONDS: Final = 300
 PROMETHEUS_MCP_PROMPT_VERSION: Final = "prometheus-mcp-agent-v18"
-PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v4"
+PROMETHEUS_MCP_EVIDENCE_SCHEMA_VERSION: Final = "prometheus-evidence-v5"
 # China Standard Time has no daylight-saving transitions. A fixed offset keeps
 # model-facing timestamps stable on Windows images without an IANA tzdata package.
 PROMETHEUS_MCP_MODEL_TIMEZONE: Final = timezone(
@@ -69,7 +69,38 @@ _ALERT_THRESHOLD_SUFFIX: Final = re.compile(
     r"(?i)_(?:more|less|greater|higher|lower)_than_\d+(?:\.\d+)?%?$"
 )
 _UNKNOWN_METRIC_IDENTIFIERS: Final = {"n/a", "none", "null", "unknown"}
-_PROJECTED_METRIC_LABEL_KEYS: Final = ("__name__", "metric")
+_PROJECTED_METRIC_LABEL_KEYS: Final = (
+    "__name__",
+    "metric",
+    "command",
+    "operation",
+    "pool",
+    "quantile",
+    "state",
+    "type",
+)
+_PROMQL_ARGUMENT_KEYS: Final = ("promql", "query", "expr", "expression")
+_PROMQL_FUNCTION_PATTERN: Final = re.compile(r"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_PROMQL_RATE_FUNCTIONS: Final = {"irate", "rate"}
+_PROMQL_AGGREGATE_FUNCTIONS: Final = {
+    "avg",
+    "avg_over_time",
+    "bottomk",
+    "count",
+    "count_over_time",
+    "histogram_quantile",
+    "max",
+    "max_over_time",
+    "min",
+    "min_over_time",
+    "quantile",
+    "quantile_over_time",
+    "stddev",
+    "stdvar",
+    "sum",
+    "sum_over_time",
+    "topk",
+}
 _RANGE_WINDOW_FIELD_PAIRS: Final = (
     ("start_time", "end_time"),
     ("start", "end"),
@@ -481,6 +512,8 @@ class PrometheusMCPClient:
     def _project_numeric_series(
         cls,
         series: list[tuple[Mapping[str, Any], list[tuple[Any, float]]]],
+        *,
+        value_semantics: str = "unknown",
     ) -> dict[str, Any]:
         summaries: list[dict[str, Any]] = []
         for metric, samples in series:
@@ -488,6 +521,7 @@ class PrometheusMCPClient:
             summaries.append(
                 {
                     "metric": cls._project_metric_labels(metric),
+                    "value_semantics": value_semantics,
                     "sample_count": len(values),
                     "min": cls._display_number(min(values)),
                     "max": cls._display_number(max(values)),
@@ -520,7 +554,7 @@ class PrometheusMCPClient:
         window_start: datetime,
         window_end: datetime,
     ) -> dict[str, Any] | None:
-        """Project only a target-scoped range response for the authoritative window."""
+        """Project only identity-safe, target-scoped data for the authoritative window."""
 
         argument_window = cls._argument_window(arguments)
         if argument_window != (
@@ -528,10 +562,10 @@ class PrometheusMCPClient:
             window_end.astimezone(UTC),
         ):
             return None
-        del arguments
+        value_semantics = cls._query_value_semantics(arguments)
         all_series = cls._range_series(payload)
-        selected: list[tuple[Mapping[str, Any], list[tuple[Any, float]]]] = []
-        matched_fields: list[str] = []
+        candidates: list[tuple[dict[str, Any], list[tuple[Any, float]], list[str]]] = []
+        identity_missing_count = 0
         for metric, samples, samples_valid in all_series:
             series_match = cls._metric_alert_target_fields(metric, alert=alert)
             if (
@@ -545,13 +579,37 @@ class PrometheusMCPClient:
                 )
             ):
                 continue
-            selected.append((metric, samples))
-            matched_fields.extend(series_match)
+            public_metric = cls._project_metric_labels(metric)
+            if not public_metric:
+                identity_missing_count += 1
+                continue
+            candidates.append((public_metric, samples, series_match))
+
+        identity_counts = Counter(
+            json.dumps(metric, ensure_ascii=True, sort_keys=True)
+            for metric, _samples, _matched_fields in candidates
+        )
+        colliding_identities = {
+            identity for identity, count in identity_counts.items() if count > 1
+        }
+        collision_count = sum(identity_counts[identity] for identity in colliding_identities)
+        selected = [
+            (metric, samples, matched_fields)
+            for metric, samples, matched_fields in candidates
+            if json.dumps(metric, ensure_ascii=True, sort_keys=True) not in colliding_identities
+        ]
         if not selected:
             return None
-        projection = cls._project_numeric_series(selected)
+
+        projection = cls._project_numeric_series(
+            [(metric, samples) for metric, samples, _matched_fields in selected],
+            value_semantics=value_semantics,
+        )
         if projection["has_numeric_samples"] is not True:
             return None
+        projection["excluded_metric_identity_missing_count"] = identity_missing_count
+        projection["excluded_metric_identity_collision_count"] = collision_count
+        matched_fields = [field for _metric, _samples, fields in selected for field in fields]
         return {
             "projection_kind": "alert_window_range",
             "window": {
@@ -565,6 +623,37 @@ class PrometheusMCPClient:
             "timeseries": projection,
             "excluded_series_count": max(len(all_series) - len(selected), 0),
         }
+
+    @staticmethod
+    def _query_value_semantics(arguments: Mapping[str, Any]) -> str:
+        query = next(
+            (
+                candidate.strip()
+                for key in _PROMQL_ARGUMENT_KEYS
+                if isinstance((candidate := arguments.get(key)), str) and candidate.strip()
+            ),
+            "",
+        )
+        if not query:
+            return "unknown"
+        normalized = query.casefold()
+        functions = {
+            match.group(1).casefold() for match in _PROMQL_FUNCTION_PATTERN.finditer(normalized)
+        }
+        if "increase" in functions:
+            return "increase"
+        if functions & _PROMQL_RATE_FUNCTIONS:
+            return "rate"
+        if functions & _PROMQL_AGGREGATE_FUNCTIONS or any(
+            re.search(rf"\b{function}\s+(?:by|without)\s*\(", normalized)
+            for function in _PROMQL_AGGREGATE_FUNCTIONS
+        ):
+            return "aggregate"
+        if functions:
+            return "expression"
+        if re.fullmatch(r"[a-z_:][a-z0-9_:]*(?:\{.*\})?", normalized, flags=re.DOTALL):
+            return "raw"
+        return "expression"
 
     @classmethod
     def target_series_bindings(

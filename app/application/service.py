@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -88,7 +88,7 @@ class AlertAnalysisService:
         react_max_rounds: int = 8,
         analysis_timeout_seconds: int = 1800,
         alert_analysis_filter_enabled: bool = False,
-        alert_analysis_filter_max_severity: Severity = Severity.INFO,
+        alert_analysis_filter_severities: Collection[Severity] = frozenset({Severity.INFO}),
         external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
         runtime_manifest_config: dict[str, Any] | None = None,
@@ -112,7 +112,7 @@ class AlertAnalysisService:
         self.react_max_rounds = react_max_rounds
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.alert_analysis_filter_enabled = alert_analysis_filter_enabled
-        self.alert_analysis_filter_max_severity = alert_analysis_filter_max_severity
+        self.alert_analysis_filter_severities = frozenset(alert_analysis_filter_severities)
         self.external_knowledge_min_relevance = external_knowledge_min_relevance
         self.knowledge_sources = knowledge_sources or []
         self.runtime_manifest_config = dict(runtime_manifest_config or {})
@@ -140,7 +140,7 @@ class AlertAnalysisService:
     def _initial_alert_status(self, severity: Severity) -> AlertStatus:
         if (
             self.alert_analysis_filter_enabled
-            and not severity.is_higher_than(self.alert_analysis_filter_max_severity)
+            and severity in self.alert_analysis_filter_severities
         ):
             return AlertStatus.FILTERED
         return AlertStatus.QUEUED

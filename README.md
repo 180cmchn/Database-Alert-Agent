@@ -97,7 +97,7 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | --- | --- |
 | FlashDuty 协作空间 | `.env` 中 `FLASHDUTY_POLL_CHANNEL_IDS`，修改后重启 |
 | FlashDuty 轮询开关和间隔 | `.env` / Agent 设置页；模板见 `.env.example` |
-| 告警等级过滤开关和仅入库上限 | `.env` / Agent 设置页；`ALERT_ANALYSIS_FILTER_*` |
+| 告警等级过滤开关和仅入库等级多选 | `.env` / Agent 设置页；`ALERT_ANALYSIS_FILTER_*` |
 | MCP 连接与提示词引用 | `config/mcp/settings.json` |
 | MCP 角色、作用、工作流程和行为边界 | `config/mcp/prompts/<provider>/{role,purpose,workflow,safety}.md` |
 | MCP 原始结果的程序投影 | `app/adapters/tool_result_analysis.py` |
@@ -310,7 +310,7 @@ REACT_MAX_ROUNDS=8
 ANALYSIS_TIMEOUT_SECONDS=1800
 SCHEDULER_WORKERS=1
 ALERT_ANALYSIS_FILTER_ENABLED=false
-ALERT_ANALYSIS_FILTER_MAX_SEVERITY=INFO
+ALERT_ANALYSIS_FILTER_SEVERITIES=["INFO"]
 # 必填部署基线；可在 Agent 设置页运行时覆盖。
 STREAM_MAIN_AGENT_REASONING=false
 ```
@@ -324,11 +324,15 @@ DeepSeek 或内部兼容网关。使用 OpenAI Responses API 时设置为 `opena
 `AI_MAX_TOKENS` 应为 reasoning 和结构化输出预留足够空间。模型超时或结构化输出不可用时，保守降级
 为 `现有结果无法得出根因`，不会虚构结果。
 
-`ALERT_ANALYSIS_FILTER_ENABLED` 默认关闭。开启后，系统只自动分析严格高于
-`ALERT_ANALYSIS_FILTER_MAX_SEVERITY` 的新告警：上限为 `INFO` 时只过滤 INFO，上限为 `WARNING` 时
-过滤 INFO 和 WARNING，上限为 `CRITICAL` 时全部新告警只入库。该决定在首次入库时持久化，不会取消
-已排队或正在分析的任务，也不会因之后修改配置而自动补跑历史 `FILTERED` 告警；管理员仍可显式重新
-分析这类告警。
+`ALERT_ANALYSIS_FILTER_ENABLED` 默认关闭。开启后，`ALERT_ANALYSIS_FILTER_SEVERITIES` 中明确选中的
+等级只入库，未选中的等级自动分析。例如 `["CRITICAL", "INFO"]` 会过滤 CRITICAL 和 INFO，仅分析
+WARNING。列表按 `CRITICAL`、`WARNING`、`INFO` 的固定顺序去重；也可用逗号分隔形式
+`CRITICAL,INFO`。该决定在首次入库时持久化，不会取消已排队或正在分析的任务，也不会因之后修改配置
+而自动补跑历史 `FILTERED` 告警；管理员仍可显式重新分析这类告警。
+
+旧版 `ALERT_ANALYSIS_FILTER_MAX_SEVERITY` 仅用于升级兼容：`INFO`、`WARNING`、`CRITICAL` 分别迁移为
+`["INFO"]`、`["WARNING", "INFO"]`、`["CRITICAL", "WARNING", "INFO"]`。新列表存在时优先使用新
+配置；Agent 设置页下一次保存后，运行时覆盖文件只保留新字段。
 
 `STREAM_MAIN_AGENT_REASONING` 没有代码默认值，部署时必须显式设置。Agent 设置页中的开关属于运行级
 覆盖，只影响之后创建的分析运行；清空运行级覆盖后，API 和 Worker 会立即恢复环境变量中的部署基线，

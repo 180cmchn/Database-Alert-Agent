@@ -25,6 +25,79 @@ def _artifact() -> ArtifactRef:
     )
 
 
+def _prometheus_projection_item(
+    series: list[dict[str, object]],
+    *,
+    omitted_series_count: int = 0,
+    tool_name: str = "query_range",
+) -> dict[str, object]:
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    return {
+        "tool_name": tool_name,
+        "projection_kind": "alert_window_range",
+        "projection": {
+            "projection_kind": "alert_window_range",
+            "window": {
+                "start": (window_end - timedelta(minutes=5)).isoformat(),
+                "end": window_end.isoformat(),
+            },
+            "target_match": {
+                "matched": True,
+                "authoritative_fields": ["database.host", "database.endpoint"],
+            },
+            "timeseries": {
+                "has_numeric_samples": bool(series) or omitted_series_count > 0,
+                "series_count": len(series) + omitted_series_count,
+                "sample_count": sum(int(item.get("sample_count", 0)) for item in series),
+                "series": series,
+                "omitted_series_count": omitted_series_count,
+                "excluded_metric_identity_missing_count": 0,
+                "excluded_metric_identity_collision_count": 0,
+            },
+        },
+    }
+
+
+def _prometheus_v5_raw_result(
+    monitoring_results: list[dict[str, object]],
+) -> dict[str, object]:
+    window_end = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    return {
+        "status": "SUCCESS",
+        "structured_data": {
+            "schema_version": "prometheus-evidence-v5",
+            "window_start": (window_end - timedelta(minutes=5)).isoformat(),
+            "window_end": window_end.isoformat(),
+            "required_target": {
+                "database_engine": "mysql",
+                "host": "mysql-17",
+                "port": 3306,
+            },
+            "monitoring_results": monitoring_results,
+            "range_query_success_count": len(monitoring_results),
+            "range_query_empty_count": 0,
+        },
+    }
+
+
+def _prometheus_series(
+    metric: dict[str, str],
+    *,
+    value_semantics: str = "raw",
+    value: int | float = 1,
+) -> dict[str, object]:
+    return {
+        "metric": metric,
+        "value_semantics": value_semantics,
+        "sample_count": 2,
+        "min": value,
+        "max": value,
+        "avg": value,
+        "latest": value,
+        "delta": 0,
+    }
+
+
 ARCHERY_COLUMN_LIST: tuple[str, ...] = (
     "id",
     "ts_min",
@@ -326,7 +399,7 @@ async def test_flashduty_alert_context_uses_api_projection_without_mcp_wording()
         [result.summary, *(item.statement for item in result.observations), *result.limitations]
     )
     assert result.analysis_usable is True
-    assert result.prompt_version == "program-fact-projection-v8"
+    assert result.prompt_version == "program-fact-projection-v9"
     assert "FlashDuty API" in projected
     assert "MCP" not in projected
     assert "must-not-enter-model" not in projected
@@ -603,6 +676,7 @@ async def test_prometheus_aggregates_numeric_series_without_host_sentinel_gates(
                             {
                                 "metric": {
                                     "__name__": "threads_running",
+                                    "metric": "threads_connected",
                                     "job": "mysql",
                                     "instance": "mysql-17:3306",
                                 },
@@ -644,6 +718,7 @@ async def test_prometheus_aggregates_numeric_series_without_host_sentinel_gates(
     assert '"avg":3' in aggregate
     assert '"latest":5' in aggregate
     assert '"delta":4' in aggregate
+    assert '"metric":"threads_connected"' in aggregate
     assert aggregate.index('"first_timestamp"') < aggregate.index('"latest_timestamp"')
     assert result.analysis_usable is True
     assert any(
@@ -745,6 +820,170 @@ async def test_prometheus_consumes_only_valid_bounded_range_projection() -> None
         ]
         for item in result.observations
     )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_public_projection_preserves_semantic_identity_without_refiltering() -> (
+    None
+):
+    secret = "must-stay-in-source-artifact"
+    raw_result = _prometheus_v5_raw_result(
+        [
+            _prometheus_projection_item(
+                [
+                    _prometheus_series(
+                        {
+                            "__name__": "mysql:all_server_status:all",
+                            "metric": "threads_connected",
+                            "subsystem": "connections",
+                            "raw_payload": secret,
+                            "artifact_uri": f"agent-artifact://{secret}",
+                        },
+                        value_semantics="raw",
+                        value=5,
+                    ),
+                    _prometheus_series(
+                        {
+                            "__name__": "mysql:all_server_status:all",
+                            "metric": "innodb_buffer_pool_pages_free",
+                            "subsystem": "buffer_pool",
+                        },
+                        value_semantics="rate",
+                        value=7,
+                    ),
+                ]
+            )
+        ]
+    )
+
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result=raw_result,
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join(item.statement for item in result.observations)
+    assert result.analysis_usable is True
+    assert result.limitations == []
+    assert '"metric":"threads_connected"' in projected
+    assert '"metric":"innodb_buffer_pool_pages_free"' in projected
+    assert '"subsystem":"connections"' in projected
+    assert '"value_semantics":"raw"' in projected
+    assert '"value_semantics":"rate"' in projected
+    assert secret not in projected
+    assert "agent-artifact://" not in projected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("series", "exclusion"),
+    [
+        (
+            [_prometheus_series({}, value_semantics="raw")],
+            "metric_identity_missing_or_invalid_series",
+        ),
+        (
+            [
+                _prometheus_series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    value_semantics="raw",
+                ),
+                _prometheus_series(
+                    {
+                        "__name__": "mysql:all_server_status:all",
+                        "metric": "threads_connected",
+                    },
+                    value_semantics="raw",
+                ),
+            ],
+            "metric_identity_collision_series",
+        ),
+    ],
+)
+async def test_prometheus_public_projection_rejects_anonymous_or_colliding_series(
+    series: list[dict[str, object]],
+    exclusion: str,
+) -> None:
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result=_prometheus_v5_raw_result([_prometheus_projection_item(series)]),
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join([*(item.statement for item in result.observations), *result.limitations])
+    assert result.analysis_usable is False
+    assert f'"{exclusion}"' in projected
+    assert not any("时序聚合" in item.statement for item in result.observations[1:])
+
+
+@pytest.mark.asyncio
+async def test_prometheus_public_projection_bounds_whole_series_without_cutting_identity() -> None:
+    first = [
+        _prometheus_series(
+            {
+                "__name__": "mysql:all_server_status:all",
+                "metric": f"semantic_metric_{index}_" + ("x" * 150),
+            },
+            value=index,
+        )
+        for index in range(15)
+    ]
+    second = [
+        _prometheus_series(
+            {
+                "__name__": "mysql:all_server_status:all",
+                "metric": f"semantic_metric_{index}_" + ("x" * 150),
+            },
+            value=index,
+        )
+        for index in range(15, 25)
+    ]
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result=_prometheus_v5_raw_result(
+            [
+                _prometheus_projection_item(first, omitted_series_count=2),
+                _prometheus_projection_item(second),
+            ]
+        ),
+        artifact=_artifact(),
+    )
+
+    aggregate_statements = [
+        item.statement for item in result.observations if "时序聚合" in item.statement
+    ]
+    assert result.analysis_usable is True
+    assert len(aggregate_statements) == 20
+    assert "semantic_metric_19_" + ("x" * 150) in aggregate_statements[-1]
+    assert all("[omitted,total_chars" not in statement for statement in aggregate_statements)
+    assert any("Provider 公开投影按完整时序项省略 2 条" in item for item in result.limitations)
+    assert any("另有 5 条合格投影" in item for item in result.limitations)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_v5_requires_declared_value_semantics() -> None:
+    series = _prometheus_series({"__name__": "mysql_threads_connected"})
+    del series["value_semantics"]
+    result = await DeterministicToolResultProcessor().analyze(
+        tool_name="query_mcp_prometheus",
+        source_system="prometheus_mcp",
+        request={},
+        raw_result=_prometheus_v5_raw_result([_prometheus_projection_item([series])]),
+        artifact=_artifact(),
+    )
+
+    projected = "\n".join([*(item.statement for item in result.observations), *result.limitations])
+    assert result.analysis_usable is False
+    assert '"invalid_value_semantics_series":1' in projected
 
 
 @pytest.mark.asyncio
@@ -881,7 +1120,7 @@ async def test_prometheus_v4_empty_range_uses_execution_counts_not_zero_over_zer
         artifact=_artifact(),
     )
 
-    assert result.prompt_version == "program-fact-projection-v8"
+    assert result.prompt_version == "program-fact-projection-v9"
     assert result.analysis_usable is False
     assert "成功范围查询 1 次" in result.summary
     assert "匹配 0/0" not in result.summary

@@ -174,7 +174,7 @@ class RuntimeSettingsPatch(BaseModel):
     react_max_rounds: int | None = Field(default=None, ge=1, le=100)
     analysis_timeout_seconds: int | None = Field(default=None, ge=30, le=86_400)
     alert_analysis_filter_enabled: bool | None = None
-    alert_analysis_filter_max_severity: Severity | None = None
+    alert_analysis_filter_severities: list[Severity] | None = None
     scheduler_workers: int | None = Field(default=None, ge=1, le=16)
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     wecom_page_base_url: str | None = Field(default=None, max_length=2048)
@@ -211,7 +211,7 @@ class RuntimeSettingsResponse(BaseModel):
     analysis_timeout_seconds: int
     scheduler_workers: int
     alert_analysis_filter_enabled: bool
-    alert_analysis_filter_max_severity: Severity
+    alert_analysis_filter_severities: list[Severity]
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
     wecom_page_base_url: str
@@ -264,7 +264,7 @@ class RuntimeSettingsResponse(BaseModel):
             analysis_timeout_seconds=settings.analysis_timeout_seconds,
             scheduler_workers=settings.scheduler_workers,
             alert_analysis_filter_enabled=settings.alert_analysis_filter_enabled,
-            alert_analysis_filter_max_severity=settings.alert_analysis_filter_max_severity,
+            alert_analysis_filter_severities=settings.alert_analysis_filter_severities,
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             wecom_page_base_url=settings.wecom_page_base_url,

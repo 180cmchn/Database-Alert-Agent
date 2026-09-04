@@ -109,7 +109,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     with client:
         initial = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
         assert initial["alert_analysis_filter_enabled"] is False
-        assert initial["alert_analysis_filter_max_severity"] == "INFO"
+        assert initial["alert_analysis_filter_severities"] == ["INFO"]
         response = client.patch(
             "/api/v1/admin/settings",
             headers=ADMIN_HEADERS,
@@ -123,7 +123,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
                 "analysis_timeout_seconds": 2400,
                 "stream_main_agent_reasoning": True,
                 "alert_analysis_filter_enabled": True,
-                "alert_analysis_filter_max_severity": "WARNING",
+                "alert_analysis_filter_severities": ["INFO", "CRITICAL", "INFO"],
             },
         )
         assert response.status_code == 200
@@ -134,7 +134,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert body["analysis_timeout_seconds"] == 2400
         assert body["stream_main_agent_reasoning"] is True
         assert body["alert_analysis_filter_enabled"] is True
-        assert body["alert_analysis_filter_max_severity"] == "WARNING"
+        assert body["alert_analysis_filter_severities"] == ["CRITICAL", "INFO"]
         assert "archery_mcp_max_agent_steps" not in body
         assert body["apply_status"] == "applied"
         assert body["worker_refresh_mode"] == "before_each_batch"
@@ -185,9 +185,13 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert runtime.settings.stream_main_agent_reasoning is True
         assert runtime.service.stream_main_agent_reasoning is True
         assert runtime.settings.alert_analysis_filter_enabled is True
-        assert runtime.settings.alert_analysis_filter_max_severity.value == "WARNING"
+        assert [
+            item.value for item in runtime.settings.alert_analysis_filter_severities
+        ] == ["CRITICAL", "INFO"]
         assert runtime.service.alert_analysis_filter_enabled is True
-        assert runtime.service.alert_analysis_filter_max_severity.value == "WARNING"
+        assert {
+            item.value for item in runtime.service.alert_analysis_filter_severities
+        } == {"CRITICAL", "INFO"}
         assert "validation_enabled" not in body
 
         removed_validator_setting = client.patch(
@@ -244,7 +248,7 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
     assert persisted["ai_api_key"] == secret
     assert persisted["analysis_timeout_seconds"] == 2400
     assert persisted["alert_analysis_filter_enabled"] is True
-    assert persisted["alert_analysis_filter_max_severity"] == "WARNING"
+    assert persisted["alert_analysis_filter_severities"] == ["CRITICAL", "INFO"]
     assert "archery_mcp_max_agent_steps" not in persisted
     audit = (tmp_path / "runtime-settings.audit.jsonl").read_text(encoding="utf-8")
     assert secret not in audit
@@ -436,7 +440,7 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
                 "scheduler_workers": 2,
                 "stream_main_agent_reasoning": True,
                 "alert_analysis_filter_enabled": True,
-                "alert_analysis_filter_max_severity": "CRITICAL",
+                "alert_analysis_filter_severities": ["CRITICAL", "WARNING", "INFO"],
             },
         )
         assert patched.status_code == 200
@@ -445,7 +449,7 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
         assert body["scheduler_workers"] == 2
         assert body["stream_main_agent_reasoning"] is True
         assert body["alert_analysis_filter_enabled"] is True
-        assert body["alert_analysis_filter_max_severity"] == "CRITICAL"
+        assert body["alert_analysis_filter_severities"] == ["CRITICAL", "WARNING", "INFO"]
 
         reset = client.delete(
             "/api/v1/admin/settings/runtime-overrides",
@@ -459,9 +463,11 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
         assert reset_body["scheduler_workers"] == 1
         assert reset_body["stream_main_agent_reasoning"] is False
         assert reset_body["alert_analysis_filter_enabled"] is False
-        assert reset_body["alert_analysis_filter_max_severity"] == "INFO"
+        assert reset_body["alert_analysis_filter_severities"] == ["INFO"]
         assert runtime.service.alert_analysis_filter_enabled is False
-        assert runtime.service.alert_analysis_filter_max_severity.value == "INFO"
+        assert {item.value for item in runtime.service.alert_analysis_filter_severities} == {
+            "INFO"
+        }
 
         persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
         assert persisted == {}
