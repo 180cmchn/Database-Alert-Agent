@@ -19,7 +19,6 @@ import {
   LockKeyhole,
   Radio,
   RefreshCw,
-  Siren,
   TerminalSquare,
   Users,
   XCircle,
@@ -544,7 +543,7 @@ export function AlertDetailPage() {
       )}
 
       <section className="incident-facts">
-        <div><span><CircleAlert size={15} /> 告警原因</span><strong>{alert.reason}</strong></div>
+        <div><span><CircleAlert size={15} /> 告警项</span><strong>{alert.reason}</strong></div>
         <div><span><Database size={15} /> 数据库目标</span><strong>{[alert.database?.engine, alert.database?.instance].filter(Boolean).join(" · ") || "未提供"}</strong></div>
         <div><span><Gauge size={15} /> 环境 / 服务</span><strong>{alert.environment} · {alert.service_name}</strong></div>
         <div><span><Clock3 size={15} /> 发生时间</span><strong>{formatDateTime(alert.occurred_at)}</strong></div>
@@ -592,6 +591,50 @@ export function AlertDetailPage() {
         >
           <StageTimeline currentStage={currentStage} progress={record.progress} />
         </SectionCard>
+        <SectionCard
+          eyebrow="ACTION PLAN"
+          title="建议处理结果"
+          description="基于已验证根因给出实际恢复动作；涉及变更时请遵循风险、审批和回滚要求"
+        >
+          {recommendation ? (
+            recommendation.steps.length > 0 ? (
+              <ol className="action-steps">
+                {recommendation.steps.map((step) => (
+                  <li key={step.order}>
+                    <span className="step-number">{String(step.order).padStart(2, "0")}</span>
+                    <div>
+                      <strong>{step.action}</strong>
+                      {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
+                      {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
+                      {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="muted-copy">现有结果未建立根因，因此未生成猜测性处置步骤。</p>
+            )
+          ) : (
+            <div className="waiting-panel">
+              <Bot size={29} />
+              <strong>
+                {isActive
+                  ? "Agent 正在生成建议处理结果"
+                  : !record.selected_run_result_available
+                    ? "历史建议处理结果不可恢复"
+                    : "本次分析未生成建议处理结果"}
+              </strong>
+              <span>
+                {isActive
+                  ? "建议将在根因确认和结果校验完成后显示。"
+                  : !record.selected_run_result_available
+                    ? "该次运行发生在运行级结果开始保存之前。"
+                    : "请查看页面中的错误与校验记录；本次没有可展示的建议。"}
+              </span>
+            </div>
+          )}
+        </SectionCard>
+      </section>
         <SectionCard
           eyebrow="KNOWLEDGE"
           title="知识匹配"
@@ -664,7 +707,6 @@ export function AlertDetailPage() {
             )}
           </div>
         </SectionCard>
-      </section>
 
       {selectedRun && (
         <AgentTrace
@@ -730,36 +772,9 @@ export function AlertDetailPage() {
             )}
           </SectionCard>
 
-          <section className="advice-grid">
-            <SectionCard eyebrow="ACTION PLAN" title="建议处置步骤" description="基于已验证根因给出实际恢复动作；涉及变更时请遵循风险、审批和回滚要求">
-              {recommendation.steps.length > 0 ? (
-                <ol className="action-steps">
-                  {recommendation.steps.map((step) => (
-                    <li key={step.order}>
-                      <span className="step-number">{String(step.order).padStart(2, "0")}</span>
-                      <div>
-                        <strong>{step.action}</strong>
-                        {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
-                        {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
-                        {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <p className="muted-copy">现有结果未建立根因，因此未生成猜测性处置步骤。</p>
-              )}
+            <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
+              {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref"><ExternalLink size={13} /> {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
             </SectionCard>
-
-            <div className="advice-side">
-              <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
-                {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref"><ExternalLink size={13} /> {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
-              </SectionCard>
-              <SectionCard eyebrow="RISK GUARD" title="风险提示" className="risk-card">
-                {recommendation.risks.length ? <ul className="risk-points">{recommendation.risks.map((risk) => <li key={risk}><Siren size={14} /> {risk}</li>)}</ul> : <p className="muted-copy">没有额外风险提示。</p>}
-              </SectionCard>
-            </div>
-          </section>
         </section>
       ) : (
         <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
@@ -771,7 +786,6 @@ export function AlertDetailPage() {
         </SectionCard>
       )}
 
-      <section className="detail-grid audit-grid">
         <SectionCard eyebrow="VALIDATION" title="结果契约校验" description="程序只核对结构、引用与来源资格，不重新判断根因">
           {record.validations.length ? (
             <div className="validation-list">
@@ -798,7 +812,6 @@ export function AlertDetailPage() {
           ) : <EmptyState title="暂无校验记录" description="建议生成后，校验结果会记录在审计链路中。" />}
         </SectionCard>
 
-      </section>
 
       <SectionCard
         eyebrow="DEBUG TOOLS"

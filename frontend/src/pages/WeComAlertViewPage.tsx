@@ -189,14 +189,6 @@ function RecoveryAdviceContent({ record }: { record: StoredAlert }) {
         )}
       </section>
 
-      {recommendation.risks.length > 0 && (
-        <section className="wecom-content-card wecom-risk-card">
-          <div className="wecom-section-title"><ShieldAlert size={20} /><h2>风险与审批提示</h2></div>
-          <ul className="wecom-simple-list">
-            {recommendation.risks.map((risk) => <li key={risk}>{risk}</li>)}
-          </ul>
-        </section>
-      )}
     </div>
   );
 }
