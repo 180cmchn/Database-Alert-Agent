@@ -32,6 +32,7 @@ from app.domain.models import (
     RootCauseAssessment,
     RootCauseStatus,
     RunStatus,
+    Severity,
     ToolExecutionRequest,
     ToolStatus,
     ValidationKind,
@@ -628,6 +629,128 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
     assert [item.kind for item in first.validations] == [ValidationKind.RULE]
     assert all(item.passed for item in first.validations)
     assert all(not item.evidence_sufficient for item in first.validations)
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "max_severity", "severity", "filtered"),
+    [
+        pytest.param(False, Severity.CRITICAL, Severity.INFO, False, id="disabled"),
+        pytest.param(True, Severity.INFO, Severity.INFO, True, id="info-filters-info"),
+        pytest.param(True, Severity.INFO, Severity.WARNING, False, id="info-admits-warning"),
+        pytest.param(True, Severity.INFO, Severity.CRITICAL, False, id="info-admits-critical"),
+        pytest.param(True, Severity.WARNING, Severity.INFO, True, id="warning-filters-info"),
+        pytest.param(True, Severity.WARNING, Severity.WARNING, True, id="warning-filters-warning"),
+        pytest.param(
+            True,
+            Severity.WARNING,
+            Severity.CRITICAL,
+            False,
+            id="warning-admits-critical",
+        ),
+        pytest.param(True, Severity.CRITICAL, Severity.INFO, True, id="critical-filters-info"),
+        pytest.param(
+            True,
+            Severity.CRITICAL,
+            Severity.WARNING,
+            True,
+            id="critical-filters-warning",
+        ),
+        pytest.param(
+            True,
+            Severity.CRITICAL,
+            Severity.CRITICAL,
+            True,
+            id="critical-filters-critical",
+        ),
+    ],
+)
+async def test_analysis_filter_applies_normalized_severity_matrix(
+    tmp_path: Path,
+    enabled: bool,
+    max_severity: Severity,
+    severity: Severity,
+    filtered: bool,
+) -> None:
+    events: list[str] = []
+    advisor = RecordingAdvisor(events)
+    settings = settings_for(tmp_path).model_copy(
+        update={
+            "alert_analysis_filter_enabled": enabled,
+            "alert_analysis_filter_max_severity": max_severity,
+        }
+    )
+    runtime = build_runtime(settings, advisor=advisor, notifier=RecordingNotifier(events))
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": f"filter-{enabled}-{max_severity.value}-{severity.value}",
+            "severity": severity.value,
+            "title": "Severity admission test",
+            "reason": "test",
+        },
+    )
+
+    if filtered:
+        assert result.status == AlertStatus.FILTERED
+        assert result.latest_run is None
+        assert result.all_runs == []
+        assert result.recommendation is None
+        assert result.progress == []
+        assert result.evidence_records == []
+        assert result.validations == []
+        assert events == []
+        retried = await runtime.service.analyze_by_id(str(result.alert.id))
+        assert retried.status == AlertStatus.FILTERED
+        assert events == []
+    else:
+        assert result.status == AlertStatus.INCONCLUSIVE
+        assert events == ["ADVISOR", f"RESULT:{severity.value}"]
+
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_explicit_reanalysis_overrides_filtered_admission(tmp_path: Path) -> None:
+    events: list[str] = []
+    settings = settings_for(tmp_path).model_copy(
+        update={
+            "alert_analysis_filter_enabled": True,
+            "alert_analysis_filter_max_severity": Severity.CRITICAL,
+        }
+    )
+    runtime = build_runtime(
+        settings,
+        advisor=RecordingAdvisor(events),
+        notifier=RecordingNotifier(events),
+    )
+    await runtime.repository.initialize()
+    filtered, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "filtered-manual-reanalysis",
+            "severity": "WARNING",
+            "title": "Explicit reanalysis",
+            "reason": "test",
+        },
+    )
+    assert filtered.status == AlertStatus.FILTERED
+
+    run, _ = await runtime.service.reanalyze(str(filtered.alert.id))
+    current = await runtime.repository.get(str(filtered.alert.id))
+    assert current is not None and current.latest_run is not None
+    async with asyncio.timeout(3):
+        while current.latest_run.status == RunStatus.RUNNING:
+            await asyncio.sleep(0.01)
+            current = await runtime.repository.get(str(filtered.alert.id))
+            assert current is not None and current.latest_run is not None
+
+    assert current.status == AlertStatus.INCONCLUSIVE
+    assert current.latest_run.id == run.id
+    assert current.latest_run.status == RunStatus.INCONCLUSIVE
+    assert events == ["ADVISOR", "RESULT:WARNING"]
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

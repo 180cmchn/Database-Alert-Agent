@@ -4,6 +4,7 @@ import {
   CircleAlert,
   Eye,
   EyeOff,
+  Filter,
   KeyRound,
   RefreshCw,
   Save,
@@ -28,6 +29,7 @@ import type {
   AdminSettingsPatch,
   AIProvider,
   ReasoningEffort,
+  Severity,
 } from "../types/api";
 import { REASONING_EFFORT_OPTIONS } from "../types/api";
 
@@ -71,6 +73,8 @@ export function SettingsPage() {
   const [showKnowledgeApiKey, setShowKnowledgeApiKey] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState("openai_compatible");
   const [flashdutyPollingEnabled, setFlashdutyPollingEnabled] = useState(false);
+  const [alertAnalysisFilterEnabled, setAlertAnalysisFilterEnabled] = useState(false);
+  const [alertAnalysisFilterMaxSeverity, setAlertAnalysisFilterMaxSeverity] = useState<Severity>("INFO");
   const [wecomEnabled, setWecomEnabled] = useState(false);
   const [externalKnowledgeSelected, setExternalKnowledgeSelected] = useState(false);
 
@@ -98,6 +102,8 @@ export function SettingsPage() {
     if (settings) {
       setSelectedProvider(settings.ai_provider);
       setFlashdutyPollingEnabled(settings.flashduty_polling_enabled);
+      setAlertAnalysisFilterEnabled(settings.alert_analysis_filter_enabled);
+      setAlertAnalysisFilterMaxSeverity(settings.alert_analysis_filter_max_severity);
       setWecomEnabled(settings.wecom_enabled);
       setExternalKnowledgeSelected(settings.knowledge_sources.includes("external_knowledge"));
     }
@@ -136,6 +142,8 @@ export function SettingsPage() {
         react_max_rounds: numberField(form, "react_max_rounds"),
         analysis_timeout_seconds: numberField(form, "analysis_timeout_seconds"),
         scheduler_workers: numberField(form, "scheduler_workers"),
+        alert_analysis_filter_enabled: alertAnalysisFilterEnabled,
+        alert_analysis_filter_max_severity: alertAnalysisFilterMaxSeverity,
         knowledge_sources: knowledgeSources,
         flashduty_polling_enabled: form.get("flashduty_polling_enabled") === "on",
         flashduty_poll_interval_seconds: numberField(
@@ -241,6 +249,58 @@ export function SettingsPage() {
             <label className="field span-2"><span>官方 API Endpoint</span><input value={settings.flashduty_base_url} readOnly /></label>
             <label className="field"><span>协作空间范围</span><input value={settings.flashduty_poll_channel_ids.length ? settings.flashduty_poll_channel_ids.join(", ") : "未配置（服务不会拉取）"} readOnly /></label>
             <label className="field"><span>集成范围</span><input value={settings.flashduty_poll_integration_ids.length ? settings.flashduty_poll_integration_ids.join(", ") : "全部集成"} readOnly /></label>
+          </div>
+        </SectionCard>
+
+        <SectionCard
+          eyebrow="ALERT ADMISSION"
+          title="告警分析准入"
+          description="按归一化告警等级决定新告警是否进入自动分析；被过滤的告警仍会入库。"
+          action={
+            <span className={`configured-chip ${alertAnalysisFilterEnabled ? "yes" : "no"}`}>
+              <Filter size={13} />
+              {alertAnalysisFilterEnabled ? "等级过滤已开启" : "等级过滤未开启"}
+            </span>
+          }
+        >
+          <div className="switch-stack">
+            <label className="switch-row">
+              <span>
+                <Filter size={17} />
+                <span>
+                  <strong>启用告警等级过滤</strong>
+                  <small>开启后，指定等级及以下的新告警只入库，不分析且不发送企微通知</small>
+                </span>
+              </span>
+              <input
+                name="alert_analysis_filter_enabled"
+                type="checkbox"
+                checked={alertAnalysisFilterEnabled}
+                onChange={(event) => setAlertAnalysisFilterEnabled(event.target.checked)}
+              />
+              <i />
+            </label>
+          </div>
+          <div className="form-grid two-cols settings-inline-fields">
+            <label className="field">
+              <span>仅入库等级上限</span>
+              <select
+                name="alert_analysis_filter_max_severity"
+                value={alertAnalysisFilterMaxSeverity}
+                onChange={(event) => setAlertAnalysisFilterMaxSeverity(event.target.value as Severity)}
+                disabled={!alertAnalysisFilterEnabled}
+              >
+                <option value="INFO">INFO（仅 INFO 只入库）</option>
+                <option value="WARNING">WARNING（INFO、WARNING 只入库）</option>
+                <option value="CRITICAL">CRITICAL（全部等级只入库）</option>
+              </select>
+              <small>只分析严格高于该等级的告警；关闭开关时仍保留此选择。</small>
+            </label>
+            <div className="field">
+              <span>生效范围</span>
+              <input value="之后首次接入的新告警" readOnly />
+              <small>不会取消已排队或分析中的任务，也不会自动补跑历史仅入库告警。</small>
+            </div>
           </div>
         </SectionCard>
 

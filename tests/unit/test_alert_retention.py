@@ -48,6 +48,7 @@ async def test_cleanup_removes_all_expired_terminal_alerts(
     old_active = await _create_alert(repository, "old-active")
     recent_completed = await _create_alert(repository, "recent-completed")
     old_inconclusive = await _create_alert(repository, "old-inconclusive")
+    old_filtered = await _create_alert(repository, "old-filtered")
     cutoff = datetime.now(UTC) - timedelta(days=7)
     old_time = cutoff - timedelta(seconds=1)
 
@@ -58,6 +59,7 @@ async def test_cleanup_removes_all_expired_terminal_alerts(
             old_active,
             recent_completed,
             old_inconclusive,
+            old_filtered,
         ]
         rows = {
             row.id: row
@@ -65,19 +67,21 @@ async def test_cleanup_removes_all_expired_terminal_alerts(
             .scalars()
             .all()
         }
-        for alert_id in (old_completed, old_active, old_inconclusive, old_failed):
+        for alert_id in (old_completed, old_active, old_inconclusive, old_failed, old_filtered):
             rows[alert_id].created_at = old_time
         rows[old_completed].status = AlertStatus.COMPLETED.value
         rows[old_failed].status = AlertStatus.FAILED.value
         rows[old_active].status = AlertStatus.QUEUED.value
         rows[recent_completed].status = AlertStatus.COMPLETED.value
         rows[old_inconclusive].status = AlertStatus.INCONCLUSIVE.value
+        rows[old_filtered].status = AlertStatus.FILTERED.value
         await session.commit()
 
-    assert await repository.cleanup_expired_alerts(cutoff) == 3
+    assert await repository.cleanup_expired_alerts(cutoff) == 4
     assert await repository.get(old_completed) is None
     assert await repository.get(old_failed) is None
     assert await repository.get(old_inconclusive) is None
+    assert await repository.get(old_filtered) is None
     assert await repository.get(recent_completed) is not None
     assert await repository.get(old_active) is not None
     await repository.close()

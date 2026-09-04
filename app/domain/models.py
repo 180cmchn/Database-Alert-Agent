@@ -19,15 +19,31 @@ class Severity(StrEnum):
     WARNING = "WARNING"
     INFO = "INFO"
 
+    def is_higher_than(self, other: Severity) -> bool:
+        if self is Severity.INFO:
+            return False
+        if self is Severity.WARNING:
+            return other is Severity.INFO
+        return other is not Severity.CRITICAL
+
 
 class AlertStatus(StrEnum):
     RECEIVED = "RECEIVED"
     QUEUED = "QUEUED"
     ANALYZING = "ANALYZING"
+    FILTERED = "FILTERED"
     COMPLETED = "COMPLETED"
     INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+AUTO_ANALYSIS_SCHEDULABLE_STATUSES = frozenset(
+    {
+        AlertStatus.RECEIVED,
+        AlertStatus.QUEUED,
+        AlertStatus.FAILED,
+    }
+)
 
 
 class InvestigationStage(StrEnum):

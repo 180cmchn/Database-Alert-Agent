@@ -10,6 +10,7 @@ export const statusLabel: Record<AlertStatus, string> = {
   RECEIVED: "已接收",
   QUEUED: "排队中",
   ANALYZING: "分析中",
+  FILTERED: "仅入库",
   COMPLETED: "已完成",
   INCONCLUSIVE: "结论不充分",
   FAILED: "分析失败",

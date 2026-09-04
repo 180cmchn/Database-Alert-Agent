@@ -10,7 +10,9 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
 ## 分析流程
 
 1. 后台轮询由 `FLASHDUTY_POLLING_ENABLED` 控制，默认关闭。轮询器按
-   `FLASHDUTY_POLL_CHANNEL_IDS` 查询协作空间，以 `source + alert_id` 去重，只有新告警自动入队。
+   `FLASHDUTY_POLL_CHANNEL_IDS` 查询协作空间，以 `source + alert_id` 去重。新告警完成标准化后先执行
+   等级准入：符合策略的告警进入分析队列；被过滤的告警以 `FILTERED` 状态入库，不创建分析运行，
+   也不发送企微通知。
 2. 分析首先调用 FlashDuty `/alert/info`。详情中的数据库、`alarm_host`、`alarm_port` 和
    `occurred_at` 同时参与知识匹配、MCP 选择和查询；host、port 不从标题推断或补全。
 3. 系统检索本次选择的知识来源，保留实际命中的来源、知识 ID、标题和 URI。
@@ -95,6 +97,7 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | --- | --- |
 | FlashDuty 协作空间 | `.env` 中 `FLASHDUTY_POLL_CHANNEL_IDS`，修改后重启 |
 | FlashDuty 轮询开关和间隔 | `.env` / Agent 设置页；模板见 `.env.example` |
+| 告警等级过滤开关和仅入库上限 | `.env` / Agent 设置页；`ALERT_ANALYSIS_FILTER_*` |
 | MCP 连接与提示词引用 | `config/mcp/settings.json` |
 | MCP 角色、作用、工作流程和行为边界 | `config/mcp/prompts/<provider>/{role,purpose,workflow,safety}.md` |
 | MCP 原始结果的程序投影 | `app/adapters/tool_result_analysis.py` |
@@ -288,7 +291,7 @@ FLASHDUTY_POLL_INTEGRATION_IDS=[]
 ```
 
 `FLASHDUTY_POLLING_ENABLED=false` 时不启动自动轮询，手动轮询和重新分析不受该开关影响。轮询器先
-读取完整游标分页再入库，不设置影子模式。
+读取完整游标分页再入库，不设置影子模式；手动和后台轮询接入的新告警都执行相同的等级准入策略。
 
 ## 运行配置
 
@@ -306,6 +309,8 @@ AI_TIMEOUT_SECONDS=300
 REACT_MAX_ROUNDS=8
 ANALYSIS_TIMEOUT_SECONDS=1800
 SCHEDULER_WORKERS=1
+ALERT_ANALYSIS_FILTER_ENABLED=false
+ALERT_ANALYSIS_FILTER_MAX_SEVERITY=INFO
 # 必填部署基线；可在 Agent 设置页运行时覆盖。
 STREAM_MAIN_AGENT_REASONING=false
 ```
@@ -318,6 +323,12 @@ DeepSeek 或内部兼容网关。使用 OpenAI Responses API 时设置为 `opena
 `REACT_MAX_ROUNDS` 范围 1–100，默认 8；`ANALYSIS_TIMEOUT_SECONDS` 范围 30–86400，默认 1800。
 `AI_MAX_TOKENS` 应为 reasoning 和结构化输出预留足够空间。模型超时或结构化输出不可用时，保守降级
 为 `现有结果无法得出根因`，不会虚构结果。
+
+`ALERT_ANALYSIS_FILTER_ENABLED` 默认关闭。开启后，系统只自动分析严格高于
+`ALERT_ANALYSIS_FILTER_MAX_SEVERITY` 的新告警：上限为 `INFO` 时只过滤 INFO，上限为 `WARNING` 时
+过滤 INFO 和 WARNING，上限为 `CRITICAL` 时全部新告警只入库。该决定在首次入库时持久化，不会取消
+已排队或正在分析的任务，也不会因之后修改配置而自动补跑历史 `FILTERED` 告警；管理员仍可显式重新
+分析这类告警。
 
 `STREAM_MAIN_AGENT_REASONING` 没有代码默认值，部署时必须显式设置。Agent 设置页中的开关属于运行级
 覆盖，只影响之后创建的分析运行；清空运行级覆盖后，API 和 Worker 会立即恢复环境变量中的部署基线，

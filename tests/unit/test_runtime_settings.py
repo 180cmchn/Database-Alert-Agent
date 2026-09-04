@@ -15,6 +15,7 @@ from app.application.admin import (
 )
 from app.application.factory import _mcp_environment
 from app.config import RUNTIME_SETTINGS_KEYS, Settings, get_settings
+from app.domain.models import Severity
 
 
 def test_windows_file_lock_backend_uses_a_stable_lock_byte(
@@ -566,6 +567,35 @@ def test_runtime_patch_schema_requires_revision_and_excludes_it_from_updates() -
             scheduler_workers=17,
         )
 
+def test_alert_analysis_filter_settings_are_runtime_editable(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        alert_analysis_filter_enabled=True,
+        alert_analysis_filter_max_severity="WARNING",
+        runtime_settings_path=tmp_path / "runtime-settings.json",
+    )
+
+    assert settings.alert_analysis_filter_enabled is True
+    assert settings.alert_analysis_filter_max_severity == Severity.WARNING
+    assert "alert_analysis_filter_enabled" in RUNTIME_SETTINGS_KEYS
+    assert "alert_analysis_filter_max_severity" in RUNTIME_SETTINGS_KEYS
+
+    patch = RuntimeSettingsPatch(
+        expected_revision="0123456789abcdef",
+        alert_analysis_filter_enabled=True,
+        alert_analysis_filter_max_severity="CRITICAL",
+    )
+    assert patch.updates() == {
+        "alert_analysis_filter_enabled": True,
+        "alert_analysis_filter_max_severity": "CRITICAL",
+    }
+    with pytest.raises(ValidationError):
+        RuntimeSettingsPatch(
+            expected_revision="0123456789abcdef",
+            alert_analysis_filter_max_severity="DEBUG",  # type: ignore[arg-type]
+        )
+
 
 def test_stream_main_agent_reasoning_requires_valid_deployment_baseline(
     monkeypatch: pytest.MonkeyPatch,
@@ -770,6 +800,8 @@ def test_runtime_settings_response_contains_only_safe_readiness_summary(
     assert body["flashduty_polling_enabled"] is False
     assert body["flashduty_poll_interval_seconds"] == 300
     assert body["analysis_timeout_seconds"] == 1800
+    assert body["alert_analysis_filter_enabled"] is False
+    assert body["alert_analysis_filter_max_severity"] == "INFO"
     assert "archery_mcp_max_agent_steps" not in body
     assert "shadow_enabled" not in body
     assert "production_gate_approved" not in body

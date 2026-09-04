@@ -137,6 +137,7 @@ button { color: inherit; }
 .severity-info { color: var(--info); background: rgba(50, 162, 95, 0.07); border: 1px solid rgba(50, 162, 95, 0.22); }
 .status { color: var(--text-soft); background: rgba(102, 102, 102, 0.08); border: 1px solid var(--line); }
 .status-analyzing { color: var(--cyan); background: rgba(22, 119, 255, 0.07); border-color: rgba(22, 119, 255, 0.22); }
+.status-filtered { color: var(--muted); background: rgba(153, 153, 153, 0.1); border-color: var(--line); }
 .status-completed { color: var(--success); background: rgba(50, 162, 95, 0.07); border-color: rgba(50, 162, 95, 0.22); }
 .status-inconclusive { color: var(--warning); background: rgba(255, 140, 0, 0.07); border-color: rgba(255, 140, 0, 0.22); }
 .status-failed { color: var(--danger); background: rgba(219, 0, 7, 0.07); border-color: rgba(219, 0, 7, 0.22); }
@@ -160,7 +161,7 @@ button { color: inherit; }
 .pipeline-row strong { color: var(--text); font-size: 13px; text-align: right; }
 .pipeline-track { height: 7px; overflow: hidden; background: var(--line-soft); border-radius: 99px; }
 .pipeline-fill { display: block; height: 100%; background: var(--muted); border-radius: inherit; transition: width 300ms ease; }
-.fill-analyzing { background: var(--cyan); }.fill-completed { background: var(--success); }.fill-inconclusive { background: var(--warning); }.fill-failed { background: var(--danger); }.fill-queued { background: #999999; }
+.fill-analyzing { background: var(--cyan); }.fill-completed { background: var(--success); }.fill-inconclusive { background: var(--warning); }.fill-failed { background: var(--danger); }.fill-filtered { background: #777777; }.fill-queued { background: #999999; }
 .dashboard-split .section-card:last-child { display: grid; grid-template-columns: 145px 1fr; align-items: center; }
 .dashboard-split .section-card:last-child .section-heading { grid-column: 1 / -1; }
 .severity-ring { width: 122px; aspect-ratio: 1; margin: 0 auto; display: grid; place-items: center; background: var(--surface-3); border-radius: 50%; }

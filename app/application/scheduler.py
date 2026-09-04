@@ -13,7 +13,7 @@ from app.adapters.flashduty import FlashDutyClient
 from app.agent_runtime.leases import LeaseLostError
 from app.application.service import AlertAnalysisService
 from app.config import Settings
-from app.domain.models import AlertStatus, StoredAlert
+from app.domain.models import AUTO_ANALYSIS_SCHEDULABLE_STATUSES, AlertStatus, StoredAlert
 
 logger = logging.getLogger(__name__)
 
@@ -187,11 +187,7 @@ class FlashDutyAlertPoller:
                         "flashduty",
                         {"request_id": request_id, "data": item},
                     )
-                    if created or stored.status in {
-                        AlertStatus.RECEIVED,
-                        AlertStatus.QUEUED,
-                        AlertStatus.FAILED,
-                    }:
+                    if stored.status in AUTO_ANALYSIS_SCHEDULABLE_STATUSES:
                         await self.scheduler.enqueue(str(stored.alert.id))
                     processed.append(FlashDutyPollItemResult(stored=stored, created=created))
                 except asyncio.CancelledError:

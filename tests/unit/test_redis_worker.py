@@ -200,13 +200,14 @@ async def test_active_lease_is_deferred_without_dlq_or_retry_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_envelope_accepts_terminal_duplicate() -> None:
-    service = StubService(status=AlertStatus.COMPLETED)
+@pytest.mark.parametrize("status", [AlertStatus.COMPLETED, AlertStatus.FILTERED])
+async def test_process_envelope_accepts_terminal_duplicate(status: AlertStatus) -> None:
+    service = StubService(status=status)
     result = await process_envelope(
         service,  # type: ignore[arg-type]
         {"job_type": "investigate", "alert_id": "alert-1"},
     )
-    assert result.status == AlertStatus.COMPLETED
+    assert result.status == status
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ import { api } from "../lib/api";
 import { severityLabel, statusLabel } from "../lib/format";
 import type { AlertListResponse, AlertStatus, Severity } from "../types/api";
 
-const statuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING", "COMPLETED", "INCONCLUSIVE", "FAILED", "CANCELLED"];
+const statuses: AlertStatus[] = ["RECEIVED", "QUEUED", "ANALYZING", "FILTERED", "COMPLETED", "INCONCLUSIVE", "FAILED", "CANCELLED"];
 const severities: Severity[] = ["CRITICAL", "WARNING", "INFO"];
 const PAGE_SIZE = 20;
 

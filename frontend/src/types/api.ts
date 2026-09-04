@@ -4,6 +4,7 @@ export type AlertStatus =
   | "RECEIVED"
   | "QUEUED"
   | "ANALYZING"
+  | "FILTERED"
   | "COMPLETED"
   | "INCONCLUSIVE"
   | "FAILED"
@@ -417,6 +418,8 @@ export interface AdminSettings {
   scheduler_workers: number;
   react_max_rounds: number;
   analysis_timeout_seconds: number;
+  alert_analysis_filter_enabled: boolean;
+  alert_analysis_filter_max_severity: Severity;
   ai_api_key_configured: boolean;
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
@@ -460,6 +463,8 @@ export interface AdminSettingsPatch {
   wecom_enabled?: boolean;
   react_max_rounds?: number;
   analysis_timeout_seconds?: number;
+  alert_analysis_filter_enabled?: boolean;
+  alert_analysis_filter_max_severity?: Severity;
   ai_api_key?: string;
   knowledge_sources?: string[];
   flashduty_polling_enabled?: boolean;

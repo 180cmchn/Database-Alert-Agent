@@ -506,6 +506,7 @@ export function AlertDetailPage() {
   const { alert, recommendation } = record;
   const visibleRootCauses = recommendation?.root_causes || [];
   const isActive = isTracking;
+  const isFilteredWithoutRun = record.status === "FILTERED" && !selectedRun;
   const knowledgeCard = buildKnowledgeCardModel({
     run: selectedRun,
     recommendation,
@@ -583,6 +584,20 @@ export function AlertDetailPage() {
           </div>
         )}
 
+      {isFilteredWithoutRun ? (
+        <SectionCard
+          eyebrow="ANALYSIS ADMISSION"
+          title="自动分析未启动"
+          description="该告警已完成标准化和持久化，但未进入主 Agent 调查流程。"
+        >
+          <div className="waiting-panel large">
+            <CircleAlert size={29} />
+            <strong>该告警按等级过滤策略仅入库</strong>
+            <span>系统未创建分析运行，也不会发送企微通知；管理员仍可在下方显式发起重新分析。</span>
+          </div>
+        </SectionCard>
+      ) : (
+        <>
       <section className="detail-grid workflow-grid">
         <SectionCard
           eyebrow="LIVE WORKFLOW"
@@ -811,6 +826,8 @@ export function AlertDetailPage() {
             </div>
           ) : <EmptyState title="暂无校验记录" description="建议生成后，校验结果会记录在审计链路中。" />}
         </SectionCard>
+        </>
+      )}
 
 
       <SectionCard

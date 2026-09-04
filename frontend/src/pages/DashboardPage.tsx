@@ -19,6 +19,7 @@ import type { AlertStatus, DashboardSummary, Severity } from "../types/api";
 const statusOrder: AlertStatus[] = [
   "ANALYZING",
   "QUEUED",
+  "FILTERED",
   "INCONCLUSIVE",
   "COMPLETED",
   "FAILED",

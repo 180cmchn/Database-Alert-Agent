@@ -214,7 +214,12 @@ class AlertRepository(Protocol):
 
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int: ...
 
-    async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]: ...
+    async def create_or_get(
+        self,
+        alert: NormalizedAlert,
+        *,
+        initial_status: AlertStatus = AlertStatus.QUEUED,
+    ) -> tuple[StoredAlert, bool]: ...
 
     async def update_alert(
         self,

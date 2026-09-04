@@ -718,6 +718,7 @@ class SQLAlchemyAlertRepository:
                         AlertStatus.COMPLETED.value,
                         AlertStatus.INCONCLUSIVE.value,
                         AlertStatus.FAILED.value,
+                        AlertStatus.FILTERED.value,
                         AlertStatus.CANCELLED.value,
                     ]
                 ),
@@ -826,7 +827,14 @@ class SQLAlchemyAlertRepository:
                 "Database schema is not current (" + "; ".join(details) + f"). {recovery}"
             )
 
-    async def create_or_get(self, alert: NormalizedAlert) -> tuple[StoredAlert, bool]:
+    async def create_or_get(
+        self,
+        alert: NormalizedAlert,
+        *,
+        initial_status: AlertStatus = AlertStatus.QUEUED,
+    ) -> tuple[StoredAlert, bool]:
+        if initial_status not in (AlertStatus.QUEUED, AlertStatus.FILTERED):
+            raise ValueError("initial alert status must be QUEUED or FILTERED")
         async with self.session_factory() as session:
             existing = await self._find_by_identity(session, alert.source, alert.external_id)
             if existing:
@@ -836,7 +844,7 @@ class SQLAlchemyAlertRepository:
                 id=str(alert.id),
                 source=alert.source,
                 external_id=alert.external_id,
-                status=AlertStatus.QUEUED.value,
+                status=initial_status.value,
                 alert_json=alert.model_dump(mode="json"),
             )
             session.add(row)
@@ -1093,6 +1101,7 @@ class SQLAlchemyAlertRepository:
             if not alert_row or alert_row.status in {
                 AlertStatus.COMPLETED.value,
                 AlertStatus.INCONCLUSIVE.value,
+                AlertStatus.FILTERED.value,
                 AlertStatus.CANCELLED.value,
             }:
                 return None

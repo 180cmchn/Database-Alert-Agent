@@ -713,6 +713,33 @@ async def test_new_alert_is_atomically_persisted_as_queued(tmp_path: Path) -> No
     assert stored.status == AlertStatus.QUEUED
     await repository.close()
 
+@pytest.mark.asyncio
+async def test_new_alert_can_be_atomically_filtered_and_cannot_auto_claim(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "filtered.db"))
+    await repository.initialize()
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "external_id": "atomic-filtered-1",
+            "severity": "INFO",
+            "title": "Atomic filtered state",
+            "reason": "test",
+        }
+    )
+
+    stored, created = await repository.create_or_get(
+        alert,
+        initial_status=AlertStatus.FILTERED,
+    )
+
+    assert created is True
+    assert stored.status == AlertStatus.FILTERED
+    assert await repository.create_run(str(stored.alert.id), "worker-1", 300) is None
+    with pytest.raises(ValueError, match="initial alert status"):
+        await repository.create_or_get(alert, initial_status=AlertStatus.COMPLETED)
+    await repository.close()
+
 
 def test_harness_migration_fails_unrecoverable_legacy_running_run(
     tmp_path: Path,

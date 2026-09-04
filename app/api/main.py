@@ -56,6 +56,7 @@ from app.domain.errors import (
     UnknownAlertSourceError,
 )
 from app.domain.models import (
+    AUTO_ANALYSIS_SCHEDULABLE_STATUSES,
     AlertListResult,
     AlertStatus,
     DashboardSummary,
@@ -266,11 +267,7 @@ def create_app(
                 },
             )
         stored, created = await runtime.service.ingest(source, payload)
-        if created or stored.status in {
-            AlertStatus.RECEIVED,
-            AlertStatus.QUEUED,
-            AlertStatus.FAILED,
-        }:
+        if stored.status in AUTO_ANALYSIS_SCHEDULABLE_STATUSES:
             await scheduler.enqueue(str(stored.alert.id))
         return AlertAccepted(
             alert_id=stored.alert.id,
@@ -613,7 +610,7 @@ def create_app(
         """Manually run the same configured window used by the background poller.
 
         This endpoint fetches alerts from FlashDuty API, persists new alerts,
-        enqueues their analysis, and returns the deduplication result.
+        enqueues alerts admitted by the severity policy, and returns the deduplication result.
         """
         if not runtime.flashduty_client:
             raise HTTPException(

@@ -12,8 +12,8 @@ mindmap
     接入与调度
       FlashDuty 轮询
       其它来源 HTTP API
-      标准化 去重 入队
-      Redis Streams 和 Analysis Worker
+      标准化 去重 等级准入 入库
+      符合策略才进入 Redis Streams 和 Analysis Worker
     Agent 分析
       FlashDuty 权威详情
       可选知识来源
@@ -50,7 +50,7 @@ mindmap
 
 图上的七个一级主题，可以归并成三条讲解线：
 
-1. **事件线**：FlashDuty 轮询或其它来源接入，经标准化、去重、调度后交给 Worker。
+1. **事件线**：FlashDuty 轮询或其它来源接入，经标准化、去重和等级准入后持久化；只有符合策略的告警才交给 Worker，过滤告警保持 `FILTERED` 且不发送通知。
 2. **分析线**：LangGraph 先补齐详情和知识，再由主 Agent 循环选择工具并形成结论。
 3. **审计线**：运行状态、模型事件、工具调用、原始结果和 checkpoint 全部持久化，前端只展示适合用户查看的轨迹和投影结果。
 

@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import AliasChoices, Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.domain.models import Severity
+
 DEFAULT_ENVIRONMENT_ALIASES = {
     "production": ["prod", "prd", "production", "生产", "生产环境"],
     "staging": ["staging", "stage", "pre", "预发", "预发布"],
@@ -43,6 +45,8 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "ai_mcp_model",
         "ai_mcp_reasoning_effort",
         "stream_main_agent_reasoning",
+        "alert_analysis_filter_enabled",
+        "alert_analysis_filter_max_severity",
         "wecom_webhook_url",
         "wecom_page_base_url",
         "wecom_enabled",
@@ -139,6 +143,10 @@ class Settings(BaseSettings):
     environment_aliases: dict[str, list[str]] = Field(
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALIASES.copy()
     )
+    # When enabled, alerts at or below this normalized severity are persisted
+    # without creating an automatic investigation run.
+    alert_analysis_filter_enabled: bool = False
+    alert_analysis_filter_max_severity: Severity = Severity.INFO
     wecom_webhook_url: str = Field(default="", repr=False)
     # Public/intranet frontend origin used by WeCom's in-app browser. Root-cause
     # and recovery actions open dedicated lightweight pages under this origin.

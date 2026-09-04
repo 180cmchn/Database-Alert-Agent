@@ -427,6 +427,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.knowledge_registry = knowledge_registry
     service.react_max_rounds = settings.react_max_rounds
     service.analysis_timeout_seconds = settings.analysis_timeout_seconds
+    service.alert_analysis_filter_enabled = settings.alert_analysis_filter_enabled
+    service.alert_analysis_filter_max_severity = settings.alert_analysis_filter_max_severity
     service.ai_fallback_enabled = settings.ai_fallback_enabled
     service.stream_main_agent_reasoning = settings.stream_main_agent_reasoning
     service.external_knowledge_min_relevance = settings.external_knowledge_min_relevance
@@ -506,6 +508,8 @@ def build_runtime(
         stream_main_agent_reasoning=settings.stream_main_agent_reasoning,
         react_max_rounds=settings.react_max_rounds,
         analysis_timeout_seconds=settings.analysis_timeout_seconds,
+        alert_analysis_filter_enabled=settings.alert_analysis_filter_enabled,
+        alert_analysis_filter_max_severity=settings.alert_analysis_filter_max_severity,
         external_knowledge_min_relevance=(settings.external_knowledge_min_relevance),
         knowledge_sources=settings.knowledge_sources,
         runtime_manifest_config=_runtime_manifest_config(settings),

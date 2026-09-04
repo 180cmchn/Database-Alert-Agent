@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.adapters.flashduty import FlashDutyAPIError, FlashDutyResponse
@@ -16,6 +17,7 @@ def create_test_client(
     settings = Settings(
         _env_file=None,
         ai_provider="fake",
+        runtime_settings_path=tmp_path / "runtime-settings.json",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
         **setting_overrides,
     )
@@ -64,6 +66,72 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         assert "knowledge_matches" not in detail_body
         assert all(item["passed"] for item in detail_body["validations"])
         assert all(not item["evidence_sufficient"] for item in detail_body["validations"])
+
+
+def test_analysis_filter_persists_without_scheduling_or_run(tmp_path: Path) -> None:
+    client, _, scheduler = create_test_client(
+        tmp_path,
+        alert_analysis_filter_enabled=True,
+        alert_analysis_filter_max_severity="INFO",
+    )
+    with client:
+        filtered = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "api-filtered-info",
+                "severity": "INFO",
+                "title": "Stored only alert",
+                "reason": "test",
+            },
+        )
+        assert filtered.status_code == 202
+        filtered_body = filtered.json()
+        assert filtered_body["status"] == "FILTERED"
+        assert filtered_body["deduplicated"] is False
+        assert scheduler.jobs == []
+
+        detail = client.get(filtered_body["detail_url"])
+        assert detail.status_code == 200
+        detail_body = detail.json()
+        assert detail_body["status"] == "FILTERED"
+        assert detail_body["latest_run"] is None
+        assert detail_body["all_runs"] == []
+        assert detail_body["recommendation"] is None
+        assert detail_body["progress"] == []
+        assert detail_body["evidence_records"] == []
+        assert detail_body["validations"] == []
+
+        duplicate = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "api-filtered-info",
+                "severity": "INFO",
+                "title": "Stored only alert",
+                "reason": "test",
+            },
+        )
+        assert duplicate.status_code == 202
+        assert duplicate.json()["status"] == "FILTERED"
+        assert duplicate.json()["deduplicated"] is True
+        assert scheduler.jobs == []
+
+        admitted = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "api-admitted-warning",
+                "severity": "WARNING",
+                "title": "Admitted alert",
+                "reason": "test",
+            },
+        )
+        assert admitted.status_code == 202
+        assert admitted.json()["status"] == "QUEUED"
+        assert scheduler.jobs == [admitted.json()["alert_id"]]
+
+        dashboard = client.get("/api/v1/dashboard/summary")
+        assert dashboard.status_code == 200
+        assert dashboard.json()["by_status"]["FILTERED"] == 1
+        assert dashboard.json()["active"] == 1
 
 
 def test_unknown_source_and_invalid_payload(tmp_path: Path) -> None:
@@ -132,7 +200,29 @@ def test_readiness_does_not_probe_external_knowledge_service(tmp_path: Path) -> 
     assert response.json() == {"status": "ready", "issues": []}
 
 
-def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    (
+        "filter_enabled",
+        "raw_severity",
+        "max_severity",
+        "expected_status",
+        "expected_job_count",
+    ),
+    [
+        (False, "Warning", "INFO", "QUEUED", 1),
+        (True, "Warning", "WARNING", "FILTERED", 0),
+        (True, "Ok", "INFO", "FILTERED", 0),
+        (True, "Warning", "INFO", "QUEUED", 1),
+    ],
+)
+def test_manual_flashduty_poll_applies_analysis_filter(
+    tmp_path: Path,
+    filter_enabled: bool,
+    raw_severity: str,
+    max_severity: str,
+    expected_status: str,
+    expected_job_count: int,
+) -> None:
     client, runtime, scheduler = create_test_client(
         tmp_path,
         admin_api_token="test-admin-token",
@@ -141,6 +231,8 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
         flashduty_polling_enabled=False,
         flashduty_poll_lookback_seconds=1200,
         flashduty_poll_channel_ids=[7],
+        alert_analysis_filter_enabled=filter_enabled,
+        alert_analysis_filter_max_severity=max_severity,
     )
     requests: list[dict] = []
 
@@ -155,8 +247,8 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
                             "alert_id": "663a1b2c3d4e5f6789abcdef",
                             "title": "Database latency",
                             "description": "Latency is above threshold",
-                            "alert_severity": "Warning",
-                            "alert_status": "Warning",
+                            "alert_severity": raw_severity,
+                            "alert_status": raw_severity,
                             "alert_key": "database-latency",
                             "start_time": 900,
                             "labels": {"env": "test", "service": "orders-db"},
@@ -176,12 +268,15 @@ def test_manual_flashduty_poll_persists_and_enqueues_new_alert(tmp_path: Path) -
             "/api/v1/admin/flashduty/poll",
             headers={"Authorization": "Bearer test-admin-token"},
         )
+        alerts = client.get("/api/v1/alerts")
 
     assert response.status_code == 200
     assert response.json()["new_count"] == 1
     assert response.json()["time_range_seconds"] == 1200
     assert response.json()["end_time"] - response.json()["start_time"] == 1200
-    assert len(scheduler.jobs) == 1
+    assert len(scheduler.jobs) == expected_job_count
+    assert alerts.status_code == 200
+    assert alerts.json()["items"][0]["status"] == expected_status
     assert requests[0]["by_updated_at"] is False
 
 

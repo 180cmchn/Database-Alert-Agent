@@ -42,6 +42,7 @@ from app.domain.models import (
     ProgressRecord,
     Recommendation,
     RunStatus,
+    Severity,
     StoredAlert,
 )
 from app.domain.ports import (
@@ -86,6 +87,8 @@ class AlertAnalysisService:
         alert_sanitizer: Callable[[NormalizedAlert], NormalizedAlert] = sanitize_alert,
         react_max_rounds: int = 8,
         analysis_timeout_seconds: int = 1800,
+        alert_analysis_filter_enabled: bool = False,
+        alert_analysis_filter_max_severity: Severity = Severity.INFO,
         external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
         runtime_manifest_config: dict[str, Any] | None = None,
@@ -108,6 +111,8 @@ class AlertAnalysisService:
         self.alert_sanitizer = alert_sanitizer
         self.react_max_rounds = react_max_rounds
         self.analysis_timeout_seconds = analysis_timeout_seconds
+        self.alert_analysis_filter_enabled = alert_analysis_filter_enabled
+        self.alert_analysis_filter_max_severity = alert_analysis_filter_max_severity
         self.external_knowledge_min_relevance = external_knowledge_min_relevance
         self.knowledge_sources = knowledge_sources or []
         self.runtime_manifest_config = dict(runtime_manifest_config or {})
@@ -132,6 +137,14 @@ class AlertAnalysisService:
             knowledge_sources=knowledge_sources,
         )
 
+    def _initial_alert_status(self, severity: Severity) -> AlertStatus:
+        if (
+            self.alert_analysis_filter_enabled
+            and not severity.is_higher_than(self.alert_analysis_filter_max_severity)
+        ):
+            return AlertStatus.FILTERED
+        return AlertStatus.QUEUED
+
     async def ingest(self, source: str, payload: dict[str, Any]) -> tuple[StoredAlert, bool]:
         """Ingest an alert from a source.
 
@@ -144,7 +157,10 @@ class AlertAnalysisService:
         """
         normalized = preprocess_normalized_alert(self.source_registry.normalize(source, payload))
         alert = self.alert_sanitizer(normalized)
-        stored, created = await self.repository.create_or_get(alert)
+        stored, created = await self.repository.create_or_get(
+            alert,
+            initial_status=self._initial_alert_status(alert.severity),
+        )
         if not created:
             return stored, False
 
@@ -171,9 +187,10 @@ class AlertAnalysisService:
             The stored alert after analysis
         """
         stored, created = await self.ingest(source, payload)
-        if not created and stored.status in {
+        if stored.status in {
             AlertStatus.COMPLETED,
             AlertStatus.INCONCLUSIVE,
+            AlertStatus.FILTERED,
         }:
             return stored
         if not created and stored.status == AlertStatus.FAILED and not retry_failed:
@@ -192,7 +209,11 @@ class AlertAnalysisService:
             The stored alert after analysis
         """
         stored = await self.get(alert_id)
-        if stored.status in {AlertStatus.COMPLETED, AlertStatus.INCONCLUSIVE}:
+        if stored.status in {
+            AlertStatus.COMPLETED,
+            AlertStatus.INCONCLUSIVE,
+            AlertStatus.FILTERED,
+        }:
             return stored
 
         self._active_analyses += 1
