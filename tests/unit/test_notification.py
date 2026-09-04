@@ -118,13 +118,18 @@ def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
     ]
     assert actions[0]["url"] == (
         f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/root-cause"
+        f"?run_id={event.run_id}"
     )
     assert actions[1]["url"] == (
         f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/recovery-advice"
+        f"?run_id={event.run_id}"
     )
     assert card["card_action"] == {
         "type": 1,
-        "url": f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}",
+        "url": (
+            f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}"
+            f"?run_id={event.run_id}"
+        ),
     }
 
 

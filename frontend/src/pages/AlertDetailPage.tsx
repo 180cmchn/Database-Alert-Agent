@@ -27,6 +27,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
 import { AgentTrace } from "../components/AgentTrace";
+import { AIConclusionContent } from "../components/AIConclusionContent";
 import {
   EmptyState,
   ErrorState,
@@ -54,7 +55,6 @@ import type {
   EvidenceUnit,
   FlashDutyHandlingResponse,
   InvestigationRun,
-  RootCauseAssessment,
   StoredAlert,
 } from "../types/api";
 
@@ -77,57 +77,6 @@ function knowledgeReference(reference: AnalysisBasis["source_ref"]): string | nu
   return `${reference.title} · ${reference.source}`;
 }
 
-function RootCauseContent({ rootCause }: { rootCause: RootCauseAssessment }) {
-  const analysisProcess = rootCause.analysis_process || [];
-  const problemSql = rootCause.problem_sql;
-  const explainResult = rootCause.explain_result;
-
-  return (
-    <div className="root-cause-content">
-      <strong className="root-cause-title">{rootCause.cause}</strong>
-
-      {problemSql && (
-        <div className="root-detail-block">
-          <span className="root-detail-label">问题 SQL</span>
-          {problemSql.statement && <pre className="root-sql"><code>{problemSql.statement}</code></pre>}
-          {problemSql.sample_id && <p><b>SQL sample ID：</b>{problemSql.sample_id}</p>}
-          {problemSql.structure && <p><b>SQL 结构：</b>{problemSql.structure}</p>}
-          <small>来源证据：{compactId(problemSql.evidence_ref, 6)}</small>
-        </div>
-      )}
-
-      {explainResult && (
-        <div className="root-detail-block">
-          <span className="root-detail-label">EXPLAIN 结果</span>
-          <pre className="root-explain-result">{explainResult.result}</pre>
-          <p><b>计划解读：</b>{explainResult.interpretation}</p>
-          <small>来源证据：{compactId(explainResult.evidence_ref, 6)}</small>
-        </div>
-      )}
-
-      {analysisProcess.length > 0 && (
-        <div className="root-detail-block">
-          <span className="root-detail-label">分析过程与依据</span>
-          <ol className="root-analysis-process">
-            {analysisProcess.map((step, index) => (
-              <li key={`${step.observation}-${index}`}>
-                <span>{index + 1}</span>
-                <div>
-                  <p><b>观察：</b>{step.observation}</p>
-                  <p><b>推导：</b>{step.inference}</p>
-                  <small>证据：{step.evidence_refs.map((id) => compactId(id, 6)).join("、")}</small>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-
-      <p className="root-evidence-summary">{rootCause.evidence_refs.length ? `关联证据：${rootCause.evidence_refs.map((id) => compactId(id, 6)).join("、")}` : "暂未关联可验证证据"}</p>
-      {rootCause.next_probe && <p>下一步：{rootCause.next_probe}</p>}
-    </div>
-  );
-}
 
 function FlashDutyHandlingCard({
   handling,
@@ -771,20 +720,7 @@ export function AlertDetailPage() {
         <section className="recommendation-stack">
 
           <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
-            {visibleRootCauses.length > 0 ? (
-              <div className="root-causes">
-                {visibleRootCauses.map((rootCause, index) => (
-                  <article key={`${rootCause.cause}-${index}`} className={rootCause.verified ? "verified" : "unverified"}>
-                    <span className="root-index">{String(index + 1).padStart(2, "0")}</span>
-                    <RootCauseContent rootCause={rootCause} />
-                    <span className="root-confidence">{formatPercent(rootCause.confidence)}</span>
-                    <span className="verified-label">{rootCause.verified ? <><Check size={13} /> 已验证</> : <><CircleAlert size={13} /> {rootCause.status}</>}</span>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <EmptyState title="现有结果无法得出根因" description="" />
-            )}
+            <AIConclusionContent rootCauses={visibleRootCauses} />
           </SectionCard>
 
             <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">

@@ -743,16 +743,9 @@ input:disabled { color: var(--muted); background: var(--surface-3); cursor: not-
 .wecom-overview-links { margin-top: 14px; display: grid; gap: 7px; }
 .wecom-overview-links a { min-height: 44px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; color: var(--text-soft); background: rgba(255, 188, 13, 0.05); border: 1px solid rgba(255, 188, 13, 0.22); border-radius: 9px; font-size: 14px; }
 
-.wecom-root-cause { border-left: 3px solid var(--warning); }
-.wecom-root-cause.root-support,
-.wecom-root-cause.root-supported { border-left-color: var(--accent); }
-.wecom-root-cause.root-contradicted { border-left-color: var(--critical); opacity: 0.78; }
-.wecom-root-cause header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 10px; }
-.wecom-root-cause header > span { width: 29px; height: 29px; display: grid; place-items: center; color: var(--text-soft); background: var(--surface-3); border-radius: 8px; font-weight: 600; font-size: 12px; }
-.wecom-root-cause h3, .wecom-advice-list h3 { margin: 0; color: var(--text); font-size: 14px; line-height: 1.55; }
-.wecom-root-cause small { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
-.wecom-root-cause header > strong { color: var(--accent-active); font-size: 12px; }
-.wecom-root-cause > p { margin: 12px 0 0 39px; color: var(--text-soft); font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.wecom-ai-conclusion .root-causes,
+.wecom-ai-conclusion .empty-state { margin-top: 14px; }
+.wecom-advice-list h3 { margin: 0; color: var(--text); font-size: 14px; line-height: 1.55; }
 .wecom-simple-list { margin: 13px 0 0; padding-left: 19px; color: var(--text-soft); font-size: 14px; line-height: 1.75; }
 .wecom-simple-list li + li { margin-top: 7px; }
 .wecom-simple-list strong { color: var(--accent-active); font-size: 12px; }

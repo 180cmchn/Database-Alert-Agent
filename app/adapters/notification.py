@@ -41,11 +41,13 @@ def _action_urls(
     page_base_url: str,
 ) -> dict[str, str]:
     alert_id = quote(str(event.alert.id), safe="")
+    run_id = quote(str(event.run_id), safe="")
     wecom_url = f"{page_base_url.rstrip('/')}/wecom/alerts/{alert_id}"
+    run_query = f"?run_id={run_id}"
     return {
-        "overview": wecom_url,
-        "root_cause": f"{wecom_url}/root-cause",
-        "recovery_advice": f"{wecom_url}/recovery-advice",
+        "overview": f"{wecom_url}{run_query}",
+        "root_cause": f"{wecom_url}/root-cause{run_query}",
+        "recovery_advice": f"{wecom_url}/recovery-advice{run_query}",
     }
 
 

@@ -9,28 +9,25 @@ import {
   Wrench,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
+import { AIConclusionContent } from "../components/AIConclusionContent";
 import { api } from "../lib/api";
-import { compactId, formatDateTime, formatPercent, statusLabel } from "../lib/format";
+import { formatDateTime, formatPercent, statusLabel } from "../lib/format";
 import type { StoredAlert } from "../types/api";
 
 type WeComView = "overview" | "root-cause" | "recovery-advice";
 
-const rootCauseLabels = {
-  SUPPORT: "历史结果：实时证据已支持",
-  SUPPORTED: "实时证据已支持",
-  CONTRADICTED: "历史结果：已被实时证据反驳",
-  UNKNOWN: "证据不足",
-} as const;
 
 export function WeComAlertViewPage({ view }: { view: WeComView }) {
   const { alertId = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const runId = searchParams.get("run_id");
   const [record, setRecord] = useState<StoredAlert | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     let active = true;
-    api.getAlert(alertId)
+    api.getAlert(alertId, runId)
       .then((result) => {
         if (active) setRecord(result);
       })
@@ -40,7 +37,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
         }
       });
     return () => { active = false; };
-  }, [alertId]);
+  }, [alertId, runId]);
 
   if (error) {
     return (
@@ -90,7 +87,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
           <p>请稍后从企微卡片重新进入。</p>
         </section>
       ) : view === "root-cause" ? (
-        <RootCauseContent record={record} />
+        <AIConclusionView record={record} />
       ) : view === "recovery-advice" ? (
         <RecoveryAdviceContent record={record} />
       ) : (
@@ -117,35 +114,14 @@ function OverviewContent({ record }: { record: StoredAlert }) {
   );
 }
 
-function RootCauseContent({ record }: { record: StoredAlert }) {
+function AIConclusionView({ record }: { record: StoredAlert }) {
   const recommendation = record.recommendation!;
-  const visibleRootCauses = recommendation.root_causes;
   return (
     <div className="wecom-content-stack">
-      <section className="wecom-content-card">
+      <section className="wecom-content-card wecom-ai-conclusion">
         <div className="wecom-section-title"><BrainCircuit size={20} /><h2>AI 分析结论</h2></div>
-        <p className="wecom-summary">{recommendation.summary}</p>
-        <div className="wecom-confidence">
-          <span>分析置信度</span><strong>{formatPercent(recommendation.confidence)}</strong>
-        </div>
+        <AIConclusionContent rootCauses={recommendation.root_causes} />
       </section>
-
-      {visibleRootCauses.length > 0 ? (
-        visibleRootCauses.map((rootCause, index) => (
-          <article className={`wecom-content-card wecom-root-cause root-${rootCause.status.toLowerCase()}`} key={`${rootCause.cause}-${index}`}>
-            <header>
-              <span>{String(index + 1).padStart(2, "0")}</span>
-              <div><h3>{rootCause.cause}</h3><small>{rootCauseLabels[rootCause.status]}</small></div>
-              <strong>{formatPercent(rootCause.confidence)}</strong>
-            </header>
-            {rootCause.evidence_refs.length > 0 && (
-              <p>关联证据：{rootCause.evidence_refs.map((id) => compactId(id, 8)).join("、")}</p>
-            )}
-          </article>
-        ))
-      ) : (
-        <section className="wecom-content-card wecom-empty-content"><CircleHelp size={26} /><p>现有结果无法得出根因</p></section>
-      )}
 
       {recommendation.analysis_bases.length > 0 && (
         <section className="wecom-content-card">
