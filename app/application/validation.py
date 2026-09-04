@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from app.domain.alert_preprocessing import (
     has_management_platform_sql_filter_note,
     is_management_platform_collection_sql_cause,
@@ -41,6 +44,104 @@ def _unit_contains_sql_sample(unit: EvidenceUnit) -> bool:
             if str(key).casefold() == "sample" and isinstance(value, str) and value.strip():
                 return True
     return False
+
+def _casefolded_value(data: Mapping[str, Any], key: str) -> Any:
+    normalized_key = key.casefold()
+    return next(
+        (
+            value
+            for current_key, value in data.items()
+            if str(current_key).casefold() == normalized_key
+        ),
+        None,
+    )
+
+
+def _identity_text(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _history_rows(unit: EvidenceUnit) -> list[Mapping[str, Any]]:
+    if unit.stage.casefold() != "history":
+        return []
+    rows = unit.data.get("rows")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
+def _resolve_problem_history_row(
+    unit: EvidenceUnit,
+    *,
+    sample_id: str | None,
+    statement: str | None,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    rows = _history_rows(unit)
+    if sample_id is not None:
+        normalized_sample_id = sample_id.strip()
+        matches = [
+            row
+            for row in rows
+            if _identity_text(_casefolded_value(row, "id")) == normalized_sample_id
+        ]
+        return (matches[0] if len(matches) == 1 else None), True
+    if statement is not None:
+        normalized_statement = statement.strip()
+        matches = [
+            row
+            for row in rows
+            if isinstance(sample := _casefolded_value(row, "sample"), str)
+            and sample.strip() == normalized_statement
+        ]
+        return (matches[0] if len(matches) == 1 else None), True
+    return None, False
+
+
+def _same_history_identity(
+    history_row: Mapping[str, Any],
+    source_history_row: Mapping[str, Any],
+) -> bool:
+    history_id = _identity_text(_casefolded_value(history_row, "id"))
+    source_id = _identity_text(_casefolded_value(source_history_row, "id"))
+    if history_id is None or source_id is None or history_id != source_id:
+        return False
+
+    for key in ("checksum", "sample_sha256"):
+        expected = _identity_text(_casefolded_value(history_row, key))
+        if expected is None:
+            continue
+        actual = _identity_text(_casefolded_value(source_history_row, key))
+        if actual is None or actual.casefold() != expected.casefold():
+            return False
+
+    history_sample = _casefolded_value(history_row, "sample")
+    source_sample = _casefolded_value(source_history_row, "sample")
+    return not (
+        isinstance(history_sample, str)
+        and isinstance(source_sample, str)
+        and history_sample != source_sample
+    )
+
+
+def _successful_explain_refs_for_history(
+    parent: EvidenceRecord,
+    history_row: Mapping[str, Any],
+) -> set[str]:
+    refs: set[str] = set()
+    for unit in parent.evidence_units:
+        if unit.stage.casefold() != "explain":
+            continue
+        if not parent.is_evidence_unit_root_cause_support_eligible(unit):
+            continue
+        source_history_row = unit.data.get("source_history_row")
+        if not isinstance(source_history_row, Mapping):
+            continue
+        if _same_history_identity(history_row, source_history_row):
+            refs.add(str(unit.id))
+    return refs
 
 
 def enforce_post_evidence_root_cause_policy(
@@ -134,15 +235,6 @@ class RuleConclusionValidator:
         knowledge_warnings: list[str] = []
         evidence_by_id = {str(item.id): item for item in evidence}
         evidence_units_by_id = _evidence_units_by_id(evidence)
-        successful_explain_refs_by_parent = {
-            str(record.id): {
-                str(unit.id)
-                for unit in record.evidence_units
-                if unit.stage.casefold() == "explain"
-                and record.is_evidence_unit_root_cause_support_eligible(unit)
-            }
-            for record in evidence
-        }
         has_supported_cause = bool(recommendation.root_causes)
 
         if not recommendation.root_causes:
@@ -158,7 +250,6 @@ class RuleConclusionValidator:
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
             live_successful_refs: set[str] = set()
-            referenced_history_parent_ids: set[str] = set()
             has_sql_sample = False
             if root_cause.status != RootCauseStatus.SUPPORTED:
                 issues.append(
@@ -184,7 +275,6 @@ class RuleConclusionValidator:
                     if parent.is_evidence_unit_root_cause_support_eligible(unit):
                         live_successful_refs.add(evidence_ref)
                         if unit.stage.casefold() == "history":
-                            referenced_history_parent_ids.add(str(parent.id))
                             has_sql_sample = has_sql_sample or _unit_contains_sql_sample(unit)
                     else:
                         issues.append(
@@ -239,27 +329,56 @@ class RuleConclusionValidator:
                     )
                     has_supported_cause = False
 
-            if has_sql_sample and root_cause.problem_sql is None:
+            problem_history_parent: EvidenceRecord | None = None
+            problem_history_row: Mapping[str, Any] | None = None
+            problem_binding_attempted = False
+            problem_binding_invalid = False
+            problem_sql = root_cause.problem_sql
+            if has_sql_sample and problem_sql is None:
                 issues.append(
                     f"SUPPORTED 根因 #{index}（{cause_label}）引用了问题 SQL sample，"
                     "必须展示具体 SQL、SQL 结构或 sample ID"
                 )
                 has_supported_cause = False
-            if (
-                root_cause.problem_sql is not None
-                and root_cause.problem_sql.evidence_ref not in live_successful_refs
-            ):
-                issues.append(
-                    f"根因 #{index} 的问题 SQL 引用了未在该根因中验证的证据："
-                    f"{root_cause.problem_sql.evidence_ref}"
-                )
-                has_supported_cause = False
+            if problem_sql is not None:
+                if problem_sql.evidence_ref not in live_successful_refs:
+                    issues.append(
+                        f"根因 #{index} 的问题 SQL 引用了未在该根因中验证的证据："
+                        f"{problem_sql.evidence_ref}"
+                    )
+                    has_supported_cause = False
+                else:
+                    problem_entry = evidence_units_by_id.get(problem_sql.evidence_ref)
+                    if problem_entry is not None:
+                        problem_history_parent, problem_history_unit = problem_entry
+                        if problem_history_unit.stage.casefold() != "history":
+                            issues.append(f"根因 #{index} 的问题 SQL 必须引用 history 证据单元")
+                            has_supported_cause = False
+                            problem_binding_invalid = True
+                        else:
+                            problem_history_row, problem_binding_attempted = (
+                                _resolve_problem_history_row(
+                                    problem_history_unit,
+                                    sample_id=problem_sql.sample_id,
+                                    statement=problem_sql.statement,
+                                )
+                            )
+                            if problem_binding_attempted and problem_history_row is None:
+                                issues.append(
+                                    f"根因 #{index} 的问题 SQL 无法与其 history 证据中的"
+                                    "唯一样本绑定"
+                                )
+                                has_supported_cause = False
+                                problem_binding_invalid = True
 
-            available_explain_refs = {
-                evidence_ref
-                for parent_id in referenced_history_parent_ids
-                for evidence_ref in successful_explain_refs_by_parent.get(parent_id, set())
-            }
+            available_explain_refs = (
+                _successful_explain_refs_for_history(
+                    problem_history_parent,
+                    problem_history_row,
+                )
+                if problem_history_parent is not None and problem_history_row is not None
+                else set()
+            )
             if available_explain_refs and root_cause.explain_result is None:
                 issues.append(
                     f"SUPPORTED 根因 #{index}（{cause_label}）存在成功 EXPLAIN，"
@@ -278,11 +397,20 @@ class RuleConclusionValidator:
                     if explain_entry is None or explain_entry[1].stage.casefold() != "explain":
                         issues.append(f"根因 #{index} 的 EXPLAIN 结果必须引用 explain 证据单元")
                         has_supported_cause = False
-                    elif available_explain_refs and explain_ref not in available_explain_refs:
-                        issues.append(
-                            f"根因 #{index} 的 EXPLAIN 结果未引用问题 SQL 对应的成功计划证据"
-                        )
-                        has_supported_cause = False
+                    elif problem_history_parent is not None:
+                        if problem_history_row is None:
+                            if not problem_binding_invalid:
+                                issues.append(
+                                    f"根因 #{index} 的问题 SQL 缺少可唯一定位的 sample_id "
+                                    "或原始 statement，无法绑定 EXPLAIN 结果"
+                                )
+                                has_supported_cause = False
+                        elif explain_ref not in available_explain_refs:
+                            issues.append(
+                                f"根因 #{index} 的 EXPLAIN 证据与 problem_sql 对应的 "
+                                "history 样本不一致"
+                            )
+                            has_supported_cause = False
 
             if not live_successful_refs:
                 issues.append(f"SUPPORTED 根因 #{index}（{cause_label}）缺少合格实时 SUCCESS 证据")

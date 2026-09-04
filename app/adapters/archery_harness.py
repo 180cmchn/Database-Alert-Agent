@@ -3433,7 +3433,7 @@ class ArcheryHarnessScenario:
             else "target_resolution"
         )
         if executed_sql is not None and isinstance(requested_sql, str) and not actual_sql_verified:
-            return self._local_rejection(
+            failure = self._local_rejection(
                 stage=stage,
                 target=target,
                 error_type="result_mismatch",
@@ -3441,6 +3441,32 @@ class ArcheryHarnessScenario:
                 detail="MCP 回显的实际执行 SQL 与已验证请求不一致，结果未投影。",
                 source_history_row=source if isinstance(source, Mapping) else None,
             )
+            source_row = source if isinstance(source, Mapping) else {}
+            requested_tables = self.client.explainable_physical_table_reference_sequence(
+                requested_sql
+            )
+            executed_tables = self.client.explainable_physical_table_reference_sequence(
+                executed_sql
+            )
+            failure["sql_binding"] = {
+                "history_id": self.client._casefolded_value(source_row, "id"),
+                "checksum": self.client._casefolded_value(source_row, "checksum"),
+                "sample_sha256": self.client._casefolded_value(source_row, "sample_sha256"),
+                "requested_sql_sha256": sha256(
+                    requested_sql.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "executed_sql_sha256": sha256(
+                    executed_sql.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "mismatch_kind": (
+                    "physical_table_changed"
+                    if requested_tables is not None
+                    and executed_tables is not None
+                    and requested_tables != executed_tables
+                    else "statement_identity_changed"
+                ),
+            }
+            return failure
         reported_values = self.client.reported_execution_target_values(
             payload,
             supplemental_text=supplemental_text,

@@ -18,11 +18,13 @@ from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.config import Settings
 from app.domain.errors import AdvisorError, AnalysisFailedError
 from app.domain.models import (
+    EVIDENCE_RECORD_V2,
     AdvisorMetadata,
     AlertStatus,
     AnalysisBasis,
     AnalysisBasisSource,
     DatabaseTarget,
+    EvidenceUnitStatus,
     InvestigationDecision,
     InvestigationDecisionResult,
     InvestigationStage,
@@ -30,10 +32,13 @@ from app.domain.models import (
     RecommendationStep,
     RootCauseAnalysisStep,
     RootCauseAssessment,
+    RootCauseSqlEvidence,
     RootCauseStatus,
     RunStatus,
     Severity,
     ToolExecutionRequest,
+    ToolResultAnalysis,
+    ToolResultObservation,
     ToolStatus,
     ValidationKind,
 )
@@ -1688,4 +1693,220 @@ async def test_runtime_refresh_does_not_change_claimed_analysis_generation(
     assert result.latest_run.config_snapshot.react_max_rounds == settings.react_max_rounds
     assert result.latest_run.config_snapshot.stream_main_agent_reasoning is False
     await runtime.service.close()
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: Path) -> None:
+    source_a = {
+        "id": 42,
+        "checksum": "shared-checksum",
+        "sample_sha256": "a" * 64,
+        "sample": "SELECT * FROM orders WHERE customer_id = 42",
+    }
+    source_b = {
+        "id": 43,
+        "checksum": "shared-checksum",
+        "sample_sha256": "b" * 64,
+        "sample": "SELECT * FROM orders WHERE customer_id = 43",
+    }
+    history_payload = {
+        "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "rows": [source_a, source_b],
+    }
+    slow_query_analysis = {
+        "status": "partial",
+        "explain_results": [
+            {
+                "source_history_row": source_a,
+                "result": {"rows": [{"table": "orders", "type": "ALL"}]},
+            }
+        ],
+        "table_structure_results": [],
+        "index_results": [],
+        "failures": [
+            {
+                "stage": "explain",
+                "reason_code": "actual_sql_mismatch",
+                "source_history_row": source_b,
+            }
+        ],
+        "missing_stages": [],
+    }
+
+    class MultiSampleArcheryTool:
+        name = "multi_sample_archery"
+        source_system = "archery_mcp"
+        read_only = True
+        input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        async def execute(self, request, context):  # type: ignore[no-untyped-def]
+            del request, context
+            return "Archery history and supplemental analysis collected.", {
+                "final_result_payload": history_payload,
+                "slow_query_analysis": slow_query_analysis,
+            }
+
+    class MultiSampleAnalyzer:
+        async def analyze(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            tool_name,
+            source_system,
+            request,
+            raw_result,
+            artifact,
+        ):
+            assert tool_name == MultiSampleArcheryTool.name
+            assert source_system == "archery_mcp"
+            assert request == {}
+            structured_data = raw_result["structured_data"]
+            return ToolResultAnalysis(
+                summary="Archery 返回两个 history 样本及逐样本 supplemental 结果。",
+                observations=[
+                    ToolResultObservation(
+                        statement="history 样本 43 的 EXPLAIN 因实际 SQL 不一致而失败。",
+                        source_paths=[
+                            "/structured_data/slow_query_analysis/failures/0/reason_code"
+                        ],
+                    )
+                ],
+                analysis_usable=True,
+                source_coverage_complete=True,
+                source_artifact_id=artifact.artifact_id,
+                source_sha256=artifact.sha256,
+                provider="deterministic-test",
+                model="program-projection",
+                prompt_version="test-v1",
+                passthrough_payload=structured_data["final_result_payload"],
+                slow_query_analysis=structured_data["slow_query_analysis"],
+            )
+
+    class MultiSampleAdvisor:
+        def __init__(self) -> None:
+            self.react_calls = 0
+
+        async def decide_investigation(self, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            self.react_calls += 1
+            decision = (
+                InvestigationDecision(
+                    action="tool",
+                    tool_name=MultiSampleArcheryTool.name,
+                    objective="Collect bound history and EXPLAIN evidence.",
+                )
+                if self.react_calls == 1
+                else InvestigationDecision(
+                    action="finish",
+                    reason="The exact history sample is sufficient for final synthesis.",
+                )
+            )
+            return InvestigationDecisionResult(
+                decision=decision,
+                metadata=AdvisorMetadata(
+                    provider="test",
+                    model="multi-sample-advisor",
+                    prompt_version="test-v1",
+                ),
+            )
+
+        async def advise(  # type: ignore[no-untyped-def]
+            self,
+            alert,
+            knowledge,
+            evidence=None,
+            knowledge_match_summary="",
+            reasoning_callback=None,
+        ):
+            del alert, knowledge, reasoning_callback
+            parent = next(item for item in evidence or [] if item.source_system == "archery_mcp")
+            assert parent.contract_version == EVIDENCE_RECORD_V2
+            history = next(unit for unit in parent.evidence_units if unit.stage == "history")
+            assert any(
+                unit.stage == "explain" and unit.status == EvidenceUnitStatus.SUCCESS
+                for unit in parent.evidence_units
+            )
+            assert any(
+                unit.stage == "explain"
+                and unit.status == EvidenceUnitStatus.FAILED
+                and unit.data["source_history_row"]["id"] == 43
+                for unit in parent.evidence_units
+            )
+            history_ref = str(history.id)
+            cause = "样本 43 的高频扫描持续占用连接槽位。"
+            return (
+                Recommendation(
+                    summary=cause,
+                    knowledge_match_summary=knowledge_match_summary,
+                    likely_causes=[cause],
+                    analysis_bases=[
+                        AnalysisBasis(
+                            source=AnalysisBasisSource.AI,
+                            statement="依据样本 43 的完整 history 事实判断。",
+                        )
+                    ],
+                    steps=[
+                        RecommendationStep(
+                            order=1,
+                            action="优化样本 43 对应查询并限制其并发。",
+                        )
+                    ],
+                    risks=[],
+                    confidence=0.9,
+                    root_causes=[
+                        RootCauseAssessment(
+                            cause=cause,
+                            analysis_process=[
+                                RootCauseAnalysisStep(
+                                    observation="history 样本 43 显示高频慢查询。",
+                                    inference="该样本持续占用连接槽位。",
+                                    evidence_refs=[history_ref],
+                                )
+                            ],
+                            problem_sql=RootCauseSqlEvidence(
+                                statement=source_b["sample"],
+                                sample_id="43",
+                                evidence_ref=history_ref,
+                            ),
+                            status=RootCauseStatus.SUPPORTED,
+                            evidence_refs=[history_ref],
+                            confidence=0.9,
+                            verified=True,
+                        )
+                    ],
+                ),
+                AdvisorMetadata(
+                    provider="test",
+                    model="multi-sample-advisor",
+                    prompt_version="test-v1",
+                ),
+            )
+
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        advisor=MultiSampleAdvisor(),
+        tool_registry=InvestigationToolRegistry([MultiSampleArcheryTool()]),
+        tool_result_analyzer=MultiSampleAnalyzer(),
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "archery-explain-sample-binding",
+            "severity": "WARNING",
+            "title": "MySQL slow query alert",
+            "reason": "mysql_slow_query_400",
+        },
+    )
+
+    assert result.status == AlertStatus.COMPLETED
+    assert result.latest_run is not None
+    assert result.latest_run.status == RunStatus.COMPLETED
+    assert result.recommendation is not None
+    assert [cause.problem_sql.sample_id for cause in result.recommendation.root_causes] == ["43"]
+    assert len(result.validations) == 1
+    assert result.validations[0].passed is True
+    assert result.validations[0].evidence_sufficient is True
+    assert result.validations[0].issues == []
     await runtime.repository.close()  # type: ignore[attr-defined]

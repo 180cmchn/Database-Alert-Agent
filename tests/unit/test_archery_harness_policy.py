@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
 
@@ -1411,7 +1412,7 @@ async def test_plain_explain_requires_prior_structure_result_or_failure() -> Non
 async def test_supplemental_actual_sql_mismatch_is_not_projected_as_explain() -> None:
     sample = "SELECT * FROM orders WHERE id = 1"
     explain_sql = f"EXPLAIN {sample}"
-    actual_sql = "EXPLAIN SELECT * FROM unrelated WHERE id = 1"
+    actual_sql = "EXPLAIN SELECT id FROM orders WHERE id = 1 LIMIT 100"
     columns_sql = (
         "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = 'orders_prod' AND TABLE_NAME = 'orders'"
@@ -1424,6 +1425,7 @@ async def test_supplemental_actual_sql_mismatch_is_not_projected_as_explain() ->
         {
             "id": 1042,
             "checksum": "actual-sql-orders",
+            "sample_sha256": sha256(sample.encode("utf-8")).hexdigest(),
             "sample": sample,
             "Query_time_max": 7.0,
             "hostname_max": "orders-db.example:3306",
@@ -1475,7 +1477,7 @@ async def test_supplemental_actual_sql_mismatch_is_not_projected_as_explain() ->
                             "structuredContent": {
                                 "status": "success",
                                 "full_sql": actual_sql,
-                                "rows": [{"table": "unrelated", "type": "ALL"}],
+                                "rows": [{"table": "orders", "type": "ALL"}],
                             }
                         },
                     ),
@@ -1494,7 +1496,16 @@ async def test_supplemental_actual_sql_mismatch_is_not_projected_as_explain() ->
     assert result.payload["rows"] == history_rows
     assert result.slow_query_analysis is not None
     assert result.slow_query_analysis["explain_results"] == []
-    assert any(
-        failure["reason_code"] == "actual_sql_mismatch"
+    failure = next(
+        failure
         for failure in result.slow_query_analysis["failures"]
+        if failure["reason_code"] == "actual_sql_mismatch"
     )
+    assert failure["sql_binding"] == {
+        "history_id": 1042,
+        "checksum": "actual-sql-orders",
+        "sample_sha256": sha256(sample.encode("utf-8")).hexdigest(),
+        "requested_sql_sha256": sha256(explain_sql.encode("utf-8")).hexdigest(),
+        "executed_sql_sha256": sha256(actual_sql.encode("utf-8")).hexdigest(),
+        "mismatch_kind": "statement_identity_changed",
+    }
