@@ -122,11 +122,11 @@ START -> enrich_alert -> fingerprint -> knowledge -> react_decide
 
 ### 2.1 主 Agent 的输入与输出
 
-每次 `react_decide` 都会收到以下有界输入：
+每次 `react_decide` 都会收到以下按 provider 契约构造的输入：
 
 - `/alert/info` 归一化后的权威告警，尤其是 `occurred_at`、`alarm_host`、`alarm_port`；
 - 达到阈值的通用知识匹配结果；
-- 前几轮工具产生的 `EvidenceRecord` 程序投影；
+- 前几轮工具产生的 `EvidenceRecord` 程序投影；通用 provider 保持有界，Archery History 走专用无损 DTO；
 - 当前运行时可用工具的 `ToolSpec`，包括角色、用途、工作流、安全边界、输入 Schema 和超时；
 - 当前轮次与 `REACT_MAX_ROUNDS`。
 
@@ -225,16 +225,21 @@ mindmap
 4. MCP 内部调查 Agent 按远端真实 Schema 逐次调用工具，每次根据返回决定继续或结束。
 5. 完整远端响应和完整外层结果进入内部 Artifact；确定性投影器按 provider 契约生成模型可见事实。
 6. `EvidenceRecord` 作为 observation 返回主 Agent，供下一轮 ReAct 决策使用；通用 provider 使用有界
-   投影，Archery 的最终 history 则按专用契约完整透传，并把 EXPLAIN、表结构和索引事实独立投影。
+   投影，Archery 最终 History 则只做 JSON 格式转换和既有秘密净化后完整透传，EXPLAIN、表结构和
+   索引事实保持独立 supplemental 投影。
 
 关键边界如下：
 
 - 主 Agent 选择的是“外层能力”，例如 `query_archery_slow_logs`、`query_prometheus_metrics` 或 `query_mcp_<provider>`。
 - MCP 内部调查 Agent 只在被选中的 provider 会话中工作，可以根据上一步返回连续调用多个远端工具；这些内部调用不消耗主 Agent 的 ReAct 轮次。
 - 远端工具名、描述和 JSON Schema 来自运行时发现。Host 负责连接、超时、持久化和恢复，不替模型硬编码远端调用参数。
-- 完整原始响应保存在内部 artifact，供审计和恢复使用；它不会直接进入主 Agent 的根因分析上下文或用户轨迹。
-- 主 Agent 接收的是确定性投影，包括真实数值聚合、事实、异常、限制和 JSON source path。Archery
-  history 只做格式转换，补充分析与它相互独立；所有投影器都不做因果判断。
+- 完整原始响应保存在内部 artifact，供审计和恢复使用；认证与导航信封不会直接进入主 Agent 的根因分析上下文或用户轨迹。
+- provenance 按类型字段与结构位置隔离：`source_artifact_id`、调用 `request_id/usage/source_sha256` 和
+  Harness diagnostics 保持内部；不得递归按键名或文本内容删除 History 业务数据。
+- 对合格 Archery History，三层不变量是 artifact 中的 `final_result_payload`、History
+  `EvidenceUnit.data`、共享模型/trace DTO 中该 unit 的 `data` 精确相等。行顺序、全部字段、嵌套结构、
+  长字符串及 `raw`、`hash`、`request_id` 等业务同名键均不改变。
+- ReAct observation 和最终 advise 使用同一个显式 DTO projector；它不序列化内部 artifact provenance。
 - Prometheus Adapter 先生成已净化公开投影，保留 `__name__`、`metric` 和有限语义标签，并用
   `value_semantics` 标明数值是原始样本、速率、增量、聚合还是其它表达式；下游只校验结构、身份
   完整性和碰撞，并按完整时序项限量，不再维护第二套业务字段白名单。
@@ -400,7 +405,7 @@ mindmap
 
 系统不输出暂定原因、可能原因、被排除原因，也不使用 `SUPPORT`、`UNKNOWN`、`CONTRADICTED` 等旧状态。`FAILED` 表示执行链路失败，不等同于“没有根因”。
 
-`analysis_process` 是面向用户的“可核验事实 → 推导”审计说明，不保存或展示模型内部思维链。问题 SQL 不超过 4000 字符时逐字展示；超长或仅有结构化 sample 时只展示真实 sample ID 和/或 SQL 结构，不重建缺失字面量。
+`analysis_process` 是面向用户的“可核验事实 → 推导”审计说明，不保存或展示模型内部思维链。引用 `evidence-record/v2` history 单元的问题 SQL 必须携带真实 `sample_id`；程序先按该 ID 唯一绑定 history 行，再在原始 sample 完整且不超过 4000 字符时确定性逐字投影 `statement`。sample 不完整或超长时只展示真实 sample ID 和/或 SQL 结构，不复制、重建或格式化缺失字面量。历史 v1 证据继续兼容原有逐字 statement 行为。
 
 ### 5.3 可靠性与恢复
 

@@ -18,20 +18,16 @@ from pydantic import ValidationError
 
 from app.agent_runtime.contracts import CallToolAction, parse_agent_action
 from app.agent_runtime.trace import provider_reasoning_delta, provider_reasoning_text
+from app.application.evidence_context import model_evidence_payload
 from app.application.sanitization import sanitize, sanitize_text
-from app.domain.alert_preprocessing import (
-    preprocess_alert_data,
-    preprocess_normalized_alert,
-)
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import AdvisorError
 from app.domain.models import (
-    EVIDENCE_RECORD_V2,
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AdvisorMetadata,
     AnalysisBasis,
     AnalysisBasisSource,
     EvidenceRecord,
-    EvidenceUnit,
     InvestigationDecision,
     InvestigationDecisionResult,
     KnowledgeExcerpt,
@@ -46,7 +42,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v27"
+PROMPT_VERSION = "database-alert-advisor-v29"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -276,309 +272,6 @@ def _responses_failure_diagnostic(value: Any) -> str:
     return ", ".join(details)
 
 
-_MODEL_EVIDENCE_FIELDS = (
-    "id",
-    "tool_name",
-    "source_system",
-    "status",
-    "request",
-    "summary",
-    "error",
-    "started_at",
-    "collected_at",
-    "duration_ms",
-    "truncated",
-)
-_MODEL_EVIDENCE_UNIT_FIELDS = (
-    "id",
-    "parent_evidence_id",
-    "kind",
-    "stage",
-    "result_index",
-    "status",
-    "summary",
-    "data",
-    "root_cause_eligible",
-    "root_cause_ineligible_reason",
-    "source_paths",
-)
-_MODEL_STATUS_FIELDS = (
-    "partial",
-    "query_completed",
-    "range_query_completed",
-    "range_query_attempt_count",
-    "range_query_success_count",
-    "range_query_empty_count",
-    "processing_status",
-    "processing_error_type",
-    "root_cause_eligible",
-    "root_cause_ineligible_reason",
-    "termination_reason",
-    "termination_error_type",
-    "reason_code",
-    "monitoring_scope_status",
-    "monitoring_scope_reason",
-    "model_declared_scope_status",
-    "scope_declaration_verified",
-    "unverified_scope_declaration",
-    "target_binding_count",
-)
-_MODEL_TOOL_ANALYSIS_FIELDS = (
-    "summary",
-    "observations",
-    "anomalies",
-    "limitations",
-    "analysis_usable",
-    "source_coverage_complete",
-    "provider",
-    "model",
-    "prompt_version",
-    "passthrough_payload",
-    "slow_query_analysis",
-)
-_MODEL_OBSERVATION_FIELDS = ("statement", "source_paths", "source_spans")
-_MODEL_SOURCE_SPAN_FIELDS = (
-    "path",
-    "character_start",
-    "character_end",
-    "character_total",
-)
-_NON_PROJECTION_EVIDENCE_SOURCES = frozenset({"alert_platform", "flashduty_alert_detail"})
-_OMIT_MODEL_VALUE = object()
-_INTERNAL_ARTIFACT_URI = re.compile(r"(?i)agent-artifact://[^\s\"'<>\]}),]+")
-_BOUNDED_SHA_SUFFIX = re.compile(r"(?i)\[sha256:[0-9a-f]+,total_chars:(?P<chars>\d+)\]")
-_SHA_LABEL = re.compile(r"(?i)\bsha-?256\b(?:\s*前\s*\d+\s*位)?")
-_EMBEDDED_PROVENANCE_KEY = re.compile(
-    r"""(?ix)
-    ["']?
-    (?:
-        raw[_-][a-z0-9_-]*
-        | [a-z0-9_-]*artifact[a-z0-9_-]*
-        | source[_-]?sha256
-        | sha256
-        | [a-z0-9_-]*_hash
-        | hash
-        | request[_-]?id
-        | usage
-    )
-    ["']?\s*[:=]
-    """
-)
-
-
-def _model_key_name(value: str) -> str:
-    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value.strip())
-    return re.sub(r"[^a-z0-9]+", "_", snake_case.casefold()).strip("_")
-
-
-def _is_internal_provenance_key(value: str) -> bool:
-    key = _model_key_name(value)
-    return (
-        key == "raw"
-        or key.startswith("raw_")
-        or "artifact" in key
-        or key in {"hash", "request_id", "sha256", "source_sha256", "usage"}
-        or key.endswith("_hash")
-        or key.endswith("_sha256")
-    )
-
-
-def _clean_model_string(value: str) -> str | object:
-    if value.casefold().startswith("agent-artifact://"):
-        return _OMIT_MODEL_VALUE
-
-    cleaned = _BOUNDED_SHA_SUFFIX.sub(
-        lambda match: f"[total_chars:{match.group('chars')}]",
-        value,
-    )
-
-    # Program projections sometimes embed one JSON object after a textual prefix.
-    # Parse it when possible so blocked fields are removed with their values.
-    object_start = cleaned.find("{")
-    if object_start >= 0 and cleaned.rstrip().endswith("}"):
-        try:
-            embedded = json.loads(cleaned[object_start:])
-        except (TypeError, ValueError):
-            pass
-        else:
-            projected = _clean_model_value(embedded)
-            if projected is _OMIT_MODEL_VALUE:
-                projected = {}
-            cleaned = cleaned[:object_start] + json.dumps(
-                projected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-
-    # A malformed/truncated embedded payload cannot be safely field-filtered.
-    if _EMBEDDED_PROVENANCE_KEY.search(cleaned):
-        return "[内部审计来源信息已移除]"
-    cleaned = _INTERNAL_ARTIFACT_URI.sub("[内部审计工件已移除]", cleaned)
-    return _SHA_LABEL.sub("匿名分组标识", cleaned)
-
-
-def _clean_model_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        cleaned: dict[str, Any] = {}
-        for raw_key, raw_value in value.items():
-            key = str(raw_key)
-            if _is_internal_provenance_key(key):
-                continue
-            projected = _clean_model_value(raw_value)
-            if projected is not _OMIT_MODEL_VALUE:
-                cleaned[key] = projected
-        return cleaned
-    if isinstance(value, (list, tuple)):
-        cleaned_items = [_clean_model_value(item) for item in value]
-        return [item for item in cleaned_items if item is not _OMIT_MODEL_VALUE]
-    if isinstance(value, str):
-        return _clean_model_string(value)
-    return value
-
-
-def _model_source_path(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.startswith("/"):
-        return None
-    if any(
-        _is_internal_provenance_key(part.replace("~1", "/").replace("~0", "~"))
-        for part in value.split("/")[1:]
-    ):
-        return None
-    cleaned = _clean_model_string(value)
-    return cleaned if isinstance(cleaned, str) else None
-
-
-def _model_observation_payload(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    result: dict[str, Any] = {}
-    for field_name in _MODEL_OBSERVATION_FIELDS:
-        if field_name not in value:
-            continue
-        if field_name == "source_paths":
-            paths = (
-                [
-                    path
-                    for item in value[field_name]
-                    if (path := _model_source_path(item)) is not None
-                ]
-                if isinstance(value[field_name], (list, tuple))
-                else []
-            )
-            result[field_name] = paths
-            continue
-        if field_name == "source_spans":
-            spans: list[dict[str, Any]] = []
-            if isinstance(value[field_name], (list, tuple)):
-                for raw_span in value[field_name]:
-                    if not isinstance(raw_span, Mapping):
-                        continue
-                    span = {
-                        key: _clean_model_value(raw_span[key])
-                        for key in _MODEL_SOURCE_SPAN_FIELDS
-                        if key in raw_span
-                    }
-                    path = _model_source_path(span.get("path"))
-                    if path is not None:
-                        span["path"] = path
-                        spans.append(span)
-            result[field_name] = spans
-            continue
-        projected = _clean_model_value(value[field_name])
-        if projected is not _OMIT_MODEL_VALUE:
-            result[field_name] = projected
-    return result if isinstance(result.get("statement"), str) else None
-
-
-def _model_tool_analysis_payload(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    result: dict[str, Any] = {}
-    for field_name in _MODEL_TOOL_ANALYSIS_FIELDS:
-        if field_name not in value:
-            continue
-        if field_name in {"observations", "anomalies"}:
-            items = value[field_name]
-            result[field_name] = (
-                [
-                    projected
-                    for item in items
-                    if (projected := _model_observation_payload(item)) is not None
-                ]
-                if isinstance(items, (list, tuple))
-                else []
-            )
-            continue
-        projected = _clean_model_value(value[field_name])
-        if projected is not _OMIT_MODEL_VALUE:
-            result[field_name] = projected
-    return result
-
-
-def _model_structured_data_payload(evidence: EvidenceRecord) -> dict[str, Any]:
-    data = evidence.structured_data
-    is_program_projection = (
-        evidence.source_system.casefold() not in _NON_PROJECTION_EVIDENCE_SOURCES
-        or "processing_status" in data
-        or "tool_result_analysis" in data
-    )
-    if not is_program_projection:
-        projected = _clean_model_value(data)
-        return projected if isinstance(projected, dict) else {}
-
-    result = {
-        field: projected
-        for field in _MODEL_STATUS_FIELDS
-        if field in data and (projected := _clean_model_value(data[field])) is not _OMIT_MODEL_VALUE
-    }
-    if "tool_result_analysis" in data:
-        result["tool_result_analysis"] = _model_tool_analysis_payload(data["tool_result_analysis"])
-    return result
-
-
-def _model_evidence_payload(evidence: EvidenceRecord) -> dict[str, Any]:
-    """Build an explicit model DTO without raw data or infrastructure provenance."""
-
-    serialized = evidence.model_dump(mode="json")
-    payload: dict[str, Any] = {}
-    for field_name in _MODEL_EVIDENCE_FIELDS:
-        projected = _clean_model_value(serialized[field_name])
-        if projected is not _OMIT_MODEL_VALUE:
-            payload[field_name] = projected
-    structured_data = _model_structured_data_payload(evidence)
-    if evidence.contract_version == EVIDENCE_RECORD_V2:
-        payload["contract_version"] = evidence.contract_version
-        tool_analysis = structured_data.get("tool_result_analysis")
-        if isinstance(tool_analysis, dict):
-            tool_analysis.pop("passthrough_payload", None)
-            tool_analysis.pop("slow_query_analysis", None)
-    payload["structured_data"] = structured_data
-    if evidence.evidence_units:
-        payload["evidence_units"] = [
-            _model_evidence_unit_payload(item) for item in evidence.evidence_units
-        ]
-    return preprocess_alert_data(payload)
-
-
-def _model_evidence_unit_payload(unit: EvidenceUnit) -> dict[str, Any]:
-    """Expose unit facts and raw JSON paths without internal artifact identity."""
-
-    serialized = unit.model_dump(mode="json")
-    payload: dict[str, Any] = {}
-    for field_name in _MODEL_EVIDENCE_UNIT_FIELDS:
-        if field_name == "source_paths":
-            payload[field_name] = [
-                path
-                for item in serialized[field_name]
-                if (path := _model_source_path(item)) is not None
-            ]
-            continue
-        projected = _clean_model_value(serialized[field_name])
-        if projected is not _OMIT_MODEL_VALUE:
-            payload[field_name] = projected
-    return payload
 
 
 def _accepts_keyword_argument(callable_obj: Any, argument: str) -> bool:
@@ -759,12 +452,18 @@ root_causes 是前端“AI 分析结论”的唯一正文。每项 cause 只写�
   tool_evidence 中可核验的原始事实和关键技术值，inference 说明该事实怎样支持下一步判断，
   evidence_refs 只引用该步骤实际使用且同时列在根因 evidence_refs 中的合格实时证据。它是给用户
   复核的“事实 → 推导”说明，不是内部思维链、计算草稿或自我修正过程，不得省略成“综合分析得出”。
-- 当根因涉及具体 SQL，或证据已经定位到造成问题的 SQL 时，problem_sql 必须提供。若证据中的
-  完整原始 SQL 不超过 4000 字符，statement 必须逐字展示该 SQL，不得改写；若 SQL 超过 4000
-  字符、只提供结构化 sample 或内容不完整，statement 必须为 null，并提供 evidence 中真实存在的
-  sample_id 和/或 structure。structure 应说明语句类型、涉及的表、JOIN、主要谓词、聚合/排序等
-  已知结构，但不得猜测、重建或补全缺失字面量。evidence_ref 必须指向包含该 SQL/sample 的证据。
-  仅当根因与 SQL 无关且输入没有定位到问题 SQL 时，problem_sql 才可为 null，绝不能虚构 SQL。
+- 当根因涉及具体 SQL，或证据已经定位到造成问题的 SQL 时，problem_sql 必须提供。若 evidence_ref
+  指向 evidence-record/v2 的 history 证据单元，problem_sql 必须使用稳定绑定：
+  sample_id 必须填写对应 history 行的真实 id，statement 必须为 null；程序会按 sample_id 绑定该行，
+  并在原始 sample 完整且不超过 4000 字符时确定性逐字投影 statement，禁止你复制、改写或重新格式化。
+  sample 不完整或超过 4000 字符时，程序保留 statement=null，此时应提供 evidence 中真实存在的
+  structure（如可用）。对于
+  evidence-record/v1 等非 v2 history 证据，完整原始 SQL 不超过 4000 字符时 statement 必须逐字
+  展示，不得改写；SQL 超长、只提供结构化 sample 或内容不完整时 statement 必须为 null，并提供
+  evidence 中真实存在的 sample_id 和/或 structure。structure 应说明语句类型、涉及的表、JOIN、
+  主要谓词、聚合/排序等已知结构，但不得猜测、重建或补全缺失字面量。evidence_ref 必须指向包含
+  该 SQL/sample 的证据。仅当根因与 SQL 无关且输入没有定位到问题 SQL 时，problem_sql 才可为
+  null，绝不能虚构 SQL。
 - 如果该问题 SQL 对应的普通 EXPLAIN 已成功，explain_result 必须提供：result 保留执行计划中的
   关键原始字段和值（例如 table、type、possible_keys、key、rows、filtered、Extra），interpretation
   说明这些字段怎样支持根因，evidence_ref 指向成功的 explain 证据单元。EXPLAIN 失败、未执行、
@@ -1155,7 +854,7 @@ class OpenAICompatibleAdvisor:
         user_payload = {
             "alert": analysis_alert.model_dump(mode="json", exclude={"raw_payload"}),
             "knowledge_matches": [item.model_dump(mode="json") for item in knowledge],
-            "tool_evidence": [_model_evidence_payload(item) for item in evidence or []],
+            "tool_evidence": [model_evidence_payload(item) for item in evidence or []],
             "knowledge_match_summary": knowledge_match_summary,
             "output_schema": schema,
         }
@@ -1238,7 +937,7 @@ class OpenAICompatibleAdvisor:
             ),
             "knowledge_matches": [item.model_dump(mode="json") for item in knowledge],
             "knowledge_match_summary": knowledge_match_summary,
-            "evidence": [_model_evidence_payload(item) for item in evidence],
+            "evidence": [model_evidence_payload(item) for item in evidence],
             "available_tools": [item.model_dump(mode="json") for item in available_tools],
             "react_round": react_round,
             "react_max_rounds": react_max_rounds,

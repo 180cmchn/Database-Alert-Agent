@@ -15,6 +15,7 @@ from app.adapters.ai import (
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.tool_result_analysis import DeterministicToolResultProcessor
 from app.agent_runtime.contracts import ArtifactRef
+from app.application.evidence_context import model_evidence_payload
 from app.domain.errors import AdvisorError
 from app.domain.models import (
     EVIDENCE_RECORD_V2,
@@ -58,6 +59,40 @@ def test_v2_model_evidence_dto_exposes_units_without_internal_artifact_identity(
         },
     )
     artifact_id = uuid4()
+    long_business_value = "业务字段" * 10_001
+    history_data = {
+        "column_list": [
+            "id",
+            "raw",
+            "raw_metric",
+            "artifact_count",
+            "hash",
+            "content_hash",
+            "request_id",
+            "usage",
+            "sha256",
+            "sample_sha256",
+            "sample",
+            "business_blob",
+        ],
+        "rows": [
+            {
+                "id": 41,
+                "raw": {"nested": ["value", {"raw": True}]},
+                "raw_metric": 7,
+                "artifact_count": 3,
+                "hash": "business-hash",
+                "content_hash": "business-content-hash",
+                "request_id": "business-request-id",
+                "usage": {"business_units": 9},
+                "sha256": "business-sha256",
+                "sample_sha256": "business-sample-sha256",
+                "sample": "SELECT  * FROM t WHERE note = 'A  B'  ;",
+                "business_blob": long_business_value,
+            }
+        ],
+        "row_count": 1,
+    }
     history = EvidenceUnit(
         id=EvidenceUnit.build_id(parent.id, "history"),
         parent_evidence_id=parent.id,
@@ -66,7 +101,7 @@ def test_v2_model_evidence_dto_exposes_units_without_internal_artifact_identity(
         stage="history",
         status=EvidenceUnitStatus.SUCCESS,
         summary="History complete",
-        data={"rows": [{"id": 41}]},
+        data=history_data,
         root_cause_eligible=True,
         source_artifact_id=artifact_id,
         source_paths=["/structured_data/final_result_payload"],
@@ -79,12 +114,12 @@ def test_v2_model_evidence_dto_exposes_units_without_internal_artifact_identity(
         }
     )
 
-    payload = ai_module._model_evidence_payload(parent)
+    payload = model_evidence_payload(parent)
 
     assert payload["contract_version"] == EVIDENCE_RECORD_V2
     assert payload["evidence_units"][0]["id"] == str(history.id)
     assert payload["evidence_units"][0]["parent_evidence_id"] == str(parent.id)
-    assert payload["evidence_units"][0]["data"] == {"rows": [{"id": 41}]}
+    assert payload["evidence_units"][0]["data"] == history_data
     analysis = payload["structured_data"]["tool_result_analysis"]
     assert "passthrough_payload" not in analysis
     assert "slow_query_analysis" not in analysis
@@ -188,7 +223,7 @@ async def test_prometheus_model_evidence_dto_preserves_public_metric_identity_on
         },
     )
 
-    payload = ai_module._model_evidence_payload(evidence)
+    payload = model_evidence_payload(evidence)
     tool_analysis = payload["structured_data"]["tool_result_analysis"]
     metric_statement = next(
         item["statement"]
@@ -254,11 +289,16 @@ def test_final_recommendations_are_actionable_without_repeating_mcp_checks() -> 
 
 def test_final_conclusion_requires_auditable_sql_and_explain_details() -> None:
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
+    normalized_prompt = " ".join(ai_module.SYSTEM_PROMPT.split())
 
-    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v27"
+    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v29"
     assert "root_causes 是前端“AI 分析结论”的唯一正文" in prompt
     assert "analysis_process 至少包含一项" in prompt
     assert "事实 → 推导" in prompt
+    assert "evidence_ref 指向 evidence-record/v2 的 history 证据单元" in normalized_prompt
+    assert "sample_id 必须填写对应 history 行的真实 id" in normalized_prompt
+    assert "statement 必须为 null" in normalized_prompt
+    assert "程序会按 sample_id 绑定该行" in normalized_prompt
     assert "完整原始 SQL 不超过 4000 字符" in prompt
     assert "sample_id 和/或 structure" in prompt
     assert "该问题 SQL 对应的普通 EXPLAIN 已成功" in prompt
@@ -363,7 +403,7 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
 
 
 @pytest.mark.asyncio
-async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> None:
+async def test_advisor_applies_slow_query_filter_note_only_to_alert_payload() -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
     advisor._api_key = "test-key"
     advisor._model = "test-model"
@@ -402,10 +442,16 @@ async def test_advisor_removes_slow_query_filter_note_from_model_payload() -> No
 
     await advisor.advise(alert, [], evidence=[evidence])
 
-    serialized = json.dumps(captured_payload, ensure_ascii=False)
-    assert "数据库管理平台采集数据用" not in serialized
+    serialized_alert = json.dumps(captured_payload["alert"], ensure_ascii=False)
+    assert "数据库管理平台采集数据用" not in serialized_alert
     assert captured_payload["alert"]["reason"] == signal  # type: ignore[index]
-    assert captured_payload["tool_evidence"][0]["summary"] == signal  # type: ignore[index]
+    assert captured_payload["tool_evidence"][0]["summary"] == raw_text  # type: ignore[index]
+    assert (
+        captured_payload["tool_evidence"][0]["structured_data"]["flashduty"]["alert"][
+            "description"
+        ]
+        == raw_text
+    )
 
 
 @pytest.mark.asyncio

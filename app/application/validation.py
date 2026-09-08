@@ -24,6 +24,9 @@ from app.domain.models import (
     ValidationRecord,
 )
 
+_MAX_PROBLEM_SQL_STATEMENT_CHARS = 4_000
+
+
 
 def _evidence_units_by_id(
     evidence: list[EvidenceRecord],
@@ -73,31 +76,125 @@ def _history_rows(unit: EvidenceUnit) -> list[Mapping[str, Any]]:
     return [row for row in rows if isinstance(row, Mapping)]
 
 
+def _complete_history_statement(row: Mapping[str, Any]) -> str | None:
+    sample = _casefolded_value(row, "sample")
+    if (
+        not isinstance(sample, str)
+        or not sample.strip()
+        or len(sample) > _MAX_PROBLEM_SQL_STATEMENT_CHARS
+    ):
+        return None
+
+    representation = _identity_text(_casefolded_value(row, "sample_representation"))
+    if representation is not None and representation.casefold() != "full":
+        return None
+
+    length_markers = [
+        value
+        for key, value in row.items()
+        if str(key).casefold() == "sample_full_length"
+    ]
+    if length_markers:
+        marker = length_markers[0]
+        if isinstance(marker, bool):
+            return None
+        if isinstance(marker, int):
+            full_length = marker
+        elif isinstance(marker, str) and marker.strip().isdecimal():
+            full_length = int(marker.strip())
+        else:
+            return None
+        if full_length <= 0 or full_length != len(sample.encode("utf-8")):
+            return None
+    return sample
+
+
+def _only_whitespace_differs(left: str, right: str) -> bool:
+    return left != right and "".join(left.split()) == "".join(right.split())
+
+
 def _resolve_problem_history_row(
     unit: EvidenceUnit,
     *,
     sample_id: str | None,
     statement: str | None,
-) -> tuple[Mapping[str, Any] | None, bool]:
-    rows = _history_rows(unit)
-    if sample_id is not None:
-        normalized_sample_id = sample_id.strip()
-        matches = [
-            row
-            for row in rows
-            if _identity_text(_casefolded_value(row, "id")) == normalized_sample_id
-        ]
-        return (matches[0] if len(matches) == 1 else None), True
-    if statement is not None:
-        normalized_statement = statement.strip()
-        matches = [
-            row
-            for row in rows
-            if isinstance(sample := _casefolded_value(row, "sample"), str)
-            and sample.strip() == normalized_statement
-        ]
-        return (matches[0] if len(matches) == 1 else None), True
-    return None, False
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    normalized_sample_id = _identity_text(sample_id)
+    if normalized_sample_id is None:
+        return None, "缺少稳定的 history sample_id"
+
+    matches = [
+        row
+        for row in _history_rows(unit)
+        if _identity_text(_casefolded_value(row, "id")) == normalized_sample_id
+    ]
+    if not matches:
+        return None, f"sample_id={normalized_sample_id} 在其 history 证据中不存在"
+    if len(matches) > 1:
+        return (
+            None,
+            f"sample_id={normalized_sample_id} 在其 history 证据中匹配到 {len(matches)} 行，"
+            "无法唯一绑定",
+        )
+
+    row = matches[0]
+    if statement is None:
+        return row, None
+
+    history_statement = _complete_history_statement(row)
+    if history_statement is None:
+        return (
+            row,
+            f"sample_id={normalized_sample_id} 对应的 history sample 不完整或超过 "
+            f"{_MAX_PROBLEM_SQL_STATEMENT_CHARS} 字符，statement 必须为空",
+        )
+    if statement != history_statement:
+        whitespace_detail = (
+            "（文本差异仅涉及空白字符，但仍不满足逐字展示契约）"
+            if _only_whitespace_differs(statement, history_statement)
+            else ""
+        )
+        return (
+            row,
+            f"statement 与 sample_id={normalized_sample_id} 对应的 history sample "
+            f"不是逐字一致{whitespace_detail}",
+        )
+    return row, None
+
+
+def _project_history_problem_statement(
+    root_cause: RootCauseAssessment,
+    evidence_units_by_id: Mapping[str, tuple[EvidenceRecord, EvidenceUnit]],
+    *,
+    eligible_evidence_refs: set[str],
+) -> RootCauseAssessment:
+    """Render a displayable SQL statement from the row selected by stable history id."""
+
+    problem_sql = root_cause.problem_sql
+    if (
+        problem_sql is None
+        or problem_sql.sample_id is None
+        or problem_sql.evidence_ref not in eligible_evidence_refs
+    ):
+        return root_cause
+    problem_entry = evidence_units_by_id.get(problem_sql.evidence_ref)
+    if problem_entry is None or problem_entry[1].stage.casefold() != "history":
+        return root_cause
+
+    history_row, binding_issue = _resolve_problem_history_row(
+        problem_entry[1],
+        sample_id=problem_sql.sample_id,
+        statement=None,
+    )
+    if binding_issue is not None or history_row is None:
+        return root_cause
+
+    statement = _complete_history_statement(history_row)
+    return root_cause.model_copy(
+        update={
+            "problem_sql": problem_sql.model_copy(update={"statement": statement}),
+        }
+    )
 
 
 def _same_history_identity(
@@ -190,8 +287,13 @@ def enforce_post_evidence_root_cause_policy(
                 qualified_refs.append(evidence_ref)
         if not qualified_refs:
             continue
+        projected_root_cause = _project_history_problem_statement(
+            root_cause,
+            evidence_units_by_id,
+            eligible_evidence_refs=set(qualified_refs),
+        )
         supported_causes.append(
-            root_cause.model_copy(
+            projected_root_cause.model_copy(
                 update={
                     "hypothesis_id": None,
                     "status": RootCauseStatus.SUPPORTED,
@@ -331,13 +433,12 @@ class RuleConclusionValidator:
 
             problem_history_parent: EvidenceRecord | None = None
             problem_history_row: Mapping[str, Any] | None = None
-            problem_binding_attempted = False
             problem_binding_invalid = False
             problem_sql = root_cause.problem_sql
             if has_sql_sample and problem_sql is None:
                 issues.append(
                     f"SUPPORTED 根因 #{index}（{cause_label}）引用了问题 SQL sample，"
-                    "必须展示具体 SQL、SQL 结构或 sample ID"
+                    "必须提供 problem_sql 及稳定的 history sample_id"
                 )
                 has_supported_cause = False
             if problem_sql is not None:
@@ -356,18 +457,13 @@ class RuleConclusionValidator:
                             has_supported_cause = False
                             problem_binding_invalid = True
                         else:
-                            problem_history_row, problem_binding_attempted = (
-                                _resolve_problem_history_row(
-                                    problem_history_unit,
-                                    sample_id=problem_sql.sample_id,
-                                    statement=problem_sql.statement,
-                                )
+                            problem_history_row, binding_issue = _resolve_problem_history_row(
+                                problem_history_unit,
+                                sample_id=problem_sql.sample_id,
+                                statement=problem_sql.statement,
                             )
-                            if problem_binding_attempted and problem_history_row is None:
-                                issues.append(
-                                    f"根因 #{index} 的问题 SQL 无法与其 history 证据中的"
-                                    "唯一样本绑定"
-                                )
+                            if binding_issue is not None:
+                                issues.append(f"根因 #{index} 的问题 SQL {binding_issue}")
                                 has_supported_cause = False
                                 problem_binding_invalid = True
 
@@ -401,8 +497,8 @@ class RuleConclusionValidator:
                         if problem_history_row is None:
                             if not problem_binding_invalid:
                                 issues.append(
-                                    f"根因 #{index} 的问题 SQL 缺少可唯一定位的 sample_id "
-                                    "或原始 statement，无法绑定 EXPLAIN 结果"
+                                    f"根因 #{index} 的问题 SQL 缺少已绑定的 history 样本，"
+                                    "无法绑定 EXPLAIN 结果"
                                 )
                                 has_supported_cause = False
                         elif explain_ref not in available_explain_refs:

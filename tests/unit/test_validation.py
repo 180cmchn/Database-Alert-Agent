@@ -713,7 +713,9 @@ async def test_rule_validator_requires_sql_explain_and_analysis_audit_details() 
     assert result.passed is False
     assert result.evidence_sufficient is False
     assert any("必须给出分析过程与依据" in issue for issue in result.issues)
-    assert any("必须展示具体 SQL、SQL 结构或 sample ID" in issue for issue in result.issues)
+    assert any(
+        "必须提供 problem_sql 及稳定的 history sample_id" in issue for issue in result.issues
+    )
 
 
 @pytest.mark.asyncio
@@ -882,7 +884,7 @@ async def test_rule_validator_requires_explain_only_for_bound_history_sample() -
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_binds_unique_history_sample_by_exact_statement() -> None:
+async def test_rule_validator_requires_history_sample_id_even_when_statement_matches() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
     parent, history, explain_a, _failed_explain_b = make_multi_sample_archery_sql_evidence()
@@ -917,9 +919,191 @@ async def test_rule_validator_binds_unique_history_sample_by_exact_statement() -
         [parent],
     )
 
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("缺少稳定的 history sample_id" in issue for issue in result.issues)
+
+@pytest.mark.parametrize(
+    ("statement", "expected_detail"),
+    [
+        (
+            "SELECT * FROM orders WHERE customer_id = 43",
+            "statement 与 sample_id=42 对应的 history sample 不是逐字一致",
+        ),
+        (
+            "SELECT * FROM orders\n WHERE customer_id = 42",
+            "文本差异仅涉及空白字符，但仍不满足逐字展示契约",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rule_validator_checks_statement_against_bound_history_sample(
+    statement: str,
+    expected_detail: str,
+) -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent, history, explain_a, _failed_explain_b = make_multi_sample_archery_sql_evidence()
+    history_ref = str(history.id)
+    explain_ref = str(explain_a.id)
+    recommendation = make_recommendation(
+        summary="样本 42 的全表扫描导致连接持续占用。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="样本 42 的全表扫描持续占用连接槽位。",
+                problem_sql=RootCauseSqlEvidence(
+                    statement=statement,
+                    sample_id="42",
+                    evidence_ref=history_ref,
+                ),
+                explain_result=RootCauseExplainEvidence(
+                    result="table=orders, type=ALL",
+                    interpretation="全表扫描增加执行时间。",
+                    evidence_ref=explain_ref,
+                ),
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[history_ref, explain_ref],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [parent],
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any(expected_detail in issue for issue in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_post_evidence_policy_projects_verbatim_statement_from_history_sample_id() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent, history, explain = make_archery_sql_evidence()
+    history_statement = (
+        "SELECT id FROM `xxl_job_log`\n"
+        "\t\tWHERE alarm_status = 0\n"
+        "\t\tORDER BY id ASC"
+    )
+    history = history.model_copy(
+        update={
+            "data": {
+                "rows": [
+                    {
+                        "id": 42,
+                        "sample": history_statement,
+                        "sample_full_length": len(history_statement.encode("utf-8")),
+                        "sample_representation": "full",
+                    }
+                ]
+            }
+        }
+    )
+    parent = parent.model_copy(update={"evidence_units": [history, explain]})
+    history_ref = str(history.id)
+    explain_ref = str(explain.id)
+    recommendation = make_recommendation(
+        summary="全表扫描导致连接持续占用。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="任务日志查询全表扫描并长期占用连接槽位。",
+                problem_sql=RootCauseSqlEvidence(
+                    statement=(
+                        "SELECT id FROM `xxl_job_log`\n"
+                        " WHERE alarm_status = 0\n"
+                        " ORDER BY id ASC"
+                    ),
+                    sample_id="42",
+                    evidence_ref=history_ref,
+                ),
+                explain_result=RootCauseExplainEvidence(
+                    result="table=xxl_job_log, type=ALL",
+                    interpretation="全表扫描增加执行时间。",
+                    evidence_ref=explain_ref,
+                ),
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[history_ref, explain_ref],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    )
+
+    projected = enforce_post_evidence_root_cause_policy(recommendation, [parent], alert)
+    projected_problem_sql = projected.root_causes[0].problem_sql
+
+    assert projected_problem_sql is not None
+    assert projected_problem_sql.sample_id == "42"
+    assert projected_problem_sql.statement == history_statement
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        projected,
+        [parent],
+    )
+
     assert result.passed is True
     assert result.evidence_sufficient is True
     assert result.issues == []
+
+
+@pytest.mark.parametrize(
+    "history_row",
+    [
+        {
+            "id": 42,
+            "sample": "SELECT prefix",
+            "sample_full_length": 1_000,
+            "sample_representation": "prefix",
+        },
+        {
+            "id": 42,
+            "sample": "S" * 4_001,
+            "sample_full_length": 4_001,
+            "sample_representation": "full",
+        },
+    ],
+)
+def test_post_evidence_policy_does_not_render_incomplete_or_oversized_sample(
+    history_row: dict,
+) -> None:
+    parent, history, _explain = make_archery_sql_evidence()
+    history = history.model_copy(update={"data": {"rows": [history_row]}})
+    parent = parent.model_copy(update={"evidence_units": [history]})
+    history_ref = str(history.id)
+    recommendation = make_recommendation(
+        summary="结构化慢查询导致连接持续占用。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="结构化慢查询持续占用连接槽位。",
+                problem_sql=RootCauseSqlEvidence(
+                    statement="SELECT model_reformatted_text",
+                    structure="SELECT statement with unavailable full text",
+                    sample_id="42",
+                    evidence_ref=history_ref,
+                ),
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[history_ref],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    )
+
+    projected = enforce_post_evidence_root_cause_policy(recommendation, [parent])
+    projected_problem_sql = projected.root_causes[0].problem_sql
+
+    assert projected_problem_sql is not None
+    assert projected_problem_sql.sample_id == "42"
+    assert projected_problem_sql.statement is None
+
 
 
 @pytest.mark.asyncio
@@ -954,11 +1138,55 @@ async def test_rule_validator_rejects_unbound_history_sample_id() -> None:
 
     assert result.passed is False
     assert result.evidence_sufficient is False
-    assert any("无法与其 history 证据中的唯一样本绑定" in issue for issue in result.issues)
+    assert any("sample_id=404 在其 history 证据中不存在" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
-async def test_rule_validator_does_not_guess_sample_from_sql_structure_only() -> None:
+async def test_rule_validator_reports_duplicate_history_sample_id() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    parent, history, explain_a, failed_explain_b = make_multi_sample_archery_sql_evidence()
+    source_rows = history.data["rows"]
+    duplicate_row = {**source_rows[1], "id": 42}
+    history = history.model_copy(update={"data": {"rows": [source_rows[0], duplicate_row]}})
+    parent = parent.model_copy(
+        update={"evidence_units": [history, explain_a, failed_explain_b]}
+    )
+    history_ref = str(history.id)
+    recommendation = make_recommendation(
+        summary="重复样本标识无法稳定绑定。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="重复样本标识对应的查询持续占用连接槽位。",
+                problem_sql=RootCauseSqlEvidence(
+                    sample_id="42",
+                    evidence_ref=history_ref,
+                ),
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[history_ref],
+                confidence=0.9,
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(
+        run,
+        alert,
+        recommendation,
+        [parent],
+    )
+
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any(
+        "sample_id=42 在其 history 证据中匹配到 2 行，无法唯一绑定" in issue
+        for issue in result.issues
+    )
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_requires_sample_id_for_sql_structure_only() -> None:
     alert = make_alert()
     run = InvestigationRun(alert_id=alert.id)
     parent, history, _explain_a, _failed_explain_b = make_multi_sample_archery_sql_evidence()
@@ -987,9 +1215,9 @@ async def test_rule_validator_does_not_guess_sample_from_sql_structure_only() ->
         [parent],
     )
 
-    assert result.passed is True
-    assert result.evidence_sufficient is True
-    assert result.issues == []
+    assert result.passed is False
+    assert result.evidence_sufficient is False
+    assert any("缺少稳定的 history sample_id" in issue for issue in result.issues)
 
 
 @pytest.mark.asyncio
