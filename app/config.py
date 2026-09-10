@@ -249,7 +249,7 @@ class Settings(BaseSettings):
     archery_slow_log_window_seconds: int = Field(default=300, ge=60, le=86_400)
     archery_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
     # The Host stops the Archery investigation cleanly before the outer tool
-    # deadline so compact history evidence survives an enrichment timeout.
+    # deadline; only fully recovered History survives an enrichment timeout.
     archery_investigation_budget_seconds: float = Field(default=150, gt=0, le=1200)
     archery_mcp_tool_timeout_seconds: float = Field(default=180, gt=0, le=1200)
 

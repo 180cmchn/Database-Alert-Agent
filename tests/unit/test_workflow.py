@@ -13,6 +13,7 @@ from app.agent_runtime.events import AgentEvent, AgentEventKind
 from app.agent_runtime.persistence import RepositoryEventSink
 from app.agents.nodes import enrich_alert_node, react_decide_node
 from app.agents.state import AgentState
+from app.application.evidence_context import model_evidence_payload
 from app.application.factory import apply_runtime_settings, build_runtime
 from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.config import Settings
@@ -636,6 +637,7 @@ async def test_every_severity_sends_one_final_ai_result(tmp_path: Path, severity
     assert all(not item.evidence_sufficient for item in first.validations)
     await runtime.repository.close()  # type: ignore[attr-defined]
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "filtered_severities",
@@ -678,9 +680,7 @@ async def test_analysis_filter_supports_every_severity_subset(
         )
         assert created is True
         assert stored.status == (
-            AlertStatus.FILTERED
-            if severity in filtered_severities
-            else AlertStatus.QUEUED
+            AlertStatus.FILTERED if severity in filtered_severities else AlertStatus.QUEUED
         )
 
     await runtime.repository.close()  # type: ignore[attr-defined]
@@ -723,9 +723,7 @@ async def test_non_contiguous_filter_only_analyzes_unselected_severity(
     assert results[Severity.INFO].latest_run is None
     assert events == ["ADVISOR", "RESULT:WARNING"]
 
-    retried = await runtime.service.analyze_by_id(
-        str(results[Severity.CRITICAL].alert.id)
-    )
+    retried = await runtime.service.analyze_by_id(str(results[Severity.CRITICAL].alert.id))
     assert retried.status == AlertStatus.FILTERED
     assert events == ["ADVISOR", "RESULT:WARNING"]
     await runtime.repository.close()  # type: ignore[attr-defined]
@@ -1698,6 +1696,11 @@ async def test_runtime_refresh_does_not_change_claimed_analysis_generation(
 
 @pytest.mark.asyncio
 async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: Path) -> None:
+    long_sample = (
+        "SELECT  * FROM orders WHERE note = 'A  B' AND id IN ("
+        + ",".join(map(str, range(4_000)))
+        + ")  ;"
+    )
     source_a = {
         "id": 42,
         "checksum": "shared-checksum",
@@ -1708,11 +1711,22 @@ async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: 
         "id": 43,
         "checksum": "shared-checksum",
         "sample_sha256": "b" * 64,
-        "sample": "SELECT * FROM orders WHERE customer_id = 43",
+        "sample": long_sample,
+        "raw": {"nested": ["business", {"raw": True}]},
+        "raw_metric": 7,
+        "artifact_count": 2,
+        "hash": "business-hash",
+        "content_hash": "business-content-hash",
+        "request_id": "business-request-id",
+        "usage": {"business_units": 9},
+        "sha256": "business-sha256",
+        "business_blob": "业务字段" * 10_001,
     }
     history_payload = {
         "full_sql": "SELECT * FROM mysql_slow_query_review_history",
+        "column_list": list(source_b),
         "rows": [source_a, source_b],
+        "row_count": 2,
     }
     slow_query_analysis = {
         "status": "partial",
@@ -1864,7 +1878,8 @@ async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: 
                                 )
                             ],
                             problem_sql=RootCauseSqlEvidence(
-                                statement=source_b["sample"],
+                                statement=None,
+                                structure="SELECT orders with predicates on note and id",
                                 sample_id="43",
                                 evidence_ref=history_ref,
                             ),
@@ -1909,4 +1924,24 @@ async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: 
     assert result.validations[0].passed is True
     assert result.validations[0].evidence_sufficient is True
     assert result.validations[0].issues == []
+    archery_evidence = next(
+        item for item in result.evidence_records if item.source_system == "archery_mcp"
+    )
+    history_unit = next(unit for unit in archery_evidence.evidence_units if unit.stage == "history")
+    assert history_unit.data == history_payload
+    trace_events = await runtime.repository.list_agent_events(str(result.latest_run.id))
+    observations = [
+        event for event in trace_events if event.kind == AgentEventKind.TRACE_OBSERVATION
+    ]
+    assert len(observations) == 1
+    observation = json.loads(observations[0].payload["content"])
+    assert observation == model_evidence_payload(archery_evidence)
+    observation_history = next(
+        unit for unit in observation["evidence_units"] if unit["stage"] == "history"
+    )
+    assert observation_history["data"] == history_payload
+    serialized = observations[0].payload["content"]
+    assert str(archery_evidence.source_artifact_id) not in serialized
+    assert "business-request-id" in serialized
+    assert long_sample in serialized
     await runtime.repository.close()  # type: ignore[attr-defined]

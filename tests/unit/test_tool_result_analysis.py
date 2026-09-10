@@ -191,11 +191,29 @@ def _archery_final_result_payload(rows: list[dict[str, object]]) -> dict[str, ob
 
 @pytest.mark.asyncio
 async def test_archery_passes_final_result_json_through_without_modification() -> None:
+    long_sample = "SELECT  * FROM t WHERE note = 'A  B' AND id IN (" + ",".join(
+        map(str, range(4_000))
+    ) + ")  ;"
     slower_first = _archery_keyed_row(
         row_id=24311020,
         checksum="sql-a",
         sample="select * from orders where id = 1",
         query_time_sum=9.5,
+    )
+    slower_first.update(
+        {
+            "raw": {"nested": ["value", {"raw": True}]},
+            "raw_metric": 7,
+            "artifact_count": 4,
+            "hash": "business-hash",
+            "content_hash": "business-content-hash",
+            "request_id": "business-request-id",
+            "usage": {"business_units": 8},
+            "sha256": "business-sha256",
+            "sample_sha256": "business-sample-sha256",
+            "sample": long_sample,
+            "business_blob": "业务字段" * 10_001,
+        }
     )
     faster_second = _archery_keyed_row(
         row_id=24311019,
@@ -249,9 +267,22 @@ async def test_archery_passes_final_result_json_through_without_modification() -
     # the slower row stays first because the program never filters or re-sorts.
     assert result.passthrough_payload == payload
     assert result.passthrough_payload["rows"][0]["checksum"] == "sql-a"
-    assert result.passthrough_payload["rows"][0]["sample"] == ("select * from orders where id = 1")
+    assert result.passthrough_payload["rows"][0]["sample"] == long_sample
     assert result.passthrough_payload["affected_rows"] == 2
     assert result.passthrough_payload["column_list"] == list(ARCHERY_COLUMN_LIST)
+    for key in (
+        "raw",
+        "raw_metric",
+        "artifact_count",
+        "hash",
+        "content_hash",
+        "request_id",
+        "usage",
+        "sha256",
+        "sample_sha256",
+        "business_blob",
+    ):
+        assert result.passthrough_payload["rows"][0][key] == slower_first[key]
     serialized = json.dumps(result.passthrough_payload, ensure_ascii=False)
     assert "TOP-SECRET" not in serialized
     assert "INSTANCE-SECRET" not in serialized

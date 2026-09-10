@@ -15,9 +15,10 @@ from app.agent_runtime.outer_dispatch import DurableOuterToolDispatcher
 from app.agent_runtime.persistence import RepositoryEventSink
 from app.agent_runtime.trace import AgentTraceEmitter, AgentTraceScope
 from app.agents.state import AgentState
+from app.application.evidence_context import model_evidence_payload
 from app.application.sanitization import sanitize, sanitize_alert
 from app.application.validation import enforce_post_evidence_root_cause_policy
-from app.domain.alert_preprocessing import preprocess_alert_data, preprocess_normalized_alert
+from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.models import (
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AdvisorMetadata,
@@ -594,7 +595,7 @@ async def execute_react_tool_node(state: AgentState, ctx: NodeContext) -> dict[s
         provider=str(getattr(ctx.advisor, "provider", type(ctx.advisor).__name__)),
         scope=AgentTraceScope.MAIN_AGENT,
     )
-    observation = preprocess_alert_data(result.model_dump(mode="json"))
+    observation = model_evidence_payload(result)
     await emitter.emit_observation(
         json.dumps(observation, ensure_ascii=False),
         actor=request.tool_name,

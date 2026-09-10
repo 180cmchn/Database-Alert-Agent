@@ -14,7 +14,7 @@ from app.adapters.alert_sources import (
     incident_fingerprint,
 )
 from app.application.sanitization import sanitize_text
-from app.domain.alert_preprocessing import preprocess_alert_data
+from app.domain.alert_preprocessing import preprocess_alert_payload
 from app.domain.errors import InvalidAlertPayloadError
 from app.domain.models import (
     DatabaseTarget,
@@ -658,7 +658,7 @@ class FlashDutyAlertSourceAdapter:
             "attributes": attributes,
         }
         normalized = self._canonical.normalize(mapped)
-        analysis_mapped = {key: preprocess_alert_data(value) for key, value in mapped.items()}
+        analysis_mapped = preprocess_alert_payload(mapped)
         analysis_mapped.update(title=normalized.title, reason=normalized.reason)
         parsed = CanonicalAlertPayload.model_validate(analysis_mapped)
         fingerprint = incident_fingerprint(

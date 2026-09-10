@@ -18,8 +18,9 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
 3. 系统检索本次选择的知识来源，保留实际命中的来源、知识 ID、标题和 URI。
 4. 主 Agent 进入 ReAct 循环。每轮按 `thought -> action -> observation` 执行一个外层工具，或输出
    `finish`；它根据 MCP 的角色和作用判断是否需要调用，不存在按告警类型硬编码的必调 MCP。
-5. MCP 完整原始响应保存为内部审计 artifact。程序侧确定性过滤、聚合、排序并产生可追溯
-   observation；原始响应和辅助调用结果不发送给主 Agent，结果处理阶段不调用模型。
+5. MCP 完整原始响应保存为内部审计 artifact。程序侧按 provider 契约产生可追溯 observation；通用
+   provider 使用有界投影，Archery History 只做 JSON 格式转换和既有秘密净化后完整透传。认证、导航、
+   请求 ID、usage、hash 等内部 provenance 不发送给主 Agent，结果处理阶段不调用模型。
 6. 主 Agent 是唯一可以结合不同证据判断根因的组件。达到 `finish` 或 `REACT_MAX_ROUNDS` 后正常结束
    调查并生成结论；程序随后只校验输出结构、证据引用与来源资格，不调用第二个模型判断或否决根因。
    整次分析还受 `ANALYSIS_TIMEOUT_SECONDS` 和主动取消控制。
@@ -69,8 +70,8 @@ GET /api/v1/alerts/{alert_id}/runs/{run_id}/trace?after_sequence=0
 | MCP 辅助响应 | 认证、资源定位、Schema 和目录发现 | 否，仅内部审计 |
 
 程序投影可以过滤、聚合、排序、计算统计量和识别异常，但不能声称某个事实支持或反驳某个根因。
-每条 observation 必须能追溯到原始 artifact 及真实数据路径。完整原始结果不设通用字符上限，不因
-主 Agent 上下文大小而删除；主 Agent 只接收有界投影。
+每条 observation 必须能追溯到原始 artifact 及真实数据路径。完整原始结果不设通用字符上限；通用
+provider 的模型 DTO 保持有界，Archery History 的业务 payload 则按专用无损契约完整进入主 Agent。
 
 某个 MCP 未被选择、目标未被该 MCP 覆盖、返回 `NO_DATA`、超时或失败，都不会单独把全局
 `evidence_sufficient` 置为 false。充分性只取决于主 Agent 最终引用的相关、完整、可用实时证据是否
@@ -195,30 +196,31 @@ Archery 的作用是查询慢查询日志，提示词位于 `config/mcp/prompts/
 `[occurred_at - 5 分钟, occurred_at]`。
 
 认证、实例枚举、`t_instance_member` 和 `sql_instance` 等导航响应仅保存为内部审计 artifact。
-最终 `mysql_slow_query_review_history` 结果只做 JSON 格式转换后完整透传，不过滤、聚合、排序或
-截断。上游 MCP 目前只返回文本，Archery 内部模型必须通过本地结果评估动作，根据原始响应显式报告
-`complete`、`content_too_long` 或 `uncertain`；Host 不猜测或伪造上游截断字段。命中恢复状态后，
-Host 按稳定 directive ID 将 `workflow.md` 中对应的原文片段追加到下一轮上下文：先查完整 id 清单，
-再逐 id 查询，提高单条结果上限后仍不完整时，最后使用带 `sample_full_length` 的 sample 前缀投影。
+最终 `mysql_slow_query_review_history` 结果只做 JSON 格式转换和既有秘密净化后完整透传，不过滤、
+聚合、重排、截断、压缩 SQL 或设置最终结果大小上限。History 行中的 `raw`、`request_id`、`usage`、
+`hash` 等同名键属于业务字段，必须保留；请求信封、调用 ID、usage 和 artifact hash 通过类型化字段与
+结构位置隔离，不靠递归键名猜测删除。
 
-动态 MCP Schema 负责普通 required、类型和额外参数校验；专用 Host 只保留只读边界、单语句和数据
+确定性 Host 先发现 history 表全部真实字段，再进行固定快照下的排名扫描和“全部非 sample 字段”扫描；
+排名只决定内部恢复顺序，最终行仍按 `id DESC`。每行 `sample` 使用直接查询或 Host 生成的
+`SUBSTRING` 分片精确重组，并按 `LENGTH(sample)` 的 UTF-8 字节长度核验。只有字段、行集合和每个
+sample 全部恢复后，History 才能成功并获得根因资格；任一分页、快照、字段、预算或分片失败都保留
+已收到 artifact，但 History 显式不完整且不运行 supplemental。完整 History 超出模型上下文能力时必须
+显式失败或返回 inconclusive，不能静默缩短。
+
+动态 MCP Schema 负责普通 required、类型和额外参数校验；专用 Host 保留只读边界、单语句和数据
 范围等安全门禁。单 id history 恢复使用 MySQL AST 做语义校验，允许大小写、空白、反引号、别名、
 `ORDER BY id ASC|DESC` 和任意普通顶层 `LIMIT`；该 `LIMIT` 的存在与数值不参与 SQL 身份或本地拒绝
 判定，`OFFSET` 仍保持独立语义。JOIN、子查询、额外谓词、错误目标表及未授权 id 仍在 transport 前拒绝。
 
-完整恢复 history 后，Archery adapter 将 sample 与真实 history 行、allowlist 实例和 `db_max` 严格
-绑定。实例发现工具的结构化 allowlist 行可以在同一调查中保留并复用；真实 MCP 无筛选返回的
-“实例清单（第 N 页）”编号文本仅作为目录和审计信息，必须通过精确 `instance_ref` 定向查询成功后
-才能进入执行 allowlist。实例 allowlist 也只授权对应实例的数据库发现；只有 `db_max` 同时出现在该
-实例随后真实返回的数据库清单中，业务目标 SQL 才能通过 transport 前门禁。任何 sample 都不能直接执行，但与完整 sample
-绑定的普通 `EXPLAIN` 可以包裹 SELECT、WITH 以及目标引擎支持的 DML。`EXPLAIN ANALYZE` 和截断
-sample 前缀始终禁止。目标及实际执行 SQL 核对成功的 EXPLAIN、表结构和索引结果分别形成独立
-supplemental 证据单元；失败单元只形成证据缺口，不修改或降级完整 history 单元。只要仍有 history
-id 或适用的 supplemental 阶段处于 `PENDING`，内部 `finish` 就会被拒绝；全部工作项进入成功、失败、
-不适用或不可用等终态后即可结束，不要求全部成功。新 Archery 父 evidence 只关联调用和原始 artifact，
-根因必须引用具备资格的具体子单元 ID。已由完整 history 最终结果覆盖的显式非终态恢复失败显示为
-`RECOVERED`；因目标解析或工具能力阻断而未执行的下游阶段显示为 `UNAVAILABLE`；同一阶段已有
-成功结果但仍有目标未覆盖时显示为 `PARTIAL`；只有实际空结果继续使用 `NO_DATA`。
+完整恢复所有 History 行后，Archery adapter 才将 sample 与真实 history 行、allowlist 实例和 `db_max`
+严格绑定并运行 supplemental。实例发现工具的结构化 allowlist 行可以在同一调查中保留并复用；真实
+MCP 无筛选返回的编号文本只作目录，必须通过精确 `instance_ref` 定向查询成功后才能授权数据库发现。
+任何 sample 都不能直接执行，但与完整 sample 绑定的普通 `EXPLAIN` 可以包裹 SELECT、WITH 以及目标
+引擎支持的 DML；`EXPLAIN ANALYZE` 始终禁止。目标及实际执行 SQL 核对成功的 EXPLAIN、表结构和索引
+结果形成独立 supplemental 单元。History 已完整但 supplemental 未完成时，完整 History 内容和资格不变，
+仅 supplemental 标记为 `PARTIAL` 或 `FAILED`。新 Archery 父 evidence 只关联调用和原始 artifact，根因
+必须引用具备资格的具体子单元 ID。
 
 ```dotenv
 MCP_SETTINGS_PATH=./config/mcp/settings.json

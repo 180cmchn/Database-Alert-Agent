@@ -79,10 +79,12 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     )
     assert archery.prompts.workflow_directives[
         "archery.history.truncation.fetch_single_id"
-    ].startswith("紧凑扫描完成后")
-    assert archery.prompts.workflow_directives[
+    ].startswith("完整非 sample 字段扫描完成后")
+    sample_directive = archery.prompts.workflow_directives[
         "archery.history.truncation.project_sample_prefix"
-    ].endswith("始终保留原文长度和 SHA-256 绑定。")
+    ]
+    assert "不得截断、压缩" in sample_directive
+    assert sample_directive.endswith("其它 provenance 同名词也必须保留。")
     assert set(archery.prompts.workflow_directives) == {
         "archery.alert.scope",
         "archery.tools.dynamic_contract",
@@ -122,8 +124,12 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert "`query_request`" in prometheus.prompts.workflow
     assert "五分钟范围" in prometheus.prompts.workflow
     assert "当前回合暴露的工具说明和 JSON Schema 是唯一调用契约" in (prometheus.prompts.workflow)
-    assert "监控目标目录" in prometheus.prompts.workflow
-    assert "不是范围查询的硬前置条件" in prometheus.prompts.workflow
+    assert "目录、标签、序列、元数据和即时查询只用于建立映射" in (
+        prometheus.prompts.workflow
+    )
+    assert "最终证据必须是同时匹配权威目标和完整告警窗口" in (
+        prometheus.prompts.workflow
+    )
     assert "序列发现" in prometheus.prompts.workflow
     assert "`instance` 可能是 exporter 或代理地址" in prometheus.prompts.workflow
     assert "`metric_candidates` 和 `promql_candidates` 仅作为语义提示" in (

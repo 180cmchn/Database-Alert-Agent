@@ -20,11 +20,11 @@ Archery 慢查询 history 后的补充分析，并落实以下边界：
 数据源或 `EXPLAIN ANALYZE`，调用仍可能到达 MCP。恢复旧 checkpoint 时还可能复用旧策略生成的
 PENDING 调用，从而绕过升级后的限制。
 
-### 2. 截断恢复缺少统一的完成状态
+### 2. History 完整恢复缺少统一契约
 
-字符截断后的 window 结果、id 清单和 per-id 行曾由多个局部条件判断。只恢复部分 id 时，子集可能
-被合并成看似完整的 history，并错误获得根因资格；字段级 sample 前缀也可能覆盖已经取得的完整
-sample。
+旧路径可把紧凑字段或 sample 前缀合并成看似成功的 history，并错误获得根因资格；业务字段还可能因
+与 `raw`、`request_id`、`usage`、`hash` 等 provenance 名称相同而在模型边界被递归删除。History
+完整性必须由真实 schema、完整行集合和逐行精确 sample 共同证明，内部来源元数据则按类型和位置隔离。
 
 ### 3. 补充结果需要同时绑定请求、history 和真实目标
 
@@ -43,24 +43,27 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 - Archery SQL 只能通过正式 SQL 查询工具发送；未知 SQL 工具和 history 后的未知工具会被本地拒绝。
 - 动态认证工具仅在明确声明 `readOnlyHint=true` 且未声明 `destructiveHint=true` 时放行；每次重新
   发现工具都会重建认证 allowlist，冲突或过期声明不会沿用到新会话。
-- history window 强制使用单一 history 数据源、`SELECT *`、真实解析的 endpoint 和完整告警时间边界。
-- history 后仅允许受约束的恢复查询、真实目标发现、字段/索引元数据查询及绑定 sample 的普通
-  EXPLAIN。
+- history 查询强制使用单一数据源、真实解析的 endpoint 和完整告警时间边界；确定性 Host 先读取真实
+  schema，再执行排名扫描、全部非 sample 字段扫描和逐行精确 sample 恢复。
+- history 后仅允许受约束的恢复查询、真实目标发现、字段/索引元数据查询及绑定 sample 的普通 EXPLAIN。
 - sample 直接执行使用格式无关但不改写字面量的 SQL 身份核对；普通 SELECT sample 也不能例外。
 - `EXPLAIN ANALYZE`、多语句、未绑定 EXPLAIN、DDL、CALL、管理语句和带副作用的直接查询在
   transport 前失败关闭。
 
-### History 截断恢复
+### History 无损恢复
 
-- id 清单必须保留原 endpoint 和时间窗口，并且只有清单真实返回的正整数 id 才能授权 per-id 查询。
-- per-id 查询只允许 `SELECT *` 或程序生成的固定字段级 sample 投影；不允许额外字段、换序、漏项、
-  重复字段或 `IN (...)` 合并查询。
-- per-id 恢复重试中的 `max_result_chars` 只允许缺省值或固定为 `24000`；其它查询继续遵循
-  MCP 动态 Schema 中的容量参数约束。
-- 统一跟踪 id 清单是否完整、缺失 id、清单外 id、未解析位置行和终态失败。恢复不完整时最终证据
-  保持 partial，不能获得 `root_cause_eligible`。
-- `sample_full_length` 按 UTF-8 字节长度核对；字段级前缀保留为 history 证据，但不进入 EXPLAIN。
-- 字段级前缀不能覆盖已恢复的完整 sample；完整行可以替换前缀并移除过期长度标记。
+- 排名扫描和完整非 sample 字段扫描都使用固定快照上界及 `id` keyset 分页，禁止 OFFSET；第二轮字段
+  来自真实 schema，不使用固定业务白名单。
+- 第二轮仅增加 Host 内部的 `LENGTH(sample) AS __history_sample_octet_length`。该 alias、排名、优先级、
+  恢复状态和 hash 不注入最终业务行。
+- 两次扫描 id 集必须一致；分页、字段、快照或行集合无法完整核验时，已收到内容保留为内部 artifact，
+  但 History 保持 incomplete 且不能获得 `root_cause_eligible`。
+- 所有 id 的 sample 都通过单行读取或 Host 生成的 `SUBSTRING` 分片恢复，UTF-8 字节长度必须与
+  `LENGTH(sample)` 精确相等。完整原 SQL原样写回真实 `sample` 字段，不做压缩、前后缀投影或空白改写。
+- 排名只决定恢复和 supplemental 调度顺序；最终 History 保持查询的 `id DESC` 行顺序，并包含 schema
+  中每个真实字段。所有 History 行完整后才能开始 supplemental。
+- 预算、deadline 或分片失败发生在 History 恢复阶段时 fail closed；若只发生在 supplemental 阶段，
+  完整 History 内容和资格保持不变，仅 supplemental 标记为 partial/failed。
 
 ### 补充证据绑定
 
@@ -78,10 +81,12 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 
 ### 证据契约与恢复语义
 
-- `final_result_payload` 继续只做格式转换并完整透传，不过滤、聚合、排序或设置程序侧大小上限。
-- EXPLAIN、字段、索引和失败原因通过独立 `slow_query_analysis` 进入主 Agent；补充失败不改变 history
-  的成功状态、可用性或根因资格。
-- 最终完整 history 已覆盖的显式非终态恢复失败投影为 `RECOVERED`；终态或未恢复失败仍为 `FAILED`。
+- `final_result_payload` 只做 JSON 格式转换和既有秘密净化后完整透传，不过滤、聚合、重排、截断、压缩
+  SQL 或设置最终大小上限。业务 History 内与 provenance 同名的键仍是业务字段，必须保留。
+- 请求信封、artifact ID、调用 request ID、usage 和 source hash 由类型化 DTO 字段与结构位置隔离，不
+  递归扫描并删除业务 payload；artifact payload、History `EvidenceUnit.data` 和模型/trace DTO 精确相等。
+- EXPLAIN、字段、索引和失败原因通过独立 `slow_query_analysis` 进入主 Agent；补充失败不改变完整
+  History 的成功状态、内容、可用性或根因资格。
 - 因目标解析或工具能力导致的内部 `UNAVAILABLE` 会原样进入 evidence unit；`NO_DATA` 仅表示已执行
   的查询没有数据或缺少更精确的历史状态，不能再代替依赖阻断。
 - 本地策略拒绝也进入 checkpoint lineage；当前策略直接判定的本地拒绝不会新增远端调用 debit，
@@ -92,7 +97,7 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 
 ### 可维护性
 
-- 新增集中式 MySQL 词法与表引用辅助模块，生成器和精确校验器共享同一字段级投影常量。
+- 新增集中式 MySQL 词法与表引用辅助模块；Host 生成器和精确校验器共享动态 schema、快照与分片契约。
 - Archery provider 的顺序、SQL 绑定和证据投影规则保留在专用 Adapter/Harness，不向通用 MCP Host
   引入 Archery 业务分支。
 - 同步更新 Archery 四份提示词、数据库告警分析技能、主 Agent 提示、README 和项目架构说明，并
@@ -106,22 +111,24 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 | `EXPLAIN <完整且已绑定的 SELECT/WITH sample>` | 满足目标和字段前置条件后允许 |
 | `EXPLAIN <完整且已绑定的受支持 DML sample>` | 满足目标和字段前置条件后允许 |
 | `EXPLAIN ANALYZE <sample>` | 永久本地拒绝 |
-| `EXPLAIN <字段级截断 sample 前缀>` | 本地拒绝 |
-| 未完整恢复 history 时开始 metadata/EXPLAIN | 本地拒绝，history 保持 partial |
+| `EXPLAIN <未完整恢复的 sample 分片>` | 本地拒绝 |
+| 未完整恢复所有 History 字段和 sample 时开始 metadata/EXPLAIN | 本地拒绝，History 保持 incomplete |
 | MCP 回显实际 SQL 或目标冲突 | 不投影结果，记录结构化证据缺口 |
-| 补充分析权限、空结果或 transport 失败 | 保留 history，仅标记对应补充阶段失败 |
+| History 恢复预算耗尽 | 保留内部 artifact，History 不具备根因资格且不运行 supplemental |
+| 完整 History 后 supplemental 权限、空结果或 transport 失败 | History 不变，仅标记对应 supplemental 阶段失败 |
 
 ## 验证
 
 最终提交前执行并记录以下离线验证：
 
 ```text
-pytest -m "not live" -q: 949 passed, 1 skipped, 3 deselected
+pytest -m "not live" -q: 1227 passed, 1 skipped, 3 deselected, 24 warnings
 ruff check app tests migrations: 通过
-python -m compileall -q app tests: 通过
-git diff --check: 通过
+python -m compileall -q app tests migrations: 通过
+受影响应用文件的 LSP diagnostics: 通过
 ```
 
-pytest 警告来自 FastAPI、Starlette、LangGraph/LangChain、Python 3.14 和 Alembic 依赖的弃用提示，
-没有本次实现产生的测试失败。
+24 条 warning 来自 Starlette、LangGraph/LangChain 和 Alembic 依赖的弃用提示，没有本次实现产生的
+测试失败。该离线套件的持久化 fixture 使用隔离的临时 SQLite 数据库；它不写入已迁移的 MySQL，也不
+把 SQLite 结果表述为 MySQL 事务语义验证。
 

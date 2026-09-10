@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -956,7 +957,7 @@ class DurableOuterToolDispatcher:
                     result_index=result_index,
                     status=status,
                     summary=summary,
-                    data=dict(data or {}),
+                    data=deepcopy(dict(data or {})),
                     root_cause_eligible=eligible,
                     root_cause_ineligible_reason=(
                         None if eligible else ineligible_reason or "evidence_unit_unusable"
@@ -973,7 +974,9 @@ class DurableOuterToolDispatcher:
         history_incomplete = bool(
             history_data is not None
             and (
-                history_data.get("result_incomplete") is True
+                raw_structured_data.get("partial") is True
+                or raw_structured_data.get("history_scan_complete") is False
+                or history_data.get("result_incomplete") is True
                 or history_data.get("history_recovery_complete") is False
             )
         )
@@ -1036,6 +1039,11 @@ class DurableOuterToolDispatcher:
                 ineligible_reason="history_no_data",
             )
         else:
+            missing_history_path = (
+                history_path
+                if "final_result_payload" in raw_structured_data
+                else "/structured_data"
+            )
             append_unit(
                 unit_key="history",
                 kind=EvidenceUnitKind.HISTORY,
@@ -1043,7 +1051,7 @@ class DurableOuterToolDispatcher:
                 status=EvidenceUnitStatus.FAILED,
                 summary="Archery history 结果缺少可验证的 rows。",
                 data=history_data,
-                source_paths=["/structured_data"],
+                source_paths=[missing_history_path],
                 eligible=False,
                 ineligible_reason="history_rows_missing",
             )
@@ -1226,12 +1234,37 @@ class DurableOuterToolDispatcher:
                     raise OuterDispatchError(
                         f"evidence-unit source path does not resolve: {source_path}"
                     ) from exc
+            if unit.kind == EvidenceUnitKind.HISTORY:
+                missing_payload_failure = (
+                    not unit.data
+                    and unit.status == EvidenceUnitStatus.FAILED
+                    and unit.source_paths == ["/structured_data"]
+                )
+                if not missing_payload_failure and not any(
+                    cls._history_value_matches_source(unit.data, source)
+                    for source in resolved_values
+                ):
+                    raise OuterDispatchError(
+                        "Archery history evidence-unit data is not identical to its raw source"
+                    )
+                continue
             if unit.status == EvidenceUnitStatus.SUCCESS and not any(
                 cls._projected_value_matches_source(unit.data, source) for source in resolved_values
             ):
                 raise OuterDispatchError(
                     "successful evidence-unit data does not match its raw source path"
                 )
+
+    @staticmethod
+    def _history_value_matches_source(projected: Mapping[str, Any], source: Any) -> bool:
+        """Require lossless History payloads, including unparseable text wrappers."""
+
+        if dict(projected) == source:
+            return True
+        return (
+            isinstance(source, str)
+            and dict(projected) == {"final_result_text": source}
+        )
 
     @classmethod
     def _projected_value_matches_source(cls, projected: Any, source: Any) -> bool:

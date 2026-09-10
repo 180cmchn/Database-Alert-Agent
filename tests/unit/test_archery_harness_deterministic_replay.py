@@ -8,9 +8,12 @@ import pytest
 from app.adapters import archery_harness as archery_harness_module
 from app.adapters.archery_harness import ARCHERY_HARNESS_PROVIDER
 from app.adapters.archery_mcp import (
+    ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
+    ARCHERY_MCP_TABLES_TOOL_NAME,
+    ARCHERY_SLOW_QUERY_REVIEW_TABLE,
 )
 from app.mcp_runtime import (
     DiscoveredMCPTool,
@@ -70,6 +73,18 @@ def _live_archery_tools() -> list[DiscoveredMCPTool]:
                     "size": {"type": "integer", "minimum": 1, "maximum": 200},
                 },
                 "required": ["instance_id"],
+            },
+        ),
+        DiscoveredMCPTool(
+            name=ARCHERY_MCP_TABLES_TOOL_NAME,
+            description="列出指定数据库的数据表",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "integer"},
+                    "db_name": {"type": "string"},
+                },
+                "required": ["instance_id", "db_name"],
             },
         ),
         DiscoveredMCPTool(
@@ -194,6 +209,49 @@ def _preview_replay_fixtures() -> list[ReplayCallFixture]:
     fixtures.append(_result_fixture(instance, instance_result))
     _apply_result(scenario, state, instance, instance_result)
 
+    history_tables = _named_call(
+        "discover-history-table",
+        ARCHERY_MCP_TABLES_TOOL_NAME,
+        {"instance_id": 17, "db_name": "archery"},
+    )
+    history_tables_result = {
+        "structuredContent": {
+            "status": "success",
+            "rows": [{"name": ARCHERY_SLOW_QUERY_REVIEW_TABLE}],
+        }
+    }
+    fixtures.append(_result_fixture(history_tables, history_tables_result))
+    _apply_result(scenario, state, history_tables, history_tables_result)
+
+    history_columns = _named_call(
+        "discover-history-columns",
+        ARCHERY_MCP_COLUMNS_TOOL_NAME,
+        {
+            "instance_id": 17,
+            "db_name": "archery",
+            "tb_name": ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+        },
+    )
+    history_column_names = [
+        "id",
+        "hostname_max",
+        "db_max",
+        "checksum",
+        "ts_min",
+        "ts_max",
+        "Query_time_max",
+        "Query_time_sum",
+        "sample",
+    ]
+    history_columns_result = {
+        "structuredContent": {
+            "status": "success",
+            "rows": [{"name": name} for name in history_column_names],
+        }
+    }
+    fixtures.append(_result_fixture(history_columns, history_columns_result))
+    _apply_result(scenario, state, history_columns, history_columns_result)
+
     ranking = scenario.next_host_call(specs)
     assert ranking is not None
     ranking_result = _sql_result(
@@ -218,7 +276,7 @@ def _preview_replay_fixtures() -> list[ReplayCallFixture]:
                 "ts_max": "2026-07-23 16:00:00",
                 "Query_time_max": 9.5,
                 "Query_time_sum": 63.0,
-                "sample_full_length": len(sample.encode("utf-8")),
+                ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS: len(sample.encode("utf-8")),
             }
         ],
     )
@@ -292,6 +350,20 @@ async def test_live_schema_replay_requires_targeted_instance_before_allowlisting
             _named_call("instance-directory", ARCHERY_MCP_INSTANCES_TOOL_NAME, {}),
             _call("resolve-member", MEMBER_SQL),
             _call("resolve-instance", INSTANCE_SQL),
+            _named_call(
+                "discover-history-table",
+                ARCHERY_MCP_TABLES_TOOL_NAME,
+                {"instance_id": 17, "db_name": "archery"},
+            ),
+            _named_call(
+                "discover-history-columns",
+                ARCHERY_MCP_COLUMNS_TOOL_NAME,
+                {
+                    "instance_id": 17,
+                    "db_name": "archery",
+                    "tb_name": ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+                },
+            ),
         ]
     )
     connector = ReplayMCPConnector(
@@ -317,7 +389,9 @@ async def test_live_schema_replay_requires_targeted_instance_before_allowlisting
 
     assert result.payload["row_count"] == 1
     assert result.payload["rows"][0]["id"] == 501
-    assert result.payload["rows"][0]["sample_recovery_status"] == "ANALYZED"
+    assert result.payload["rows"][0]["sample"] == "SELECT * FROM orders WHERE customer_id = 42"
+    assert "sample_recovery_status" not in result.payload["rows"][0]
+    assert result.history_complete is True
     assert result.slow_query_analysis is not None
     assert result.slow_query_analysis["target"] == {
         "instance_id": 3,
@@ -328,12 +402,14 @@ async def test_live_schema_replay_requires_targeted_instance_before_allowlisting
         result.slow_query_analysis["explain_results"][0]["result"]["rows"][0]["key"]
         == "idx_customer"
     )
-    assert len(model.requests) == 3
+    assert len(model.requests) == 5
     assert result.model_tool_calls == (
         ARCHERY_MCP_INSTANCES_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
         ARCHERY_MCP_QUERY_TOOL_NAME,
+        ARCHERY_MCP_TABLES_TOOL_NAME,
+        ARCHERY_MCP_COLUMNS_TOOL_NAME,
     )
-    assert result.diagnostics["model_decision_count"] == 3
+    assert result.diagnostics["model_decision_count"] == 5
     assert result.diagnostics["host_executed_tool_calls"]
     assert connector.opened_session_ids == ["archery-live-schema-offline-replay"]

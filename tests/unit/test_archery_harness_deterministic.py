@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
 from app.adapters import archery_harness as archery_harness_module
 from app.adapters.archery_mcp import (
+    ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
     ARCHERY_SAMPLE_CHUNK_MIN_CHARS,
     ARCHERY_SAMPLE_CHUNK_RESULT_CHARS,
     ARCHERY_SLOW_QUERY_REVIEW_TABLE,
@@ -81,6 +83,16 @@ def _pipeline_scenario():
             "ts_max",
             "query_time_max",
             "query_time_sum",
+            "raw",
+            "raw_metric",
+            "artifact_count",
+            "hash",
+            "content_hash",
+            "request_id",
+            "usage",
+            "sha256",
+            "sample_sha256",
+            "business_blob",
             "sample",
         }
     }
@@ -106,7 +118,17 @@ def _history_compact_row(
         "ts_max": "2026-07-23 16:00:00",
         "Query_time_max": float(row_id),
         "Query_time_sum": float(row_id * 10),
-        "sample_full_length": sample_full_length,
+        ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS: sample_full_length,
+        "raw": {"nested": ["value", {"raw": True}]},
+        "raw_metric": row_id * 7,
+        "artifact_count": row_id,
+        "hash": f"business-hash-{row_id}",
+        "content_hash": f"business-content-hash-{row_id}",
+        "request_id": f"business-request-{row_id}",
+        "usage": {"business_units": row_id},
+        "sha256": f"business-sha256-{row_id}",
+        "sample_sha256": f"business-sample-sha256-{row_id}",
+        "business_blob": f"business-value-{row_id}",
     }
 
 
@@ -208,11 +230,16 @@ def _prime_reuse_candidate(
     return exact_sample
 
 
-def test_pipeline_starts_after_verified_archery_target_without_table_discovery() -> None:
+def test_pipeline_requires_discovered_complete_history_schema_before_start() -> None:
     scenario, state, specs = _pipeline_scenario()
-    state.slow_log_tables.clear()
-    state.table_columns.clear()
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    discovered_tables = state.slow_log_tables.pop(target)
+    discovered_columns = state.table_columns.pop(target)
 
+    assert scenario.next_host_call(specs) is None
+
+    state.slow_log_tables[target] = discovered_tables
+    state.table_columns[target] = discovered_columns
     ranking = scenario.next_host_call(specs)
 
     assert ranking is not None
@@ -322,45 +349,26 @@ def test_missing_compact_id_is_reconciled_before_global_ranking() -> None:
     )
     compact = scenario.next_host_call(specs)
     assert compact is not None
-    shared = {
-        "hostname_max": "db-1.example:3306",
-        "db_max": "orders_prod",
-        "ts_min": "2026-07-23 15:59:00",
-        "ts_max": "2026-07-23 16:00:00",
-        "Query_time_max": 8.0,
-        "Query_time_sum": 9.0,
-        "sample_full_length": 8,
-    }
-    _apply_query_result(
-        scenario,
-        state,
-        compact,
-        [{"id": 2, "checksum": "checksum-2", **shared}],
-    )
+    row_two = _history_compact_row(2, sample_full_length=8)
+    row_two["Query_time_max"] = 8.0
+    row_two["Query_time_sum"] = 9.0
+    _apply_query_result(scenario, state, compact, [row_two])
 
     reconciliation = scenario.next_host_call(specs)
     assert reconciliation is not None
     assert "id = 1" in reconciliation.arguments["sql_content"]
-    _apply_query_result(
-        scenario,
-        state,
-        reconciliation,
-        [
-            {
-                "id": 1,
-                "checksum": "checksum-1",
-                **{
-                    **shared,
-                    "Query_time_max": 4.0,
-                    "Query_time_sum": 5.0,
-                },
-            }
-        ],
-    )
+    row_one = _history_compact_row(1, sample_full_length=8)
+    row_one["Query_time_max"] = 4.0
+    row_one["Query_time_sum"] = 5.0
+    _apply_query_result(scenario, state, reconciliation, [row_one])
 
     assert state.history_pipeline_phase == "ENRICHMENT"
-    assert state.final_result.payload["history_snapshot_consistent"] is True
+    assert state.final_result.history_incomplete_reasons == (
+        "history_lossless_recovery_incomplete",
+    )
     assert state.history_processing_order == [2, 1]
+    assert [row["id"] for row in state.final_result.payload["rows"]] == [2, 1]
+    assert ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS not in state.final_result.payload["rows"][0]
 
 
 def test_budget_stop_materializes_completed_ranking_rows_before_compact_scan() -> None:
@@ -383,13 +391,14 @@ def test_budget_stop_materializes_completed_ranking_rows_before_compact_scan() -
     )
 
     assert state.final_result is not None
-    assert state.final_result.payload["history_scan_complete"] is False
-    assert state.final_result.payload["result_incomplete"] is True
+    assert state.final_result.history_complete is False
+    assert "history_scan_incomplete" in state.final_result.history_incomplete_reasons
     assert state.final_result.payload["rows"][0]["id"] == 1
-    assert state.final_result.payload["enrichment_unfinished_ids"] == [1]
+    assert "result_incomplete" not in state.final_result.payload
+    assert "enrichment_unfinished_ids" not in state.final_result.payload
 
 
-def test_budget_stop_keeps_complete_compact_history_root_cause_eligible() -> None:
+def test_budget_stop_before_sample_recovery_makes_history_ineligible() -> None:
     scenario, state, specs = _pipeline_scenario()
     ranking = scenario.next_host_call(specs)
     assert ranking is not None
@@ -405,19 +414,7 @@ def test_budget_stop_keeps_complete_compact_history_root_cause_eligible() -> Non
         scenario,
         state,
         compact,
-        [
-            {
-                "id": 1,
-                "hostname_max": "db-1.example:3306",
-                "db_max": "orders_prod",
-                "checksum": "checksum-1",
-                "ts_min": "2026-07-23 15:59:00",
-                "ts_max": "2026-07-23 16:00:00",
-                "Query_time_max": 4.0,
-                "Query_time_sum": 7.0,
-                "sample_full_length": 20_000,
-            }
-        ],
+        [_history_compact_row(1, sample_full_length=20_000)],
     )
 
     archery_harness_module._finalize_deterministic_pipeline_stop(
@@ -426,10 +423,46 @@ def test_budget_stop_keeps_complete_compact_history_root_cause_eligible() -> Non
         stop_reason="budget_exhausted",
     )
 
-    assert state.final_result.payload["result_incomplete"] is False
-    assert state.final_result.payload["enrichment_partial"] is True
-    assert state.final_result.payload["enrichment_unfinished_ids"] == [1]
+    assert state.final_result.history_complete is False
+    assert "history_lossless_recovery_incomplete" in state.final_result.history_incomplete_reasons
+    assert state.final_result.enrichment_partial is False
+    assert state.final_result.enrichment_unfinished_ids == ()
     assert state.history_sample_states[1] == "BUDGET_EXHAUSTED"
+    assert "sample_recovery_status" not in state.final_result.payload["rows"][0]
+    evidence = ArcherySlowLogEvidenceTool(scenario.client)._build_slow_query_evidence(
+        state.final_result,
+        session_attempts=1,
+        root_cause_ineligible_reason="",
+        parsed_rows=scenario.client._tabular_rows(state.final_result.payload),
+    )
+    assert evidence["partial"] is True
+    assert evidence["history_scan_complete"] is False
+    assert evidence["root_cause_eligible"] is False
+
+
+def test_budget_stop_after_lossless_history_only_marks_supplemental_partial() -> None:
+    scenario, state, _ = _pipeline_scenario()
+    sample = "SELECT * FROM orders WHERE id = 1"
+    _prime_enrichment(
+        scenario,
+        state,
+        [_history_compact_row(1, sample_full_length=len(sample.encode("utf-8")))],
+    )
+    scenario._accept_reconstructed_sample(state, 1, sample)
+    clean_payload = deepcopy(state.final_result.payload)
+
+    archery_harness_module._finalize_deterministic_pipeline_stop(
+        scenario.client,
+        state,
+        stop_reason="BUDGET_EXHAUSTED",
+    )
+
+    assert state.final_result.payload == clean_payload
+    assert state.final_result.history_complete is True
+    assert state.final_result.history_incomplete_reasons == ()
+    assert state.final_result.enrichment_partial is True
+    assert state.final_result.enrichment_unfinished_ids == (1,)
+    assert "sample_recovery_status" not in state.final_result.payload["rows"][0]
     evidence = ArcherySlowLogEvidenceTool(scenario.client)._build_slow_query_evidence(
         state.final_result,
         session_attempts=1,
@@ -437,8 +470,9 @@ def test_budget_stop_keeps_complete_compact_history_root_cause_eligible() -> Non
         parsed_rows=scenario.client._tabular_rows(state.final_result.payload),
     )
     assert evidence["partial"] is False
-    assert evidence["enrichment_partial"] is True
+    assert evidence["history_scan_complete"] is True
     assert evidence["root_cause_eligible"] is True
+    assert evidence["enrichment_partial"] is True
 
 
 def test_host_generated_calls_use_separate_audit_counters() -> None:
@@ -482,17 +516,12 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
 
     compact = scenario.next_host_call(specs)
     assert compact is not None
-    compact_row = {
-        "id": 81,
-        "hostname_max": "db-1.example:3306",
-        "db_max": "orders_prod",
-        "checksum": "checksum-81",
-        "ts_min": "2026-07-23 15:59:00",
-        "ts_max": "2026-07-23 16:00:00",
-        "Query_time_max": 8.5,
-        "Query_time_sum": 91.0,
-        "sample_full_length": len(sample.encode("utf-8")),
-    }
+    compact_row = _history_compact_row(
+        81,
+        sample_full_length=len(sample.encode("utf-8")),
+    )
+    compact_row["Query_time_max"] = 8.5
+    compact_row["Query_time_sum"] = 91.0
     _apply_query_result(scenario, state, compact, [compact_row])
 
     recovered = ""
@@ -519,22 +548,22 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
     assert chunk_calls < len(sample) // 4000
     assert recovered == sample
     projected = state.history_id_rows[81]
-    assert projected["sample_representation"] == "structured"
-    assert projected["sample_source_reconstructed"] is True
-    assert projected["sample_structure_executable"] is True
-    assert len(projected["sample"]) <= 12_000
-    assert projected["sample"] != sample
-    assert "IN (0," in projected["sample"]
-    assert "5999)" in projected["sample"]
-    assert projected["sample_in_lists"][0]["head_value_count"] > 0
-    assert projected["sample_in_lists"][0]["tail_value_count"] > 0
-    assert (
-        scenario.client.history_row_for_explain(
-            f"EXPLAIN {projected['sample']}",
-            state.final_result.payload,
-        )
-        is None
+    assert projected["sample"] == sample
+    assert projected["raw"] == {"nested": ["value", {"raw": True}]}
+    assert projected["request_id"] == "business-request-81"
+    assert projected["usage"] == {"business_units": 81}
+    assert projected["sample_sha256"] == "business-sample-sha256-81"
+    assert "sample_recovery_status" not in projected
+    assert "sample_source_reconstructed" not in projected
+    assert state.history_sample_metadata[81]["sample_source_reconstructed"] is True
+    assert state.history_sample_metadata[81]["sample_sha256"] != projected["sample_sha256"]
+    explainable = scenario.client.history_row_for_explain(
+        f"EXPLAIN {sample}",
+        state.final_result.payload,
     )
+    assert explainable is not None
+    assert explainable["id"] == 81
+    assert state.final_result.history_complete is True
 
     state.analysis_instance_endpoints[3] = {"db-1.example:3306"}
     state.analysis_database_names[3] = {"orders_prod"}
@@ -549,7 +578,6 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
             "result": {"row_count": 1, "rows": [{"COLUMN_NAME": "id"}]},
         }
     )
-
     indexes = scenario.next_host_call(specs)
     assert indexes is not None
     assert "information_schema.STATISTICS" in indexes.arguments["sql_content"]
@@ -565,7 +593,7 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
     assert explain is not None
     assert explain.arguments["sql_content"] == f"EXPLAIN {sample}"
     assert explain.arguments["max_result_chars"] >= len(sample) + 12_000
-    assert sample not in projected["sample"]
+    assert projected["sample"] == sample
 
     _apply_query_result(
         scenario,
@@ -573,10 +601,8 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
         explain,
         [{"id": 1, "select_type": "SIMPLE", "table": "orders", "type": "range"}],
     )
-    assert (
-        state.slow_query_explain_results[0]["source_history_row"]["sample"] == (projected["sample"])
-    )
-    assert sample not in str(state.slow_query_explain_results[0])
+    assert state.slow_query_explain_results[0]["source_history_row"]["sample"] == sample
+    assert sample in str(state.slow_query_explain_results[0])
 
     finish = scenario.next_host_call(specs)
     assert finish is not None
@@ -587,8 +613,11 @@ def test_oversized_sample_is_chunked_but_exact_sql_is_used_for_explain() -> None
     assert state.history_exact_sample is None
     assert state.finish_accepted is True
     final_row = state.final_result.payload["rows"][0]
-    assert final_row["sample"] == projected["sample"]
-    assert sample not in str(state.final_result.payload)
+    assert {key.casefold(): value for key, value in final_row.items()} == {
+        key.casefold(): value for key, value in projected.items()
+    }
+    assert final_row["sample"] == sample
+    assert sample in str(state.final_result.payload)
 
 
 def test_explain_reuse_is_bound_to_instance_database_and_checksum() -> None:
@@ -607,7 +636,7 @@ def test_explain_reuse_is_bound_to_instance_database_and_checksum() -> None:
     assert state.history_sample_metadata[1]["explain_status"] == "reused"
     assert state.history_sample_metadata[1]["explain_reused_from_history_id"] == 2
     assert state.history_exact_sample is None
-    assert exact_sample not in str(state.final_result.payload)
+    assert exact_sample in str(state.final_result.payload)
     assert exact_sample not in str(state.slow_query_explain_results)
 
 
@@ -677,10 +706,15 @@ def test_history_page_failure_retains_available_partial_rows(phase: str) -> None
 
     assert state.history_pipeline_phase == "COMPLETED"
     assert state.final_result is not None
-    assert state.final_result.payload["result_incomplete"] is True
+    assert state.final_result.history_complete is False
+    assert "history_scan_incomplete" in state.final_result.history_incomplete_reasons
     expected_ids = [3, 2] if phase == "RANKING" else [3]
     assert [row["id"] for row in state.final_result.payload["rows"]] == expected_ids
-    assert state.final_result.payload["enrichment_unfinished_ids"] == expected_ids
+    assert "result_incomplete" not in state.final_result.payload
+    assert "enrichment_unfinished_ids" not in state.final_result.payload
+    assert all(
+        "sample_recovery_status" not in row for row in state.final_result.payload["rows"]
+    )
 
 
 def test_direct_sample_failure_switches_to_chunk_recovery() -> None:
@@ -803,6 +837,19 @@ def test_explain_failure_finishes_current_row_and_continues_next_id() -> None:
             else state.slow_query_index_results
         ).append(target_result)
 
+    next_recovery = scenario.next_host_call(specs)
+    assert next_recovery is not None
+    assert "SELECT sample FROM" in next_recovery.arguments["sql_content"]
+    assert "id = 1" in next_recovery.arguments["sql_content"]
+    assert not next_recovery.arguments["sql_content"].startswith("EXPLAIN")
+    _apply_query_result(
+        scenario,
+        state,
+        next_recovery,
+        [{"sample": samples[1]}],
+    )
+    assert state.final_result.history_complete is True
+
     explain = scenario.next_host_call(specs)
     assert explain is not None
     assert explain.arguments["sql_content"] == f"EXPLAIN {samples[2]}"
@@ -812,5 +859,5 @@ def test_explain_failure_finishes_current_row_and_continues_next_id() -> None:
     assert state.history_sample_states[2] == "ANALYZED"
     assert state.history_sample_metadata[2]["explain_status"] == "failed"
     assert next_sample is not None
-    assert "id = 1" in next_sample.arguments["sql_content"]
+    assert next_sample.arguments["sql_content"] == f"EXPLAIN {samples[1]}"
     assert state.history_current_id == 1

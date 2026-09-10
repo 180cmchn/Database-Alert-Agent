@@ -8,8 +8,15 @@ from uuid import uuid4
 import pytest
 
 from app.adapters import archery_harness as archery_harness_module
-from app.adapters.archery_harness import ARCHERY_HARNESS_PROVIDER
-from app.adapters.archery_mcp import ARCHERY_SLOW_QUERY_REVIEW_TABLE
+from app.adapters.archery_harness import (
+    ARCHERY_HARNESS_PROVIDER,
+    ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION,
+)
+from app.adapters.archery_mcp import (
+    ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
+    ARCHERY_SLOW_QUERY_REVIEW_TABLE,
+    ArcherySlowLogQueryResult,
+)
 from app.agent_runtime import (
     BudgetLedger,
     BudgetLimits,
@@ -130,7 +137,7 @@ def _compact_row(
         "ts_max": "2026-07-23 16:00:00",
         "Query_time_max": float(row_id),
         "Query_time_sum": float(row_id * 10),
-        "sample_full_length": sample_full_length,
+        ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS: sample_full_length,
     }
 
 
@@ -178,6 +185,50 @@ def _analysis_binding(state, *, instance_id: int = 3, db_name: str = "orders_pro
             "result": {"row_count": 1, "rows": [{"INDEX_NAME": "PRIMARY"}]},
         }
     )
+
+
+def test_legacy_compact_checkpoint_restarts_lossless_read_only_materialization() -> None:
+    connector = ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, [])
+    scenario, state = _pipeline_scenario(connector)
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    state.history_payload_contract_version = ""
+    state.history_pipeline_phase = "COMPLETED"
+    state.history_pipeline_target = target
+    state.history_pipeline_endpoint = "db-1.example:3306"
+    state.history_ranking_rows = {1: {"id": 1}}
+    state.history_compact_rows = {1: _compact_row(1)}
+    state.history_id_rows = {1: {"id": 1, "sample": "SELECT prefix"}}
+    state.history_sample_prefix_ids = {1}
+    state.history_full_row_ids = {1}
+    state.history_sample_states = {1: "ANALYZED"}
+    state.slow_query_explain_results = [{"stage": "explain", "result": {"rows": []}}]
+    state.finish_accepted = True
+    state.final_result = ArcherySlowLogQueryResult(
+        payload={"rows": [{"id": 1, "sample": "SELECT prefix"}], "row_count": 1},
+        requested_sql="SELECT compact_columns FROM mysql_slow_query_review_history",
+        window_start=state.window_start,
+        window_end=state.window_end,
+    )
+    durable_host_calls = [{"tool_name": "sql_query_gymJPA", "artifact_id": "durable"}]
+    state.executed_host_calls = deepcopy(durable_host_calls)
+
+    scenario.restore_state(state)
+
+    assert state.history_payload_contract_version == ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION
+    assert state.history_pipeline_phase == "IDLE"
+    assert state.history_pipeline_target is None
+    assert state.history_ranking_rows == {}
+    assert state.history_compact_rows == {}
+    assert state.history_id_rows == {}
+    assert state.history_sample_prefix_ids == set()
+    assert state.history_full_row_ids == set()
+    assert state.slow_query_explain_results == []
+    assert state.final_result is None
+    assert state.finish_accepted is False
+    assert state.executed_host_calls == durable_host_calls
+    ranking = scenario.next_host_call(scenario.build_tool_specs(_analysis_tools()))
+    assert ranking is not None
+    assert "SELECT id, Query_time_max, Query_time_sum" in ranking.arguments["sql_content"]
 
 
 @pytest.mark.parametrize("phase", ["RANKING", "COMPACT"])
@@ -416,10 +467,13 @@ async def test_complete_sample_checkpoint_resumes_with_exact_explain_sql() -> No
     captured = []
 
     async def interrupt_after_sample(snapshot) -> None:
+        final_result = snapshot.state.final_result
         if (
             snapshot.active_call is None
             and snapshot.state.history_sample_states.get(42) == "READY"
-            and snapshot.state.history_exact_sample == sample
+            and final_result is not None
+            and final_result.history_complete is True
+            and final_result.payload["rows"][0]["sample"] == sample
             and not snapshot.state.slow_query_explain_results
         ):
             captured.append(snapshot)
@@ -552,7 +606,7 @@ async def test_staged_explain_response_is_applied_on_resume_without_replay() -> 
     )
 
     assert len(resumed.state.slow_query_explain_results) == 1
-    assert exact_sample not in str(resumed.state.slow_query_explain_results)
+    assert exact_sample in str(resumed.state.slow_query_explain_results)
     assert resumed.budget.consumed.remote_tool_calls == 1
     assert resumed.state.history_sample_states[91] == "ANALYZED"
     assert resumed.state.history_sample_metadata[91]["explain_status"] == "succeeded"
@@ -583,8 +637,10 @@ async def test_budget_stop_checkpoint_rematerializes_same_partial_result() -> No
     )
 
     assert terminal_checkpoint.state.history_pipeline_phase == "ENRICHMENT"
-    assert first.payload["enrichment_unfinished_ids"] == [7]
-    assert first.payload["rows"][0]["sample_recovery_status"] == "BUDGET_EXHAUSTED"
+    assert first.history_complete is False
+    assert "history_lossless_recovery_incomplete" in first.history_incomplete_reasons
+    assert first.enrichment_unfinished_ids == ()
+    assert "sample_recovery_status" not in first.payload["rows"][0]
 
     resumed_connector = ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, [])
     resumed_scenario, _ = _restored_scenario(terminal_checkpoint, resumed_connector)
@@ -602,10 +658,15 @@ async def test_budget_stop_checkpoint_rematerializes_same_partial_result() -> No
     )
 
     assert second.payload == first.payload
+    assert second.history_complete is False
+    assert second.history_incomplete_reasons == first.history_incomplete_reasons
+    assert isinstance(second.history_incomplete_reasons, tuple)
+    assert second.enrichment_unfinished_ids == first.enrichment_unfinished_ids
+    assert isinstance(second.enrichment_unfinished_ids, tuple)
     assert resumed_connector.opened_session_ids == []
     assert (
         sum(
-            item.get("reason_code") == "archery_investigation_budget_exhausted"
+            item.get("reason_code") == "history_lossless_recovery_incomplete"
             for item in resumed_runtime_result.state.slow_query_analysis_failures
         )
         == 1

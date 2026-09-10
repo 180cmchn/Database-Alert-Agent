@@ -491,12 +491,11 @@ async def test_per_id_only_history_keeps_supplemental_success_and_failure() -> N
 
 @pytest.mark.asyncio
 async def test_truncated_id_retrieval_with_high_limit_skips_to_projection_hint() -> None:
-    """Replay of run 2c18cb74 (attempt=18): the model already sent
-    max_result_chars=24000 on the very first per-id query, so the level-1
-    "retry with 24000" hint was a dead end the model correctly skipped --
-    and the projection hint never fired because it required a second
-    truncation of the same SQL. A first truncation under a high
-    max_result_chars now goes straight to the field-level projection hint.
+    """Legacy replay of run 2c18cb74 (attempt=18).
+
+    A first truncation under the historical high result limit routes directly
+    to the compatibility projection hint. The current directive additionally
+    requires lossless sample recovery; this replay only covers hint routing.
     """
     row_40 = {
         "id": 24413640,
@@ -566,15 +565,15 @@ async def test_truncated_id_retrieval_with_high_limit_skips_to_projection_hint()
         alert_context=ALERT_CONTEXT,
     )
 
-    # The very first truncation under max_result_chars=24000 goes straight to
-    # the field-level projection hint; the level-1 retry hint never appears.
+    # A first truncation under max_result_chars=24000 goes straight to the
+    # compatibility projection hint; the level-1 retry hint never appears.
     tool_contents = [
         str(message.get("content"))
         for request in model.requests
         for message in request["messages"]
         if message.get("role") in {"tool", "user"}
     ]
-    assert any("字段级" in content for content in tool_contents)
+    assert any("重组后的原始完整 sample" in content for content in tool_contents)
     assert any(
         "LEFT(sample, '4000') AS sample" in content for content in tool_contents
     )
@@ -588,6 +587,7 @@ async def test_truncated_id_retrieval_with_high_limit_skips_to_projection_hint()
     assert payload_rows[0]["sample"] == _PROJECTION_SAMPLE_PREFIX
     assert payload_rows[0]["sample_full_length"] == 321237
     assert result.payload["merged_query_count"] == 2
+    assert result.payload["history_recovery_complete"] is False
 
 
 @pytest.mark.asyncio

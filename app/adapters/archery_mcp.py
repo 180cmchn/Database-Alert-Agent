@@ -69,15 +69,15 @@ ARCHERY_SLOW_LOG_DEFAULT_WINDOW_SECONDS: Final = 300
 # 存储；窗口本身仍以 UTC 计算，仅在传给 MCP 内层 Agent 时投影为北京时区字面量。
 ARCHERY_SLOW_LOG_TS_COLUMN_TIMEZONE: Final = timezone(timedelta(hours=8))
 ARCHERY_MCP_SERVER_NAME: Final = "archery"
-ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v32"
-ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v6"
+ARCHERY_SLOW_LOG_PROMPT_VERSION: Final = "archery-slow-log-mcp-agent-v33"
+ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION: Final = "archery-slow-query-summary-v7"
 ARCHERY_HISTORY_PAGE_SIZE: Final = 100
 ARCHERY_HISTORY_RESULT_CHARS: Final = 12_000
 ARCHERY_SAMPLE_FULL_LENGTH_LIMIT: Final = 12_000
-ARCHERY_SAMPLE_STRUCTURE_CHARS: Final = 12_000
 ARCHERY_SAMPLE_CHUNK_RESULT_CHARS: Final = 12_000
 ARCHERY_SAMPLE_CHUNK_RESERVE_CHARS: Final = 2_000
 ARCHERY_SAMPLE_CHUNK_MIN_CHARS: Final = 1_000
+ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS: Final = "__history_sample_octet_length"
 _MISSING: Final = object()
 
 _SLOW_QUERY_IDENTITY_FIELDS: Final = (
@@ -349,6 +349,14 @@ class ArcherySlowLogQueryResult:
     diagnostics: dict[str, Any] | None = None
     query_completed: bool = True
     slow_query_analysis: dict[str, Any] | None = None
+    # ``None`` preserves compatibility for model-driven legacy results. The
+    # deterministic pipeline sets this explicitly and never infers completeness
+    # from a compact or truncated payload.
+    history_complete: bool | None = None
+    history_incomplete_reasons: tuple[str, ...] = ()
+    enrichment_partial: bool = False
+    enrichment_stop_reason: str | None = None
+    enrichment_unfinished_ids: tuple[int, ...] = ()
 
 
 def load_mcp_server_settings(
@@ -1083,9 +1091,47 @@ class ArcheryMCPClient:
     def history_ranking_projection_sql() -> str:
         return ", ".join(_HISTORY_RANKING_PROJECTION_EXPRESSIONS)
 
-    @staticmethod
-    def history_compact_projection_sql() -> str:
-        return ", ".join(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS)
+    @classmethod
+    def history_base_projection_columns(
+        cls,
+        columns: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return every discovered History column in a deterministic safe order."""
+
+        normalized: dict[str, str] = {}
+        for raw_column in columns:
+            column = str(raw_column).strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", column) is None:
+                raise ValueError("history column is not a safe MySQL identifier")
+            folded = column.casefold()
+            if folded in normalized:
+                raise ValueError("history columns are ambiguous after case folding")
+            normalized[folded] = column
+        if "id" not in normalized or "sample" not in normalized:
+            raise ValueError("history columns must include id and sample")
+        if ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS.casefold() in normalized:
+            raise ValueError("history columns collide with the Host-only sample length alias")
+        return tuple(sorted(normalized.values(), key=lambda item: (item.casefold(), item)))
+
+    @classmethod
+    def history_compact_projection_sql(
+        cls,
+        columns: Sequence[str] | None = None,
+    ) -> str:
+        """Build the lossless non-sample projection used before sample chunking.
+
+        The no-argument form remains only for validating legacy checkpoints.
+        New deterministic runs supply the complete discovered table schema.
+        """
+
+        if columns is None:
+            return ", ".join(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS)
+        ordered = cls.history_base_projection_columns(columns)
+        direct = [f"`{column}`" for column in ordered if column.casefold() != "sample"]
+        direct.append(
+            "LENGTH(`sample`) AS " f"`{ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS}`"
+        )
+        return ", ".join(direct)
 
     @classmethod
     def is_history_ranking_projection(cls, sql: str) -> bool:
@@ -1095,7 +1141,11 @@ class ArcheryMCPClient:
         )
 
     @classmethod
-    def is_history_compact_projection(cls, sql: str) -> bool:
+    def is_history_compact_projection(
+        cls,
+        sql: str,
+        columns: Sequence[str] | None = None,
+    ) -> bool:
         parser_input = cls._sql_without_comments(sql)
         if parser_input is None:
             return False
@@ -1112,8 +1162,21 @@ class ArcheryMCPClient:
         qualifier = cls._ascii_identifier(tables[0].alias or tables[0].name)
         if qualifier is None:
             return False
+        if columns is None:
+            expected_columns = tuple(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS[:-1])
+            expected_alias = "sample_full_length"
+        else:
+            try:
+                expected_columns = tuple(
+                    column
+                    for column in cls.history_base_projection_columns(columns)
+                    if column.casefold() != "sample"
+                )
+            except ValueError:
+                return False
+            expected_alias = ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS
         projections = list(tree.expressions)
-        if len(projections) != len(_HISTORY_COMPACT_PROJECTION_EXPRESSIONS):
+        if len(projections) != len(expected_columns) + 1:
             return False
 
         def direct_column(value: exp.Expression, expected: str) -> bool:
@@ -1133,7 +1196,7 @@ class ArcheryMCPClient:
             not direct_column(value, expected)
             for value, expected in zip(
                 projections[:-1],
-                _HISTORY_COMPACT_PROJECTION_EXPRESSIONS[:-1],
+                expected_columns,
                 strict=True,
             )
         ):
@@ -1141,7 +1204,7 @@ class ArcheryMCPClient:
         length_projection = projections[-1]
         return bool(
             isinstance(length_projection, exp.Alias)
-            and cls._ascii_identifier(length_projection.alias) == "sample_full_length"
+            and cls._ascii_identifier(length_projection.alias) == expected_alias.casefold()
             and isinstance(length_projection.this, exp.Length)
             and length_projection.this.args.get("binary") is True
             and direct_column(length_projection.this.this, "sample")
@@ -1334,115 +1397,6 @@ class ArcheryMCPClient:
             return float("-inf")
         return numeric if isfinite(numeric) else float("-inf")
 
-    @classmethod
-    def compress_sample_for_agent(
-        cls,
-        sample: str,
-        *,
-        max_chars: int = ARCHERY_SAMPLE_STRUCTURE_CHARS,
-    ) -> dict[str, Any]:
-        """Build a bounded display SQL while retaining both ends of literal IN lists."""
-
-        sample_hash = sha256(sample.encode("utf-8")).hexdigest()
-        if len(sample) <= max_chars:
-            return {
-                "sample": sample,
-                "representation": "full",
-                "structure_executable": cls.classify_explainable_statement(sample) is not None,
-                "sample_sha256": sample_hash,
-                "in_lists": [],
-            }
-        try:
-            statements = parse(sample, read="mysql")
-        except (ParseError, TokenError):
-            statements = []
-        if len(statements) != 1 or statements[0] is None:
-            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
-        source_tree = statements[0]
-        source_lists = [
-            node
-            for node in source_tree.find_all(exp.In)
-            if node.args.get("query") is None and len(node.expressions) > 2
-        ]
-        if not source_lists:
-            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
-        counts = [len(node.expressions) for node in source_lists]
-
-        def render(fraction: float) -> tuple[str, list[int]]:
-            tree = source_tree.copy()
-            target_lists = [
-                node
-                for node in tree.find_all(exp.In)
-                if node.args.get("query") is None and len(node.expressions) > 2
-            ]
-            retained_counts: list[int] = []
-            for node, count in zip(target_lists, counts, strict=True):
-                retained = min(count, max(2, int(count * fraction)))
-                head_count = (retained + 1) // 2
-                tail_count = retained // 2
-                expressions = list(node.expressions)
-                node.set(
-                    "expressions",
-                    [
-                        *(item.copy() for item in expressions[:head_count]),
-                        *(item.copy() for item in expressions[count - tail_count :]),
-                    ],
-                )
-                retained_counts.append(retained)
-            return tree.sql(dialect="mysql"), retained_counts
-
-        minimum_sql, minimum_counts = render(0.0)
-        if len(minimum_sql) > max_chars:
-            return cls._sample_head_tail_fallback(sample, sample_hash, max_chars)
-        best_sql = minimum_sql
-        best_counts = minimum_counts
-        lower = 0.0
-        upper = 1.0
-        for _ in range(24):
-            midpoint = (lower + upper) / 2
-            candidate_sql, candidate_counts = render(midpoint)
-            if len(candidate_sql) <= max_chars:
-                lower = midpoint
-                best_sql = candidate_sql
-                best_counts = candidate_counts
-            else:
-                upper = midpoint
-        statement_type = cls.classify_explainable_statement(best_sql)
-        return {
-            "sample": best_sql,
-            "representation": "structured",
-            "structure_executable": statement_type is not None,
-            "sample_sha256": sample_hash,
-            "in_lists": [
-                {
-                    "original_value_count": original,
-                    "retained_value_count": retained,
-                    "omitted_value_count": original - retained,
-                    "head_value_count": (retained + 1) // 2,
-                    "tail_value_count": retained // 2,
-                }
-                for original, retained in zip(counts, best_counts, strict=True)
-            ],
-        }
-
-    @staticmethod
-    def _sample_head_tail_fallback(
-        sample: str,
-        sample_hash: str,
-        max_chars: int,
-    ) -> dict[str, Any]:
-        marker = "\n/* sample middle omitted for Agent context */\n"
-        available = max(max_chars - len(marker), 0)
-        head_chars = (available + 1) // 2
-        tail_chars = available // 2
-        display = f"{sample[:head_chars]}{marker}{sample[-tail_chars:] if tail_chars else ''}"
-        return {
-            "sample": display[:max_chars],
-            "representation": "structured",
-            "structure_executable": False,
-            "sample_sha256": sample_hash,
-            "in_lists": [],
-        }
 
     @classmethod
     def select_explainable_history_rows(
@@ -4013,7 +3967,10 @@ class ArcherySlowLogEvidenceTool:
         parsed_rows = ArcheryMCPClient._tabular_rows(result.payload)
         row_count = self._reported_row_count(result.payload)
         has_log_content = any(self._semantic_slow_query_row(row) for row in parsed_rows)
-        remote_result_partial = ArcheryMCPClient.is_result_incomplete(result.payload)
+        remote_result_partial = (
+            result.history_complete is False
+            or ArcheryMCPClient.is_result_incomplete(result.payload)
+        )
         if has_log_content and row_count is not None:
             row_summary = f"返回 {row_count} 行"
         elif row_count is not None and row_count > 0:
@@ -4043,17 +4000,25 @@ class ArcherySlowLogEvidenceTool:
             f"{evidence_summary}。"
             "具体根因仍须结合日志内容和其他实时信号判断。"
         )
-        if result.payload.get("enrichment_partial") is True:
-            unfinished_count = len(result.payload.get("enrichment_unfinished_ids") or [])
-            stop_reason = str(result.payload.get("enrichment_stop_reason") or "").upper()
+        if result.enrichment_partial or result.payload.get("enrichment_partial") is True:
+            unfinished_ids = (
+                result.enrichment_unfinished_ids
+                or tuple(result.payload.get("enrichment_unfinished_ids") or ())
+            )
+            unfinished_count = len(unfinished_ids)
+            stop_reason = str(
+                result.enrichment_stop_reason
+                or result.payload.get("enrichment_stop_reason")
+                or ""
+            ).upper()
             stop_summary = (
                 "内部调查预算到期"
                 if stop_reason in {"BUDGET_EXHAUSTED", "DEADLINE_EXCEEDED"}
                 else "内部深度调查提前终止"
             )
             summary += (
-                f"{stop_summary}，仍有 {unfinished_count} 条 sample/EXPLAIN "
-                "未完成；已完成结果和全量紧凑证据均已保留。"
+                f"{stop_summary}，仍有 {unfinished_count} 条 supplemental 调查未完成；"
+                "完整 History 不受影响，已完成补充结果继续保留。"
             )
         ineligible_reason = (
             ""
@@ -4151,9 +4116,19 @@ class ArcherySlowLogEvidenceTool:
         semantic_rows = [row for row in semantic_rows if row]
         reported_row_count = self._reported_row_count(result.payload)
         total_row_count = max(reported_row_count or 0, len(source_rows))
-        partial = ArcheryMCPClient.is_result_incomplete(result.payload)
-        history_scan_complete = result.payload.get("history_scan_complete") is not False
-        enrichment_partial = result.payload.get("enrichment_partial") is True
+        partial = (
+            result.history_complete is False
+            or ArcheryMCPClient.is_result_incomplete(result.payload)
+        )
+        history_scan_complete = (
+            result.history_complete
+            if result.history_complete is not None
+            else result.payload.get("history_scan_complete") is not False
+        )
+        enrichment_partial = (
+            result.enrichment_partial
+            or result.payload.get("enrichment_partial") is True
+        )
         final_result_payload, final_result_text = self._final_result_passthrough(result.payload)
         structured_data: dict[str, Any] = {
             "schema_version": ARCHERY_SLOW_LOG_EVIDENCE_SCHEMA_VERSION,
@@ -4180,9 +4155,14 @@ class ArcherySlowLogEvidenceTool:
             "partial": partial,
             "history_scan_complete": history_scan_complete,
             "enrichment_partial": enrichment_partial,
-            "enrichment_stop_reason": sanitize(result.payload.get("enrichment_stop_reason")),
+            "enrichment_stop_reason": sanitize(
+                result.enrichment_stop_reason
+                or result.payload.get("enrichment_stop_reason")
+            ),
             "enrichment_unfinished_ids": sanitize(
-                result.payload.get("enrichment_unfinished_ids") or []
+                list(result.enrichment_unfinished_ids)
+                or result.payload.get("enrichment_unfinished_ids")
+                or []
             ),
             "root_cause_eligible": bool(semantic_rows) and history_scan_complete and not partial,
             "root_cause_ineligible_reason": root_cause_ineligible_reason,

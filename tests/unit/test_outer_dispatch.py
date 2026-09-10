@@ -34,6 +34,7 @@ from app.domain.models import (
     EVIDENCE_RECORD_V2,
     EvidenceRecord,
     EvidenceUnit,
+    EvidenceUnitKind,
     EvidenceUnitStatus,
     InvestigationContext,
     ToolExecutionRequest,
@@ -488,7 +489,7 @@ async def test_same_epoch_recovers_started_only_after_persisted_deadline(
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-deadline-recovery")
     executor = RecordingExecutor()
-    request = _request(timeout_seconds=0.05)
+    request = _request(timeout_seconds=0.5)
 
     with pytest.raises(RuntimeError, match="AFTER_HANDLER_RETURNED"):
         await DurableOuterToolDispatcher(
@@ -501,7 +502,7 @@ async def test_same_epoch_recovers_started_only_after_persisted_deadline(
             context=context,
             tool_spec=_spec(),
         )
-    await asyncio.sleep(0.06)
+    await asyncio.sleep(0.55)
 
     evidence = await DurableOuterToolDispatcher(repository, executor).execute(
         alert_id=alert_id,
@@ -529,7 +530,7 @@ async def test_late_same_epoch_result_cannot_overwrite_deadline_recovery(
     alert_id, context = await _context(repository, external_id="outer-late-result")
     executor = RecordingExecutor()
     hold = HoldAfterHandler()
-    request = _request(timeout_seconds=0.05)
+    request = _request(timeout_seconds=0.5)
     tool_spec = _spec()
 
     first_task = asyncio.create_task(
@@ -1272,13 +1273,45 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
     repository = SQLAlchemyAlertRepository(_sqlite_url(tmp_path / "evidence-units.db"))
     await repository.initialize()
     alert_id, context = await _context(repository, external_id="outer-evidence-units")
+    history_payload = {
+        "column_list": [
+            "id",
+            "raw",
+            "raw_metric",
+            "artifact_count",
+            "hash",
+            "content_hash",
+            "request_id",
+            "usage",
+            "sha256",
+            "sample_sha256",
+            "sample",
+            "business_blob",
+        ],
+        "rows": [
+            {
+                "id": 41,
+                "raw": {"nested": ["original", {"raw": "business"}]},
+                "raw_metric": 7,
+                "artifact_count": 2,
+                "hash": "business-hash",
+                "content_hash": "business-content-hash",
+                "request_id": "business-request-id",
+                "usage": {"business_units": 9},
+                "sha256": "business-sha256",
+                "sample_sha256": "business-sample-sha256",
+                "sample": "SELECT * FROM orders WHERE id IN ("
+                + ",".join(map(str, range(4_000)))
+                + ")",
+                "business_blob": "业务字段" * 10_001,
+            }
+        ],
+        "row_count": 1,
+    }
     executor = RecordingExecutor(
         [
             {
-                "final_result_payload": {
-                    "full_sql": "SELECT * FROM mysql_slow_query_review_history",
-                    "rows": [{"id": 41}],
-                },
+                "final_result_payload": history_payload,
                 "slow_query_analysis": {
                     "status": "partial",
                     "explain_results": [{"result": {"row_count": 1}}],
@@ -1338,6 +1371,7 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
     assert history.status == EvidenceUnitStatus.SUCCESS
     assert history.root_cause_eligible is True
     assert history.source_paths == ["/structured_data/final_result_payload"]
+    assert history.data == history_payload
     assert explain.status == EvidenceUnitStatus.SUCCESS
     assert explain.root_cause_eligible is True
     assert explain.source_paths == ["/structured_data/slow_query_analysis/explain_results/0"]
@@ -1348,7 +1382,7 @@ async def test_archery_projection_persists_independent_v2_evidence_units(
     assert stored_artifact is not None
     artifact_payload = stored_artifact[1]
     assert isinstance(artifact_payload, dict)
-    assert artifact_payload["structured_data"]["final_result_payload"]["rows"] == [{"id": 41}]
+    assert artifact_payload["structured_data"]["final_result_payload"] == history_payload
     assert (
         artifact_payload["structured_data"]["slow_query_analysis"]["failures"][0]["stage"]
         == "indexes"
@@ -1812,6 +1846,59 @@ def test_supplemental_unit_ids_do_not_depend_on_result_order() -> None:
     assert set(forward) == {"first", "second"}
 
 
+def test_parse_failed_history_text_is_wrapped_verbatim_and_exactly_validated() -> None:
+    artifact_id = uuid4()
+    raw_text = (
+        "mysql_slow_query_review_history result: "
+        "SELECT  * FROM t WHERE request_id = 'biz'  ;\n"
+        '{"usage":1,"raw_metric":7}'
+    )
+    raw_result = {"structured_data": {"final_result_text": raw_text}}
+    evidence = EvidenceRecord(
+        run_id=uuid4(),
+        tool_name="query_mcp_archery",
+        source_system="archery_mcp",
+        status=ToolStatus.SUCCESS,
+        summary="Archery parse failed",
+        structured_data=raw_result["structured_data"],
+        source_artifact_id=artifact_id,
+    )
+    analysis = ToolResultAnalysis(
+        summary="Archery final result could not be parsed.",
+        analysis_usable=False,
+        source_coverage_complete=False,
+        source_artifact_id=artifact_id,
+        source_sha256="a" * 64,
+        provider="deterministic_host",
+        model="none",
+        prompt_version="test-v1",
+        passthrough_payload={"final_result_text": raw_text},
+        passthrough_parse_failed=True,
+    )
+
+    units = DurableOuterToolDispatcher._archery_evidence_units(
+        evidence,
+        analysis=analysis,
+    )
+
+    assert len(units) == 1
+    assert units[0].kind == EvidenceUnitKind.HISTORY
+    assert units[0].status == EvidenceUnitStatus.FAILED
+    assert units[0].data == {"final_result_text": raw_text}
+    DurableOuterToolDispatcher._validate_evidence_unit_sources(
+        raw_result,
+        units,
+        artifact_id=artifact_id,
+    )
+    tampered = units[0].model_copy(update={"data": {"final_result_text": raw_text[:-1]}})
+    with pytest.raises(OuterDispatchError, match="not identical"):
+        DurableOuterToolDispatcher._validate_evidence_unit_sources(
+            raw_result,
+            [tampered],
+            artifact_id=artifact_id,
+        )
+
+
 @pytest.mark.asyncio
 async def test_incomplete_history_unit_is_ineligible_without_downgrading_supplemental(
     tmp_path: Path,
@@ -1825,12 +1912,12 @@ async def test_incomplete_history_unit_is_ineligible_without_downgrading_supplem
     executor = RecordingExecutor(
         [
             {
+                "partial": True,
+                "history_scan_complete": False,
                 "final_result_payload": {
-                    "full_sql": "SELECT * FROM mysql_slow_query_review_history",
-                    "rows": [{"id": 41}],
-                    "result_incomplete": True,
-                    "history_recovery_complete": False,
-                    "history_recovery_missing_ids": [42],
+                    "column_list": ["id", "sample"],
+                    "rows": [{"id": 41, "sample": "SELECT 1"}],
+                    "row_count": 1,
                 },
                 "slow_query_analysis": {
                     "status": "partial",

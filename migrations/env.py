@@ -12,7 +12,7 @@ from app.config import get_settings
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 # ConfigParser treats percent signs as interpolation tokens. Escape percent-encoded
 # credentials when storing the URL; get_main_option resolves %% back to %.
 config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))

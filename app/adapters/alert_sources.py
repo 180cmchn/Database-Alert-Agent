@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.domain.alert_preprocessing import preprocess_alert_data
+from app.domain.alert_preprocessing import preprocess_alert_payload
 from app.domain.errors import InvalidAlertPayloadError, UnknownAlertSourceError
 from app.domain.models import (
     DatabaseTarget,
@@ -134,9 +134,7 @@ class CanonicalAlertSourceAdapter:
         self._environment_resolver = EnvironmentResolver(environment_aliases or {})
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedAlert:
-        analysis_payload = {
-            key: preprocess_alert_data(value) for key, value in payload.items()
-        }
+        analysis_payload = preprocess_alert_payload(payload)
         for field in ("title", "reason"):
             raw_value = payload.get(field)
             if (

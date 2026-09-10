@@ -24,6 +24,7 @@ from mcp.client.streamable_http import streamable_http_client
 from app.adapters.archery_mcp import (
     ARCHERY_HISTORY_PAGE_SIZE,
     ARCHERY_HISTORY_RESULT_CHARS,
+    ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
@@ -81,8 +82,9 @@ from app.mcp_runtime import (
 )
 
 ARCHERY_HARNESS_PROVIDER = "archery_mcp"
-ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v6"
-ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v6"
+ARCHERY_HARNESS_POLICY_VERSION = "archery-discovered-tools-v7"
+ARCHERY_HARNESS_SCHEMA_VERSION = "mcp-discovery-v7"
+ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION = "archery-history-lossless-v1"
 _FINISH_TOOL_NAME = "finish_archery_investigation"
 _RESULT_ASSESSMENT_TOOL_NAME = "report_archery_result_assessment"
 _LOCAL_ACTION_TOOL_NAMES = frozenset({_FINISH_TOOL_NAME, _RESULT_ASSESSMENT_TOOL_NAME})
@@ -294,6 +296,7 @@ class ArcheryHarnessState:
     # Deterministic history pipeline fields are intentionally separate from the
     # legacy SELECT * recovery state so old checkpoints remain resumable.
     history_pipeline_enabled: bool = False
+    history_payload_contract_version: str = ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION
     history_pipeline_phase: str = _HISTORY_PIPELINE_IDLE
     history_pipeline_target: tuple[int, str] | None = None
     history_pipeline_endpoint: str | None = None
@@ -386,11 +389,7 @@ def _history_recovery_complete(state: ArcheryHarnessState) -> bool:
         state.history_recovery_listing_completed
         and not _history_recovery_missing_ids(state)
         and all(
-            _history_id_status(state, row_id)
-            in {
-                _HISTORY_ID_RECOVERED_FULL,
-                _HISTORY_ID_RECOVERED_SAMPLE_PREFIX,
-            }
+            _history_id_status(state, row_id) == _HISTORY_ID_RECOVERED_FULL
             for row_id in state.history_recovery_ids
         )
         and not _history_recovery_unlisted_ids(state)
@@ -419,24 +418,10 @@ def _history_payload_with_recovery_status(
     state: ArcheryHarnessState,
 ) -> dict[str, Any]:
     projected = dict(payload)
-    if state.history_pipeline_enabled and "history_scan_complete" in projected:
-        if projected.get("history_scan_complete") is False:
-            projected["result_incomplete"] = True
-            pipeline_reason = (
-                "history_snapshot_inconsistent"
-                if projected.get("history_ranking_scan_complete") is True
-                and projected.get("history_compact_scan_complete") is True
-                else "history_scan_incomplete"
-            )
-            projected["result_incomplete_reasons"] = list(
-                dict.fromkeys(
-                    [
-                        *list(projected.get("result_incomplete_reasons") or []),
-                        pipeline_reason,
-                    ]
-                )
-            )
-        return ArcheryMCPClient.with_result_completeness(projected)
+    if state.history_pipeline_enabled:
+        # Pipeline qualification lives on ArcherySlowLogQueryResult and in
+        # internal diagnostics; never inject Host metadata into History rows.
+        return projected
     if _history_recovery_complete(state):
         projected["result_completeness_assessment"] = "complete"
         projected.pop("result_incomplete", None)
@@ -1032,6 +1017,26 @@ class ArcheryHarnessScenario:
             or getattr(state, "history_merge_sources", [])
             or getattr(state, "history_positional_rows", [])
         )
+        if state.final_result is not None:
+            restored_result = state.final_result
+            state.final_result = replace(
+                restored_result,
+                model_tool_calls=tuple(
+                    getattr(restored_result, "model_tool_calls", ()) or ()
+                ),
+                model_request_ids=tuple(
+                    getattr(restored_result, "model_request_ids", ()) or ()
+                ),
+                metadata_resolution_tables=tuple(
+                    getattr(restored_result, "metadata_resolution_tables", ()) or ()
+                ),
+                history_incomplete_reasons=tuple(
+                    getattr(restored_result, "history_incomplete_reasons", ()) or ()
+                ),
+                enrichment_unfinished_ids=tuple(
+                    getattr(restored_result, "enrichment_unfinished_ids", ()) or ()
+                ),
+            )
         incomplete_final_result = bool(
             state.final_result is not None
             and self.client.is_result_incomplete(state.final_result.payload)
@@ -1193,6 +1198,10 @@ class ArcheryHarnessScenario:
             state.pending_history_candidate = None
         if not hasattr(state, "pending_supplemental_candidate"):
             state.pending_supplemental_candidate = None
+        legacy_history_payload_contract = (
+            getattr(state, "history_payload_contract_version", "")
+            != ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION
+        )
         pipeline_defaults: dict[str, Any] = {
             "history_pipeline_enabled": False,
             "history_pipeline_phase": _HISTORY_PIPELINE_IDLE,
@@ -1233,6 +1242,56 @@ class ArcheryHarnessScenario:
             state.finish_accepted = False
         if not hasattr(state, "finish_summary"):
             state.finish_summary = None
+        state.history_payload_contract_version = ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION
+        if legacy_history_payload_contract and state.history_pipeline_enabled:
+            # Compact rows from the previous contract cannot prove that every real
+            # History column and the complete sample were retained. Keep durable
+            # remote artifacts, but restart the read-only materialization itself.
+            state.history_pipeline_phase = _HISTORY_PIPELINE_IDLE
+            state.history_pipeline_target = None
+            state.history_pipeline_endpoint = None
+            state.history_pipeline_requested_sql = ""
+            state.history_pipeline_executed_sqls = []
+            state.history_snapshot_max_id = None
+            state.history_page_cursor = None
+            state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+            state.history_ranking_rows = {}
+            state.history_compact_rows = {}
+            state.history_ranking_scan_complete = False
+            state.history_compact_scan_complete = False
+            state.history_ranking_page_count = 0
+            state.history_compact_page_count = 0
+            state.history_reconcile_ids = []
+            state.history_processing_order = []
+            state.history_high_priority_ids = set()
+            state.history_rank_metadata = {}
+            state.history_id_rows = {}
+            state.history_recovery_ids = set()
+            state.history_recovery_required = False
+            state.history_recovery_listing_completed = False
+            state.history_sample_prefix_ids = set()
+            state.history_full_row_ids = set()
+            state.history_sample_states = {}
+            state.history_sample_metadata = {}
+            state.history_current_id = None
+            state.history_chunk_offset = 1
+            state.history_chunk_size = 0
+            state.history_chunk_parts = []
+            state.history_exact_sample_id = None
+            state.history_exact_sample = None
+            state.history_window_state = _HISTORY_WINDOW_PENDING
+            state.history_window_failure = None
+            state.final_result = None
+            state.supplemental_analysis_started = False
+            state.supplemental_stage_states = {}
+            state.supplemental_work_items = {}
+            state.slow_query_explain_results = []
+            state.slow_query_table_structure_results = []
+            state.slow_query_index_results = []
+            state.finish_accepted = False
+            state.finish_summary = None
+            state.workflow_revision = self.client.prompts.workflow_revision
+            state.workflow_directives = dict(self.client.prompts.workflow_directives)
         self.state = state
 
     def initial_state(self) -> ArcheryHarnessState:
@@ -1286,39 +1345,55 @@ class ArcheryHarnessScenario:
             )
             limit_num = 1
         elif state.history_pipeline_phase == _HISTORY_PIPELINE_ENRICHMENT:
-            row_id = self._ensure_current_history_id(state)
-            if row_id is None:
-                state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
-                state.finish_summary = "Deterministic Archery history enrichment completed."
-                return self._make_host_call(
-                    _FINISH_TOOL_NAME,
-                    {"reason": state.finish_summary},
-                    purpose="finish-pipeline",
-                    state=state,
-                )
-            sample_state = state.history_sample_states.get(row_id, _SAMPLE_PENDING)
-            if sample_state in {_SAMPLE_PENDING, _SAMPLE_DIRECT_PENDING}:
-                full_length = self.client._coerce_nonnegative_integer(
-                    self.client._casefolded_value(
-                        state.history_compact_rows.get(row_id, {}),
-                        "sample_full_length",
+            recovery_id = self._next_history_recovery_id(state)
+            if recovery_id is not None:
+                state.history_current_id = recovery_id
+                sample_state = state.history_sample_states.get(recovery_id, _SAMPLE_PENDING)
+                if sample_state in {_SAMPLE_PENDING, _SAMPLE_DIRECT_PENDING}:
+                    full_length = self.client._coerce_nonnegative_integer(
+                        self.client._casefolded_value(
+                            state.history_compact_rows.get(recovery_id, {}),
+                            ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
+                        )
                     )
-                )
-                if full_length is not None and full_length <= ARCHERY_SAMPLE_FULL_LENGTH_LIMIT:
-                    state.history_sample_states[row_id] = _SAMPLE_DIRECT_PENDING
-                    sql = self.client.history_sample_sql(row_id)
+                    if full_length is not None and full_length <= ARCHERY_SAMPLE_FULL_LENGTH_LIMIT:
+                        state.history_sample_states[recovery_id] = _SAMPLE_DIRECT_PENDING
+                        sql = self.client.history_sample_sql(recovery_id)
+                        limit_num = 1
+                    else:
+                        self._start_history_chunk_recovery(state, recovery_id)
+                        sample_state = _SAMPLE_CHUNK_PENDING
+                if sample_state == _SAMPLE_CHUNK_PENDING:
+                    sql = self.client.history_sample_chunk_sql(
+                        recovery_id,
+                        state.history_chunk_offset,
+                        state.history_chunk_size,
+                    )
                     limit_num = 1
-                else:
-                    self._start_history_chunk_recovery(state, row_id)
-                    sample_state = _SAMPLE_CHUNK_PENDING
-            if sample_state == _SAMPLE_CHUNK_PENDING:
-                sql = self.client.history_sample_chunk_sql(
-                    row_id,
-                    state.history_chunk_offset,
-                    state.history_chunk_size,
-                )
-                limit_num = 1
-            elif sample_state == _SAMPLE_READY:
+            else:
+                self._refresh_history_pipeline_result(state)
+                if state.final_result is None or state.final_result.history_complete is not True:
+                    state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+                    state.finish_summary = (
+                        "Deterministic Archery History recovery ended without a complete payload."
+                    )
+                    return self._make_host_call(
+                        _FINISH_TOOL_NAME,
+                        {"reason": state.finish_summary},
+                        purpose="finish-incomplete-history-pipeline",
+                        state=state,
+                    )
+                state.history_recovery_required = False
+                row_id = self._ensure_current_history_id(state)
+                if row_id is None:
+                    state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+                    state.finish_summary = "Deterministic Archery history enrichment completed."
+                    return self._make_host_call(
+                        _FINISH_TOOL_NAME,
+                        {"reason": state.finish_summary},
+                        purpose="finish-pipeline",
+                        state=state,
+                    )
                 return self._next_host_supplemental_call(
                     state,
                     row_id=row_id,
@@ -1355,6 +1430,42 @@ class ArcheryHarnessScenario:
             request_id=f"host-request-{digest}",
         )
 
+    def _history_pipeline_columns(
+        self,
+        state: ArcheryHarnessState,
+    ) -> tuple[str, ...]:
+        target = state.history_pipeline_target or state.history_result_target
+        if target is None:
+            return ()
+        columns = state.table_columns.get(target, {}).get(
+            ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
+        )
+        if not columns:
+            return ()
+        try:
+            return self.client.history_base_projection_columns(tuple(columns))
+        except ValueError:
+            return ()
+
+    @staticmethod
+    def _next_history_recovery_id(state: ArcheryHarnessState) -> int | None:
+        pending_states = {
+            _SAMPLE_PENDING,
+            _SAMPLE_DIRECT_PENDING,
+            _SAMPLE_CHUNK_PENDING,
+        }
+        current = state.history_current_id
+        if current is not None and state.history_sample_states.get(current) in pending_states:
+            return current
+        return next(
+            (
+                row_id
+                for row_id in state.history_processing_order
+                if state.history_sample_states.get(row_id, _SAMPLE_PENDING) in pending_states
+            ),
+            None,
+        )
+
     def _start_history_pipeline_if_ready(
         self,
         state: ArcheryHarnessState,
@@ -1382,9 +1493,13 @@ class ArcheryHarnessScenario:
             discovered_columns = state.table_columns.get(target, {}).get(
                 ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
             )
-            if discovered_columns and not required_columns <= {
+            if not discovered_columns or not required_columns <= {
                 column.casefold() for column in discovered_columns
             }:
+                continue
+            try:
+                self.client.history_base_projection_columns(tuple(discovered_columns))
+            except ValueError:
                 continue
             endpoints = sorted(endpoints_value)
             if len(endpoints) == 1:
@@ -1423,7 +1538,7 @@ class ArcheryHarnessScenario:
         selected = (
             self.client.history_ranking_projection_sql()
             if projection == "ranking"
-            else self.client.history_compact_projection_sql()
+            else self.client.history_compact_projection_sql(self._history_pipeline_columns(state))
         )
         predicates = [
             f"hostname_max = '{endpoint}'",
@@ -1488,7 +1603,9 @@ class ArcheryHarnessScenario:
         tools: Sequence[ToolSpec],
     ) -> MCPModelToolCall | None:
         source = state.history_id_rows.get(row_id)
-        exact_sample = state.history_exact_sample
+        exact_sample = (
+            self.client._casefolded_value(source, "sample") if isinstance(source, Mapping) else None
+        )
         if not isinstance(source, Mapping) or not isinstance(exact_sample, str):
             self._finish_host_history_id(
                 state,
@@ -1497,6 +1614,8 @@ class ArcheryHarnessScenario:
                 reason_code="exact_sample_unavailable",
             )
             return self.next_host_call(tools)
+        state.history_exact_sample_id = row_id
+        state.history_exact_sample = exact_sample
         if reused_from := self._reusable_explain_source_id(state, source):
             self._finish_host_history_id(
                 state,
@@ -2721,7 +2840,10 @@ class ArcheryHarnessScenario:
                     state.history_pipeline_phase == _HISTORY_PIPELINE_RANKING
                     and self._is_scoped_history_ranking_query(state, sql)
                 )
-            if self.client.is_history_compact_projection(sql):
+            if self.client.is_history_compact_projection(
+                sql,
+                self._history_pipeline_columns(state),
+            ):
                 return bool(
                     state.history_pipeline_phase
                     in {_HISTORY_PIPELINE_COMPACT, _HISTORY_PIPELINE_RECONCILE}
@@ -2848,7 +2970,11 @@ class ArcheryHarnessScenario:
         *,
         projection: str,
     ) -> bool:
-        if not self._has_simple_history_source(sql, projection=projection):
+        if not self._has_simple_history_source(
+            sql,
+            projection=projection,
+            columns=(self._history_pipeline_columns(state) if projection == "compact" else None),
+        ):
             return False
         if not self._has_scoped_history_window_predicates(
             state,
@@ -2921,7 +3047,13 @@ class ArcheryHarnessScenario:
             is not None
         )
 
-    def _has_simple_history_source(self, sql: str, *, projection: str) -> bool:
+    def _has_simple_history_source(
+        self,
+        sql: str,
+        *,
+        projection: str,
+        columns: Sequence[str] | None = None,
+    ) -> bool:
         """Match the fixed, single-source shape used by history recovery."""
 
         statement = self.client._single_sql_statement(sql)
@@ -2936,7 +3068,7 @@ class ArcheryHarnessScenario:
                 return False
             projection_pattern = r".+?"
         elif projection == "compact":
-            if not self.client.is_history_compact_projection(statement):
+            if not self.client.is_history_compact_projection(statement, columns):
                 return False
             projection_pattern = r".+?"
         else:
@@ -5057,7 +5189,10 @@ class ArcheryHarnessScenario:
         if not state.history_pipeline_enabled:
             return None
         is_ranking = self.client.is_history_ranking_projection(result_sql)
-        is_compact = self.client.is_history_compact_projection(result_sql)
+        is_compact = self.client.is_history_compact_projection(
+            result_sql,
+            self._history_pipeline_columns(state),
+        )
         retrieval = self.client.history_id_retrieval(result_sql)
         is_sample = retrieval is not None and (
             retrieval[1] == "sample" or retrieval[1].startswith("sample_chunk:")
@@ -5202,25 +5337,25 @@ class ArcheryHarnessScenario:
             )
         rows = self.client._tabular_rows(payload)
         parsed_rows: list[tuple[int, dict[str, Any]]] = []
+        history_base_fields = {
+            column.casefold()
+            for column in self._history_pipeline_columns(state)
+            if column.casefold() != "sample"
+        } | {ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS.casefold()}
         for row in rows:
             row_id = self.client._coerce_positive_integer(self.client._casefolded_value(row, "id"))
             required_fields = (
                 {"id", "query_time_max", "query_time_sum"}
                 if projection == "ranking"
-                else {
-                    "id",
-                    "hostname_max",
-                    "db_max",
-                    "checksum",
-                    "query_time_max",
-                    "query_time_sum",
-                    "sample_full_length",
-                }
+                else history_base_fields
             )
             row_fields = {str(key).casefold() for key in row}
             sample_length = (
                 self.client._coerce_nonnegative_integer(
-                    self.client._casefolded_value(row, "sample_full_length")
+                    self.client._casefolded_value(
+                        row,
+                        ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
+                    )
                 )
                 if projection == "compact"
                 else 1
@@ -5232,8 +5367,8 @@ class ArcheryHarnessScenario:
                     raw_result,
                     reason_code="history_pipeline_page_row_invalid",
                     detail=(
-                        f"The {projection} page contained a row without its fixed "
-                        "projection or a non-negative sample length."
+                        f"The {projection} page omitted a discovered History column "
+                        "or a non-negative sample length."
                     ),
                 )
             parsed_rows.append((row_id, dict(row)))
@@ -5308,56 +5443,72 @@ class ArcheryHarnessScenario:
 
     def _finalize_history_pipeline_scan(self, state: ArcheryHarnessState) -> None:
         ranking_ids = set(state.history_ranking_rows)
-        compact_ids = set(state.history_compact_rows)
-        usable_ids = ranking_ids & compact_ids
+        base_ids = set(state.history_compact_rows)
+        usable_ids = ranking_ids & base_ids
         scan_consistent = bool(
             state.history_ranking_scan_complete
             and state.history_compact_scan_complete
-            and ranking_ids == compact_ids
+            and ranking_ids == base_ids
         )
-        if ranking_ids != compact_ids:
+        if ranking_ids != base_ids:
             state.slow_query_analysis_failures.append(
                 self._local_rejection(
                     stage="history_recovery",
                     target={
-                        "ranking_only_ids": sorted(ranking_ids - compact_ids),
-                        "compact_only_ids": sorted(compact_ids - ranking_ids),
+                        "ranking_only_ids": sorted(ranking_ids - base_ids),
+                        "base_only_ids": sorted(base_ids - ranking_ids),
                     },
                     error_type="result_mismatch",
                     reason_code="history_snapshot_inconsistent",
-                    detail="Ranking and compact history scans returned different id sets.",
+                    detail=("Ranking and lossless-base History scans returned different id sets."),
                     terminal=True,
                 )
             )
         rows = [
-            {
-                **state.history_compact_rows[row_id],
-                **state.history_ranking_rows[row_id],
-            }
-            for row_id in sorted(usable_ids, reverse=True)
+            dict(state.history_compact_rows[row_id]) for row_id in sorted(usable_ids, reverse=True)
         ]
-        priority = self.client.prioritize_history_rows(rows)
+        priority = self.client.prioritize_history_rows(
+            [
+                {
+                    **row,
+                    **state.history_ranking_rows[
+                        self.client._coerce_positive_integer(
+                            self.client._casefolded_value(row, "id")
+                        )
+                        or -1
+                    ],
+                }
+                for row in rows
+            ]
+        )
         state.history_processing_order = list(priority["ordered_ids"])
         state.history_high_priority_ids = set(priority["high_priority_ids"])
         state.history_rank_metadata = {
             int(row_id): dict(metadata) for row_id, metadata in priority["ranks"].items()
         }
         state.history_id_rows = {}
+        state.history_full_row_ids.clear()
+        state.history_sample_prefix_ids.clear()
         for row in rows:
             row_id = self.client._coerce_positive_integer(self.client._casefolded_value(row, "id"))
             assert row_id is not None
-            rank = state.history_rank_metadata.get(row_id, {})
             state.history_id_rows[row_id] = {
-                **row,
-                **rank,
-                "sample_recovery_status": _SAMPLE_PENDING,
+                key: deepcopy(value)
+                for key, value in row.items()
+                if str(key).casefold() != ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS.casefold()
             }
             state.history_sample_states[row_id] = _SAMPLE_PENDING
         state.history_recovery_ids = set(usable_ids)
-        state.history_recovery_listing_completed = True
-        state.history_recovery_required = False
+        state.history_recovery_listing_completed = bool(
+            state.history_ranking_scan_complete and state.history_compact_scan_complete
+        )
+        state.history_recovery_required = bool(usable_ids)
         state.history_window_state = (
-            _HISTORY_WINDOW_SUCCEEDED if usable_ids else _HISTORY_WINDOW_NO_DATA
+            _HISTORY_WINDOW_PENDING
+            if usable_ids
+            else _HISTORY_WINDOW_NO_DATA
+            if scan_consistent
+            else _HISTORY_WINDOW_FAILED_TERMINAL
         )
         state.history_pipeline_phase = (
             _HISTORY_PIPELINE_ENRICHMENT if usable_ids else _HISTORY_PIPELINE_COMPLETED
@@ -5369,7 +5520,11 @@ class ArcheryHarnessScenario:
         )
         if not usable_ids:
             state.finish_accepted = True
-            state.finish_summary = "The bounded Archery history scan returned no rows."
+            state.finish_summary = (
+                "The complete Archery history scan returned no rows."
+                if scan_consistent
+                else "The Archery history scans were inconsistent and cannot be used."
+            )
 
     def _refresh_history_pipeline_result(
         self,
@@ -5383,43 +5538,56 @@ class ArcheryHarnessScenario:
                 and state.history_compact_scan_complete
                 and set(state.history_ranking_rows) == set(state.history_compact_rows)
             )
+        columns = self._history_pipeline_columns(state)
         rows: list[dict[str, Any]] = []
         for row_id in sorted(state.history_id_rows, reverse=True):
-            row = dict(state.history_id_rows[row_id])
-            row["sample_recovery_status"] = state.history_sample_states.get(row_id, _SAMPLE_PENDING)
-            if metadata := state.history_sample_metadata.get(row_id):
-                row.update(deepcopy(metadata))
+            source = state.history_id_rows[row_id]
+            values = {str(key).casefold(): value for key, value in source.items()}
+            row = {
+                column: deepcopy(values[column.casefold()])
+                for column in columns
+                if column.casefold() in values
+            }
             rows.append(row)
+
+        row_ids = set(state.history_id_rows)
+        rows_complete = row_ids <= state.history_full_row_ids
+        history_complete = bool(scan_consistent and rows_complete)
+        incomplete_reasons: list[str] = []
+        if not scan_consistent:
+            incomplete_reasons.append("history_snapshot_inconsistent")
+        if not rows_complete:
+            incomplete_reasons.append("history_lossless_recovery_incomplete")
+        state.history_recovery_required = bool(row_ids) and not history_complete
+        if history_complete:
+            state.history_window_state = (
+                _HISTORY_WINDOW_SUCCEEDED if row_ids else _HISTORY_WINDOW_NO_DATA
+            )
+        elif (
+            any(
+                status in {_SAMPLE_FAILED, _SAMPLE_BUDGET_EXHAUSTED}
+                for status in state.history_sample_states.values()
+            )
+            or not scan_consistent
+        ):
+            state.history_window_state = _HISTORY_WINDOW_FAILED_TERMINAL
+
         payload: dict[str, Any] = {
+            "column_list": list(columns),
             "rows": rows,
             "row_count": len(rows),
-            "history_scan_complete": scan_consistent,
-            "history_ranking_scan_complete": state.history_ranking_scan_complete,
-            "history_compact_scan_complete": state.history_compact_scan_complete,
-            "history_snapshot_consistent": scan_consistent,
-            "history_ranking_page_count": state.history_ranking_page_count,
-            "history_compact_page_count": state.history_compact_page_count,
-            "history_high_priority_ids": sorted(state.history_high_priority_ids),
-            "sample_recovery_complete_count": sum(
-                status in {_SAMPLE_READY, _SAMPLE_ANALYZED}
-                for status in state.history_sample_states.values()
-            ),
-            "sample_recovery_pending_count": sum(
-                status
-                not in {
-                    _SAMPLE_READY,
-                    _SAMPLE_ANALYZED,
-                    _SAMPLE_FAILED,
-                    _SAMPLE_BUDGET_EXHAUSTED,
-                }
-                for status in state.history_sample_states.values()
-            ),
-            "result_incomplete": not scan_consistent,
-            "result_incomplete_reasons": (
-                [] if scan_consistent else ["history_snapshot_inconsistent"]
-            ),
         }
         target = state.history_pipeline_target
+        diagnostics = self._diagnostics(state, target=target, completed=True)
+        diagnostics["history_payload_contract_version"] = ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION
+        diagnostics["history_pipeline"] = {
+            "scan_consistent": scan_consistent,
+            "ranking_page_count": state.history_ranking_page_count,
+            "base_page_count": state.history_compact_page_count,
+            "high_priority_ids": sorted(state.history_high_priority_ids),
+            "full_row_ids": sorted(state.history_full_row_ids),
+            "incomplete_reasons": incomplete_reasons,
+        }
         result = ArcherySlowLogQueryResult(
             payload=payload,
             requested_sql=state.history_pipeline_requested_sql,
@@ -5440,7 +5608,9 @@ class ArcheryHarnessScenario:
             metadata_resolution_tables=tuple(
                 state.metadata_resolution_steps.get(target, []) if target is not None else []
             ),
-            diagnostics=self._diagnostics(state, target=target, completed=True),
+            diagnostics=diagnostics,
+            history_complete=history_complete,
+            history_incomplete_reasons=tuple(incomplete_reasons),
         )
         state.final_result = result
 
@@ -5461,7 +5631,7 @@ class ArcheryHarnessScenario:
         expected_length = self.client._coerce_nonnegative_integer(
             self.client._casefolded_value(
                 state.history_compact_rows.get(row_id, {}),
-                "sample_full_length",
+                ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
             )
         )
         if not isinstance(sample, str) or len(sample.encode("utf-8")) != expected_length:
@@ -5524,7 +5694,7 @@ class ArcheryHarnessScenario:
         expected_length = self.client._coerce_nonnegative_integer(
             self.client._casefolded_value(
                 state.history_compact_rows.get(row_id, {}),
-                "sample_full_length",
+                ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
             )
         )
         actual_length = len(reconstructed.encode("utf-8"))
@@ -5558,34 +5728,33 @@ class ArcheryHarnessScenario:
         row_id: int,
         sample: str,
     ) -> None:
-        compacted = self.client.compress_sample_for_agent(sample)
         statement_type = self.client.classify_explainable_statement(sample)
         references = self.client.explainable_physical_table_reference_sequence(sample)
+        columns = self._history_pipeline_columns(state)
+        sample_column = next(
+            (column for column in columns if column.casefold() == "sample"),
+            "sample",
+        )
+        state.history_id_rows[row_id][sample_column] = sample
+        state.history_full_row_ids.add(row_id)
+        state.history_sample_prefix_ids.discard(row_id)
+        state.history_id_states[row_id] = _HISTORY_ID_RECOVERED_FULL
         metadata = {
-            "sample": compacted["sample"],
-            "sample_representation": compacted["representation"],
-            "sample_structure_executable": compacted["structure_executable"],
             "sample_source_reconstructed": True,
-            "sample_sha256": compacted["sample_sha256"],
+            "sample_sha256": sha256(sample.encode("utf-8")).hexdigest(),
             "sample_statement_type": statement_type,
             "sample_table_references": [reference.table for reference in references or ()],
-            "sample_in_lists": compacted["in_lists"],
         }
         state.history_sample_metadata[row_id] = metadata
-        state.history_id_rows[row_id].update(deepcopy(metadata))
         if statement_type is None or references is None:
             state.history_sample_states[row_id] = _SAMPLE_ANALYZED
-            state.history_sample_metadata[row_id]["explain_status"] = "not_applicable"
-            state.history_sample_metadata[row_id]["explain_skip_reason"] = (
-                "sample_not_supported_by_plain_explain"
-            )
-            state.history_exact_sample_id = None
-            state.history_exact_sample = None
-            state.history_current_id = None
+            metadata["explain_status"] = "not_applicable"
+            metadata["explain_skip_reason"] = "sample_not_supported_by_plain_explain"
         else:
             state.history_sample_states[row_id] = _SAMPLE_READY
-            state.history_exact_sample_id = row_id
-            state.history_exact_sample = sample
+        state.history_exact_sample_id = None
+        state.history_exact_sample = None
+        state.history_current_id = None
         state.history_chunk_parts = []
         state.history_chunk_offset = 1
         state.history_chunk_size = 0
@@ -7177,50 +7346,53 @@ def _materialize_incomplete_pipeline_scan(
         available_ids &= set(state.history_compact_rows)
     if not available_ids:
         return
-    rows = [
-        {
+    target = state.history_pipeline_target or state.history_result_target
+    discovered = (
+        state.table_columns.get(target, {}).get(ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold())
+        if target is not None
+        else None
+    )
+    try:
+        columns = client.history_base_projection_columns(tuple(discovered or ()))
+    except ValueError:
+        columns = tuple()
+    state.history_id_rows = {}
+    for row_id in sorted(available_ids, reverse=True):
+        source = {
             **state.history_compact_rows.get(row_id, {}),
             **state.history_ranking_rows[row_id],
         }
-        for row_id in sorted(available_ids, reverse=True)
-    ]
-    priority = client.prioritize_history_rows(rows)
-    state.history_processing_order = list(priority["ordered_ids"])
-    state.history_high_priority_ids = set(priority["high_priority_ids"])
-    state.history_rank_metadata = {
-        int(row_id): dict(metadata) for row_id, metadata in priority["ranks"].items()
-    }
-    state.history_id_rows = {}
-    for row in rows:
-        row_id = client._coerce_positive_integer(client._casefolded_value(row, "id"))
-        assert row_id is not None
+        values = {
+            str(key).casefold(): deepcopy(value)
+            for key, value in source.items()
+            if str(key).casefold() != ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS.casefold()
+        }
         state.history_id_rows[row_id] = {
-            **row,
-            **state.history_rank_metadata.get(row_id, {}),
-            "sample_recovery_status": _SAMPLE_BUDGET_EXHAUSTED,
+            column: values[column.casefold()] for column in columns if column.casefold() in values
         }
         state.history_sample_states[row_id] = _SAMPLE_BUDGET_EXHAUSTED
     state.history_recovery_ids = set(available_ids)
-    state.history_recovery_required = False
+    state.history_recovery_required = True
     state.history_recovery_listing_completed = state.history_ranking_scan_complete
     state.history_window_state = _HISTORY_WINDOW_FAILED_TERMINAL
     state.history_window_failure = {
         "stage": "history_recovery",
         "error_type": "investigation_stopped",
         "reason_code": "history_scan_incomplete",
-        "detail": "The deterministic history scan stopped before both logical scans completed.",
+        "detail": "The deterministic History scan stopped before lossless recovery completed.",
     }
-    target = state.history_pipeline_target
+    diagnostics = {
+        "history_payload_contract_version": ARCHERY_HISTORY_PAYLOAD_CONTRACT_VERSION,
+        "history_pipeline": {
+            "scan_consistent": False,
+            "incomplete_reasons": ["history_scan_incomplete"],
+        },
+    }
     state.final_result = ArcherySlowLogQueryResult(
         payload={
+            "column_list": list(columns),
             "rows": list(state.history_id_rows.values()),
             "row_count": len(state.history_id_rows),
-            "history_scan_complete": False,
-            "history_ranking_scan_complete": state.history_ranking_scan_complete,
-            "history_compact_scan_complete": state.history_compact_scan_complete,
-            "history_snapshot_consistent": False,
-            "result_incomplete": True,
-            "result_incomplete_reasons": ["history_scan_incomplete"],
         },
         requested_sql=state.history_pipeline_requested_sql,
         window_start=state.window_start,
@@ -7238,6 +7410,9 @@ def _materialize_incomplete_pipeline_scan(
         table_name=ARCHERY_SLOW_QUERY_REVIEW_TABLE,
         query_time_column="ts_min",
         query_completed=True,
+        diagnostics=diagnostics,
+        history_complete=False,
+        history_incomplete_reasons=("history_scan_incomplete",),
     )
     state.history_pipeline_phase = _HISTORY_PIPELINE_ENRICHMENT
 
@@ -7258,28 +7433,43 @@ def _finalize_deterministic_pipeline_stop(
         RuntimeStopReason.BUDGET_EXHAUSTED.value,
         RuntimeStopReason.DEADLINE_EXCEEDED.value,
     }
-    unfinished: list[int] = []
+    recovery_states = {_SAMPLE_PENDING, _SAMPLE_DIRECT_PENDING, _SAMPLE_CHUNK_PENDING}
+    recovery_unfinished: list[int] = []
+    supplemental_unfinished: list[int] = []
     for row_id in state.history_processing_order:
         status = state.history_sample_states.get(row_id, _SAMPLE_PENDING)
-        if status in {_SAMPLE_ANALYZED, _SAMPLE_FAILED}:
-            continue
-        unfinished.append(row_id)
         metadata = state.history_sample_metadata.setdefault(row_id, {})
-        if status == _SAMPLE_READY:
+        if status in recovery_states:
+            recovery_unfinished.append(row_id)
+            terminal_status = _SAMPLE_BUDGET_EXHAUSTED if budget_exhausted else _SAMPLE_FAILED
+            state.history_sample_states[row_id] = terminal_status
+            metadata["sample_recovery_status"] = terminal_status
+        elif status == _SAMPLE_READY:
+            supplemental_unfinished.append(row_id)
             state.history_sample_states[row_id] = _SAMPLE_ANALYZED
             metadata["explain_status"] = (
                 "budget_exhausted" if budget_exhausted else "investigation_stopped"
             )
             metadata["explain_source_sql_exact"] = True
-        else:
-            terminal_status = _SAMPLE_BUDGET_EXHAUSTED if budget_exhausted else _SAMPLE_FAILED
-            state.history_sample_states[row_id] = terminal_status
-            metadata["sample_recovery_status"] = terminal_status
-    if unfinished:
+    if recovery_unfinished:
+        state.history_window_state = _HISTORY_WINDOW_FAILED_TERMINAL
+        state.slow_query_analysis_failures.append(
+            {
+                "stage": "history_recovery",
+                "target": {"history_ids": recovery_unfinished},
+                "error_type": ("budget_exhausted" if budget_exhausted else "investigation_stopped"),
+                "reason_code": "history_lossless_recovery_incomplete",
+                "detail": (
+                    "Archery stopped before every History row and sample were recovered exactly."
+                ),
+                "terminal": True,
+            }
+        )
+    if supplemental_unfinished:
         state.slow_query_analysis_failures.append(
             {
                 "stage": "explain",
-                "target": {"history_ids": unfinished},
+                "target": {"history_ids": supplemental_unfinished},
                 "error_type": ("budget_exhausted" if budget_exhausted else "investigation_stopped"),
                 "reason_code": (
                     "archery_investigation_budget_exhausted"
@@ -7287,11 +7477,8 @@ def _finalize_deterministic_pipeline_stop(
                     else "archery_investigation_stopped"
                 ),
                 "detail": (
-                    "Archery investigation stopped at its internal deadline; compact "
-                    "history evidence and completed enrichment were retained."
-                    if budget_exhausted
-                    else "Archery enrichment stopped before all rows reached a terminal state; "
-                    "compact history evidence and completed enrichment were retained."
+                    "Archery supplemental analysis stopped; the complete History "
+                    "payload is unchanged."
                 ),
                 "terminal": True,
             }
@@ -7301,29 +7488,17 @@ def _finalize_deterministic_pipeline_stop(
     state.history_chunk_parts = []
     state.history_current_id = None
     state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
-    rows: list[dict[str, Any]] = []
-    for source in state.final_result.payload.get("rows", []):
-        if not isinstance(source, Mapping):
-            continue
-        row = dict(source)
-        row_id = ArcheryMCPClient._coerce_positive_integer(
-            ArcheryMCPClient._casefolded_value(row, "id")
-        )
-        if row_id is not None:
-            row["sample_recovery_status"] = state.history_sample_states.get(
-                row_id, _SAMPLE_BUDGET_EXHAUSTED
-            )
-            row.update(deepcopy(state.history_sample_metadata.get(row_id, {})))
-        rows.append(row)
-    payload = {
-        **state.final_result.payload,
-        "rows": rows,
-        "enrichment_partial": bool(unfinished),
-        "enrichment_stop_reason": stop_reason,
-        "enrichment_unfinished_ids": unfinished,
-        "sample_recovery_pending_count": 0,
-    }
-    state.final_result = replace(state.final_result, payload=payload)
+    incomplete_reasons = list(state.final_result.history_incomplete_reasons)
+    if recovery_unfinished and "history_lossless_recovery_incomplete" not in incomplete_reasons:
+        incomplete_reasons.append("history_lossless_recovery_incomplete")
+    state.final_result = replace(
+        state.final_result,
+        history_complete=(False if recovery_unfinished else state.final_result.history_complete),
+        history_incomplete_reasons=tuple(incomplete_reasons),
+        enrichment_partial=bool(supplemental_unfinished),
+        enrichment_stop_reason=(stop_reason if supplemental_unfinished else None),
+        enrichment_unfinished_ids=tuple(supplemental_unfinished),
+    )
 
 
 def _query_result(

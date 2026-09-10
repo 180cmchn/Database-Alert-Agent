@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from app.domain.models import NormalizedAlert
@@ -22,18 +23,22 @@ def preprocess_alert_text(value: str) -> str:
     return cleaned.strip()
 
 
-def preprocess_alert_data(value: Any) -> Any:
-    """Recursively preprocess model-bound alert data without mutating its source."""
-
+def _preprocess_alert_value(value: Any) -> Any:
     if isinstance(value, str):
         return preprocess_alert_text(value)
-    if isinstance(value, dict):
-        return {key: preprocess_alert_data(item) for key, item in value.items()}
+    if isinstance(value, Mapping):
+        return {str(key): _preprocess_alert_value(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [preprocess_alert_data(item) for item in value]
+        return [_preprocess_alert_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(preprocess_alert_data(item) for item in value)
+        return tuple(_preprocess_alert_value(item) for item in value)
     return value
+
+
+def preprocess_alert_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Preprocess one alert payload without accepting arbitrary tool evidence."""
+
+    return {str(key): _preprocess_alert_value(item) for key, item in value.items()}
 
 
 def has_management_platform_sql_filter_note(value: Any) -> bool:
@@ -58,7 +63,7 @@ def is_management_platform_collection_sql_cause(value: str) -> bool:
 def preprocess_normalized_alert(alert: NormalizedAlert) -> NormalizedAlert:
     """Build the analysis view while retaining the original payload for audit."""
 
-    analysis_data = preprocess_alert_data(
+    analysis_data = preprocess_alert_payload(
         alert.model_dump(mode="python", exclude={"raw_payload"})
     )
     for field in ("title", "reason"):

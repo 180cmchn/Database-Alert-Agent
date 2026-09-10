@@ -16,7 +16,7 @@ from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 
 from app.application.sanitization import sanitize, sanitize_text
-from app.domain.alert_preprocessing import preprocess_alert_data
+from app.domain.alert_preprocessing import preprocess_alert_payload
 from app.domain.models import (
     InvestigationContext,
     NormalizedAlert,
@@ -1746,7 +1746,7 @@ class PrometheusMCPClient:
         task = {
             "prompt_version": PROMETHEUS_MCP_PROMPT_VERSION,
             "prompt_revision": self.prompt_revision,
-            "alert": preprocess_alert_data(alert),
+            "alert": preprocess_alert_payload(alert),
             "required_window": self.required_window_context(window_start, window_end),
             "required_target": self.monitoring_target_context(context.alert),
             "agent_contract": {

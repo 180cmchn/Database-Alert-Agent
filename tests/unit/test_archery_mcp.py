@@ -13,6 +13,7 @@ import pytest
 from app.adapters.ai import FakeAIAdvisor
 from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.archery_mcp import (
+    ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS,
     ARCHERY_MCP_COLUMNS_TOOL_NAME,
     ARCHERY_MCP_DATABASES_TOOL_NAME,
     ARCHERY_MCP_INSTANCES_TOOL_NAME,
@@ -904,33 +905,51 @@ def test_history_sample_and_chunk_retrieval_use_closed_host_shapes() -> None:
     )
     assert all(ArcheryMCPClient.history_sample_chunk_retrieval(sql) is None for sql in invalid)
 
-
-def test_agent_sample_structure_retains_both_ends_of_large_literal_in() -> None:
-    sample = (
-        "SELECT * FROM orders WHERE id IN ("
-        + ",".join(str(value) for value in range(20_000))
-        + ") AND status = 'open'"
+def test_history_base_projection_uses_every_real_non_sample_column() -> None:
+    columns = (
+        "id",
+        "raw",
+        "raw_metric",
+        "request_id",
+        "usage",
+        "hash",
+        "Query_time_max",
+        "sample",
     )
 
-    structured = ArcheryMCPClient.compress_sample_for_agent(sample)
+    sql = ArcheryMCPClient.history_compact_projection_sql(columns)
+    full_sql = f"SELECT {sql} FROM {ARCHERY_SLOW_QUERY_REVIEW_TABLE}"
 
-    assert structured["representation"] == "structured"
-    assert structured["structure_executable"] is True
-    assert len(structured["sample"]) <= 12_000
-    assert "IN (0," in structured["sample"]
-    assert "19999)" in structured["sample"]
-    assert structured["in_lists"][0]["omitted_value_count"] > 0
+    assert "`raw`" in sql
+    assert "`raw_metric`" in sql
+    assert "`request_id`" in sql
+    assert "`usage`" in sql
+    assert "`hash`" in sql
+    assert "`sample`" not in sql.split("LENGTH", maxsplit=1)[0]
+    assert f"AS `{ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS}`" in sql
+    assert ArcheryMCPClient.is_history_compact_projection(full_sql, columns) is True
+    assert (
+        ArcheryMCPClient.is_history_compact_projection(full_sql, (*columns, "new_field"))
+        is False
+    )
 
 
-def test_non_in_oversized_sample_uses_non_executable_head_tail_display() -> None:
-    sample = "SELECT * FROM notes WHERE body = '" + ("x" * 13_000) + "'"
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ("id", "sample", "RAW", "raw"),
+        ("id", "sample", "unsafe-column"),
+        ("id", "sample", ARCHERY_HISTORY_SAMPLE_LENGTH_ALIAS),
+        ("id", "raw"),
+    ],
+)
+def test_history_base_projection_rejects_ambiguous_or_incomplete_schema(
+    columns: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        ArcheryMCPClient.history_base_projection_columns(columns)
 
-    structured = ArcheryMCPClient.compress_sample_for_agent(sample)
 
-    assert structured["representation"] == "structured"
-    assert structured["structure_executable"] is False
-    assert len(structured["sample"]) == 12_000
-    assert "sample middle omitted for Agent context" in structured["sample"]
 
 
 @pytest.mark.parametrize(
@@ -2773,19 +2792,48 @@ async def test_slow_query_result_is_persisted_as_live_agent_evidence(
 
 
 @pytest.mark.asyncio
-async def test_slow_log_evidence_keys_positional_rows_by_column_list() -> None:
+async def test_slow_log_evidence_keys_all_positional_business_fields_without_loss() -> None:
+    long_sample = "SELECT  * FROM t WHERE note = 'A  B' AND id IN (" + ",".join(
+        map(str, range(4_000))
+    ) + ")  ;"
+    long_business_value = "业务字段" * 10_001
+    columns = [
+        "id",
+        "raw",
+        "raw_metric",
+        "artifact_count",
+        "hash",
+        "content_hash",
+        "request_id",
+        "usage",
+        "sha256",
+        "sample_sha256",
+        "sample",
+        "business_blob",
+    ]
+    values = [
+        24311020,
+        {"nested": ["value", {"raw": True}]},
+        7,
+        2,
+        "business-hash",
+        "business-content-hash",
+        "business-request-id",
+        {"business_units": 9},
+        "business-sha256",
+        "business-sample-sha256",
+        long_sample,
+        long_business_value,
+    ]
     client = RecordingArcheryClient(
         payload={
-            "full_sql": ("SELECT id, checksum, sample FROM mysql_slow_query_review_history;"),
+            "full_sql": "SELECT all_real_columns FROM mysql_slow_query_review_history;",
             "is_execute": False,
-            "rows": [
-                [24311020, "2DBE950C61C1BBB4617E83D777A3A810", "select * from orders"],
-                [24311019, "FFFCA4D67EA0A788813031B8BBC3B329", "commit"],
-            ],
-            "column_list": ["id", "checksum", "sample"],
-            "column_type": ["LONG", "STRING", "BLOB"],
+            "rows": [values],
+            "column_list": columns,
+            "column_type": ["VAR_STRING"] * len(columns),
             "status": None,
-            "affected_rows": 2,
+            "affected_rows": 1,
         }
     )
     tool = ArcherySlowLogEvidenceTool(client)  # type: ignore[arg-type]
@@ -2797,23 +2845,10 @@ async def test_slow_log_evidence_keys_positional_rows_by_column_list() -> None:
     )
 
     payload = structured["final_result_payload"]
-    assert payload["rows"] == [
-        {
-            "id": 24311020,
-            "checksum": "2DBE950C61C1BBB4617E83D777A3A810",
-            "sample": "select * from orders",
-        },
-        {
-            "id": 24311019,
-            "checksum": "FFFCA4D67EA0A788813031B8BBC3B329",
-            "sample": "commit",
-        },
-    ]
-    assert payload["column_list"] == ["id", "checksum", "sample"]
-    assert payload["full_sql"] == (
-        "SELECT id, checksum, sample FROM mysql_slow_query_review_history;"
-    )
-    assert "final_result_parse_failed" not in structured
+    assert payload["rows"] == [dict(zip(columns, values, strict=True))]
+    assert payload["column_list"] == columns
+    assert payload["rows"][0]["sample"] == long_sample
+    assert payload["rows"][0]["business_blob"] == long_business_value
 
 
 @pytest.mark.asyncio
