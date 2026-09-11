@@ -27,7 +27,6 @@ from app.domain.models import (
 _MAX_PROBLEM_SQL_STATEMENT_CHARS = 4_000
 
 
-
 def _evidence_units_by_id(
     evidence: list[EvidenceRecord],
 ) -> dict[str, tuple[EvidenceRecord, EvidenceUnit]]:
@@ -47,6 +46,7 @@ def _unit_contains_sql_sample(unit: EvidenceUnit) -> bool:
             if str(key).casefold() == "sample" and isinstance(value, str) and value.strip():
                 return True
     return False
+
 
 def _casefolded_value(data: Mapping[str, Any], key: str) -> Any:
     normalized_key = key.casefold()
@@ -90,9 +90,7 @@ def _complete_history_statement(row: Mapping[str, Any]) -> str | None:
         return None
 
     length_markers = [
-        value
-        for key, value in row.items()
-        if str(key).casefold() == "sample_full_length"
+        value for key, value in row.items() if str(key).casefold() == "sample_full_length"
     ]
     if length_markers:
         marker = length_markers[0]
@@ -310,7 +308,8 @@ def enforce_post_evidence_root_cause_policy(
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
-                "steps": [],
+                "temporary_solutions": [],
+                "long_term_optimizations": [],
                 "confidence": 0,
             }
         )
@@ -339,15 +338,27 @@ class RuleConclusionValidator:
         evidence_units_by_id = _evidence_units_by_id(evidence)
         has_supported_cause = bool(recommendation.root_causes)
 
+        recommendation_steps = [
+            *recommendation.temporary_solutions,
+            *recommendation.long_term_optimizations,
+        ]
         if not recommendation.root_causes:
             if recommendation.summary != INCONCLUSIVE_ROOT_CAUSE_SUMMARY:
                 issues.append("无法得出根因时 summary 必须固定为“现有结果无法得出根因”")
             if recommendation.likely_causes:
                 issues.append("无法得出根因时 likely_causes 必须为空")
-            if recommendation.steps:
-                issues.append("无法得出根因时 steps 必须为空")
-        elif not recommendation.steps:
-            issues.append("SUPPORTED 根因必须至少提供一项实际处置步骤")
+            if recommendation_steps:
+                issues.append("无法得出根因时两类建议必须为空")
+        elif not recommendation_steps:
+            issues.append("SUPPORTED 根因必须至少提供一项临时解决或长期优化建议")
+        for category, steps in (
+            ("临时解决建议", recommendation.temporary_solutions),
+            ("长期优化建议", recommendation.long_term_optimizations),
+        ):
+            expected_orders = list(range(1, len(steps) + 1))
+            actual_orders = [step.order for step in steps]
+            if actual_orders != expected_orders:
+                issues.append(f"{category}必须从 1 开始连续编号")
 
         for index, root_cause in enumerate(recommendation.root_causes, start=1):
             cause_label = root_cause.cause.strip() or "未命名根因"
@@ -555,21 +566,30 @@ class RuleConclusionValidator:
                 knowledge_warnings.append(f"知识依据 #{index} 的标题或来源与检索结果不一致")
 
         knowledge_matched = bool(knowledge_matches)
-        for index, step in enumerate(recommendation.steps, start=1):
-            source_ref = step.source_ref
-            if not knowledge_matched:
+        categorized_steps = (
+            ("临时解决建议", recommendation.temporary_solutions),
+            ("长期优化建议", recommendation.long_term_optimizations),
+        )
+        for category, steps in categorized_steps:
+            for index, step in enumerate(steps, start=1):
+                source_ref = step.source_ref
+                if not knowledge_matched:
+                    if source_ref is not None:
+                        knowledge_warnings.append(
+                            f"未命中知识时{category} #{index} 提供了 source_ref"
+                        )
+                    continue
                 if source_ref is not None:
-                    knowledge_warnings.append(f"未命中知识时处理步骤 #{index} 提供了 source_ref")
-                continue
-            if source_ref is not None:
-                expected = valid_knowledge_refs.get((source_ref.source, source_ref.knowledge_id))
-                if expected is None:
-                    knowledge_warnings.append(
-                        f"处理步骤 #{index} 引用了未知知识："
-                        f"{source_ref.source}/{source_ref.knowledge_id}"
+                    expected = valid_knowledge_refs.get(
+                        (source_ref.source, source_ref.knowledge_id)
                     )
-                elif (source_ref.title, source_ref.source_uri) != expected:
-                    knowledge_warnings.append(f"处理步骤 #{index} 的知识标题或来源不一致")
+                    if expected is None:
+                        knowledge_warnings.append(
+                            f"{category} #{index} 引用了未知知识："
+                            f"{source_ref.source}/{source_ref.knowledge_id}"
+                        )
+                    elif (source_ref.title, source_ref.source_uri) != expected:
+                        knowledge_warnings.append(f"{category} #{index} 的知识标题或来源不一致")
 
         source_rank = {
             AnalysisBasisSource.KNOWLEDGE: 0,
@@ -589,7 +609,8 @@ class RuleConclusionValidator:
                 "validator": type(self).__name__,
                 "alert_id": str(alert.id),
                 "checked_root_causes": len(recommendation.root_causes),
-                "checked_steps": len(recommendation.steps),
+                "checked_temporary_solutions": len(recommendation.temporary_solutions),
+                "checked_long_term_optimizations": len(recommendation.long_term_optimizations),
                 "evidence_count": len(evidence),
                 "evidence_unit_count": len(evidence_units_by_id),
                 "knowledge_count": len(knowledge_matches),

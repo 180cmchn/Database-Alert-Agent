@@ -62,6 +62,7 @@ from app.domain.models import (
     NotificationKind,
     ProgressRecord,
     Recommendation,
+    RecommendationStep,
     RunStatus,
     StoredAlert,
     ToolStatus,
@@ -177,6 +178,23 @@ def _model_payload(value: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TypeError("Persisted contract payload must be an object")
     return payload
+
+
+def _recommendation_from_persisted(
+    payload: Mapping[str, Any] | None,
+) -> tuple[Recommendation | None, list[RecommendationStep]]:
+    if not payload:
+        return None, []
+    value = dict(payload)
+    raw_legacy_steps = value.pop("steps", [])
+    legacy_steps = (
+        [RecommendationStep.model_validate(item) for item in raw_legacy_steps]
+        if isinstance(raw_legacy_steps, list)
+        else []
+    )
+    value.setdefault("temporary_solutions", [])
+    value.setdefault("long_term_optimizations", [])
+    return Recommendation.model_validate(value), legacy_steps
 
 
 def _canonical_json_hash(value: Any) -> str:
@@ -3643,13 +3661,15 @@ class SQLAlchemyAlertRepository:
                 advisor_metadata_json = None
         else:
             selected_result_available = bool(recommendation_json or advisor_metadata_json)
+        recommendation, legacy_recommendation_steps = _recommendation_from_persisted(
+            recommendation_json
+        )
 
         return StoredAlert(
             alert=normalized_alert,
             status=selected_status,
-            recommendation=(
-                Recommendation.model_validate(recommendation_json) if recommendation_json else None
-            ),
+            recommendation=recommendation,
+            legacy_recommendation_steps=legacy_recommendation_steps,
             advisor_metadata=(
                 AdvisorMetadata.model_validate(advisor_metadata_json)
                 if advisor_metadata_json

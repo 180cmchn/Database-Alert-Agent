@@ -318,8 +318,8 @@ mindmap
 | 内容 | 维护位置 | 维护要求 |
 | --- | --- | --- |
 | ReAct 决策规则 | `app/adapters/ai.py` 中的 `REACT_PROMPT` | 每轮一个真实工具或 `finish`，不得在该阶段提前生成根因 |
-| 最终结论与处置规则 | `app/adapters/ai.py` 中的 `SYSTEM_PROMPT` | 只有主 Agent 综合全部输入；严格执行两种结论形态；已建立根因时输出实际处置动作而不重复 MCP 只读取证，未建立根因时不输出猜测性步骤 |
-| 输出结构 | `InvestigationDecision`、`Recommendation` 的 Pydantic Schema | 模型输出先做 Schema 校验，不合规时要求模型只修复 JSON |
+| 最终结论与处置规则 | `app/adapters/ai.py` 中的 `SYSTEM_PROMPT` | 只有主 Agent 综合全部输入；严格执行两种结论形态；已建立根因时分别输出临时解决与长期优化建议，不重复 MCP 只读取证，证据不支持的类别保持为空；未建立根因时两个建议数组都为空 |
+| 输出结构 | `InvestigationDecision`、`Recommendation` 的 Pydantic Schema | `Recommendation` 使用 `temporary_solutions` 与 `long_term_optimizations` 两个独立数组；模型输出先做 Schema 校验，不合规时要求模型只修复 JSON |
 | 版本 | `app/adapters/ai.py` 中的 `PROMPT_VERSION` | 改变提示词语义时同步递增，并让新运行写入 snapshot / manifest |
 | 回归测试 | `tests/unit/test_ai.py`、`tests/unit/test_workflow.py` | 覆盖提示词关键约束、单工具轮次、finish、轮次上限和降级结果 |
 

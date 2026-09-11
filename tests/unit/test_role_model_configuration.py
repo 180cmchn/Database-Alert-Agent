@@ -109,7 +109,8 @@ async def test_advise_uses_main_model_and_analysis_effort() -> None:
         recommendation = ai_module.Recommendation.model_construct(
             summary="结论",
             analysis_bases=[],
-            steps=[],
+            temporary_solutions=[],
+            long_term_optimizations=[],
             confidence=0.5,
         )
         metadata = ai_module.AdvisorMetadata(
@@ -156,9 +157,7 @@ async def test_mcp_tool_call_uses_mcp_model_and_effort() -> None:
                 ],
             )
 
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=ToolCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ToolCompletions()))
     result = await advisor.request_mcp_tool_call(
         messages=[{"role": "user", "content": "confirm login"}],
         tools=[
@@ -181,6 +180,7 @@ async def test_mcp_tool_call_uses_mcp_model_and_effort() -> None:
 async def test_mcp_tool_call_omits_effort_when_not_configured() -> None:
     advisor = build_advisor()
     calls: list[dict[str, object]] = []
+
     class ToolCompletions:
         async def create(self, **kwargs: object) -> SimpleNamespace:
             calls.append(dict(kwargs))
@@ -203,9 +203,7 @@ async def test_mcp_tool_call_omits_effort_when_not_configured() -> None:
                 ],
             )
 
-    advisor._client = SimpleNamespace(
-        chat=SimpleNamespace(completions=ToolCompletions())
-    )
+    advisor._client = SimpleNamespace(chat=SimpleNamespace(completions=ToolCompletions()))
     await advisor.request_mcp_tool_call(
         messages=[{"role": "user", "content": "confirm login"}],
         tools=[

@@ -12,6 +12,7 @@ from app.adapters.alert_sources import CanonicalAlertSourceAdapter
 from app.adapters.persistence import (
     DATABASE_SCHEMA_REVISION,
     SQLAlchemyAlertRepository,
+    _recommendation_from_persisted,
 )
 from app.config import get_settings
 from app.domain.models import AlertStatus, StoredAlert
@@ -19,6 +20,22 @@ from app.domain.models import AlertStatus, StoredAlert
 
 def sqlite_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path}"
+
+
+def test_legacy_recommendation_steps_remain_readable_without_classification() -> None:
+    recommendation, legacy_steps = _recommendation_from_persisted(
+        {
+            "summary": "Historical analysis",
+            "analysis_bases": [{"source": "AI", "statement": "Historical basis"}],
+            "steps": [{"order": 1, "action": "Historical action"}],
+            "confidence": 0.5,
+        }
+    )
+
+    assert recommendation is not None
+    assert recommendation.temporary_solutions == []
+    assert recommendation.long_term_optimizations == []
+    assert [step.action for step in legacy_steps] == ["Historical action"]
 
 
 @pytest.mark.asyncio
@@ -712,6 +729,7 @@ async def test_new_alert_is_atomically_persisted_as_queued(tmp_path: Path) -> No
     assert created is True
     assert stored.status == AlertStatus.QUEUED
     await repository.close()
+
 
 @pytest.mark.asyncio
 async def test_new_alert_can_be_atomically_filtered_and_cannot_auto_claim(

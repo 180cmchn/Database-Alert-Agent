@@ -61,6 +61,10 @@ def test_analyze_and_get_alert(tmp_path: Path) -> None:
         assert detail_body["status"] == "INCONCLUSIVE"
         assert detail_body["alert"]["external_id"] == "api-1"
         assert detail_body["recommendation"]["knowledge_matches"] == []
+        assert detail_body["recommendation"]["temporary_solutions"] == []
+        assert detail_body["recommendation"]["long_term_optimizations"] == []
+        assert "steps" not in detail_body["recommendation"]
+        assert detail_body["legacy_recommendation_steps"] == []
         assert "requires_human" not in detail_body["recommendation"]
         assert "feedback" not in detail_body
         assert "knowledge_matches" not in detail_body

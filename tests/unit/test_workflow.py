@@ -278,12 +278,13 @@ async def test_knowledge_failure_does_not_block_detail_evidence_root_cause(
                             statement="结合权威告警详情中的当前值和阈值判断。",
                         )
                     ],
-                    steps=[
+                    temporary_solutions=[
                         RecommendationStep(
                             order=1,
                             action="提高连接容量或扩容数据库连接资源，并限制突发连接流量。",
                         )
                     ],
+                    long_term_optimizations=[],
                     risks=[],
                     confidence=0.9,
                     root_causes=[
@@ -1999,12 +2000,13 @@ async def test_workflow_binds_explain_to_exact_archery_history_sample(tmp_path: 
                             statement="依据样本 43 的完整 history 事实判断。",
                         )
                     ],
-                    steps=[
+                    temporary_solutions=[
                         RecommendationStep(
                             order=1,
                             action="优化样本 43 对应查询并限制其并发。",
                         )
                     ],
+                    long_term_optimizations=[],
                     risks=[],
                     confidence=0.9,
                     root_causes=[

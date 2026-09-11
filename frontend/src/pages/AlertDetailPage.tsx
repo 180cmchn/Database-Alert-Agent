@@ -28,6 +28,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { StageTimeline } from "../components/StageTimeline";
 import { AgentTrace } from "../components/AgentTrace";
 import { AIConclusionContent } from "../components/AIConclusionContent";
+import { RecommendationGroups } from "../components/RecommendationGroups";
 import {
   EmptyState,
   ErrorState,
@@ -591,26 +592,19 @@ export function AlertDetailPage() {
         <SectionCard
           eyebrow="ACTION PLAN"
           title="建议处理结果"
-          description="基于已验证根因给出实际恢复动作；涉及变更时请遵循风险、审批和回滚要求"
+          description="基于已验证根因分别给出临时解决与长期优化建议；涉及变更时请遵循风险、审批和回滚要求"
         >
           {recommendation ? (
-            recommendation.steps.length > 0 ? (
-              <ol className="action-steps">
-                {recommendation.steps.map((step) => (
-                  <li key={step.order}>
-                    <span className="step-number">{String(step.order).padStart(2, "0")}</span>
-                    <div>
-                      <strong>{step.action}</strong>
-                      {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
-                      {step.caution && <p className="caution"><CircleAlert size={14} /> 注意：{step.caution}</p>}
-                      {step.source_ref && <span className="source-ref"><ExternalLink size={13} /> {knowledgeReference(step.source_ref)}</span>}
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            ) : (
-              <p className="muted-copy">现有结果未建立根因，因此未生成猜测性处置步骤。</p>
-            )
+            recommendation.temporary_solutions.length > 0
+              || recommendation.long_term_optimizations.length > 0
+              || record.legacy_recommendation_steps.length > 0 ? (
+                <RecommendationGroups
+                  recommendation={recommendation}
+                  legacySteps={record.legacy_recommendation_steps}
+                />
+              ) : (
+                <p className="muted-copy">现有结果未建立根因，因此未生成猜测性处置建议。</p>
+              )
           ) : (
             <div className="waiting-panel">
               <Bot size={29} />

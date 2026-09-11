@@ -100,7 +100,8 @@ def make_recommendation(
                 statement="AI 已审阅告警、知识与实时证据。",
             )
         ],
-        steps=[] if action is None else [RecommendationStep(order=1, action=action)],
+        temporary_solutions=[] if action is None else [RecommendationStep(order=1, action=action)],
+        long_term_optimizations=[],
         confidence=0.5,
         root_causes=causes,
     )
@@ -157,6 +158,7 @@ def make_archery_sql_evidence() -> tuple[EvidenceRecord, EvidenceUnit, EvidenceU
         },
     )
     return parent.model_copy(update={"evidence_units": [history, explain]}), history, explain
+
 
 def make_multi_sample_archery_sql_evidence() -> tuple[
     EvidenceRecord,
@@ -541,7 +543,8 @@ def test_program_projection_usability_does_not_create_a_root_cause() -> None:
     assert result.root_causes == []
     assert result.likely_causes == []
     assert result.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
-    assert result.steps == []
+    assert result.temporary_solutions == []
+    assert result.long_term_optimizations == []
 
 
 def test_verified_unknown_status_is_not_silently_promoted() -> None:
@@ -771,6 +774,7 @@ async def test_rule_validator_accepts_auditable_sql_explain_conclusion() -> None
     assert result.evidence_sufficient is True
     assert result.issues == []
 
+
 @pytest.mark.asyncio
 async def test_rule_validator_scopes_explain_requirement_to_problem_history_sample() -> None:
     alert = make_alert()
@@ -923,6 +927,7 @@ async def test_rule_validator_requires_history_sample_id_even_when_statement_mat
     assert result.evidence_sufficient is False
     assert any("缺少稳定的 history sample_id" in issue for issue in result.issues)
 
+
 @pytest.mark.parametrize(
     ("statement", "expected_detail"),
     [
@@ -987,9 +992,7 @@ async def test_post_evidence_policy_projects_verbatim_statement_from_history_sam
     run = InvestigationRun(alert_id=alert.id)
     parent, history, explain = make_archery_sql_evidence()
     history_statement = (
-        "SELECT id FROM `xxl_job_log`\n"
-        "\t\tWHERE alarm_status = 0\n"
-        "\t\tORDER BY id ASC"
+        "SELECT id FROM `xxl_job_log`\n\t\tWHERE alarm_status = 0\n\t\tORDER BY id ASC"
     )
     history = history.model_copy(
         update={
@@ -1015,9 +1018,7 @@ async def test_post_evidence_policy_projects_verbatim_statement_from_history_sam
                 cause="任务日志查询全表扫描并长期占用连接槽位。",
                 problem_sql=RootCauseSqlEvidence(
                     statement=(
-                        "SELECT id FROM `xxl_job_log`\n"
-                        " WHERE alarm_status = 0\n"
-                        " ORDER BY id ASC"
+                        "SELECT id FROM `xxl_job_log`\n WHERE alarm_status = 0\n ORDER BY id ASC"
                     ),
                     sample_id="42",
                     evidence_ref=history_ref,
@@ -1105,7 +1106,6 @@ def test_post_evidence_policy_does_not_render_incomplete_or_oversized_sample(
     assert projected_problem_sql.statement is None
 
 
-
 @pytest.mark.asyncio
 async def test_rule_validator_rejects_unbound_history_sample_id() -> None:
     alert = make_alert()
@@ -1149,9 +1149,7 @@ async def test_rule_validator_reports_duplicate_history_sample_id() -> None:
     source_rows = history.data["rows"]
     duplicate_row = {**source_rows[1], "id": 42}
     history = history.model_copy(update={"data": {"rows": [source_rows[0], duplicate_row]}})
-    parent = parent.model_copy(
-        update={"evidence_units": [history, explain_a, failed_explain_b]}
-    )
+    parent = parent.model_copy(update={"evidence_units": [history, explain_a, failed_explain_b]})
     history_ref = str(history.id)
     recommendation = make_recommendation(
         summary="重复样本标识无法稳定绑定。",
@@ -1226,9 +1224,7 @@ async def test_rule_validator_preserves_legacy_v1_problem_sql_behavior() -> None
     run = InvestigationRun(alert_id=alert.id)
     evidence = make_live_evidence().model_copy(
         update={
-            "structured_data": {
-                "rows": [{"sample": "SELECT * FROM orders WHERE customer_id = 42"}]
-            }
+            "structured_data": {"rows": [{"sample": "SELECT * FROM orders WHERE customer_id = 42"}]}
         }
     )
     evidence_ref = str(evidence.id)
@@ -1479,7 +1475,7 @@ async def test_rule_validator_rejects_steps_without_a_supported_root_cause() -> 
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [])
 
     assert result.passed is False
-    assert "无法得出根因时 steps 必须为空" in result.issues
+    assert "无法得出根因时两类建议必须为空" in result.issues
 
 
 @pytest.mark.asyncio
@@ -1503,7 +1499,57 @@ async def test_rule_validator_requires_remediation_for_supported_root_cause() ->
     result = await RuleConclusionValidator().validate(run, alert, recommendation, [evidence])
 
     assert result.passed is False
-    assert "SUPPORTED 根因必须至少提供一项实际处置步骤" in result.issues
+    assert "SUPPORTED 根因必须至少提供一项临时解决或长期优化建议" in result.issues
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_accepts_one_supported_recommendation_category() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="已建立因果机制。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="已建立的因果机制。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+    )
+
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [evidence])
+
+    assert result.passed is True
+    assert recommendation.temporary_solutions
+    assert recommendation.long_term_optimizations == []
+
+
+@pytest.mark.asyncio
+async def test_rule_validator_rejects_non_contiguous_category_order() -> None:
+    alert = make_alert()
+    run = InvestigationRun(alert_id=alert.id)
+    evidence = make_live_evidence()
+    recommendation = make_recommendation(
+        summary="已建立因果机制。",
+        root_causes=[
+            RootCauseAssessment(
+                cause="已建立的因果机制。",
+                status=RootCauseStatus.SUPPORTED,
+                evidence_refs=[str(evidence.id)],
+                verified=True,
+            )
+        ],
+    ).model_copy(
+        update={
+            "temporary_solutions": [RecommendationStep(order=2, action="测试动作")],
+        }
+    )
+
+    result = await RuleConclusionValidator().validate(run, alert, recommendation, [evidence])
+
+    assert "临时解决建议必须从 1 开始连续编号" in result.issues
 
 
 @pytest.mark.asyncio

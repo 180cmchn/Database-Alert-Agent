@@ -45,7 +45,7 @@ from app.domain.tool_calling import (
     ReasoningTraceCallback,
 )
 
-PROMPT_VERSION = "database-alert-advisor-v29"
+PROMPT_VERSION = "database-alert-advisor-v30"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
@@ -552,8 +552,8 @@ supplemental 单元失败不影响已成功 history 单元的资格。evidence-r
 拒绝任何证据的条件，更不得据此弃用证据、把证据视作不可用或无关，或仅因该差异判定现有结果无法
 得出根因；证据可用性仍只按 status、source_system 与来源可追溯性判断，因果机制仍只能由证据内容
 本身的事实（时间窗口、SQL 指纹、执行次数、耗时、行数等）结合全部证据建立。
-不得输出 instance_id 归属核验或额外端点门控结论，也不得在 summary、steps、risks 中提及
-此类比较或差异。
+不得输出 instance_id 归属核验或额外端点门控结论，也不得在 summary、temporary_solutions、
+long_term_optimizations、risks 中提及此类比较或差异。
 
 root_causes 是前端“AI 分析结论”的唯一正文。每项 cause 只写简洁、明确的因果机制；完整的
 可审计说明写入该项自己的结构化字段：
@@ -582,18 +582,23 @@ root_causes 是前端“AI 分析结论”的唯一正文。每项 cause 只写�
 1. 能从全部输入中得出根因：root_causes 中每项 status 必须为 SUPPORTED、verified=true、
    hypothesis_id=null、next_probe=null，并引用至少一条上述可用、可追溯的实时 evidence id；
    likely_causes 与 root_causes 的 cause 一致。cause 必须是因果机制，不能只是告警症状或告警
-   reason 的复述。steps 必须给出能够直接消除根因、恢复服务或降低影响的实际处置动作，并且至少
-   包含一项；允许在证据支持时建议终止指定查询或会话、限流、切换、扩缩容、参数或配置修改等
-   非只读操作。不得把 tool_evidence 已完成的指标、日志、实例或数据库核查再次交给 DBA 重复执行。
-   证据已给出具体对象时，action 必须引用该对象；证据没有给出时不得虚构 SQL、会话 ID、进程 ID、
-   实例或参数值。涉及变更的动作仍写入 steps，并在 expected_result、caution 或 risks 中说明执行前提、
-   业务影响、审批要求、停止条件或回滚方式，不得只把真正的处置动作移入 risks。
-2. 不能得出根因：root_causes=[]、likely_causes=[]、steps=[]、summary 必须严格等于
-   “现有结果无法得出根因”。不得输出暂定原因、可能原因或猜测，也不得用重复只读核查填充 steps。
+   reason 的复述。必须把建议处理结果分为 temporary_solutions（临时解决建议）和
+   long_term_optimizations（长期优化建议）两个独立数组：临时解决建议用于控制当前影响、恢复服务或
+   降低当前风险；长期优化建议用于消除已证实根因或降低同类问题复发概率。两个数组下分别给出各自的
+   建议，数组内从 order=1 独立连续编号；不得把两类目标合并在同一条建议中。两类建议合计必须至少
+   包含一项能够直接处理已证实根因或其影响的实际动作；仅在当前证据能够支撑时输出对应类别，不得为
+   补齐任一类别而编造动作。不得把 tool_evidence 已完成的指标、日志、实例或数据库核查再次交给 DBA
+   重复执行。证据已给出具体对象时，action 必须引用该对象；证据没有给出时不得虚构 SQL、会话 ID、
+   进程 ID、实例、索引、参数或目标值。涉及变更的动作仍写入对应建议数组，并在 expected_result、
+   caution 或 risks 中说明执行前提、业务影响、审批要求、停止条件或回滚方式，不得只把真正的处置
+   动作移入 risks。
+2. 不能得出根因：root_causes=[]、likely_causes=[]、temporary_solutions=[]、
+   long_term_optimizations=[]、summary 必须严格等于“现有结果无法得出根因”。不得输出暂定原因、
+   可能原因或猜测，也不得用重复只读核查填充任一建议数组。
 
 不得为新结果使用 SUPPORT、UNKNOWN 或 CONTRADICTED。root_causes 中 cause_id 必须为 null。
-steps 是提供给 DBA 审核执行的处置建议，不表示本系统已经执行了其中任何动作。返回严格符合给定
-JSON Schema 的 JSON，不要使用 Markdown 代码围栏。"""
+两个建议数组均提供给 DBA 审核执行，不表示本系统已经执行了其中任何动作。返回严格符合给定 JSON
+Schema 的 JSON，不要使用 Markdown 代码围栏。"""
 
 REACT_PROMPT = """你是数据库告警分析的唯一主 Agent。你需要按 ReAct 方式逐轮工作：
 先在模型 API 的 reasoning_content/reasoning 字段中思考当前告警还需要什么证据，再在响应正文中
@@ -692,29 +697,33 @@ def _validate_knowledge_policy(
         ]
     new_bases = [*kept_knowledge_bases, *kept_ai_bases]
 
-    # A knowledge-backed step must cite one of the exact retrieved entries.
-    valid_steps: list[RecommendationStep] = []
-    for step in recommendation.steps:
-        if step.source_ref is not None:
-            matched = valid_knowledge.get((step.source_ref.source, step.source_ref.knowledge_id))
-            if matched is None:
-                if not knowledge:
-                    valid_steps.append(step.model_copy(update={"source_ref": None}))
-                continue
-            exact_ref = KnowledgeReference(
-                source=matched.source,
-                knowledge_id=matched.knowledge_id,
-                title=matched.title,
-                source_uri=matched.source_uri,
-            )
-            valid_steps.append(step.model_copy(update={"source_ref": exact_ref}))
-        else:
-            valid_steps.append(step)
+    def validated_steps(steps: list[RecommendationStep]) -> list[RecommendationStep]:
+        valid_steps: list[RecommendationStep] = []
+        for step in steps:
+            if step.source_ref is not None:
+                matched = valid_knowledge.get(
+                    (step.source_ref.source, step.source_ref.knowledge_id)
+                )
+                if matched is None:
+                    if not knowledge:
+                        valid_steps.append(step.model_copy(update={"source_ref": None}))
+                    continue
+                exact_ref = KnowledgeReference(
+                    source=matched.source,
+                    knowledge_id=matched.knowledge_id,
+                    title=matched.title,
+                    source_uri=matched.source_uri,
+                )
+                valid_steps.append(step.model_copy(update={"source_ref": exact_ref}))
+            else:
+                valid_steps.append(step)
+        return valid_steps
 
     update: dict[str, Any] = {
         "knowledge_matches": knowledge,
         "analysis_bases": new_bases,
-        "steps": valid_steps,
+        "temporary_solutions": validated_steps(recommendation.temporary_solutions),
+        "long_term_optimizations": validated_steps(recommendation.long_term_optimizations),
         "root_causes": [
             item.model_copy(update={"cause_id": None}) for item in recommendation.root_causes
         ],
@@ -1836,7 +1845,8 @@ class FakeAIAdvisor:
                         statement="已完成知识匹配与实时证据审阅，现有结果未建立根因机制。",
                     ),
                 ],
-                steps=[],
+                temporary_solutions=[],
+                long_term_optimizations=[],
                 risks=["知识依据不能单独证明本次事故根因；现有结果未生成有副作用的处置动作。"],
                 confidence=0.75,
                 knowledge_matches=knowledge,
@@ -1853,7 +1863,8 @@ class FakeAIAdvisor:
                         statement=("所选知识来源均未命中，现有实时结果也未建立根因机制。"),
                     )
                 ],
-                steps=[],
+                temporary_solutions=[],
+                long_term_optimizations=[],
                 risks=["现有结果未建立根因，未生成有副作用的处置动作。"],
                 confidence=0.35,
                 root_causes=[],
@@ -1891,7 +1902,8 @@ class ConservativeFallbackAdvisor(FakeAIAdvisor):
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
-                "steps": [],
+                "temporary_solutions": [],
+                "long_term_optimizations": [],
                 "confidence": 0,
             }
         )

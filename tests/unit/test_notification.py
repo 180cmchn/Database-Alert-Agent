@@ -86,13 +86,14 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
                     statement="告警字段 connection_usage_percent=95 与该场景一致。",
                 ),
             ],
-            steps=[
+            temporary_solutions=[
                 RecommendationStep(
                     order=1,
                     action="终止已确认的阻塞会话并限制异常连接流量。",
                     source_ref=reference,
                 )
             ],
+            long_term_optimizations=[],
             risks=["不要未经审批终止会话"],
             confidence=0.86,
             knowledge_matches=[knowledge],
@@ -182,7 +183,7 @@ def test_wecom_card_contains_alert_facts_and_exactly_two_actions(
     actions = card["jump_list"]
     assert [item["title"] for item in actions] == [
         "AI 分析结论",
-        "告警恢复建议",
+        "建议处理结果",
     ]
     assert [item["type"] for item in actions] == [1, 1]
     assert actions[0]["url"] == (

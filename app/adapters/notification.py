@@ -205,7 +205,7 @@ def build_wecom_template_card(
             },
             {
                 "type": 1,
-                "title": "告警恢复建议",
+                "title": "建议处理结果",
                 "url": urls["recovery_advice"],
             },
         ],

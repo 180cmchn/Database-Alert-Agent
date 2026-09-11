@@ -963,7 +963,8 @@ async def report_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 "summary": INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
                 "likely_causes": [],
                 "root_causes": [],
-                "steps": [],
+                "temporary_solutions": [],
+                "long_term_optimizations": [],
                 "confidence": 0,
             }
         )

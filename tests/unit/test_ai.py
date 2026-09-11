@@ -279,11 +279,12 @@ def test_prompts_form_final_causes_only_after_reviewing_live_evidence() -> None:
 
 def test_final_recommendations_are_actionable_without_repeating_mcp_checks() -> None:
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
-    assert "steps 必须给出能够直接消除根因、恢复服务或降低影响的实际处置动作" in prompt
-    assert "允许在证据支持时建议终止指定查询或会话" in prompt
+    assert "必须把建议处理结果分为 temporary_solutions（临时解决建议）" in prompt
+    assert "long_term_optimizations（长期优化建议）" in prompt
+    assert "不得把两类目标合并在同一条建议中" in prompt
     assert "不得把 tool_evidence 已完成的指标、日志、实例或数据库核查再次交给 DBA" in prompt
-    assert "root_causes=[]、likely_causes=[]、steps=[]" in prompt
-    assert "steps 仅允许只读核查" not in prompt
+    assert "root_causes=[]、likely_causes=[]、temporary_solutions=[]" in prompt
+    assert "long_term_optimizations=[]" in prompt
     assert "所有工具调用都必须保持只读" in ai_module.REACT_PROMPT
     assert not hasattr(ai_module.OpenAICompatibleAdvisor, "choose_next_tool")
 
@@ -292,7 +293,7 @@ def test_final_conclusion_requires_auditable_sql_and_explain_details() -> None:
     prompt = ai_module.SYSTEM_PROMPT.replace("\n", "")
     normalized_prompt = " ".join(ai_module.SYSTEM_PROMPT.split())
 
-    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v29"
+    assert ai_module.PROMPT_VERSION == "database-alert-advisor-v30"
     assert "root_causes 是前端“AI 分析结论”的唯一正文" in prompt
     assert "analysis_process 至少包含一项" in prompt
     assert "事实 → 推导" in prompt
@@ -362,14 +363,16 @@ async def test_fake_advisor_returns_fixed_no_cause_for_partial_success() -> None
     assert recommendation.summary == INCONCLUSIVE_ROOT_CAUSE_SUMMARY
     assert recommendation.root_causes == []
     assert recommendation.likely_causes == []
-    assert recommendation.steps == []
+    assert recommendation.temporary_solutions == []
+    assert recommendation.long_term_optimizations == []
 
 
 @pytest.mark.asyncio
 async def test_no_knowledge_remains_a_valid_optional_input() -> None:
     recommendation, _ = await FakeAIAdvisor().advise(make_alert(), [])
     assert recommendation.knowledge_matches == []
-    assert recommendation.steps == []
+    assert recommendation.temporary_solutions == []
+    assert recommendation.long_term_optimizations == []
     assert [item.source for item in recommendation.analysis_bases] == [AnalysisBasisSource.AI]
 
 
@@ -382,9 +385,10 @@ async def test_real_advisor_preserves_application_knowledge_match_summary() -> N
         summary="Model analysis",
         knowledge_match_summary="model-overwritten-value",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
-        steps=[
+        temporary_solutions=[
             RecommendationStep(order=1, action="terminate the evidence-identified blocking session")
         ],
+        long_term_optimizations=[],
         confidence=0.3,
     )
 
@@ -431,7 +435,8 @@ async def test_advisor_applies_slow_query_filter_note_only_to_alert_payload() ->
     model_response = Recommendation(
         summary="证据不足，需继续核查。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        temporary_solutions=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        long_term_optimizations=[],
         confidence=0.3,
     )
 
@@ -573,7 +578,8 @@ async def test_main_agent_payloads_use_bounded_evidence_dto_without_provenance()
     recommendation = Recommendation(
         summary=INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
-        steps=[],
+        temporary_solutions=[],
+        long_term_optimizations=[],
         confidence=0.3,
     )
     calls = 0
@@ -717,7 +723,8 @@ async def test_advisor_repair_repeats_chinese_output_requirement() -> None:
     valid_response = Recommendation(
         summary="中文分析结果",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        temporary_solutions=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        long_term_optimizations=[],
         confidence=0.3,
     )
     calls = 0
@@ -749,7 +756,8 @@ async def test_advisor_does_not_apply_archery_endpoint_output_gate() -> None:
             "而非告警目标实例）未能获取有效慢日志证据。"
         ),
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        temporary_solutions=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        long_term_optimizations=[],
         confidence=0.3,
     )
     calls = 0
@@ -776,7 +784,8 @@ async def test_advisor_accepts_schema_valid_archery_endpoint_statement_once() ->
     model_response = Recommendation(
         summary="Archery 查询的实例与告警目标不一致，因此慢日志无效。",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI 分析依据")],
-        steps=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        temporary_solutions=[RecommendationStep(order=1, action="终止证据标识的阻塞会话")],
+        long_term_optimizations=[],
         confidence=0.3,
     )
 
@@ -858,9 +867,10 @@ async def test_advisor_payload_uses_unified_knowledge_contract() -> None:
     model_response = Recommendation(
         summary="No semantic match",
         analysis_bases=[AnalysisBasis(source=AnalysisBasisSource.AI, statement="AI basis")],
-        steps=[
+        temporary_solutions=[
             RecommendationStep(order=1, action="terminate the evidence-identified blocking session")
         ],
+        long_term_optimizations=[],
         confidence=0.3,
     )
 
@@ -946,7 +956,7 @@ def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
                 ),
             ),
         ],
-        steps=[
+        temporary_solutions=[
             RecommendationStep(
                 order=1,
                 action="check",
@@ -958,6 +968,7 @@ def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
                 ),
             )
         ],
+        long_term_optimizations=[],
         confidence=0.8,
     )
 
@@ -971,7 +982,7 @@ def test_knowledge_reference_metadata_is_restored_from_retrieval() -> None:
     )
     assert result.analysis_bases[0].source_ref == exact
     assert result.analysis_bases[1].source_ref is None
-    assert result.steps[0].source_ref == exact
+    assert result.temporary_solutions[0].source_ref == exact
     assert result.confidence == 0.8
 
 

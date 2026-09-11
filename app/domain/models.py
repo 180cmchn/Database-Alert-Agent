@@ -469,7 +469,8 @@ class Recommendation(BaseModel):
     knowledge_match_summary: str = ""
     likely_causes: list[str] = Field(default_factory=list)
     analysis_bases: list[AnalysisBasis] = Field(default_factory=list)
-    steps: list[RecommendationStep]
+    temporary_solutions: list[RecommendationStep]
+    long_term_optimizations: list[RecommendationStep]
     risks: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
     knowledge_matches: list[KnowledgeExcerpt] = Field(default_factory=list)
@@ -770,6 +771,7 @@ class StoredAlert(BaseModel):
     alert: NormalizedAlert
     status: AlertStatus
     recommendation: Recommendation | None = None
+    legacy_recommendation_steps: list[RecommendationStep] = Field(default_factory=list)
     advisor_metadata: AdvisorMetadata | None = None
     error: str | None = None
     latest_run: InvestigationRun | None = None

@@ -5,12 +5,12 @@ import {
   CircleHelp,
   Database,
   Server,
-  ShieldAlert,
   Wrench,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { AIConclusionContent } from "../components/AIConclusionContent";
+import { RecommendationGroups } from "../components/RecommendationGroups";
 import { api } from "../lib/api";
 import { formatDateTime, formatPercent, statusLabel } from "../lib/format";
 import type { StoredAlert } from "../types/api";
@@ -167,32 +167,27 @@ function AIConclusionView({ record }: { record: StoredAlert }) {
 
 function RecoveryAdviceContent({ record }: { record: StoredAlert }) {
   const recommendation = record.recommendation!;
+  const hasAdvice = recommendation.temporary_solutions.length > 0
+    || recommendation.long_term_optimizations.length > 0
+    || record.legacy_recommendation_steps.length > 0;
   return (
     <div className="wecom-content-stack">
       <section className="wecom-content-card">
-        <div className="wecom-section-title"><Wrench size={20} /><h2>告警恢复建议</h2></div>
-        <p className="wecom-summary">{recommendation.steps.length > 0 ? "以下为 Agent 基于已证实根因生成的实际恢复处置建议；涉及变更的动作请按前提、风险和审批要求执行，本系统未执行这些动作。" : "现有结果未建立根因；为避免误导，不提供猜测性处置动作或重复核查步骤。"}</p>
+        <div className="wecom-section-title"><Wrench size={20} /><h2>建议处理结果</h2></div>
+        <p className="wecom-summary">{hasAdvice ? "以下为 Agent 基于已证实根因生成的临时解决与长期优化建议；涉及变更的动作请按前提、风险和审批要求执行，本系统未执行这些动作。" : "现有结果未建立根因；为避免误导，不提供猜测性处置动作或重复核查步骤。"}</p>
       </section>
 
-      <section className="wecom-content-card">
-        {recommendation.steps.length > 0 ? (
-          <ol className="wecom-advice-list">
-            {recommendation.steps.map((step) => (
-              <li key={step.order}>
-                <span>{String(step.order).padStart(2, "0")}</span>
-                <div>
-                  <h3>{step.action}</h3>
-                  {step.expected_result && <p><CheckCircle2 size={14} /> 预期：{step.expected_result}</p>}
-                  {step.caution && <p className="wecom-caution"><ShieldAlert size={14} /> 注意：{step.caution}</p>}
-                </div>
-              </li>
-            ))}
-          </ol>
-        ) : (
-          <p className="wecom-summary">没有可展示的处置动作。</p>
-        )}
-      </section>
-
+      {hasAdvice ? (
+        <RecommendationGroups
+          recommendation={recommendation}
+          legacySteps={record.legacy_recommendation_steps}
+          compact
+        />
+      ) : (
+        <section className="wecom-content-card">
+          <p className="wecom-summary">没有可展示的处置建议。</p>
+        </section>
+      )}
     </div>
   );
 }

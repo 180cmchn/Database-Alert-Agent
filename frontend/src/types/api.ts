@@ -184,7 +184,8 @@ export interface Recommendation {
   knowledge_match_summary: string;
   likely_causes: string[];
   analysis_bases: AnalysisBasis[];
-  steps: RecommendationStep[];
+  temporary_solutions: RecommendationStep[];
+  long_term_optimizations: RecommendationStep[];
   risks: string[];
   confidence: number;
   knowledge_matches: KnowledgeExcerpt[];
@@ -363,6 +364,7 @@ export interface StoredAlert {
   alert: NormalizedAlert;
   status: AlertStatus;
   recommendation?: Recommendation | null;
+  legacy_recommendation_steps: RecommendationStep[];
   advisor_metadata?: {
     provider: string;
     model: string;

@@ -235,19 +235,23 @@ Return a concise, traceable result:
 - summarize the symptom, scope, and impact without overstating certainty;
 - list actually retrieved knowledge references before AI analysis bases;
 - attach qualifying live evidence IDs to every `SUPPORTED` root cause;
-- for every `SUPPORTED` root cause, propose at least one evidence-grounded action that can remove the
-  cause, restore service, or reduce impact; recommendations may include state-changing operations
-  such as terminating a specific query or session, failover, throttling, scaling, or configuration
-  changes when the evidence supports them;
-- do not ask the DBA to repeat metric, log, instance, database, or SQL checks already completed through
-  MCP evidence collection;
+- for every `SUPPORTED` root cause, return recommendations in two structural categories:
+  `temporary_solutions` for controlling current impact, restoring service, or reducing immediate
+  risk, and `long_term_optimizations` for removing the established cause or reducing recurrence;
+- each category contains its own ordered recommendation steps; do not combine temporary and
+  long-term objectives into one step, and do not invent an action merely to make both categories
+  non-empty;
+- recommendations may include state-changing operations when the evidence supports them, but do not
+  ask the DBA to repeat metric, log, instance, database, or SQL checks already completed through MCP
+  evidence collection;
 - identify the real target when evidence provides it and never invent a SQL statement, session or
-  process ID, instance, parameter, or value;
-- keep state-changing actions in the recommendation steps, while recording prerequisites, expected
-  results, business risk, approval needs, stop conditions, and rollback guidance in the step details
-  or risks; recommendations are not claims that the application executed those actions;
-- when no root cause is established, return no remediation steps instead of speculative changes or
-  repeated read-only investigation;
+  process ID, instance, index, parameter, or value;
+- keep state-changing actions in the applicable recommendation category, while recording
+  prerequisites, expected results, business risk, approval needs, stop conditions, and rollback
+  guidance in the step details or risks; recommendations are not claims that the application
+  executed those actions;
+- when no root cause is established, return both recommendation arrays empty instead of speculative
+  changes or repeated read-only investigation;
 - state material evidence gaps without naming speculative causes;
 - use `现有结果无法得出根因` whenever the evidence does not establish one.
 
