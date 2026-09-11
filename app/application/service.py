@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from app.adapters.alert_sources import AlertSourceRegistry
 from app.adapters.investigation import InvestigationToolRegistry, ToolExecutor
 from app.adapters.knowledge import KnowledgeSourceRegistry
+from app.adapters.notification import WeComManagementNotifier
 from app.agent_runtime.contracts import RunManifest
 from app.agent_runtime.leases import LeaseLostError, RunLeaseGuard
 from app.agents.graph import InvestigationAgent
@@ -25,6 +26,10 @@ from app.application.analysis_control import (
     wait_for_persisted_cancellation,
 )
 from app.application.sanitization import sanitize, sanitize_alert
+from app.application.wecom_mention import (
+    WeComMentionFlashDutyClient,
+    resolve_wecom_mention_targets,
+)
 from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
     AdvisorError,
@@ -56,6 +61,7 @@ from app.domain.models import (
     RunStatus,
     Severity,
     StoredAlert,
+    WeComMentionMode,
 )
 from app.domain.ports import (
     AIAdvisor,
@@ -105,6 +111,9 @@ class AlertAnalysisService:
         external_knowledge_min_relevance: float = 0.60,
         knowledge_sources: list[str] | None = None,
         runtime_manifest_config: dict[str, Any] | None = None,
+        flashduty_client: WeComMentionFlashDutyClient | None = None,
+        wecom_mention_enabled: bool = False,
+        wecom_mention_mode: WeComMentionMode = WeComMentionMode.ON_CALL_PERSON,
     ) -> None:
         self.source_registry = source_registry
         self.knowledge_registry = knowledge_registry
@@ -129,6 +138,9 @@ class AlertAnalysisService:
         self.external_knowledge_min_relevance = external_knowledge_min_relevance
         self.knowledge_sources = knowledge_sources or []
         self.runtime_manifest_config = dict(runtime_manifest_config or {})
+        self.flashduty_client = flashduty_client
+        self.wecom_mention_enabled = wecom_mention_enabled
+        self.wecom_mention_mode = wecom_mention_mode
         self._active_analyses = 0
         self._retired_adapters: list[object] = []
         self._retired_adapter_ids: set[int] = set()
@@ -1165,8 +1177,40 @@ class AlertAnalysisService:
                         delivery.id,
                     )
                 continue
+            await self._send_wecom_mention_best_effort(event)
             completed += 1
         return completed
+
+    async def _send_wecom_mention_best_effort(
+        self, event: ManagementNotificationEvent
+    ) -> None:
+        """Best-effort "请查收@xxx" follow-up after a WeCom card is delivered.
+
+        Every failure here (resolution or send) is only logged. It must never
+        raise: WeCom's webhook has no idempotency key, so retrying this
+        delivery through the outbox would resend the already-delivered
+        analysis card.
+        """
+        if not self.wecom_mention_enabled or not isinstance(
+            self.notifier, WeComManagementNotifier
+        ):
+            return
+        try:
+            targets = await resolve_wecom_mention_targets(
+                event.alert,
+                mode=self.wecom_mention_mode,
+                repository=self.repository,
+                flashduty_client=self.flashduty_client,
+            )
+            if not targets:
+                return
+            await self.notifier.send_mention(event, targets)
+        except Exception as exc:
+            logger.warning(
+                "wecom_mention_skipped alert_id=%s error=%s",
+                event.alert.id,
+                sanitize(str(exc)),
+            )
 
     def start_notification_delivery_worker(self, *, interval_seconds: float = 10.0) -> None:
         if self._notification_delivery_task is not None:

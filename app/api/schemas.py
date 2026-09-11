@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_runtime.trace import AgentTraceEntry
 from app.application.admin import runtime_configuration_issues
@@ -18,6 +18,9 @@ from app.domain.models import (
     NormalizedAlert,
     RunStatus,
     Severity,
+    WeComMentionEngineOwner,
+    WeComMentionFlashDutyMember,
+    WeComMentionTarget,
 )
 
 
@@ -203,6 +206,8 @@ class RuntimeSettingsPatch(BaseModel):
     wecom_webhook_url: str | None = Field(default=None, max_length=2048, repr=False)
     wecom_page_base_url: str | None = Field(default=None, max_length=2048)
     wecom_enabled: bool | None = None
+    wecom_mention_enabled: bool | None = None
+    wecom_mention_mode: Literal["ON_CALL_PERSON", "DATABASE_OWNER"] | None = None
     knowledge_sources: list[str] | None = None
     flashduty_polling_enabled: bool | None = None
     flashduty_poll_interval_seconds: int | None = Field(default=None, ge=300, le=86400)
@@ -239,6 +244,8 @@ class RuntimeSettingsResponse(BaseModel):
     wecom_enabled: bool
     wecom_webhook_url_configured: bool
     wecom_page_base_url: str
+    wecom_mention_enabled: bool
+    wecom_mention_mode: str
     flashduty_enabled: bool
     flashduty_base_url: str
     flashduty_app_key_configured: bool
@@ -292,6 +299,8 @@ class RuntimeSettingsResponse(BaseModel):
             wecom_enabled=settings.wecom_enabled,
             wecom_webhook_url_configured=bool(settings.wecom_webhook_url),
             wecom_page_base_url=settings.wecom_page_base_url,
+            wecom_mention_enabled=settings.wecom_mention_enabled,
+            wecom_mention_mode=settings.wecom_mention_mode,
             flashduty_enabled=settings.flashduty_enabled,
             flashduty_base_url=settings.flashduty_base_url,
             flashduty_app_key_configured=bool(settings.flashduty_app_key),
@@ -310,3 +319,51 @@ class RuntimeSettingsResponse(BaseModel):
             revision=revision,
             changed_fields=changed_fields or [],
         )
+
+
+class WeComMentionTargetRequest(BaseModel):
+    """Admin-supplied WeCom identity for a mention mapping row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_label: str = Field(min_length=1, max_length=100)
+    wecom_userid: str | None = Field(default=None, min_length=1, max_length=128)
+    wecom_mobile: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> WeComMentionTargetRequest:
+        if not self.wecom_userid and not self.wecom_mobile:
+            raise ValueError("wecom_userid or wecom_mobile is required")
+        return self
+
+    def to_domain(self) -> WeComMentionTarget:
+        return WeComMentionTarget(
+            display_label=self.display_label,
+            wecom_userid=self.wecom_userid,
+            wecom_mobile=self.wecom_mobile,
+        )
+
+
+class WeComMentionEngineOwnerRequest(BaseModel):
+    """Upsert payload for the DATABASE_OWNER mention mapping (path carries the engine)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: WeComMentionTargetRequest
+
+
+class WeComMentionEngineOwnerListResponse(BaseModel):
+    items: list[WeComMentionEngineOwner]
+
+
+class WeComMentionFlashDutyMemberRequest(BaseModel):
+    """Upsert payload for the ON_CALL_PERSON mention mapping (path carries the person id)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flashduty_member_name: str = Field(default="", max_length=255)
+    target: WeComMentionTargetRequest
+
+
+class WeComMentionFlashDutyMemberListResponse(BaseModel):
+    items: list[WeComMentionFlashDutyMember]

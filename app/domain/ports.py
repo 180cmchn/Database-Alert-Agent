@@ -31,6 +31,9 @@ from app.domain.models import (
     ToolExecutionResult,
     ToolResultAnalysis,
     ValidationRecord,
+    WeComMentionEngineOwner,
+    WeComMentionFlashDutyMember,
+    WeComMentionTarget,
 )
 from app.domain.tool_calling import ReasoningTraceCallback
 
@@ -296,6 +299,41 @@ class AlertRepository(Protocol):
         error: str,
         unknown_outcome: bool,
     ) -> None: ...
+
+    async def list_wecom_mention_engine_owners(self) -> list[WeComMentionEngineOwner]: ...
+
+    async def get_wecom_mention_engine_owner(
+        self, engine: str
+    ) -> WeComMentionEngineOwner | None: ...
+
+    async def upsert_wecom_mention_engine_owner(
+        self,
+        engine: str,
+        target: WeComMentionTarget,
+        *,
+        updated_by: str,
+    ) -> WeComMentionEngineOwner: ...
+
+    async def delete_wecom_mention_engine_owner(self, engine: str) -> bool: ...
+
+    async def list_wecom_mention_flashduty_members(
+        self,
+    ) -> list[WeComMentionFlashDutyMember]: ...
+
+    async def get_wecom_mention_flashduty_members(
+        self, person_ids: set[int]
+    ) -> dict[int, WeComMentionFlashDutyMember]: ...
+
+    async def upsert_wecom_mention_flashduty_member(
+        self,
+        flashduty_person_id: int,
+        flashduty_member_name: str,
+        target: WeComMentionTarget,
+        *,
+        updated_by: str,
+    ) -> WeComMentionFlashDutyMember: ...
+
+    async def delete_wecom_mention_flashduty_member(self, flashduty_person_id: int) -> bool: ...
 
     async def create_or_get(
         self,

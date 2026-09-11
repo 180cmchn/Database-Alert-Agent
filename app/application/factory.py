@@ -53,6 +53,7 @@ from app.agents.graph import InvestigationAgent
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
 from app.config import Settings
+from app.domain.models import WeComMentionMode
 from app.domain.ports import (
     AIAdvisor,
     AlertRepository,
@@ -457,6 +458,8 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.external_knowledge_min_relevance = settings.external_knowledge_min_relevance
     service.knowledge_sources = settings.knowledge_sources
     service.runtime_manifest_config = _runtime_manifest_config(settings)
+    service.wecom_mention_enabled = settings.wecom_mention_enabled
+    service.wecom_mention_mode = WeComMentionMode(settings.wecom_mention_mode)
     service.agent = agent
     runtime.settings = settings
     service.retire_adapters(
@@ -536,6 +539,9 @@ def build_runtime(
         external_knowledge_min_relevance=(settings.external_knowledge_min_relevance),
         knowledge_sources=settings.knowledge_sources,
         runtime_manifest_config=_runtime_manifest_config(settings),
+        flashduty_client=flashduty_client,
+        wecom_mention_enabled=settings.wecom_mention_enabled,
+        wecom_mention_mode=WeComMentionMode(settings.wecom_mention_mode),
     )
     return Runtime(
         settings=settings,

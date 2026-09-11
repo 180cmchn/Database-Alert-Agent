@@ -12,6 +12,7 @@ from uuid import uuid4
 from jsonpointer import JsonPointerException, resolve_pointer
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Column,
     DateTime,
     ForeignKey,
@@ -68,6 +69,9 @@ from app.domain.models import (
     ToolStatus,
     ValidationKind,
     ValidationRecord,
+    WeComMentionEngineOwner,
+    WeComMentionFlashDutyMember,
+    WeComMentionTarget,
 )
 from app.domain.ports import (
     AgentCheckpointVersionConflict,
@@ -350,7 +354,7 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 
 _UNBOUNDED_TEXT = Text().with_variant(LONGTEXT(), "mysql")
-DATABASE_SCHEMA_REVISION = "0019"
+DATABASE_SCHEMA_REVISION = "0020"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -472,6 +476,29 @@ class NotificationDeliveryRow(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
     sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class WeComMentionEngineOwnerRow(Base):
+    __tablename__ = "wecom_mention_engine_owners"
+
+    engine: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    wecom_userid: Mapped[str | None] = mapped_column(String(128))
+    wecom_mobile: Mapped[str | None] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+
+class WeComMentionFlashDutyMemberRow(Base):
+    __tablename__ = "wecom_mention_flashduty_members"
+
+    flashduty_person_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    flashduty_member_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    display_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    wecom_userid: Mapped[str | None] = mapped_column(String(128))
+    wecom_mobile: Mapped[str | None] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
 class FlashDutyPollStateRow(Base):
@@ -1115,6 +1142,157 @@ class SQLAlchemyAlertRepository:
             )
             row.updated_at = now
             await session.commit()
+
+    @staticmethod
+    def _wecom_mention_engine_owner(
+        row: WeComMentionEngineOwnerRow,
+    ) -> WeComMentionEngineOwner:
+        return WeComMentionEngineOwner(
+            engine=row.engine,
+            target=WeComMentionTarget(
+                display_label=row.display_label,
+                wecom_userid=row.wecom_userid,
+                wecom_mobile=row.wecom_mobile,
+            ),
+            updated_at=row.updated_at,
+            updated_by=row.updated_by,
+        )
+
+    @staticmethod
+    def _wecom_mention_flashduty_member(
+        row: WeComMentionFlashDutyMemberRow,
+    ) -> WeComMentionFlashDutyMember:
+        return WeComMentionFlashDutyMember(
+            flashduty_person_id=row.flashduty_person_id,
+            flashduty_member_name=row.flashduty_member_name,
+            target=WeComMentionTarget(
+                display_label=row.display_label,
+                wecom_userid=row.wecom_userid,
+                wecom_mobile=row.wecom_mobile,
+            ),
+            updated_at=row.updated_at,
+            updated_by=row.updated_by,
+        )
+
+    async def list_wecom_mention_engine_owners(self) -> list[WeComMentionEngineOwner]:
+        async with self.session_factory() as session:
+            rows = await session.scalars(
+                select(WeComMentionEngineOwnerRow).order_by(WeComMentionEngineOwnerRow.engine)
+            )
+            return [self._wecom_mention_engine_owner(row) for row in rows]
+
+    async def get_wecom_mention_engine_owner(
+        self, engine: str
+    ) -> WeComMentionEngineOwner | None:
+        async with self.session_factory() as session:
+            row = await session.get(WeComMentionEngineOwnerRow, engine)
+            return self._wecom_mention_engine_owner(row) if row is not None else None
+
+    async def upsert_wecom_mention_engine_owner(
+        self,
+        engine: str,
+        target: WeComMentionTarget,
+        *,
+        updated_by: str,
+    ) -> WeComMentionEngineOwner:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            row = await session.get(WeComMentionEngineOwnerRow, engine)
+            if row is None:
+                row = WeComMentionEngineOwnerRow(
+                    engine=engine,
+                    display_label=target.display_label,
+                    wecom_userid=target.wecom_userid,
+                    wecom_mobile=target.wecom_mobile,
+                    updated_at=now,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.display_label = target.display_label
+                row.wecom_userid = target.wecom_userid
+                row.wecom_mobile = target.wecom_mobile
+                row.updated_at = now
+                row.updated_by = updated_by
+            await session.commit()
+            return self._wecom_mention_engine_owner(row)
+
+    async def delete_wecom_mention_engine_owner(self, engine: str) -> bool:
+        async with self.session_factory() as session:
+            row = await session.get(WeComMentionEngineOwnerRow, engine)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def list_wecom_mention_flashduty_members(
+        self,
+    ) -> list[WeComMentionFlashDutyMember]:
+        async with self.session_factory() as session:
+            rows = await session.scalars(
+                select(WeComMentionFlashDutyMemberRow).order_by(
+                    WeComMentionFlashDutyMemberRow.flashduty_person_id
+                )
+            )
+            return [self._wecom_mention_flashduty_member(row) for row in rows]
+
+    async def get_wecom_mention_flashduty_members(
+        self, person_ids: set[int]
+    ) -> dict[int, WeComMentionFlashDutyMember]:
+        if not person_ids:
+            return {}
+        async with self.session_factory() as session:
+            rows = await session.scalars(
+                select(WeComMentionFlashDutyMemberRow).where(
+                    WeComMentionFlashDutyMemberRow.flashduty_person_id.in_(person_ids)
+                )
+            )
+            return {
+                row.flashduty_person_id: self._wecom_mention_flashduty_member(row)
+                for row in rows
+            }
+
+    async def upsert_wecom_mention_flashduty_member(
+        self,
+        flashduty_person_id: int,
+        flashduty_member_name: str,
+        target: WeComMentionTarget,
+        *,
+        updated_by: str,
+    ) -> WeComMentionFlashDutyMember:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_person_id)
+            if row is None:
+                row = WeComMentionFlashDutyMemberRow(
+                    flashduty_person_id=flashduty_person_id,
+                    flashduty_member_name=flashduty_member_name,
+                    display_label=target.display_label,
+                    wecom_userid=target.wecom_userid,
+                    wecom_mobile=target.wecom_mobile,
+                    updated_at=now,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.flashduty_member_name = flashduty_member_name
+                row.display_label = target.display_label
+                row.wecom_userid = target.wecom_userid
+                row.wecom_mobile = target.wecom_mobile
+                row.updated_at = now
+                row.updated_by = updated_by
+            await session.commit()
+            return self._wecom_mention_flashduty_member(row)
+
+    async def delete_wecom_mention_flashduty_member(self, flashduty_person_id: int) -> bool:
+        async with self.session_factory() as session:
+            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_person_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
 
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int:
         """Delete expired terminal alerts."""

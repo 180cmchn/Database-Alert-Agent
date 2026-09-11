@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import AliasChoices, Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from app.domain.models import Severity
+from app.domain.models import Severity, WeComMentionMode
 
 DEFAULT_ENVIRONMENT_ALIASES = {
     "production": ["prod", "prd", "production", "生产", "生产环境"],
@@ -79,6 +79,8 @@ RUNTIME_SETTINGS_KEYS = frozenset(
         "wecom_webhook_url",
         "wecom_page_base_url",
         "wecom_enabled",
+        "wecom_mention_enabled",
+        "wecom_mention_mode",
         "react_max_rounds",
         "analysis_timeout_seconds",
         "knowledge_sources",
@@ -209,6 +211,14 @@ class Settings(BaseSettings):
     # are sent even if a webhook URL is configured; when true, a valid URL is
     # required before notifications can be delivered.
     wecom_enabled: bool = False
+    # Best-effort "请查收@xxx" follow-up text message sent after a WeCom
+    # notification card is delivered. Independent of wecom_enabled's card
+    # delivery outcome; failures here are only logged, never retried.
+    wecom_mention_enabled: bool = False
+    # ON_CALL_PERSON: mention the FlashDuty incident's assigned/acknowledged
+    # responder(s). DATABASE_OWNER: mention the admin-mapped owner of the
+    # alert's database engine.
+    wecom_mention_mode: str = "ON_CALL_PERSON"
 
     # FlashDuty credentials and data-source bindings are deployment settings.
     # They intentionally remain outside RUNTIME_SETTINGS_KEYS so an admin API
@@ -309,6 +319,17 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_mode(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("wecom_mention_mode")
+    @classmethod
+    def normalize_wecom_mention_mode(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in set(WeComMentionMode):
+            raise ValueError(
+                "WECOM_MENTION_MODE must be one of: "
+                + ", ".join(sorted(mode.value for mode in WeComMentionMode))
+            )
+        return normalized
 
     @field_validator(
         "redis_url",
@@ -556,6 +577,8 @@ class Settings(BaseSettings):
             issues.append("WECOM_WEBHOOK_URL is required when WeCom notifications are enabled")
         if self.wecom_enabled and not self.wecom_page_base_url:
             issues.append("WECOM_PAGE_BASE_URL is required when WeCom notifications are enabled")
+        if self.wecom_mention_enabled and not self.wecom_enabled:
+            issues.append("WECOM_ENABLED is required when WeCom mention follow-up is enabled")
         if self.app_env.lower() in {"production", "prod"} and not self.admin_api_token:
             issues.append("ADMIN_API_TOKEN is required in production")
         if self.flashduty_enabled and not self.flashduty_app_key:

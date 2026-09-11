@@ -16,6 +16,11 @@ import type {
   Severity,
   StoredAlert,
   ValidateAndResumeDispatchResponse,
+  WeComMentionEngineOwner,
+  WeComMentionEngineOwnerListResponse,
+  WeComMentionFlashDutyMember,
+  WeComMentionFlashDutyMemberListResponse,
+  WeComMentionTarget,
 } from "../types/api";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -165,6 +170,56 @@ export const api = {
           expected_settings_revision: expectedSettingsRevision,
         }),
       },
+      token,
+    ),
+
+  getWeComMentionEngineOwners: (token: string) =>
+    request<WeComMentionEngineOwnerListResponse>(
+      "/api/v1/admin/wecom-mention/engine-owners",
+      {},
+      token,
+    ),
+
+  upsertWeComMentionEngineOwner: (engine: string, target: WeComMentionTarget, token: string) =>
+    request<WeComMentionEngineOwner>(
+      `/api/v1/admin/wecom-mention/engine-owners/${encodeURIComponent(engine)}`,
+      { method: "PUT", body: JSON.stringify({ target }) },
+      token,
+    ),
+
+  deleteWeComMentionEngineOwner: (engine: string, token: string) =>
+    request<void>(
+      `/api/v1/admin/wecom-mention/engine-owners/${encodeURIComponent(engine)}`,
+      { method: "DELETE" },
+      token,
+    ),
+
+  getWeComMentionFlashDutyMembers: (token: string) =>
+    request<WeComMentionFlashDutyMemberListResponse>(
+      "/api/v1/admin/wecom-mention/flashduty-members",
+      {},
+      token,
+    ),
+
+  upsertWeComMentionFlashDutyMember: (
+    personId: number,
+    flashdutyMemberName: string,
+    target: WeComMentionTarget,
+    token: string,
+  ) =>
+    request<WeComMentionFlashDutyMember>(
+      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(String(personId))}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ flashduty_member_name: flashdutyMemberName, target }),
+      },
+      token,
+    ),
+
+  deleteWeComMentionFlashDutyMember: (personId: number, token: string) =>
+    request<void>(
+      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(String(personId))}`,
+      { method: "DELETE" },
       token,
     ),
 };

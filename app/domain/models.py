@@ -84,6 +84,46 @@ class NotificationKind(StrEnum):
     ANALYSIS_FAILURE = "ANALYSIS_FAILURE"
 
 
+class WeComMentionMode(StrEnum):
+    """Selects how the "请查收@xxx" follow-up message resolves its @ targets."""
+
+    ON_CALL_PERSON = "ON_CALL_PERSON"
+    DATABASE_OWNER = "DATABASE_OWNER"
+
+
+class WeComMentionTarget(BaseModel):
+    """One resolved WeCom identity eligible for a real mentioned_list ping."""
+
+    display_label: str = Field(min_length=1, max_length=100)
+    wecom_userid: str | None = Field(default=None, min_length=1, max_length=128)
+    wecom_mobile: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> WeComMentionTarget:
+        if not self.wecom_userid and not self.wecom_mobile:
+            raise ValueError("WeCom mention target requires a userid or a mobile number")
+        return self
+
+
+class WeComMentionEngineOwner(BaseModel):
+    """Admin-configured database-engine owner mapping (mode DATABASE_OWNER)."""
+
+    engine: str = Field(min_length=1, max_length=64)
+    target: WeComMentionTarget
+    updated_at: datetime = Field(default_factory=utc_now)
+    updated_by: str = Field(default="", max_length=255)
+
+
+class WeComMentionFlashDutyMember(BaseModel):
+    """Admin-configured FlashDuty person identity bridge (mode ON_CALL_PERSON)."""
+
+    flashduty_person_id: int = Field(gt=0)
+    flashduty_member_name: str = Field(default="", max_length=255)
+    target: WeComMentionTarget
+    updated_at: datetime = Field(default_factory=utc_now)
+    updated_by: str = Field(default="", max_length=255)
+
+
 class NotificationDeliveryStatus(StrEnum):
     PENDING = "PENDING"
     SENDING = "SENDING"

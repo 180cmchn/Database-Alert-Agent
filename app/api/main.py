@@ -31,6 +31,10 @@ from app.api.schemas import (
     RuntimeSettingsResponse,
     ValidateAndResumeDispatchRequest,
     ValidateAndResumeDispatchResponse,
+    WeComMentionEngineOwnerListResponse,
+    WeComMentionEngineOwnerRequest,
+    WeComMentionFlashDutyMemberListResponse,
+    WeComMentionFlashDutyMemberRequest,
 )
 from app.application.admin import (
     AdminAuditLogger,
@@ -72,6 +76,8 @@ from app.domain.models import (
     DashboardSummary,
     Severity,
     StoredAlert,
+    WeComMentionEngineOwner,
+    WeComMentionFlashDutyMember,
 )
 from app.domain.ports import (
     AnalysisDispatchConflict,
@@ -653,6 +659,179 @@ def create_app(
             target="runtime-settings",
         )
         return RuntimeSettingsResponse.from_settings(updated, revision=revision)
+
+    @app.get(
+        "/api/v1/admin/wecom-mention/engine-owners",
+        response_model=WeComMentionEngineOwnerListResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def list_wecom_mention_engine_owners() -> WeComMentionEngineOwnerListResponse:
+        items = await runtime.repository.list_wecom_mention_engine_owners()
+        return WeComMentionEngineOwnerListResponse(items=items)
+
+    @app.get(
+        "/api/v1/admin/wecom-mention/engine-owners/{engine}",
+        response_model=WeComMentionEngineOwner,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def get_wecom_mention_engine_owner(engine: str) -> WeComMentionEngineOwner:
+        owner = await runtime.repository.get_wecom_mention_engine_owner(engine.strip().lower())
+        if owner is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "WECOM_MENTION_ENGINE_OWNER_NOT_FOUND",
+                    "message": f"No mention mapping configured for engine {engine!r}",
+                },
+            )
+        return owner
+
+    @app.put(
+        "/api/v1/admin/wecom-mention/engine-owners/{engine}",
+        response_model=WeComMentionEngineOwner,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def upsert_wecom_mention_engine_owner(
+        engine: str,
+        payload: WeComMentionEngineOwnerRequest,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> WeComMentionEngineOwner:
+        normalized_engine = engine.strip().lower()
+        if not normalized_engine:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_ENGINE", "message": "engine must not be blank"},
+            )
+        owner = await runtime.repository.upsert_wecom_mention_engine_owner(
+            normalized_engine,
+            payload.target.to_domain(),
+            updated_by=actor,
+        )
+        await audit_logger.record(
+            action="upsert",
+            target=f"wecom-mention-engine-owner:{normalized_engine}",
+            fields=["target"],
+            actor=actor,
+        )
+        return owner
+
+    @app.delete(
+        "/api/v1/admin/wecom-mention/engine-owners/{engine}",
+        status_code=204,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def delete_wecom_mention_engine_owner(
+        engine: str,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> Response:
+        normalized_engine = engine.strip().lower()
+        deleted = await runtime.repository.delete_wecom_mention_engine_owner(normalized_engine)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "WECOM_MENTION_ENGINE_OWNER_NOT_FOUND",
+                    "message": f"No mention mapping configured for engine {engine!r}",
+                },
+            )
+        await audit_logger.record(
+            action="delete",
+            target=f"wecom-mention-engine-owner:{normalized_engine}",
+            actor=actor,
+        )
+        return Response(status_code=204)
+
+    @app.get(
+        "/api/v1/admin/wecom-mention/flashduty-members",
+        response_model=WeComMentionFlashDutyMemberListResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def list_wecom_mention_flashduty_members() -> WeComMentionFlashDutyMemberListResponse:
+        items = await runtime.repository.list_wecom_mention_flashduty_members()
+        return WeComMentionFlashDutyMemberListResponse(items=items)
+
+    @app.get(
+        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        response_model=WeComMentionFlashDutyMember,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def get_wecom_mention_flashduty_member(person_id: int) -> WeComMentionFlashDutyMember:
+        members = await runtime.repository.get_wecom_mention_flashduty_members({person_id})
+        member = members.get(person_id)
+        if member is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "WECOM_MENTION_FLASHDUTY_MEMBER_NOT_FOUND",
+                    "message": f"No mention mapping configured for person_id {person_id}",
+                },
+            )
+        return member
+
+    @app.put(
+        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        response_model=WeComMentionFlashDutyMember,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def upsert_wecom_mention_flashduty_member(
+        person_id: int,
+        payload: WeComMentionFlashDutyMemberRequest,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> WeComMentionFlashDutyMember:
+        if person_id <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INVALID_PERSON_ID",
+                    "message": "person_id must be a positive integer",
+                },
+            )
+        member = await runtime.repository.upsert_wecom_mention_flashduty_member(
+            person_id,
+            payload.flashduty_member_name,
+            payload.target.to_domain(),
+            updated_by=actor,
+        )
+        await audit_logger.record(
+            action="upsert",
+            target=f"wecom-mention-flashduty-member:{person_id}",
+            fields=["flashduty_member_name", "target"],
+            actor=actor,
+        )
+        return member
+
+    @app.delete(
+        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        status_code=204,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def delete_wecom_mention_flashduty_member(
+        person_id: int,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> Response:
+        deleted = await runtime.repository.delete_wecom_mention_flashduty_member(person_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "WECOM_MENTION_FLASHDUTY_MEMBER_NOT_FOUND",
+                    "message": f"No mention mapping configured for person_id {person_id}",
+                },
+            )
+        await audit_logger.record(
+            action="delete",
+            target=f"wecom-mention-flashduty-member:{person_id}",
+            actor=actor,
+        )
+        return Response(status_code=204)
 
     @app.post(
         "/api/v1/alerts/{alert_id}/reanalyze",

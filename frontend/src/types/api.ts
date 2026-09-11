@@ -469,6 +469,42 @@ export const REASONING_EFFORT_OPTIONS: ReadonlyArray<{ value: ReasoningEffort; l
   { value: "max", label: "max · 最大推理" },
 ];
 
+export type WeComMentionMode = "ON_CALL_PERSON" | "DATABASE_OWNER";
+
+export const WECOM_MENTION_MODE_OPTIONS: ReadonlyArray<{ value: WeComMentionMode; label: string }> = [
+  { value: "ON_CALL_PERSON", label: "值班/认领人员（FlashDuty 分派）" },
+  { value: "DATABASE_OWNER", label: "数据库类型负责人" },
+];
+
+export interface WeComMentionTarget {
+  display_label: string;
+  wecom_userid: string | null;
+  wecom_mobile: string | null;
+}
+
+export interface WeComMentionEngineOwner {
+  engine: string;
+  target: WeComMentionTarget;
+  updated_at: string;
+  updated_by: string;
+}
+
+export interface WeComMentionFlashDutyMember {
+  flashduty_person_id: number;
+  flashduty_member_name: string;
+  target: WeComMentionTarget;
+  updated_at: string;
+  updated_by: string;
+}
+
+export interface WeComMentionEngineOwnerListResponse {
+  items: WeComMentionEngineOwner[];
+}
+
+export interface WeComMentionFlashDutyMemberListResponse {
+  items: WeComMentionFlashDutyMember[];
+}
+
 export interface AdminSettings {
   app_env: string;
   fake_provider_allowed: boolean;
@@ -495,6 +531,8 @@ export interface AdminSettings {
   wecom_enabled: boolean;
   wecom_webhook_url_configured: boolean;
   wecom_page_base_url: string;
+  wecom_mention_enabled: boolean;
+  wecom_mention_mode: WeComMentionMode;
   flashduty_enabled: boolean;
   flashduty_base_url: string;
   flashduty_app_key_configured: boolean;
@@ -532,6 +570,8 @@ export interface AdminSettingsPatch {
   wecom_webhook_url?: string;
   wecom_page_base_url?: string;
   wecom_enabled?: boolean;
+  wecom_mention_enabled?: boolean;
+  wecom_mention_mode?: WeComMentionMode;
   react_max_rounds?: number;
   analysis_timeout_seconds?: number;
   alert_analysis_filter_enabled?: boolean;

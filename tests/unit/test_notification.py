@@ -12,6 +12,7 @@ from app.adapters.notification import (
     LogManagementNotifier,
     WeComManagementNotifier,
     build_wecom_failure_card,
+    build_wecom_mention_text,
     build_wecom_template_card,
 )
 from app.domain.errors import NotificationError
@@ -30,6 +31,7 @@ from app.domain.models import (
     Recommendation,
     RecommendationStep,
     Severity,
+    WeComMentionTarget,
 )
 from app.logging_config import configure_logging
 
@@ -559,3 +561,106 @@ async def test_wecom_webhook_key_is_not_written_to_http_transport_logs(
         httpcore_logger.setLevel(original_levels[1])
 
     assert "log-secret-key" not in caplog.text
+
+
+def test_build_wecom_mention_text_userid_uses_at_chip_and_mentioned_list() -> None:
+    targets = [
+        WeComMentionTarget(display_label="张三", wecom_userid="zhangsan", wecom_mobile=None),
+        WeComMentionTarget(display_label="李四", wecom_userid="lisi", wecom_mobile=None),
+    ]
+
+    text = build_wecom_mention_text(targets)
+
+    assert text["content"] == "请查收 <@zhangsan> <@lisi>"
+    assert text["mentioned_list"] == ["zhangsan", "lisi"]
+    assert "mentioned_mobile_list" not in text
+
+
+def test_build_wecom_mention_text_mobile_only_uses_display_label_and_mobile_list() -> None:
+    targets = [
+        WeComMentionTarget(
+            display_label="MySQL 值班组", wecom_userid=None, wecom_mobile="13800000000",
+        ),
+    ]
+
+    text = build_wecom_mention_text(targets)
+
+    assert text["content"] == "请查收 MySQL 值班组"
+    assert text["mentioned_mobile_list"] == ["13800000000"]
+    assert "mentioned_list" not in text
+
+
+def test_build_wecom_mention_text_mixed_userid_and_mobile_targets() -> None:
+    targets = [
+        WeComMentionTarget(display_label="张三", wecom_userid="zhangsan", wecom_mobile=None),
+        WeComMentionTarget(display_label="外部支持", wecom_userid=None, wecom_mobile="13900000000"),
+    ]
+
+    text = build_wecom_mention_text(targets)
+
+    assert text["content"] == "请查收 <@zhangsan> 外部支持"
+    assert text["mentioned_list"] == ["zhangsan"]
+    assert text["mentioned_mobile_list"] == ["13900000000"]
+
+
+def test_build_wecom_mention_text_rejects_empty_targets() -> None:
+    with pytest.raises(NotificationError):
+        build_wecom_mention_text([])
+
+
+@pytest.mark.asyncio
+async def test_wecom_notifier_send_mention_posts_text_message_with_mentions() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok", "msgid": "wecom-mention-1"})
+
+    event = analysis_result_event()
+    notifier = WeComManagementNotifier(
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
+        "https://alerts.intra.example.com",
+        transport=httpx.MockTransport(handler),
+    )
+    targets = [WeComMentionTarget(display_label="张三", wecom_userid="zhangsan", wecom_mobile=None)]
+
+    delivery_id = await notifier.send_mention(event, targets)
+
+    assert delivery_id == "wecom-mention-1"
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["x-alert-id"] == str(event.alert.id)
+    payload = json.loads(request.content)
+    assert payload["msgtype"] == "text"
+    assert payload["text"]["content"] == "请查收 <@zhangsan>"
+    assert payload["text"]["mentioned_list"] == ["zhangsan"]
+
+
+@pytest.mark.asyncio
+async def test_wecom_notifier_send_mention_rejects_empty_targets() -> None:
+    notifier = WeComManagementNotifier(
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
+        "https://alerts.intra.example.com",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"errcode": 0})),
+    )
+
+    with pytest.raises(NotificationError):
+        await notifier.send_mention(analysis_result_event(), [])
+
+
+@pytest.mark.asyncio
+async def test_wecom_notifier_send_mention_reports_errors_without_webhook_key() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errcode": 93000, "errmsg": "invalid webhook"})
+
+    notifier = WeComManagementNotifier(
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=must-not-leak-mention",
+        "https://alerts.intra.example.com",
+        transport=httpx.MockTransport(handler),
+    )
+    targets = [WeComMentionTarget(display_label="张三", wecom_userid="zhangsan", wecom_mobile=None)]
+
+    with pytest.raises(NotificationError) as caught:
+        await notifier.send_mention(analysis_result_event(), targets)
+
+    assert "must-not-leak-mention" not in str(caught.value)

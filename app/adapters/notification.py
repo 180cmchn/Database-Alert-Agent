@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from collections import deque
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
@@ -17,6 +18,7 @@ from app.domain.models import (
     AnalysisFailureEvent,
     ManagementNotificationEvent,
     NotificationKind,
+    WeComMentionTarget,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,6 +218,39 @@ def build_wecom_template_card(
     }
 
 
+def build_wecom_mention_text(targets: Sequence[WeComMentionTarget]) -> dict[str, Any]:
+    """Build the "请查收@xxx" follow-up as a standalone WeCom text message.
+
+    WeCom's group robot ``mentioned_list``/``mentioned_mobile_list`` fields
+    only exist on ``text`` messages, not on ``template_card``, so the mention
+    always travels as its own message sent right after the analysis card.
+    Targets with a userid render as a real ``<@userid>`` chip; mobile-only
+    targets fall back to their display label because WeCom does not render an
+    @ chip for a bare phone number.
+    """
+    if not targets:
+        raise NotificationError("WeCom mention text requires at least one target")
+
+    mentions: list[str] = []
+    mentioned_list: list[str] = []
+    mentioned_mobile_list: list[str] = []
+    for target in targets:
+        if target.wecom_userid:
+            mentions.append(f"<@{target.wecom_userid}>")
+            mentioned_list.append(target.wecom_userid)
+        elif target.wecom_mobile:
+            mentions.append(_safe_text(target.display_label, limit=40))
+            mentioned_mobile_list.append(target.wecom_mobile)
+
+    content = f"请查收 {' '.join(mentions)}".strip()
+    text: dict[str, Any] = {"content": content}
+    if mentioned_list:
+        text["mentioned_list"] = mentioned_list
+    if mentioned_mobile_list:
+        text["mentioned_mobile_list"] = mentioned_mobile_list
+    return text
+
+
 class _WeComRateLimiter:
     """Sliding-window rate limiter for WeCom group robot messages.
 
@@ -311,7 +346,39 @@ class WeComManagementNotifier:
                 page_base_url=self._page_base_url,
             ),
         }
+        return await self._deliver(payload, headers=headers, alert_id=event.alert.id)
 
+    async def send_mention(
+        self,
+        event: ManagementNotificationEvent,
+        targets: Sequence[WeComMentionTarget],
+    ) -> str | None:
+        """Send the "请查收@xxx" follow-up as its own text message.
+
+        WeCom's ``mentioned_list``/``mentioned_mobile_list`` fields exist only
+        on ``text`` messages, not on the ``template_card`` used by ``send``,
+        so this is always a second, independent webhook call issued after the
+        analysis card. Callers must treat any failure here as best-effort: it
+        must never affect the already-delivered card's outcome.
+        """
+        if not self._url:
+            raise NotificationError("WeCom webhook URL is not configured")
+        if not targets:
+            raise NotificationError("WeCom mention requires at least one resolved target")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Alert-Id": str(event.alert.id),
+        }
+        payload = {"msgtype": "text", "text": build_wecom_mention_text(targets)}
+        return await self._deliver(payload, headers=headers, alert_id=event.alert.id)
+
+    async def _deliver(
+        self,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str],
+        alert_id: Any,
+    ) -> str | None:
         response: httpx.Response | None = None
         for attempt in range(self._max_retries + 1):
             await self._rate_limiter.acquire()
@@ -331,7 +398,7 @@ class WeComManagementNotifier:
                 if attempt < self._max_retries:
                     logger.warning(
                         "wecom_send_retry alert_id=%s attempt=%s error=%s",
-                        event.alert.id,
+                        alert_id,
                         attempt + 1,
                         type(exc).__name__,
                     )

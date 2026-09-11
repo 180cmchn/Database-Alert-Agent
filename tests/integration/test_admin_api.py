@@ -1092,3 +1092,102 @@ def test_settings_save_never_resumes_dispatch(tmp_path: Path) -> None:
         )
         assert conflict.status_code == 409
         assert conflict.json()["detail"]["code"] == "AI_SETTINGS_REVISION_CONFLICT"
+
+
+def test_wecom_mention_engine_owner_endpoints_require_admin_and_round_trip(
+    tmp_path: Path,
+) -> None:
+    client, _ = create_admin_client(tmp_path)
+    with client:
+        list_endpoint = "/api/v1/admin/wecom-mention/engine-owners"
+        item_endpoint = f"{list_endpoint}/mysql"
+
+        assert client.get(list_endpoint).status_code == 401
+        assert client.get(item_endpoint).status_code == 401
+        assert client.put(item_endpoint, json={"target": {}}).status_code == 401
+        assert client.delete(item_endpoint).status_code == 401
+
+        assert client.get(item_endpoint, headers=ADMIN_HEADERS).status_code == 404
+
+        created = client.put(
+            item_endpoint,
+            headers=ADMIN_HEADERS,
+            json={
+                "target": {
+                    "display_label": "MySQL 值班组",
+                    "wecom_userid": "mysql_owner",
+                }
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert created_body["engine"] == "mysql"
+        assert created_body["target"]["wecom_userid"] == "mysql_owner"
+
+        fetched = client.get(item_endpoint, headers=ADMIN_HEADERS)
+        assert fetched.status_code == 200
+        assert fetched.json()["target"]["display_label"] == "MySQL 值班组"
+
+        listed = client.get(list_endpoint, headers=ADMIN_HEADERS)
+        assert listed.status_code == 200
+        assert [item["engine"] for item in listed.json()["items"]] == ["mysql"]
+
+        rejected = client.put(
+            item_endpoint,
+            headers=ADMIN_HEADERS,
+            json={"target": {"display_label": "无身份"}},
+        )
+        assert rejected.status_code == 422
+
+        deleted = client.delete(item_endpoint, headers=ADMIN_HEADERS)
+        assert deleted.status_code == 204
+        assert client.get(item_endpoint, headers=ADMIN_HEADERS).status_code == 404
+        assert client.delete(item_endpoint, headers=ADMIN_HEADERS).status_code == 404
+
+
+def test_wecom_mention_flashduty_member_endpoints_require_admin_and_round_trip(
+    tmp_path: Path,
+) -> None:
+    client, _ = create_admin_client(tmp_path)
+    with client:
+        list_endpoint = "/api/v1/admin/wecom-mention/flashduty-members"
+        item_endpoint = f"{list_endpoint}/101"
+
+        assert client.get(list_endpoint).status_code == 401
+        assert client.get(item_endpoint).status_code == 401
+        assert client.put(item_endpoint, json={"target": {}}).status_code == 401
+        assert client.delete(item_endpoint).status_code == 401
+
+        assert client.get(item_endpoint, headers=ADMIN_HEADERS).status_code == 404
+
+        created = client.put(
+            item_endpoint,
+            headers=ADMIN_HEADERS,
+            json={
+                "flashduty_member_name": "Zhang San",
+                "target": {
+                    "display_label": "张三",
+                    "wecom_userid": "zhangsan",
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert created_body["flashduty_person_id"] == 101
+        assert created_body["flashduty_member_name"] == "Zhang San"
+
+        listed = client.get(list_endpoint, headers=ADMIN_HEADERS)
+        assert listed.status_code == 200
+        assert [item["flashduty_person_id"] for item in listed.json()["items"]] == [101]
+
+        invalid_person_id = client.put(
+            f"{list_endpoint}/0",
+            headers=ADMIN_HEADERS,
+            json={"target": {"display_label": "无效", "wecom_userid": "x"}},
+        )
+        assert invalid_person_id.status_code == 422
+
+        deleted = client.delete(item_endpoint, headers=ADMIN_HEADERS)
+        assert deleted.status_code == 204
+        assert client.get(item_endpoint, headers=ADMIN_HEADERS).status_code == 404
+        assert client.delete(item_endpoint, headers=ADMIN_HEADERS).status_code == 404

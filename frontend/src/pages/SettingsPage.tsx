@@ -1,4 +1,5 @@
 import {
+  AtSign,
   Bot,
   Check,
   CircleAlert,
@@ -22,6 +23,10 @@ import {
   PageHeader,
   SectionCard,
 } from "../components/ui";
+import {
+  WeComMentionEngineOwnersEditor,
+  WeComMentionFlashDutyMembersEditor,
+} from "../components/WeComMentionMappings";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
 import { formatDateTime, severityLabel } from "../lib/format";
@@ -33,8 +38,9 @@ import type {
   AIProvider,
   ReasoningEffort,
   Severity,
+  WeComMentionMode,
 } from "../types/api";
-import { REASONING_EFFORT_OPTIONS } from "../types/api";
+import { REASONING_EFFORT_OPTIONS, WECOM_MENTION_MODE_OPTIONS } from "../types/api";
 
 const AI_PROVIDERS = new Set<AIProvider>(["openai_compatible", "openai_responses", "fake"]);
 const ALERT_FILTER_SEVERITIES: readonly Severity[] = ["CRITICAL", "WARNING", "INFO"];
@@ -90,6 +96,8 @@ export function SettingsPage() {
   const [alertAnalysisFilterSeverities, setAlertAnalysisFilterSeverities] =
     useState<Severity[]>(["INFO"]);
   const [wecomEnabled, setWecomEnabled] = useState(false);
+  const [wecomMentionEnabled, setWecomMentionEnabled] = useState(false);
+  const [wecomMentionMode, setWecomMentionMode] = useState<WeComMentionMode>("ON_CALL_PERSON");
   const [externalKnowledgeSelected, setExternalKnowledgeSelected] = useState(false);
 
   const load = useCallback(async () => {
@@ -124,6 +132,8 @@ export function SettingsPage() {
       setAlertAnalysisFilterEnabled(settings.alert_analysis_filter_enabled);
       setAlertAnalysisFilterSeverities([...settings.alert_analysis_filter_severities]);
       setWecomEnabled(settings.wecom_enabled);
+      setWecomMentionEnabled(settings.wecom_mention_enabled);
+      setWecomMentionMode(settings.wecom_mention_mode);
       setExternalKnowledgeSelected(settings.knowledge_sources.includes("external_knowledge"));
     }
   }, [settings]);
@@ -194,6 +204,8 @@ export function SettingsPage() {
       if (wecomWebhookUrl) patch.wecom_webhook_url = wecomWebhookUrl;
       patch.wecom_page_base_url = String(form.get("wecom_page_base_url") || "").trim();
       patch.wecom_enabled = wecomEnabled;
+      patch.wecom_mention_enabled = wecomMentionEnabled;
+      patch.wecom_mention_mode = wecomMentionMode;
       const knowledgeApiKey = String(form.get("external_knowledge_api_key") || "").trim();
       if (knowledgeApiKey) patch.external_knowledge_api_key = knowledgeApiKey;
       const updated = await api.updateSettings(patch, token);
@@ -513,8 +525,37 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
+        <SectionCard
+          eyebrow="WECOM MENTION"
+          title="企微 @提醒"
+          description="卡片投递成功后，追加发送一条独立的 @提醒消息；最佳努力发送，不影响卡片投递结果，绝不触发卡片重试。"
+          action={<span className={`configured-chip ${wecomMentionEnabled ? "yes" : "no"}`}><AtSign size={13} />{wecomMentionEnabled ? "已启用" : "未启用"}</span>}
+        >
+          <div className="switch-stack">
+            <label className="switch-row"><span><AtSign size={17} /><span><strong>启用@提醒</strong><small>关闭后仅发送信息卡片，不再追加@消息</small></span></span><input name="wecom_mention_enabled" type="checkbox" checked={wecomMentionEnabled} onChange={(event) => setWecomMentionEnabled(event.target.checked)} disabled={!wecomEnabled} /><i /></label>
+          </div>
+          <div className="form-grid two-cols settings-inline-fields">
+            <label className="field span-2">
+              <span>@提醒对象解析模式</span>
+              <select name="wecom_mention_mode" value={wecomMentionMode} onChange={(event) => setWecomMentionMode(event.target.value as WeComMentionMode)} disabled={!wecomMentionEnabled}>
+                {WECOM_MENTION_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              <small>值班/认领人员模式按 FlashDuty incident 当前分派或最近认领人解析；数据库类型负责人模式按告警 database.engine 匹配下方映射表。</small>
+            </label>
+          </div>
+          {!wecomEnabled && <div className="form-hint"><CircleAlert size={14} />企微机器人通知已关闭，@提醒不会生效；请先启用上方“启用企微机器人通知”。</div>}
+        </SectionCard>
+
         <div className="sticky-submit settings-submit"><span>保存后，新配置会在 Worker 处理下一条任务前生效。</span><button className="button primary large" type="submit" disabled={saving}>{saving ? <InlineLoading label="应用配置" /> : <><Save size={17} /> 保存并应用</>}</button></div>
       </form>
+
+      <SectionCard eyebrow="WECOM MENTION" title="数据库类型负责人映射" description="DATABASE_OWNER 模式使用；按告警 database.engine（如 mysql / postgresql / mongodb）匹配负责人，人工维护。">
+        <WeComMentionEngineOwnersEditor token={token} />
+      </SectionCard>
+
+      <SectionCard eyebrow="WECOM MENTION" title="FlashDuty 成员企微身份映射" description="ON_CALL_PERSON 模式使用；FlashDuty API 不暴露企微身份，需要人工维护 person_id 到企微 userid/手机号的映射。">
+        <WeComMentionFlashDutyMembersEditor token={token} />
+      </SectionCard>
     </div>
   );
 }
