@@ -19,6 +19,7 @@ from app.application.evidence_context import model_evidence_payload
 from app.application.sanitization import sanitize, sanitize_alert
 from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.domain.alert_preprocessing import preprocess_normalized_alert
+from app.domain.errors import AdvisorError
 from app.domain.models import (
     INCONCLUSIVE_ROOT_CAUSE_SUMMARY,
     AdvisorMetadata,
@@ -29,6 +30,7 @@ from app.domain.models import (
     InvestigationDecisionResult,
     InvestigationRun,
     InvestigationStage,
+    ModelFailure,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -401,7 +403,12 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
             "progress": [progress],
         }
 
-    result = await _load_react_decision(sink, run, next_round)
+    loaded_decision = await _load_react_decision(sink, run, next_round)
+    model_failure = state.model_failure
+    result: InvestigationDecisionResult | None = None
+    if loaded_decision is not None:
+        result, persisted_failure = loaded_decision
+        model_failure = persisted_failure or model_failure
     reasoning_request_attempt = await _next_reasoning_request_attempt(
         sink,
         run,
@@ -467,6 +474,8 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
                 else:
                     result = await decide(**decision_kwargs)
             except Exception as exc:
+                if isinstance(exc, AdvisorError) and exc.failure is not None:
+                    model_failure = exc.failure
                 logger.warning(
                     "react_decision_failed run_id=%s round=%s error=%s",
                     run.id,
@@ -493,6 +502,11 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
                     "react_round": next_round,
                     "decision": result.decision.model_dump(mode="json"),
                     "metadata": result.metadata.model_dump(mode="json"),
+                    **(
+                        {"model_failure": model_failure.model_dump(mode="json")}
+                        if model_failure is not None
+                        else {}
+                    ),
                 },
             )
         )
@@ -551,6 +565,7 @@ async def react_decide_node(state: AgentState, ctx: NodeContext) -> dict[str, An
         "react_finished": not pending,
         "pending_tool_requests": pending,
         "progress": [progress],
+        "model_failure": model_failure,
     }
 
 
@@ -613,16 +628,20 @@ async def _load_react_decision(
     sink: RepositoryEventSink,
     run: InvestigationRun,
     react_round: int,
-) -> InvestigationDecisionResult | None:
+) -> tuple[InvestigationDecisionResult, ModelFailure | None] | None:
     for event in reversed(await sink.read(run.id)):
         if (
             event.kind == AgentEventKind.MODEL_DECISION
             and event.payload.get("actor") == "main_agent"
             and event.payload.get("react_round") == react_round
         ):
-            return InvestigationDecisionResult(
-                decision=InvestigationDecision.model_validate(event.payload.get("decision")),
-                metadata=AdvisorMetadata.model_validate(event.payload.get("metadata")),
+            failure_payload = event.payload.get("model_failure")
+            return (
+                InvestigationDecisionResult(
+                    decision=InvestigationDecision.model_validate(event.payload.get("decision")),
+                    metadata=AdvisorMetadata.model_validate(event.payload.get("metadata")),
+                ),
+                ModelFailure.model_validate(failure_payload) if failure_payload else None,
             )
     return None
 
@@ -706,6 +725,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
     recommendation: Recommendation | None = None
     advisor_metadata: AdvisorMetadata | None = None
     final_reasoning_callback_invoked = False
+    model_failure = state.model_failure
 
     async def emit_final_reasoning(
         content: str,
@@ -723,6 +743,11 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         final_reasoning_callback_invoked = final_reasoning_callback_invoked or emitted is not None
 
     try:
+        if model_failure is not None and model_failure.pauses_dispatch:
+            raise AdvisorError(
+                "Skipping final provider call after a confirmed provider failure",
+                failure=model_failure,
+            )
         advise_kwargs = {
             "evidence": evidence,
             "knowledge_match_summary": knowledge_match_summary,
@@ -748,20 +773,39 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
             )
     except Exception as exc:
         primary_advisor_error = exc
+        if isinstance(exc, AdvisorError) and exc.failure is not None:
+            model_failure = exc.failure
         if not ai_fallback_enabled or ctx.fallback_advisor is None:
             logger.warning(
                 "advise_failed_no_fallback error=%s: %s",
                 type(exc).__name__,
                 sanitize(str(exc)),
             )
-            return {"error": f"AI advisor failed: {type(exc).__name__}: {exc}"}
+            return {
+                "error": f"AI advisor failed: {type(exc).__name__}: {sanitize(str(exc))}",
+                "model_failure": model_failure,
+            }
         advisor_degraded = True
-        recommendation, advisor_metadata = await ctx.fallback_advisor.advise(
-            alert,
-            knowledge,
-            evidence=evidence,
-            knowledge_match_summary=knowledge_match_summary,
-        )
+        try:
+            recommendation, advisor_metadata = await ctx.fallback_advisor.advise(
+                alert,
+                knowledge,
+                evidence=evidence,
+                knowledge_match_summary=knowledge_match_summary,
+            )
+        except Exception as fallback_exc:
+            logger.warning(
+                "fallback_advisor_failed error=%s: %s",
+                type(fallback_exc).__name__,
+                sanitize(str(fallback_exc)),
+            )
+            return {
+                "error": (
+                    f"AI advisor failed: {type(exc).__name__}; fallback failed: "
+                    f"{type(fallback_exc).__name__}"
+                ),
+                "model_failure": model_failure,
+            }
         advisor_metadata = advisor_metadata.model_copy(
             update={"usage": {"fallback_reason": type(exc).__name__}}
         )
@@ -774,6 +818,11 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
                 details={
                     "error_type": type(exc).__name__,
                     "error_detail": sanitize(str(exc)),
+                    **(
+                        {"model_failure": model_failure.model_dump(mode="json")}
+                        if model_failure is not None
+                        else {}
+                    ),
                 },
             ),
             **_lease_fence(run),
@@ -805,6 +854,7 @@ async def advise_node(state: AgentState, ctx: NodeContext) -> dict[str, Any]:
         "primary_advisor_error": (
             type(primary_advisor_error).__name__ if primary_advisor_error else None
         ),
+        "model_failure": model_failure,
         "progress": [
             ProgressRecord(
                 run_id=run.id,

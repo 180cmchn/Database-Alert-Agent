@@ -19,6 +19,8 @@ from app.application.sanitization import sanitize
 from app.application.service import AlertAnalysisService
 from app.config import Settings, get_deployment_settings
 from app.domain.errors import (
+    AnalysisDispatchPausedError,
+    AnalysisFailedError,
     InvalidAlertPayloadError,
     InvestigationLeaseUnavailableError,
     UnknownAlertSourceError,
@@ -82,12 +84,15 @@ def parse_envelope(value: bytes | str | dict[str, Any]) -> dict[str, Any]:
 
 async def process_envelope(service: AlertAnalysisService, envelope: dict[str, Any]) -> StoredAlert:
     parsed = parse_envelope(envelope)
-    if parsed.get("job_type") == "investigate":
-        result = await service.analyze_by_id(parsed["alert_id"])
-    else:
-        result = await service.analyze(parsed["source"], parsed["payload"], retry_failed=True)
-    if result.status == AlertStatus.FAILED:
-        raise RuntimeError(result.error or "Previously failed alert analysis")
+    try:
+        if parsed.get("job_type") == "investigate":
+            result = await service.analyze_by_id(parsed["alert_id"])
+        else:
+            result = await service.analyze(parsed["source"], parsed["payload"])
+    except AnalysisFailedError as exc:
+        # The business failure is already durable. Re-running the same analysis
+        # is not a transport retry; acknowledge this queue delivery instead.
+        result = await service.get(exc.alert_id)
     if result.status in {AlertStatus.QUEUED, AlertStatus.ANALYZING}:
         raise InvestigationLeaseUnavailableError(str(result.alert.id))
     return result
@@ -106,9 +111,9 @@ async def process_with_retries(
         attempts = attempt
         try:
             return await process_envelope(service, envelope)
-        except InvestigationLeaseUnavailableError:
-            # A live worker still owns this alert. Preserve the message in the
-            # pending entries list without consuming retries or dead-lettering it.
+        except (InvestigationLeaseUnavailableError, AnalysisDispatchPausedError):
+            # A live lease or a persisted dispatch pause must not consume the
+            # infrastructure retry budget or be dead-lettered as a bad message.
             raise
         except (InvalidAlertPayloadError, UnknownAlertSourceError) as exc:
             error = exc
@@ -297,12 +302,19 @@ class RedisAlertWorker:
         async def send_dlq(payload: dict[str, Any]) -> None:
             await self._dead_letter(message_id, payload)
 
-        result = await process_with_retries(
-            self.service,
-            envelope,
-            max_retries=self.settings.redis_max_retries,
-            dlq_sender=send_dlq,
-        )
+        try:
+            result = await process_with_retries(
+                self.service,
+                envelope,
+                max_retries=self.settings.redis_max_retries,
+                dlq_sender=send_dlq,
+            )
+        except AnalysisDispatchPausedError:
+            # The database remains the source of truth for queued work. Dropping
+            # this stream copy avoids hot claiming while dispatch is paused;
+            # explicit resume republishes every RECEIVED/QUEUED alert.
+            await self._ack_and_delete(message_id)
+            return
         if result is not None:
             await self._ack_and_delete(message_id)
 

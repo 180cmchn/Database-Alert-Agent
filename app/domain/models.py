@@ -20,7 +20,6 @@ class Severity(StrEnum):
     INFO = "INFO"
 
 
-
 class AlertStatus(StrEnum):
     RECEIVED = "RECEIVED"
     QUEUED = "QUEUED"
@@ -31,11 +30,11 @@ class AlertStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
+
 AUTO_ANALYSIS_SCHEDULABLE_STATUSES = frozenset(
     {
         AlertStatus.RECEIVED,
         AlertStatus.QUEUED,
-        AlertStatus.FAILED,
     }
 )
 
@@ -60,6 +59,115 @@ class RunStatus(StrEnum):
     INCONCLUSIVE = "INCONCLUSIVE"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class ModelFailureCategory(StrEnum):
+    AUTHENTICATION = "AUTHENTICATION"
+    AUTHORIZATION = "AUTHORIZATION"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+    CONFIGURATION = "CONFIGURATION"
+    RATE_LIMITED_OR_QUOTA_UNKNOWN = "RATE_LIMITED_OR_QUOTA_UNKNOWN"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    CONNECTION = "CONNECTION"
+    TIMEOUT = "TIMEOUT"
+    INVALID_RESPONSE = "INVALID_RESPONSE"
+    INTERNAL = "INTERNAL"
+
+
+class AnalysisDispatchState(StrEnum):
+    ENABLED = "ENABLED"
+    PAUSED = "PAUSED"
+
+
+class NotificationKind(StrEnum):
+    ANALYSIS_RESULT = "ANALYSIS_RESULT"
+    ANALYSIS_FAILURE = "ANALYSIS_FAILURE"
+
+
+class NotificationDeliveryStatus(StrEnum):
+    PENDING = "PENDING"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+class FlashDutyPollStatus(StrEnum):
+    NEVER = "NEVER"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    DISABLED = "DISABLED"
+
+
+class ModelFailure(BaseModel):
+    category: ModelFailureCategory
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(default="", max_length=300)
+    phase: Literal["react", "final", "mcp", "unknown"] = "unknown"
+    retryable: bool = False
+    pauses_dispatch: bool = False
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    vendor_code: str | None = Field(default=None, max_length=200)
+    request_id: str | None = Field(default=None, max_length=200)
+    safe_detail: str = Field(default="", max_length=2_000)
+    attempts: int = Field(default=1, ge=1)
+    elapsed_ms: int = Field(default=0, ge=0)
+    occurred_at: datetime = Field(default_factory=utc_now)
+
+
+class DispatchValidationResult(BaseModel):
+    success: bool
+    settings_revision: str = Field(min_length=64, max_length=64)
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(default="", max_length=300)
+    detail: str = Field(min_length=1, max_length=2_000)
+    failure: ModelFailure | None = None
+    validated_at: datetime = Field(default_factory=utc_now)
+    validated_by: str = Field(min_length=1, max_length=255)
+
+
+class AnalysisDispatchControl(BaseModel):
+    state: AnalysisDispatchState = AnalysisDispatchState.ENABLED
+    version: int = Field(default=1, ge=1)
+    reason: ModelFailure | None = None
+    trigger_run_id: UUID | None = None
+    paused_settings_revision: str | None = Field(default=None, max_length=64)
+    paused_at: datetime | None = None
+    resumed_at: datetime | None = None
+    resumed_by: str | None = Field(default=None, max_length=255)
+    last_validation: DispatchValidationResult | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class FlashDutyPollState(BaseModel):
+    status: FlashDutyPollStatus = FlashDutyPollStatus.NEVER
+    last_started_at: datetime | None = None
+    last_completed_at: datetime | None = None
+    last_error: str | None = Field(default=None, max_length=2_000)
+    start_time: int | None = Field(default=None, ge=0)
+    end_time: int | None = Field(default=None, ge=0)
+    fetched_count: int = Field(default=0, ge=0)
+    created_count: int = Field(default=0, ge=0)
+    deduplicated_count: int = Field(default=0, ge=0)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class NotificationDelivery(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    alert_id: UUID
+    run_id: UUID
+    kind: NotificationKind
+    status: NotificationDeliveryStatus = NotificationDeliveryStatus.PENDING
+    event: dict[str, Any]
+    attempts: int = Field(default=0, ge=0)
+    error: str | None = None
+    message_id: str | None = None
+    next_attempt_at: datetime | None = None
+    claim_owner: str | None = None
+    claim_expires_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    sent_at: datetime | None = None
 
 
 class ToolStatus(StrEnum):
@@ -548,6 +656,7 @@ class AnalysisConfigSnapshot(BaseModel):
     ai_fallback_enabled: bool = True
     ai_model: str = ""
     ai_provider: str = "openai_compatible"
+    ai_settings_revision: str = ""
     # Role-specific model usage recorded per run for audit and re-analysis
     # comparison. Empty effort values mean "provider default" (parameter not sent).
     ai_react_model: str = ""
@@ -559,10 +668,8 @@ class AnalysisConfigSnapshot(BaseModel):
     # delta at run time. Recorded per run so historical behavior stays
     # interpretable after the flag changes.
     stream_main_agent_reasoning: bool = True
-    ai_timeout_seconds: float = 300
-    # Historical compatibility only. New analyses always store zero because
-    # provider retries are bounded by analysis timeout/cancellation, not a count.
-    ai_max_retries: int = 0
+    # Number of transport retries after the initial provider attempt.
+    ai_max_retries: int = 2
     ai_max_tokens: int = 16_384
     prompt_version: str = ""
     code_version: str = ""
@@ -586,6 +693,7 @@ class InvestigationRun(BaseModel):
     config_snapshot: AnalysisConfigSnapshot | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    model_failure: ModelFailure | None = None
 
 
 class InvestigationEvidenceAssessment(BaseModel):
@@ -645,6 +753,17 @@ class AnalysisResultEvent(BaseModel):
     status: AlertStatus
     message: str
     run_id: UUID
+
+
+class AnalysisFailureEvent(BaseModel):
+    alert: NormalizedAlert
+    status: AlertStatus
+    message: str
+    run_id: UUID
+    failure: ModelFailure
+
+
+ManagementNotificationEvent = AnalysisResultEvent | AnalysisFailureEvent
 
 
 class StoredAlert(BaseModel):

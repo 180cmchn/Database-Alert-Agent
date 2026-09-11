@@ -13,6 +13,8 @@ from app.config import Settings
 from app.domain.models import (
     AlertStatus,
     AnalysisConfigSnapshot,
+    AnalysisDispatchControl,
+    FlashDutyPollState,
     NormalizedAlert,
     RunStatus,
     Severity,
@@ -151,6 +153,28 @@ class FlashDutyPollResponse(BaseModel):
     )
 
 
+class ValidateAndResumeDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_dispatch_version: int = Field(ge=1)
+    expected_settings_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AnalysisDispatchStatusResponse(BaseModel):
+    dispatch: AnalysisDispatchControl
+    flashduty_poll: FlashDutyPollState
+    flashduty_polling_enabled: bool
+    pending_count: int = Field(ge=0)
+    runtime_settings_revision: str
+    ai_settings_revision: str
+
+
+class ValidateAndResumeDispatchResponse(AnalysisDispatchStatusResponse):
+    validation_succeeded: bool
+    resumed: bool
+    republished_count: int = Field(ge=0)
+
+
 ReasoningEffort = Literal["", "low", "medium", "high", "xhigh", "max"]
 
 
@@ -281,9 +305,7 @@ class RuntimeSettingsResponse(BaseModel):
             external_knowledge_api_key_configured=(
                 settings.external_knowledge_api_key_is_current()
             ),
-            external_knowledge_min_relevance=(
-                settings.external_knowledge_min_relevance
-            ),
+            external_knowledge_min_relevance=(settings.external_knowledge_min_relevance),
             knowledge_sources=settings.knowledge_sources,
             revision=revision,
             changed_fields=changed_fields or [],

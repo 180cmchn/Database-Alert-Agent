@@ -7,6 +7,7 @@ import {
   Filter,
   KeyRound,
   RefreshCw,
+  PlayCircle,
   Save,
   ShieldCheck,
   Sparkles,
@@ -23,9 +24,10 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import { severityLabel } from "../lib/format";
+import { formatDateTime, severityLabel } from "../lib/format";
 import { knowledgeSourcesForSave } from "../lib/knowledgeSources";
 import type {
+  AnalysisDispatchStatus,
   AdminSettings,
   AdminSettingsPatch,
   AIProvider,
@@ -77,6 +79,8 @@ export function SettingsPage() {
   const [error, setError] = useState("");
   const [authError, setAuthError] = useState(false);
   const [notice, setNotice] = useState("");
+  const [dispatchStatus, setDispatchStatus] = useState<AnalysisDispatchStatus | null>(null);
+  const [resuming, setResuming] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [showWecomUrl, setShowWecomUrl] = useState(false);
   const [showKnowledgeApiKey, setShowKnowledgeApiKey] = useState(false);
@@ -92,7 +96,12 @@ export function SettingsPage() {
     if (!token) return;
     setLoading(true);
     try {
-      setSettings(await api.getSettings(token));
+      const [loadedSettings, loadedDispatch] = await Promise.all([
+        api.getSettings(token),
+        api.getAnalysisDispatch(token),
+      ]);
+      setSettings(loadedSettings);
+      setDispatchStatus(loadedDispatch);
       setError("");
       setAuthError(false);
     } catch (requestError) {
@@ -190,6 +199,12 @@ export function SettingsPage() {
       const updated = await api.updateSettings(patch, token);
       setSettings(updated);
       setNotice(updated.changed_fields.length ? `已应用 ${updated.changed_fields.length} 项配置变更` : "配置已校验，当前值无需变更");
+      try {
+        setDispatchStatus(await api.getAnalysisDispatch(token));
+      } catch (refreshError) {
+        setError(`配置已保存，但调度状态刷新失败：${refreshError instanceof Error ? refreshError.message : "未知错误"}`);
+        setAuthError(refreshError instanceof ApiError && [401, 403].includes(refreshError.status));
+      }
     } catch (saveError) {
       if (saveError instanceof ApiError && saveError.status === 409) {
         await load();
@@ -203,6 +218,35 @@ export function SettingsPage() {
     }
   }
 
+  async function validateAndResume() {
+    if (!dispatchStatus || !token) return;
+    setResuming(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.validateAndResumeDispatch(
+        dispatchStatus.dispatch.version,
+        dispatchStatus.ai_settings_revision,
+        token,
+      );
+      setDispatchStatus(result);
+      setNotice(
+        result.resumed
+          ? `模型验证通过，分析调度已恢复；已补投 ${result.republished_count} 条待执行告警。`
+          : `模型验证失败：${result.dispatch.last_validation?.detail || "未返回失败详情"}`,
+      );
+    } catch (resumeError) {
+      if (resumeError instanceof ApiError && resumeError.status === 409) {
+        await load();
+        setError("调度或模型配置已发生变化，已加载最新状态；请核对后重试。");
+      } else {
+        setError(resumeError instanceof Error ? resumeError.message : "模型验证失败");
+      }
+      setAuthError(resumeError instanceof ApiError && [401, 403].includes(resumeError.status));
+    } finally {
+      setResuming(false);
+    }
+  }
   if (!unlocked) {
     return <AdminUnlock title="解锁 Agent 设置" description="模型凭据与企微机器人地址属于敏感运行配置，只有管理员会话可以读取安全摘要或提交新值。" />;
   }
@@ -220,6 +264,15 @@ export function SettingsPage() {
   const automaticallyAnalyzedSeverities = ALERT_FILTER_SEVERITIES.filter(
     (severity) => !alertAnalysisFilterSeverities.includes(severity),
   );
+  const dispatchPaused = dispatchStatus?.dispatch.state === "PAUSED";
+  const lastPollSummary = dispatchStatus?.flashduty_poll.status === "NEVER"
+    ? "尚未执行过轮询"
+    : dispatchStatus?.flashduty_poll.status === "SUCCESS"
+      ? `最近成功：${dispatchStatus.flashduty_poll.last_completed_at ? formatDateTime(dispatchStatus.flashduty_poll.last_completed_at) : "时间未记录"} · 拉取 ${dispatchStatus.flashduty_poll.fetched_count} 条`
+      : `最近失败：${dispatchStatus?.flashduty_poll.last_error || "未记录失败详情"}`;
+  const pollSummary = dispatchStatus?.flashduty_polling_enabled
+    ? lastPollSummary
+    : `轮询已禁用或配置不完整 · ${lastPollSummary}`;
 
   return (
     <div className="page-stack settings-page">
@@ -231,7 +284,7 @@ export function SettingsPage() {
       />
 
       <div className="settings-status-strip">
-        <div><span className={settings.ready ? "applied-dot" : "applied-dot not-ready"}>{settings.ready ? <Check size={14} /> : <CircleAlert size={14} />}</span><div><strong>{settings.ready ? "配置已应用且可用" : "配置尚未就绪"}</strong><small>{settings.app_env} · 修订版本 {settings.revision}</small></div></div>
+        <div><span className={settings.ready && !dispatchPaused ? "applied-dot" : "applied-dot not-ready"}>{settings.ready && !dispatchPaused ? <Check size={14} /> : <CircleAlert size={14} />}</span><div><strong>{dispatchPaused ? "分析调度已暂停" : settings.ready ? "配置已应用且调度正常" : "配置尚未就绪"}</strong><small>{settings.app_env} · 修订版本 {settings.revision}</small></div></div>
         <div><RefreshCw size={17} /><div><strong>Worker 刷新策略</strong><small>每批任务开始前读取最新配置</small></div></div>
         <div><ShieldCheck size={17} /><div><strong>秘密值保护</strong><small>仅显示是否已配置</small></div></div>
       </div>
@@ -241,6 +294,50 @@ export function SettingsPage() {
           <CircleAlert size={18} />
           <div><strong>当前运行配置不可用</strong><span>{settings.issues.join("；")}</span></div>
         </div>
+      )}
+
+        {error && <div className="form-error" role="alert">{error}</div>}
+        {notice && <div className="form-success"><Check size={16} /> {notice}</div>}
+      {dispatchStatus && (
+        <SectionCard
+          eyebrow="ANALYSIS DISPATCH"
+          title="分析调度与数据接入"
+          description="暂停仅阻止分析执行；FlashDuty 拉取与告警入库继续运行。恢复前必须用当前模型配置完成一次显式验证。"
+          action={
+            <span className={`configured-chip ${dispatchPaused ? "no" : "yes"}`}>
+              {dispatchPaused ? <CircleAlert size={13} /> : <Check size={13} />}
+              {dispatchPaused ? "已暂停" : "运行中"}
+            </span>
+          }
+        >
+          <div className="dispatch-status-grid">
+            <div><span>待执行告警</span><strong>{dispatchStatus.pending_count}</strong></div>
+            <div><span>FlashDuty 轮询</span><strong>{pollSummary}</strong></div>
+            <div><span>调度版本</span><strong>{dispatchStatus.dispatch.version}</strong></div>
+          </div>
+          {dispatchPaused && (
+            <div className="analysis-error" role="alert">
+              <CircleAlert size={18} />
+              <div>
+                <strong>{dispatchStatus.dispatch.reason?.category || "分析调度已暂停"}</strong>
+                <span>{dispatchStatus.dispatch.reason?.safe_detail || "未记录暂停原因"}</span>
+              </div>
+            </div>
+          )}
+          {dispatchStatus.dispatch.last_validation && (
+            <div className={`dispatch-validation ${dispatchStatus.dispatch.last_validation.success ? "success" : "failed"}`}>
+              <strong>{dispatchStatus.dispatch.last_validation.success ? "最近验证通过" : "最近验证失败"}</strong>
+              <span>{dispatchStatus.dispatch.last_validation.detail}</span>
+              <small>{formatDateTime(dispatchStatus.dispatch.last_validation.validated_at)} · {dispatchStatus.dispatch.last_validation.provider} / {dispatchStatus.dispatch.last_validation.model || "默认模型"}</small>
+            </div>
+          )}
+          {dispatchPaused && (
+            <button type="button" className="button primary" onClick={() => void validateAndResume()} disabled={resuming || saving}>
+              <PlayCircle size={16} />
+              {resuming ? "正在验证模型…" : "验证模型并恢复调度"}
+            </button>
+          )}
+        </SectionCard>
       )}
 
       <form className="settings-form" key={settings.revision} onSubmit={save}>
@@ -416,8 +513,6 @@ export function SettingsPage() {
           </div>
         </SectionCard>
 
-        {error && <div className="form-error" role="alert">{error}</div>}
-        {notice && <div className="form-success"><Check size={16} /> {notice}</div>}
         <div className="sticky-submit settings-submit"><span>保存后，新配置会在 Worker 处理下一条任务前生效。</span><button className="button primary large" type="submit" disabled={saving}>{saving ? <InlineLoading label="应用配置" /> : <><Save size={17} /> 保存并应用</>}</button></div>
       </form>
     </div>

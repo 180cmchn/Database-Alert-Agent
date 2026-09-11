@@ -28,6 +28,7 @@ from app.domain.models import (
     EvidenceUnitStatus,
     KnowledgeExcerpt,
     KnowledgeReference,
+    ModelFailureCategory,
     Recommendation,
     RecommendationStep,
     ToolStatus,
@@ -447,9 +448,7 @@ async def test_advisor_applies_slow_query_filter_note_only_to_alert_payload() ->
     assert captured_payload["alert"]["reason"] == signal  # type: ignore[index]
     assert captured_payload["tool_evidence"][0]["summary"] == raw_text  # type: ignore[index]
     assert (
-        captured_payload["tool_evidence"][0]["structured_data"]["flashduty"]["alert"][
-            "description"
-        ]
+        captured_payload["tool_evidence"][0]["structured_data"]["flashduty"]["alert"]["description"]
         == raw_text
     )
 
@@ -1032,7 +1031,7 @@ def test_real_ai_client_uses_system_trust_http_client(
 
 
 @pytest.mark.asyncio
-async def test_provider_retries_recoverable_failures_past_legacy_limit(
+async def test_provider_retries_recoverable_failures_only_three_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
@@ -1043,20 +1042,22 @@ async def test_provider_retries_recoverable_failures_past_legacy_limit(
     async def operation() -> str:
         nonlocal attempts
         attempts += 1
-        if attempts <= 4:
-            raise ai_module.APIConnectionError(request=request)
-        return "ok"
+        raise ai_module.APIConnectionError(request=request)
 
     async def no_wait(delay: float) -> None:
         delays.append(delay)
 
     monkeypatch.setattr(ai_module.asyncio, "sleep", no_wait)
 
-    result = await advisor._request_provider(operation, operation="test")
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._request_provider(operation, operation="final_completion")
 
-    assert result == "ok"
-    assert attempts == 5
-    assert delays == [0.5, 1.0, 2.0, 4.0]
+    assert attempts == 3
+    assert delays == [0.5, 1.0]
+    assert caught.value.failure is not None
+    assert caught.value.failure.category == ModelFailureCategory.CONNECTION
+    assert caught.value.failure.pauses_dispatch is False
+    assert caught.value.failure.attempts == 3
 
 
 @pytest.mark.asyncio
@@ -1080,11 +1081,140 @@ async def test_provider_does_not_retry_permanent_http_error(
 
     monkeypatch.setattr(ai_module.asyncio, "sleep", no_wait)
 
-    with pytest.raises(openai.APIStatusError):
-        await advisor._request_provider(operation, operation="test")
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._request_provider(operation, operation="final_completion")
+
+    assert caught.value.failure is not None
+    assert caught.value.failure.category == ModelFailureCategory.INVALID_RESPONSE
 
     assert attempts == 1
     assert sleeps == 0
+
+
+@pytest.mark.asyncio
+async def test_structured_quota_code_pauses_but_plain_429_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(ai_module.asyncio, "sleep", no_wait)
+
+    quota_response = httpx.Response(429, request=request)
+    quota_error = openai.APIStatusError(
+        "quota",
+        response=quota_response,
+        body={"error": {"code": "insufficient_quota"}},
+    )
+
+    async def quota_operation() -> str:
+        raise quota_error
+
+    with pytest.raises(AdvisorError) as quota_caught:
+        await advisor._request_provider(quota_operation, operation="final_completion")
+
+    assert quota_caught.value.failure is not None
+    assert quota_caught.value.failure.category == ModelFailureCategory.QUOTA_EXHAUSTED
+    assert quota_caught.value.failure.pauses_dispatch is True
+    assert quota_caught.value.failure.attempts == 1
+
+    rate_response = httpx.Response(429, request=request)
+
+    async def rate_operation() -> str:
+        raise openai.APIStatusError("rate limited", response=rate_response, body=None)
+
+    with pytest.raises(AdvisorError) as rate_caught:
+        await advisor._request_provider(rate_operation, operation="final_completion")
+
+    assert rate_caught.value.failure is not None
+    assert rate_caught.value.failure.category == ModelFailureCategory.RATE_LIMITED_OR_QUOTA_UNKNOWN
+    assert rate_caught.value.failure.pauses_dispatch is False
+    assert rate_caught.value.failure.attempts == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "category"),
+    [
+        (401, ModelFailureCategory.AUTHENTICATION),
+        (403, ModelFailureCategory.AUTHORIZATION),
+    ],
+)
+async def test_provider_auth_failures_pause_with_precise_category(
+    status: int,
+    category: ModelFailureCategory,
+) -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+    response = httpx.Response(status, request=request)
+
+    async def operation() -> str:
+        raise openai.APIStatusError("access rejected", response=response, body=None)
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._request_provider(
+            operation,
+            operation="final_completion",
+            model="analysis-model",
+            phase="final",
+        )
+
+    assert caught.value.failure is not None
+    assert caught.value.failure.category == category
+    assert caught.value.failure.pauses_dispatch is True
+    assert caught.value.failure.retryable is False
+    assert caught.value.failure.attempts == 1
+    if status == 403:
+        assert "bad key" not in caught.value.failure.safe_detail.casefold()
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_details_do_not_persist_secrets() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+    response = httpx.Response(401, request=request)
+
+    async def operation() -> str:
+        raise openai.APIStatusError(
+            "api_key=sk-message-secret",
+            response=response,
+            body={
+                "error": {
+                    "code": "invalid_api_key",
+                    "api_key": "sk-body-secret",
+                }
+            },
+        )
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._request_provider(operation, operation="final_completion")
+
+    assert caught.value.failure is not None
+    serialized = caught.value.failure.model_dump_json()
+    assert "sk-message-secret" not in serialized
+    assert "sk-body-secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_provider_probe_does_not_retry_transient_failure() -> None:
+    advisor = object.__new__(ai_module.OpenAICompatibleAdvisor)
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+    attempts = 0
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise ai_module.APIConnectionError(request=request)
+
+    with pytest.raises(AdvisorError) as caught:
+        await advisor._request_provider(operation, operation="probe")
+
+    assert attempts == 1
+    assert caught.value.failure is not None
+    assert caught.value.failure.retryable is True
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from app.adapters.ai import OpenAICompatibleAdvisor, OpenAIResponsesAdvisor
+from app.adapters.ai import FakeAIAdvisor, OpenAICompatibleAdvisor, OpenAIResponsesAdvisor
 from app.adapters.notification import WeComManagementNotifier
 from app.agent_runtime import (
     AgentEvent,
@@ -19,12 +19,35 @@ from app.agent_runtime import (
 )
 from app.agent_runtime.persistence import RepositoryEventSink
 from app.api.main import create_app
-from app.application.factory import Runtime, build_runtime
+from app.application.factory import Runtime, ai_settings_revision, build_runtime
 from app.application.scheduler import ManualAnalysisScheduler
 from app.config import Settings
+from app.domain.errors import AdvisorError
+from app.domain.models import (
+    AlertStatus,
+    AnalysisDispatchState,
+    InvestigationStage,
+    ModelFailure,
+    ModelFailureCategory,
+    ProgressRecord,
+    RunStatus,
+)
 
 ADMIN_TOKEN = "integration-admin-token"
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+class FailingProbeAdvisor(FakeAIAdvisor):
+    async def probe(self):  # type: ignore[no-untyped-def]
+        failure = ModelFailure(
+            category=ModelFailureCategory.CONNECTION,
+            provider=self.provider,
+            model=self.model,
+            phase="unknown",
+            retryable=True,
+            safe_detail="provider connection failed",
+        )
+        raise AdvisorError("provider connection failed", failure=failure)
 
 
 def wait_for_run_terminal(
@@ -185,13 +208,15 @@ def test_runtime_settings_are_dynamic_persisted_and_secrets_are_write_only(
         assert runtime.settings.stream_main_agent_reasoning is True
         assert runtime.service.stream_main_agent_reasoning is True
         assert runtime.settings.alert_analysis_filter_enabled is True
-        assert [
-            item.value for item in runtime.settings.alert_analysis_filter_severities
-        ] == ["CRITICAL", "INFO"]
+        assert [item.value for item in runtime.settings.alert_analysis_filter_severities] == [
+            "CRITICAL",
+            "INFO",
+        ]
         assert runtime.service.alert_analysis_filter_enabled is True
-        assert {
-            item.value for item in runtime.service.alert_analysis_filter_severities
-        } == {"CRITICAL", "INFO"}
+        assert {item.value for item in runtime.service.alert_analysis_filter_severities} == {
+            "CRITICAL",
+            "INFO",
+        }
         assert "validation_enabled" not in body
 
         removed_validator_setting = client.patch(
@@ -465,9 +490,7 @@ def test_reset_runtime_settings_clears_overrides_back_to_env_baseline(
         assert reset_body["alert_analysis_filter_enabled"] is False
         assert reset_body["alert_analysis_filter_severities"] == ["INFO"]
         assert runtime.service.alert_analysis_filter_enabled is False
-        assert {item.value for item in runtime.service.alert_analysis_filter_severities} == {
-            "INFO"
-        }
+        assert {item.value for item in runtime.service.alert_analysis_filter_severities} == {"INFO"}
 
         persisted = json.loads((tmp_path / "runtime-settings.json").read_text(encoding="utf-8"))
         assert persisted == {}
@@ -823,3 +846,249 @@ def test_cancel_run_api_rejects_non_cancelled_terminal_run(tmp_path: Path) -> No
         )
         assert conflict.status_code == 409
         assert conflict.json()["detail"]["code"] == "RUN_CANCELLATION_CONFLICT"
+
+
+def test_dispatch_status_and_failed_validation_remain_paused(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        assert client.get("/api/v1/admin/analysis-dispatch").status_code == 401
+        assert client.portal is not None
+        revision = ai_settings_revision(runtime.settings)
+        failure = ModelFailure(
+            category=ModelFailureCategory.QUOTA_EXHAUSTED,
+            provider="fake",
+            model="fake-model",
+            phase="final",
+            pauses_dispatch=True,
+            http_status=429,
+            vendor_code="insufficient_quota",
+            safe_detail="confirmed quota exhaustion",
+        )
+
+        async def prepare() -> None:
+            trigger, _ = await runtime.service.ingest(
+                "canonical",
+                {
+                    "external_id": "pause-trigger",
+                    "severity": "CRITICAL",
+                    "title": "Pause trigger",
+                    "reason": "test",
+                },
+            )
+            run = await runtime.repository.create_run(
+                str(trigger.alert.id),
+                "pause-worker",
+                300,
+            )
+            assert run is not None
+            await runtime.repository.pause_analysis_dispatch(
+                failure,
+                trigger_run_id=str(run.id),
+                settings_revision=revision,
+            )
+            await runtime.service.ingest(
+                "canonical",
+                {
+                    "external_id": "pending-during-pause",
+                    "severity": "WARNING",
+                    "title": "Pending alert",
+                    "reason": "test",
+                },
+            )
+
+        client.portal.call(prepare)
+        status = client.get("/api/v1/admin/analysis-dispatch", headers=ADMIN_HEADERS)
+        assert status.status_code == 200
+        body = status.json()
+        assert body["dispatch"]["state"] == "PAUSED"
+        assert body["dispatch"]["reason"]["category"] == "QUOTA_EXHAUSTED"
+        assert body["pending_count"] == 1
+        assert body["flashduty_poll"]["status"] == "NEVER"
+        assert body["flashduty_polling_enabled"] is False
+        assert body["ai_settings_revision"] == revision
+
+        runtime.service.advisor = FailingProbeAdvisor()
+        failed = client.post(
+            "/api/v1/admin/analysis-dispatch/validate-and-resume",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_dispatch_version": body["dispatch"]["version"],
+                "expected_settings_revision": revision,
+            },
+        )
+        assert failed.status_code == 200
+        failed_body = failed.json()
+        assert failed_body["validation_succeeded"] is False
+        assert failed_body["republished_count"] == 0
+        assert failed_body["dispatch"]["state"] == "PAUSED"
+        assert failed_body["dispatch"]["last_validation"]["success"] is False
+        assert failed_body["dispatch"]["last_validation"]["failure"]["category"] == "CONNECTION"
+
+        conflict = client.post(
+            "/api/v1/admin/analysis-dispatch/validate-and-resume",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_dispatch_version": body["dispatch"]["version"],
+                "expected_settings_revision": revision,
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "ANALYSIS_DISPATCH_VERSION_CONFLICT"
+
+
+def test_successful_validation_resumes_and_republishes_only_pending(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        http_scheduler="manual",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'resume.db'}",
+        admin_api_token=ADMIN_TOKEN,
+        runtime_settings_path=tmp_path / "runtime-settings.json",
+        knowledge_sources=[],
+    )
+    runtime = build_runtime(settings)
+    scheduler = ManualAnalysisScheduler()
+    client = TestClient(create_app(settings, runtime, scheduler))
+    with client:
+        assert client.portal is not None
+        queued_response = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "resume-queued",
+                "severity": "WARNING",
+                "title": "Queued alert",
+                "reason": "test",
+            },
+        )
+        failed_response = client.post(
+            "/api/v1/alerts/canonical/analyze",
+            json={
+                "external_id": "resume-failed",
+                "severity": "CRITICAL",
+                "title": "Failed alert",
+                "reason": "test",
+            },
+        )
+        queued_id = queued_response.json()["alert_id"]
+        failed_id = failed_response.json()["alert_id"]
+
+        async def prepare() -> None:
+            run = await runtime.repository.create_run(failed_id, "failed-worker", 300)
+            assert run is not None
+            await runtime.repository.finalize_run(
+                failed_id,
+                str(run.id),
+                lease_owner="failed-worker",
+                fencing_token=run.fencing_token,
+                run_status=RunStatus.FAILED,
+                final_stage=InvestigationStage.FAILED,
+                alert_status=AlertStatus.FAILED,
+                progress=ProgressRecord(
+                    run_id=run.id,
+                    stage=InvestigationStage.FAILED,
+                    message="分析失败。",
+                ),
+                error="test failure",
+            )
+            await runtime.repository.pause_analysis_dispatch(
+                ModelFailure(
+                    category=ModelFailureCategory.QUOTA_EXHAUSTED,
+                    provider="fake",
+                    model="fake-model",
+                    phase="final",
+                    pauses_dispatch=True,
+                    safe_detail="confirmed quota exhaustion",
+                ),
+                trigger_run_id=str(run.id),
+                settings_revision=ai_settings_revision(runtime.settings),
+            )
+
+        client.portal.call(prepare)
+        scheduler.jobs.clear()
+        status = client.get("/api/v1/admin/analysis-dispatch", headers=ADMIN_HEADERS).json()
+        assert status["pending_count"] == 1
+
+        resumed = client.post(
+            "/api/v1/admin/analysis-dispatch/validate-and-resume",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_dispatch_version": status["dispatch"]["version"],
+                "expected_settings_revision": status["ai_settings_revision"],
+            },
+        )
+
+        assert resumed.status_code == 200
+        body = resumed.json()
+        assert body["validation_succeeded"] is True
+        assert body["republished_count"] == 1
+        assert body["dispatch"]["state"] == "ENABLED"
+        assert body["dispatch"]["resumed_by"] == "admin"
+        assert scheduler.jobs == [queued_id]
+        assert failed_id not in scheduler.jobs
+
+
+def test_settings_save_never_resumes_dispatch(tmp_path: Path) -> None:
+    client, runtime = create_admin_client(tmp_path)
+    with client:
+        assert client.portal is not None
+        failure = ModelFailure(
+            category=ModelFailureCategory.AUTHENTICATION,
+            provider="fake",
+            model="fake-model",
+            phase="final",
+            pauses_dispatch=True,
+            http_status=401,
+            safe_detail="authentication rejected",
+        )
+
+        async def pause() -> None:
+            trigger, _ = await runtime.service.ingest(
+                "canonical",
+                {
+                    "external_id": "settings-pause-trigger",
+                    "severity": "CRITICAL",
+                    "title": "Pause trigger",
+                    "reason": "test",
+                },
+            )
+            run = await runtime.repository.create_run(
+                str(trigger.alert.id),
+                "pause-worker",
+                300,
+            )
+            assert run is not None
+            await runtime.repository.pause_analysis_dispatch(
+                failure,
+                trigger_run_id=str(run.id),
+                settings_revision=ai_settings_revision(runtime.settings),
+            )
+
+        client.portal.call(pause)
+        dispatch_before = client.get(
+            "/api/v1/admin/analysis-dispatch",
+            headers=ADMIN_HEADERS,
+        ).json()
+        settings_before = client.get("/api/v1/admin/settings", headers=ADMIN_HEADERS).json()
+        saved = client.patch(
+            "/api/v1/admin/settings",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_revision": settings_before["revision"],
+                "ai_model": "new-model-requiring-validation",
+            },
+        )
+        assert saved.status_code == 200
+        status = client.get("/api/v1/admin/analysis-dispatch", headers=ADMIN_HEADERS).json()
+        assert status["dispatch"]["state"] == AnalysisDispatchState.PAUSED.value
+        assert status["dispatch"]["resumed_at"] is None
+        assert status["ai_settings_revision"] != status["dispatch"]["paused_settings_revision"]
+        conflict = client.post(
+            "/api/v1/admin/analysis-dispatch/validate-and-resume",
+            headers=ADMIN_HEADERS,
+            json={
+                "expected_dispatch_version": dispatch_before["dispatch"]["version"],
+                "expected_settings_revision": dispatch_before["ai_settings_revision"],
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "AI_SETTINGS_REVISION_CONFLICT"

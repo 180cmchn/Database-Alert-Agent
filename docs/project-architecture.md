@@ -412,7 +412,7 @@ mindmap
 - **运行快照**：每次分析冻结模型、提示词版本、工具 Schema/Policy 版本和关键参数，避免运行中配置漂移。
 - **租约与 fencing token**：Worker 只有持有当前租约才能更新运行，防止多个执行者同时写入。
 - **LangGraph checkpoint**：进程恢复时从持久化状态继续，并校验 manifest digest。
-- **跨版本恢复**：过期运行的 manifest 与当前模型、提示词、工具策略或配置不兼容时，不混用旧 checkpoint；旧尝试以明确原因安全终止，并自动使用当前运行快照创建新尝试。
+- **跨版本与损坏恢复**：过期运行只在 manifest 兼容且 checkpoint 完整时恢复同一个 run；checkpoint 缺失、损坏或不兼容时，原 run 以明确原因转为 `FAILED`，不会自动创建替代 attempt。
 - **Durable outer dispatch**：外层工具调用先落库再越过远端边界；中断后不盲目重放未知结果。
 - **MCP checkpoint 与 artifact**：远端响应先形成可恢复状态，再进入下一步模型决策；完整结果独立留存。
 - **Provider 终态门禁**：内部 `finish` 只在必要 history id 和适用 supplemental 阶段均离开 `PENDING`
@@ -421,6 +421,9 @@ mindmap
   历史 `evidence-record/v1` 继续按父 ID 校验。
 - **实时轨迹**：事件按 sequence 幂等追加，前端通过增量接口合并 `main_agent` 与 `mcp_internal` 两个 scope。
 - **降级策略**：主模型无法返回合规结果时，固定降级为 `INCONCLUSIVE`，不会猜测根因。
+- **模型故障门禁**：供应商失败保留结构化类别、状态码、安全错误码、request ID、阶段和尝试次数。只有确认的认证、授权、额度/计费和模型配置错误会持久暂停 dispatch；普通 429、5xx、连接错误和超时不暂停。
+- **暂停与恢复**：dispatch 暂停只阻止分析执行，FlashDuty 继续轮询和入库。保存配置、重启或定时探测都不能恢复；管理员必须以当前配置指纹和 dispatch version 执行一次无告警副作用的模型验证。成功后只补投 `RECEIVED`/`QUEUED`，`FAILED` 只能显式重分析。
+- **通知投递**：终态与通知意图在同一事务提交。结果卡片与失败卡片分离；失败卡片不依赖 `Recommendation`。明确失败有界补发，发送结果不确定时标记 `UNKNOWN` 而不盲目重试。
 
 ## 6. 代码目录与职责
 

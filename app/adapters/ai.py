@@ -6,14 +6,15 @@ import json
 import logging
 import re
 import ssl
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 
 import httpx
-from openai import APIConnectionError, AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from app.agent_runtime.contracts import CallToolAction, parse_agent_action
@@ -32,6 +33,8 @@ from app.domain.models import (
     InvestigationDecisionResult,
     KnowledgeExcerpt,
     KnowledgeReference,
+    ModelFailure,
+    ModelFailureCategory,
     NormalizedAlert,
     Recommendation,
     RecommendationStep,
@@ -46,6 +49,26 @@ PROMPT_VERSION = "database-alert-advisor-v29"
 AI_HTTP_USER_AGENT = "Database-Alert-Agent/0.1"
 AI_RETRY_INITIAL_DELAY_SECONDS = 0.5
 AI_RETRY_MAX_DELAY_SECONDS = 10.0
+AI_PROVIDER_MAX_ATTEMPTS = 3
+_AUTHENTICATION_CODES = frozenset({"invalid_api_key", "invalid_authentication"})
+_QUOTA_CODES = frozenset(
+    {
+        "billing_hard_limit_reached",
+        "billing_not_active",
+        "credit_balance_too_low",
+        "insufficient_quota",
+        "quota_exceeded",
+        "usage_limit_reached",
+    }
+)
+_CONFIGURATION_CODES = frozenset(
+    {
+        "deployment_not_found",
+        "invalid_model",
+        "model_not_found",
+        "unsupported_model",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,8 +295,6 @@ def _responses_failure_diagnostic(value: Any) -> str:
     return ", ".join(details)
 
 
-
-
 def _accepts_keyword_argument(callable_obj: Any, argument: str) -> bool:
     try:
         parameters = inspect.signature(callable_obj).parameters.values()
@@ -349,6 +370,94 @@ def _provider_error_diagnostic(error: Exception) -> str:
         if message:
             details.append(f"detail={message[:500]}")
     return ", ".join(details)
+
+
+def _provider_vendor_code(error: Exception) -> str | None:
+    direct = getattr(error, "code", None)
+    if isinstance(direct, str) and direct:
+        return sanitize_text(direct)[:200]
+    body = getattr(error, "body", None)
+    if isinstance(body, Mapping):
+        nested = body.get("error")
+        candidates = [body.get("code"), body.get("type")]
+        if isinstance(nested, Mapping):
+            candidates.extend((nested.get("code"), nested.get("type")))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate:
+                return sanitize_text(candidate)[:200]
+    return None
+
+
+def _model_failure_from_provider_error(
+    error: Exception,
+    *,
+    provider: str,
+    model: str,
+    phase: Literal["react", "final", "mcp", "unknown"],
+    attempts: int,
+    elapsed_ms: int,
+) -> ModelFailure:
+    if isinstance(error, AdvisorError) and error.failure is not None:
+        return error.failure.model_copy(
+            update={
+                "phase": phase,
+                "model": model,
+                "attempts": attempts,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+    status = _provider_status_code(error)
+    code = _provider_vendor_code(error)
+    normalized_code = (code or "").casefold()
+    pauses_dispatch = False
+    retryable = False
+    if normalized_code in _AUTHENTICATION_CODES:
+        category = ModelFailureCategory.AUTHENTICATION
+        pauses_dispatch = True
+    elif normalized_code in _QUOTA_CODES:
+        category = ModelFailureCategory.QUOTA_EXHAUSTED
+        pauses_dispatch = True
+    elif status == 401:
+        category = ModelFailureCategory.AUTHENTICATION
+        pauses_dispatch = True
+    elif status == 403:
+        category = ModelFailureCategory.AUTHORIZATION
+        pauses_dispatch = True
+    elif normalized_code in _CONFIGURATION_CODES:
+        category = ModelFailureCategory.CONFIGURATION
+        pauses_dispatch = True
+    elif status in {408, 409}:
+        category = ModelFailureCategory.TIMEOUT
+        retryable = True
+    elif status == 429:
+        category = ModelFailureCategory.RATE_LIMITED_OR_QUOTA_UNKNOWN
+        retryable = True
+    elif status is not None and status >= 500:
+        category = ModelFailureCategory.PROVIDER_UNAVAILABLE
+        retryable = True
+    elif isinstance(error, (APITimeoutError, TimeoutError, httpx.TimeoutException)):
+        category = ModelFailureCategory.TIMEOUT
+        retryable = True
+    elif isinstance(error, (APIConnectionError, httpx.TransportError, ConnectionError)):
+        category = ModelFailureCategory.CONNECTION
+        retryable = True
+    else:
+        category = ModelFailureCategory.INVALID_RESPONSE
+    request_id = getattr(error, "request_id", None)
+    return ModelFailure(
+        category=category,
+        provider=provider,
+        model=model,
+        phase=phase,
+        retryable=retryable,
+        pauses_dispatch=pauses_dispatch,
+        http_status=status,
+        vendor_code=code,
+        request_id=sanitize_text(str(request_id))[:200] if request_id else None,
+        safe_detail=_provider_error_diagnostic(error),
+        attempts=attempts,
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def _mcp_call_from_agent_action_content(
@@ -642,12 +751,13 @@ class OpenAICompatibleAdvisor:
         self._react_reasoning_effort = (react_reasoning_effort or "").strip().lower()
         self._mcp_reasoning_effort = (mcp_reasoning_effort or "").strip().lower()
         self._max_tokens = max_tokens
+        self._timeout_seconds = timeout_seconds
         self._json_mode = json_mode
         self._client = AsyncOpenAI(
             api_key=api_key or "missing",
             base_url=base_url,
-            # Retry ownership belongs to this adapter so the full analysis timeout
-            # and explicit cancellation are the only limits on recoverable failures.
+            # Retry ownership belongs to this adapter so retries are bounded and
+            # preserve one final structured failure.
             max_retries=0,
             default_headers={"User-Agent": AI_HTTP_USER_AGENT},
             http_client=_system_trust_http_client(timeout_seconds),
@@ -695,23 +805,111 @@ class OpenAICompatibleAdvisor:
         request: Callable[[], Awaitable[Any]],
         *,
         operation: str,
+        model: str = "",
+        phase: Literal["react", "final", "mcp", "unknown"] = "unknown",
     ) -> Any:
-        """Retry recoverable provider failures until analysis control stops the task."""
+        """Retry a bounded number of transient provider failures."""
 
         delay = AI_RETRY_INITIAL_DELAY_SECONDS
+        attempts = 0
+        started_at = time.monotonic()
         while True:
+            attempts += 1
             try:
                 return await request()
             except Exception as exc:
-                if not _is_recoverable_provider_error(exc):
+                if isinstance(exc, TypeError) and "stream_options" in str(exc):
                     raise
+                failure = _model_failure_from_provider_error(
+                    exc,
+                    provider=self.provider,
+                    model=model,
+                    phase=phase,
+                    attempts=attempts,
+                    elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                )
+                max_attempts = 1 if operation == "probe" else AI_PROVIDER_MAX_ATTEMPTS
+                if not failure.retryable or attempts >= max_attempts:
+                    raise AdvisorError(
+                        f"AI provider request failed: {failure.safe_detail}",
+                        failure=failure,
+                    ) from exc
                 logger.warning(
-                    "ai_provider_retry operation=%s error=%s",
+                    "ai_provider_retry operation=%s attempt=%s error=%s",
                     operation,
-                    _provider_error_diagnostic(exc),
+                    attempts,
+                    failure.safe_detail,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, AI_RETRY_MAX_DELAY_SECONDS)
+
+    async def probe(self) -> AdvisorMetadata:
+        if not self._api_key or not self._model:
+            failure = ModelFailure(
+                category=ModelFailureCategory.CONFIGURATION,
+                provider=self.provider,
+                model=self._model,
+                phase="unknown",
+                pauses_dispatch=True,
+                safe_detail="AI_API_KEY and AI_MODEL must be configured",
+            )
+            raise AdvisorError(failure.safe_detail, failure=failure)
+        try:
+            response = await self._stream_chat_completion(
+                {
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": "Reply with OK."},
+                        {"role": "user", "content": "health check"},
+                    ],
+                    "timeout": min(self._timeout_seconds, 10.0),
+                    "temperature": 0,
+                    "max_tokens": 1,
+                },
+                operation="probe",
+            )
+        except AdvisorError as exc:
+            if exc.failure is not None:
+                raise
+            failure = _model_failure_from_provider_error(
+                exc,
+                provider=self.provider,
+                model=self._model,
+                phase="unknown",
+                attempts=1,
+                elapsed_ms=0,
+            )
+            raise AdvisorError(str(exc), failure=failure) from exc
+        except Exception as exc:
+            failure = _model_failure_from_provider_error(
+                exc,
+                provider=self.provider,
+                model=self._model,
+                phase="unknown",
+                attempts=1,
+                elapsed_ms=0,
+            )
+            raise AdvisorError(
+                f"AI provider health probe failed: {failure.safe_detail}",
+                failure=failure,
+            ) from exc
+        if not response.had_choice:
+            failure = ModelFailure(
+                category=ModelFailureCategory.INVALID_RESPONSE,
+                provider=self.provider,
+                model=self._model,
+                phase="unknown",
+                request_id=response.request_id,
+                safe_detail="AI provider health probe returned no response choice",
+            )
+            raise AdvisorError(failure.safe_detail, failure=failure)
+        return AdvisorMetadata(
+            provider=self.provider,
+            model=self._model,
+            prompt_version=PROMPT_VERSION,
+            request_id=response.request_id,
+            usage=response.usage,
+        )
 
     async def _stream_chat_completion(
         self,
@@ -723,10 +921,22 @@ class OpenAICompatibleAdvisor:
         """Stream one OpenAI-compatible response and aggregate its public fields."""
 
         request_kwargs = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
+        model = str(kwargs.get("model") or self._model)
+        phase: Literal["react", "final", "mcp", "unknown"] = (
+            "mcp"
+            if operation.startswith("mcp")
+            else "react"
+            if operation.startswith("react")
+            else "final"
+            if operation.startswith("final")
+            else "unknown"
+        )
         try:
             response = await self._request_provider(
                 lambda: self._client.chat.completions.create(**request_kwargs),
                 operation=operation,
+                model=model,
+                phase=phase,
             )
         except TypeError as exc:
             # Test doubles and a few older compatible SDK facades return a complete
@@ -737,6 +947,8 @@ class OpenAICompatibleAdvisor:
             response = await self._request_provider(
                 lambda: self._client.chat.completions.create(**request_kwargs),
                 operation=operation,
+                model=model,
+                phase=phase,
             )
 
         if hasattr(response, "choices"):
@@ -847,7 +1059,15 @@ class OpenAICompatibleAdvisor:
         reasoning_callback: ReasoningTraceCallback | None = None,
     ) -> tuple[Recommendation, AdvisorMetadata]:
         if not self._api_key or not self._model:
-            raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
+            failure = ModelFailure(
+                category=ModelFailureCategory.CONFIGURATION,
+                provider=self.provider,
+                model=self._model,
+                phase="final",
+                pauses_dispatch=True,
+                safe_detail="AI_API_KEY and AI_MODEL must be configured",
+            )
+            raise AdvisorError(failure.safe_detail, failure=failure)
 
         analysis_alert = preprocess_normalized_alert(alert)
         schema = Recommendation.model_json_schema()
@@ -865,6 +1085,8 @@ class OpenAICompatibleAdvisor:
         messages = base_messages
         analysis_effort = getattr(self, "_reasoning_effort", "")
         complete_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_argument(self._complete, "phase"):
+            complete_kwargs["phase"] = "final"
         if analysis_effort:
             complete_kwargs["reasoning_effort"] = analysis_effort
 
@@ -929,7 +1151,15 @@ class OpenAICompatibleAdvisor:
         """Return one main-Agent ReAct action plus actual provider reasoning."""
 
         if not self._api_key or not self._model:
-            raise AdvisorError("AI_API_KEY and AI_MODEL must be configured")
+            failure = ModelFailure(
+                category=ModelFailureCategory.CONFIGURATION,
+                provider=self.provider,
+                model=self._model,
+                phase="react",
+                pauses_dispatch=True,
+                safe_detail="AI_API_KEY and AI_MODEL must be configured",
+            )
+            raise AdvisorError(failure.safe_detail, failure=failure)
         tool_names = {item.name for item in available_tools}
         payload = {
             "alert": preprocess_normalized_alert(alert).model_dump(
@@ -954,6 +1184,8 @@ class OpenAICompatibleAdvisor:
         react_model = getattr(self, "_react_model", "") or self._model
         react_effort = getattr(self, "_react_reasoning_effort", "")
         complete_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_argument(self._complete, "phase"):
+            complete_kwargs["phase"] = "react"
         if react_model != self._model:
             complete_kwargs["model"] = react_model
         if react_effort:
@@ -1135,6 +1367,7 @@ class OpenAICompatibleAdvisor:
         reasoning_callback: ReasoningDeltaCallback | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        phase: Literal["react", "final"] = "final",
     ) -> tuple[str, AdvisorMetadata]:
         input_chars = sum(
             len(message.get("content", ""))
@@ -1155,33 +1388,76 @@ class OpenAICompatibleAdvisor:
         try:
             response = await self._stream_chat_completion(
                 kwargs,
-                operation="completion",
+                operation=f"{phase}_completion",
                 reasoning_callback=reasoning_callback,
             )
+        except AdvisorError as exc:
+            if exc.failure is not None:
+                raise
+            failure = _model_failure_from_provider_error(
+                exc,
+                provider=self.provider,
+                model=effective_model,
+                phase=phase,
+                attempts=1,
+                elapsed_ms=0,
+            )
+            raise AdvisorError(str(exc), failure=failure) from exc
         except Exception as exc:
-            raise AdvisorError(f"AI provider request failed: {exc}") from exc
+            failure = _model_failure_from_provider_error(
+                exc,
+                provider=self.provider,
+                model=effective_model,
+                phase=phase,
+                attempts=1,
+                elapsed_ms=0,
+            )
+            raise AdvisorError(
+                f"AI provider request failed: {failure.safe_detail}",
+                failure=failure,
+            ) from exc
 
         request_id = response.request_id
         content = response.content
         reasoning = response.reasoning_content
         usage = response.usage
         if not response.had_choice:
-            raise AdvisorError(
+            detail = (
                 "AI provider returned no choices "
                 f"(request_id={request_id}, input_chars={input_chars}, "
                 f"max_tokens={self._max_tokens}, json_mode={self._json_mode})"
             )
+            raise AdvisorError(
+                detail,
+                failure=ModelFailure(
+                    category=ModelFailureCategory.INVALID_RESPONSE,
+                    provider=self.provider,
+                    model=effective_model,
+                    phase=phase,
+                    request_id=request_id,
+                    safe_detail=detail,
+                ),
+            )
 
         if not content:
             reasoning_chars = len(reasoning) if reasoning is not None else 0
-            raise AdvisorError(
+            detail = (
                 "AI provider returned empty content "
-                f"(request_id={request_id}, "
-                f"finish_reason={response.finish_reason}, "
+                f"(request_id={request_id}, finish_reason={response.finish_reason}, "
                 f"input_chars={input_chars}, reasoning_chars={reasoning_chars}, "
-                f"extra_keys={response.extra_keys}, "
-                f"max_tokens={self._max_tokens}, "
+                f"extra_keys={response.extra_keys}, max_tokens={self._max_tokens}, "
                 f"json_mode={self._json_mode}, usage={usage})"
+            )
+            raise AdvisorError(
+                detail,
+                failure=ModelFailure(
+                    category=ModelFailureCategory.INVALID_RESPONSE,
+                    provider=self.provider,
+                    model=effective_model,
+                    phase=phase,
+                    request_id=request_id,
+                    safe_detail=detail,
+                ),
             )
         return content, AdvisorMetadata(
             provider=self.provider,
@@ -1210,6 +1486,7 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
             "store": False,
             "include": ["reasoning.encrypted_content"],
             "stream": True,
+            **({"timeout": kwargs["timeout"]} if "timeout" in kwargs else {}),
         }
         reasoning_effort = kwargs.get("reasoning_effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
@@ -1300,9 +1577,21 @@ class OpenAIResponsesAdvisor(OpenAICompatibleAdvisor):
         """Map the shared advisor call shape onto one streamed Responses request."""
 
         request_kwargs = self._request_kwargs(kwargs)
+        model = str(kwargs.get("model") or self._model)
+        phase: Literal["react", "final", "mcp", "unknown"] = (
+            "mcp"
+            if operation.startswith("mcp")
+            else "react"
+            if operation.startswith("react")
+            else "final"
+            if operation.startswith("final")
+            else "unknown"
+        )
         response = await self._request_provider(
             lambda: self._client.responses.create(**request_kwargs),
             operation=operation,
+            model=model,
+            phase=phase,
         )
         if not hasattr(response, "__aiter__"):
             return await self._aggregate_responses_response(
@@ -1467,6 +1756,14 @@ class FakeAIAdvisor:
     @property
     def prompt_version(self) -> str:
         return PROMPT_VERSION
+
+    async def probe(self) -> AdvisorMetadata:
+        return AdvisorMetadata(
+            provider=self.provider,
+            model=self.model,
+            prompt_version=PROMPT_VERSION,
+            request_id="fake-probe",
+        )
 
     """Deterministic advisor for tests and explicit local demos."""
 

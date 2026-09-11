@@ -11,8 +11,10 @@ from redis.asyncio import Redis
 
 from app.adapters.flashduty import FlashDutyClient
 from app.agent_runtime.leases import LeaseLostError
+from app.application.sanitization import sanitize_text
 from app.application.service import AlertAnalysisService
 from app.config import Settings
+from app.domain.errors import AnalysisDispatchPausedError
 from app.domain.models import AUTO_ANALYSIS_SCHEDULABLE_STATUSES, AlertStatus, StoredAlert
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,38 @@ class FlashDutyAlertPoller:
         now: int | None = None,
         client: FlashDutyClient | None = None,
     ) -> FlashDutyPollResult:
+        end_time = int(time.time()) if now is None else now
+        start_time = max(0, end_time - self.settings.flashduty_poll_lookback_seconds)
+        await self.service.repository.record_flashduty_poll_started(
+            start_time=start_time,
+            end_time=end_time,
+        )
+        try:
+            result = await self._poll_window(now=end_time, client=client)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.service.repository.record_flashduty_poll_failed(
+                start_time=start_time,
+                end_time=end_time,
+                error=sanitize_text(f"{type(exc).__name__}: {exc}"),
+            )
+            raise
+        await self.service.repository.record_flashduty_poll_completed(
+            start_time=result.start_time,
+            end_time=result.end_time,
+            fetched_count=result.total_count,
+            created_count=result.new_count,
+            deduplicated_count=result.deduplicated_count,
+        )
+        return result
+
+    async def _poll_window(
+        self,
+        *,
+        now: int | None = None,
+        client: FlashDutyClient | None = None,
+    ) -> FlashDutyPollResult:
         """Fetch and ingest one complete, fixed FlashDuty occurrence-time window."""
 
         poll_client = client or self.client
@@ -187,7 +221,10 @@ class FlashDutyAlertPoller:
                         "flashduty",
                         {"request_id": request_id, "data": item},
                     )
-                    if stored.status in AUTO_ANALYSIS_SCHEDULABLE_STATUSES:
+                    if (
+                        stored.status in AUTO_ANALYSIS_SCHEDULABLE_STATUSES
+                        and await self.service.is_dispatch_enabled()
+                    ):
                         await self.scheduler.enqueue(str(stored.alert.id))
                     processed.append(FlashDutyPollItemResult(stored=stored, created=created))
                 except asyncio.CancelledError:
@@ -426,6 +463,8 @@ class InMemoryAnalysisScheduler:
         await self._limiter.resize(workers)
 
     async def enqueue(self, alert_id: str) -> None:
+        if not await self.service.is_dispatch_enabled():
+            return
         if alert_id in self._queued:
             return
         self._queued.add(alert_id)
@@ -448,6 +487,11 @@ class InMemoryAnalysisScheduler:
                     await self._limiter.release()
             except asyncio.CancelledError:
                 raise
+            except AnalysisDispatchPausedError:
+                logger.info(
+                    "Analysis dispatch is paused; alert remains queued alert_id=%s",
+                    alert_id,
+                )
             except LeaseLostError:
                 retry_after_lease = True
                 logger.warning(
@@ -523,6 +567,8 @@ class RedisAnalysisScheduler:
         return None
 
     async def enqueue(self, alert_id: str) -> None:
+        if not await self.service.is_dispatch_enabled():
+            return
         client = self.client
         if client is None:
             raise RuntimeError("Redis analysis scheduler is not started")

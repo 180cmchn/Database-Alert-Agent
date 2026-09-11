@@ -42,7 +42,7 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import { compactId, formatDateTime, formatJson, formatPercent } from "../lib/format";
+import { compactId, formatDateTime, formatJson, formatPercent, stageLabel } from "../lib/format";
 import {
   canRequestRunCancellation,
   isRunCancellationPending,
@@ -547,13 +547,46 @@ export function AlertDetailPage() {
         </SectionCard>
       ) : (
         <>
-      <section className="detail-grid workflow-grid">
-        <SectionCard
-          eyebrow="LIVE WORKFLOW"
-          title="Agent 排查轨迹"
-          description={`第 ${selectedRun?.attempt || 1} 次执行 · 主 Agent ReAct`}
-        >
-          <StageTimeline currentStage={currentStage} progress={record.progress} />
+      <SectionCard className="workflow-strip">
+        <details className="workflow-disclosure" key={`${alertId}:${selectedRun?.id || ""}`}>
+          <summary>
+            <h2 className="workflow-strip-summary">
+              <span className="workflow-strip-copy">
+                <span className="workflow-strip-title">Agent 排查轨迹</span>
+                <span className="workflow-strip-meta">第 {selectedRun?.attempt || 1} 次执行 · 主 Agent ReAct</span>
+                <span className="workflow-strip-stage" data-stage={currentStage || undefined}>
+                  {isActive && <Radio size={13} className="pulse" aria-hidden="true" />}
+                  {currentStage ? stageLabel[currentStage] : "等待执行"}
+                </span>
+              </span>
+              <span className="workflow-strip-toggle">
+                <span className="workflow-strip-show-label">查看轨迹</span>
+                <span className="workflow-strip-hide-label">收起轨迹</span>
+                <ChevronDown size={16} aria-hidden="true" />
+              </span>
+            </h2>
+          </summary>
+          <div className="workflow-strip-body">
+            <StageTimeline currentStage={currentStage} progress={record.progress} />
+          </div>
+        </details>
+      </SectionCard>
+
+      <section className="detail-grid analysis-results-grid">
+        <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论" className="ai-conclusion-card">
+          {recommendation ? (
+            <AIConclusionContent
+              key={`${alertId}:${selectedRun?.id || ""}`}
+              rootCauses={visibleRootCauses}
+              collapsibleAnalysisProcess
+            />
+          ) : (
+            <div className="waiting-panel large">
+              <Bot size={29} />
+              <strong>{isActive ? "Agent 正在形成分析结论" : !record.selected_run_result_available ? "历史 AI 分析结论不可恢复" : "本次分析未生成结论"}</strong>
+              <span>{isActive ? "结论将在证据采集与确定性契约校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
+            </div>
+          )}
         </SectionCard>
         <SectionCard
           eyebrow="ACTION PLAN"
@@ -716,24 +749,9 @@ export function AlertDetailPage() {
         )}
       </SectionCard>
 
-      {recommendation ? (
-        <section className="recommendation-stack">
-
-          <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
-            <AIConclusionContent rootCauses={visibleRootCauses} />
-          </SectionCard>
-
-            <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
-              {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref"><ExternalLink size={13} /> {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
-            </SectionCard>
-        </section>
-      ) : (
-        <SectionCard eyebrow="AI CONCLUSION" title="AI 分析结论">
-          <div className="waiting-panel large">
-            <Bot size={29} />
-            <strong>{isActive ? "Agent 正在形成分析结论" : !record.selected_run_result_available ? "历史 AI 分析结论不可恢复" : "本次分析未生成结论"}</strong>
-            <span>{isActive ? "结论将在证据采集与确定性契约校验结束后显示。" : !record.selected_run_result_available ? "该次运行发生在运行级结果开始保存之前。" : "请查看上方错误和校验记录；本次未形成可采纳结论。"}</span>
-          </div>
+      {recommendation && (
+        <SectionCard eyebrow="BASIS" title="判断依据" description="所选知识来源的依据同级展示，AI 分析列在其后">
+          {recommendation.analysis_bases.length ? <ol className="likely-causes">{recommendation.analysis_bases.map((basis, index) => { const reference = knowledgeReference(basis.source_ref); return <li key={`${basis.source}-${basis.statement}-${index}`}><span>{index + 1}</span><div><strong>{basisLabel(basis.source)}</strong> · {basis.statement}{reference && <small className="source-ref"><ExternalLink size={13} /> {reference}</small>}</div></li>; })}</ol> : <p className="muted-copy">本次结果没有可用判断依据。</p>}
         </SectionCard>
       )}
 

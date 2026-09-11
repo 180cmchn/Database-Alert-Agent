@@ -72,6 +72,82 @@ def test_0017_advances_sqlite_revision_without_changing_text_storage(
         get_settings.cache_clear()
 
 
+def test_0019_dispatch_control_upgrade_and_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[2]
+    database = tmp_path / "dispatch-control.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database}")
+    monkeypatch.setenv("STREAM_MAIN_AGENT_REASONING", "false")
+    get_settings.cache_clear()
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "migrations"))
+
+    try:
+        command.upgrade(config, "0018")
+        with sqlite3.connect(database) as connection:
+            before_tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            before_run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info('investigation_runs')")
+            }
+        assert "analysis_dispatch_control" not in before_tables
+        assert "analysis_notification_deliveries" not in before_tables
+        assert "flashduty_poll_state" not in before_tables
+        assert "model_failure_json" not in before_run_columns
+
+        command.upgrade(config, "0019")
+        with sqlite3.connect(database) as connection:
+            revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info('investigation_runs')")
+            }
+            dispatch = connection.execute(
+                "SELECT id, state, version FROM analysis_dispatch_control"
+            ).fetchone()
+            poll_state = connection.execute(
+                "SELECT id, status, fetched_count, created_count, deduplicated_count "
+                "FROM flashduty_poll_state"
+            ).fetchone()
+
+        assert revision == ("0019",)
+        assert {
+            "analysis_dispatch_control",
+            "analysis_notification_deliveries",
+            "flashduty_poll_state",
+        }.issubset(tables)
+        assert "model_failure_json" in run_columns
+        assert dispatch == ("global", "ENABLED", 1)
+        assert poll_state == ("global", "NEVER", 0, 0, 0)
+
+        command.downgrade(config, "0018")
+        with sqlite3.connect(database) as connection:
+            downgraded_revision = connection.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+            downgraded_tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            downgraded_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info('investigation_runs')")
+            }
+        assert downgraded_revision == ("0018",)
+        assert "analysis_dispatch_control" not in downgraded_tables
+        assert "analysis_notification_deliveries" not in downgraded_tables
+        assert "flashduty_poll_state" not in downgraded_tables
+        assert "model_failure_json" not in downgraded_columns
+    finally:
+        get_settings.cache_clear()
+
+
 def test_alembic_accepts_percent_encoded_database_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

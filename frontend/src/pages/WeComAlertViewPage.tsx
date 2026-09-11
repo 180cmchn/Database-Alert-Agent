@@ -59,6 +59,7 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
 
   const { alert, recommendation } = record;
   const host = alert.database?.host || alert.database?.instance || "未提供";
+  const selectedStatus = record.selected_run?.status ?? record.status;
 
   return (
     <main className={`wecom-page severity-${alert.severity.toLowerCase()}`}>
@@ -80,11 +81,13 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
         <div><span>服务</span><strong>{alert.service_name}</strong></div>
       </section>
 
-      {!recommendation ? (
+      {selectedStatus === "FAILED" ? (
+        <FailureContent record={record} />
+      ) : !recommendation ? (
         <section className="wecom-content-card wecom-empty-content">
           <CircleHelp size={28} />
           <h2>分析结果尚未生成</h2>
-          <p>请稍后从企微卡片重新进入。</p>
+          <p>当前运行尚未生成可展示的分析结果。</p>
         </section>
       ) : view === "root-cause" ? (
         <AIConclusionView record={record} />
@@ -95,9 +98,34 @@ export function WeComAlertViewPage({ view }: { view: WeComView }) {
       )}
 
       <footer className="wecom-page-footer">
-        手册与外部知识资料仅作为线索；本次根因结论以当前事件的实时证据为准。
+        {selectedStatus === "FAILED"
+          ? "失败详情来自该次运行的持久化记录；历史失败不会自动重新分析。"
+          : "手册与外部知识资料仅作为线索；本次根因结论以当前事件的实时证据为准。"}
       </footer>
     </main>
+  );
+}
+
+function FailureContent({ record }: { record: StoredAlert }) {
+  const run = record.selected_run ?? record.latest_run;
+  const failure = run?.model_failure;
+  return (
+    <section className="wecom-content-card wecom-empty-content">
+      <AlertTriangle size={28} />
+      <h2>本次分析失败</h2>
+      <p>{failure?.safe_detail || run?.error || record.error || "未记录失败详情"}</p>
+      {failure && (
+        <div className="wecom-failure-details">
+          <p><strong>故障分类：</strong>{failure.category}</p>
+          <p><strong>供应商 / 模型：</strong>{[failure.provider, failure.model].filter(Boolean).join(" / ")}</p>
+          <p><strong>发生阶段：</strong>{failure.phase}</p>
+          {failure.http_status && <p><strong>HTTP 状态：</strong>{failure.http_status}</p>}
+          {failure.vendor_code && <p><strong>供应商代码：</strong>{failure.vendor_code}</p>}
+          {failure.request_id && <p><strong>请求 ID：</strong>{failure.request_id}</p>}
+          <p><strong>调度影响：</strong>{failure.pauses_dispatch ? "触发暂停，需管理员验证后恢复" : "未触发暂停"}</p>
+        </div>
+      )}
+    </section>
   );
 }
 

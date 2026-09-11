@@ -27,20 +27,32 @@ from app.application.analysis_control import (
 from app.application.sanitization import sanitize, sanitize_alert
 from app.domain.alert_preprocessing import preprocess_normalized_alert
 from app.domain.errors import (
+    AdvisorError,
     AlertNotFoundError,
+    AnalysisDispatchPausedError,
     AnalysisFailedError,
+    AnalysisSettingsRevisionConflict,
     InvalidAlertPayloadError,
+    NotificationError,
 )
 from app.domain.models import (
     AlertListResult,
     AlertStatus,
     AnalysisConfigSnapshot,
+    AnalysisDispatchControl,
+    AnalysisDispatchState,
+    AnalysisFailureEvent,
+    AnalysisResultEvent,
     DashboardSummary,
+    DispatchValidationResult,
     InvestigationRun,
     InvestigationStage,
+    ManagementNotificationEvent,
+    ModelFailure,
+    ModelFailureCategory,
     NormalizedAlert,
+    NotificationKind,
     ProgressRecord,
-    Recommendation,
     RunStatus,
     Severity,
     StoredAlert,
@@ -49,6 +61,7 @@ from app.domain.ports import (
     AIAdvisor,
     AlertDetailEnricher,
     AlertRepository,
+    AnalysisDispatchConflict,
     ConclusionValidator,
     ManagementNotifier,
     RunCancellationRequested,
@@ -122,6 +135,7 @@ class AlertAnalysisService:
         self._retirement_task: asyncio.Task[None] | None = None
         self._analysis_registry = ActiveAnalysisRegistry()
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._notification_delivery_task: asyncio.Task[None] | None = None
 
         # Build the LangGraph agent
         self.agent = InvestigationAgent(
@@ -138,10 +152,7 @@ class AlertAnalysisService:
         )
 
     def _initial_alert_status(self, severity: Severity) -> AlertStatus:
-        if (
-            self.alert_analysis_filter_enabled
-            and severity in self.alert_analysis_filter_severities
-        ):
+        if self.alert_analysis_filter_enabled and severity in self.alert_analysis_filter_severities:
             return AlertStatus.FILTERED
         return AlertStatus.QUEUED
 
@@ -170,30 +181,114 @@ class AlertAnalysisService:
             raise AlertNotFoundError(alert_id)
         return queued, True
 
-    async def analyze(
-        self, source: str, payload: dict[str, Any], *, retry_failed: bool = False
-    ) -> StoredAlert:
-        """Analyze an alert synchronously (blocking).
+    async def is_dispatch_enabled(self) -> bool:
+        control = await self.repository.get_dispatch_control()
+        return control.state == AnalysisDispatchState.ENABLED
 
-        This method is primarily for testing and direct API calls.
-        For production, use ingest + scheduler.enqueue.
+    async def require_dispatch_enabled(self) -> None:
+        control = await self.repository.get_dispatch_control()
+        if control.state == AnalysisDispatchState.PAUSED:
+            raise AnalysisDispatchPausedError(
+                control.version,
+                control.reason.safe_detail if control.reason else "Analysis dispatch is paused",
+            )
 
-        Args:
-            source: The alert source identifier
-            payload: The raw alert payload
-            retry_failed: Whether to retry failed analyses
+    async def validate_and_resume_dispatch(
+        self,
+        *,
+        expected_version: int,
+        expected_ai_settings_revision: str,
+        resumed_by: str,
+    ) -> tuple[AnalysisDispatchControl, bool]:
+        control = await self.repository.get_dispatch_control()
+        if control.version != expected_version:
+            raise AnalysisDispatchConflict(expected_version, control.version)
+        if control.state != AnalysisDispatchState.PAUSED:
+            raise ValueError("Analysis dispatch is not paused")
+        current_revision = str(self.runtime_manifest_config.get("ai_settings_revision", ""))
+        if current_revision != expected_ai_settings_revision:
+            raise AnalysisSettingsRevisionConflict(
+                expected_ai_settings_revision,
+                current_revision,
+            )
 
-        Returns:
-            The stored alert after analysis
-        """
-        stored, created = await self.ingest(source, payload)
+        advisor = self.advisor
+        self._active_analyses += 1
+        try:
+            try:
+                metadata = await advisor.probe()
+            except Exception as exc:
+                if (
+                    str(self.runtime_manifest_config.get("ai_settings_revision", ""))
+                    != current_revision
+                ):
+                    raise AnalysisSettingsRevisionConflict(
+                        expected_ai_settings_revision,
+                        str(self.runtime_manifest_config.get("ai_settings_revision", "")),
+                    ) from exc
+                failure = self._model_failure_from_exception(exc) or ModelFailure(
+                    category=ModelFailureCategory.INTERNAL,
+                    provider=str(getattr(advisor, "provider", "unknown")),
+                    model=str(getattr(advisor, "model", "")),
+                    phase="unknown",
+                    safe_detail=sanitize(f"{type(exc).__name__}: {exc}"),
+                )
+                validation = DispatchValidationResult(
+                    success=False,
+                    settings_revision=current_revision,
+                    provider=failure.provider,
+                    model=failure.model,
+                    detail=failure.safe_detail or "AI provider validation failed",
+                    failure=failure,
+                    validated_by=resumed_by,
+                )
+                return (
+                    await self.repository.record_dispatch_validation(
+                        expected_version=expected_version,
+                        validation=validation,
+                    ),
+                    False,
+                )
+
+            latest_revision = str(self.runtime_manifest_config.get("ai_settings_revision", ""))
+            if latest_revision != current_revision:
+                raise AnalysisSettingsRevisionConflict(
+                    expected_ai_settings_revision,
+                    latest_revision,
+                )
+            validation = DispatchValidationResult(
+                success=True,
+                settings_revision=current_revision,
+                provider=metadata.provider,
+                model=metadata.model,
+                detail="AI provider validation succeeded",
+                validated_by=resumed_by,
+            )
+            return (
+                await self.repository.resume_analysis_dispatch(
+                    expected_version=expected_version,
+                    expected_settings_revision=current_revision,
+                    resumed_by=resumed_by,
+                    validation=validation,
+                ),
+                True,
+            )
+        finally:
+            self._active_analyses -= 1
+            if self._active_analyses == 0:
+                self._schedule_retired_adapter_close()
+
+    async def analyze(self, source: str, payload: dict[str, Any]) -> StoredAlert:
+        """Analyze a newly ingested alert synchronously."""
+
+        stored, _created = await self.ingest(source, payload)
         if stored.status in {
             AlertStatus.COMPLETED,
             AlertStatus.INCONCLUSIVE,
+            AlertStatus.FAILED,
             AlertStatus.FILTERED,
+            AlertStatus.CANCELLED,
         }:
-            return stored
-        if not created and stored.status == AlertStatus.FAILED and not retry_failed:
             return stored
         return await self.analyze_by_id(str(stored.alert.id))
 
@@ -212,9 +307,12 @@ class AlertAnalysisService:
         if stored.status in {
             AlertStatus.COMPLETED,
             AlertStatus.INCONCLUSIVE,
+            AlertStatus.FAILED,
             AlertStatus.FILTERED,
+            AlertStatus.CANCELLED,
         }:
             return stored
+        await self.require_dispatch_enabled()
 
         self._active_analyses += 1
         try:
@@ -240,8 +338,21 @@ class AlertAnalysisService:
                         )
                     fields = ", ".join(incompatible_fields)
                     error = (
-                        "Superseded because frozen run manifest is incompatible with "
-                        f"the current runtime: {fields}"
+                        f"Frozen run manifest is incompatible with the current runtime: {fields}"
+                    )
+                    failure = ModelFailure(
+                        category=ModelFailureCategory.INTERNAL,
+                        provider="runtime",
+                        model=(run.config_snapshot.ai_model if run.config_snapshot else ""),
+                        phase="unknown",
+                        safe_detail=error,
+                    )
+                    notification_event = AnalysisFailureEvent(
+                        alert=stored.alert,
+                        status=AlertStatus.FAILED,
+                        message=error,
+                        run_id=run.id,
+                        failure=failure,
                     )
                     try:
                         await self.repository.finalize_run(
@@ -255,37 +366,30 @@ class AlertAnalysisService:
                             progress=ProgressRecord(
                                 run_id=run.id,
                                 stage=InvestigationStage.FAILED,
-                                message=(
-                                    "运行环境已变更，旧检查点已安全终止；"
-                                    "将使用当前配置重新开始调查。"
-                                ),
+                                message="运行环境已变更，旧检查点无法安全恢复。",
                                 details={
                                     "reason": "incompatible_resume_manifest",
                                     "incompatible_fields": incompatible_fields,
                                 },
                             ),
                             error=error,
+                            model_failure=failure,
+                            notification_kind=NotificationKind.ANALYSIS_FAILURE,
+                            notification_event=notification_event.model_dump(mode="json"),
                         )
                     except RunCancellationRequested:
                         await self.repository.finalize_requested_cancellation(alert_id, str(run.id))
-                        return await self.get(alert_id)
                     except RunLeaseConflict as exc:
                         raise LeaseLostError(
                             run_id=str(run.id),
                             lease_owner=run.lease_owner,
                             fencing_token=run.fencing_token,
                             reason=(
-                                "the lease was lost before the incompatible run could be superseded"
+                                "the lease was lost before the incompatible run could be terminated"
                             ),
                         ) from exc
-                    logger.info(
-                        "Restarting expired investigation with current runtime "
-                        "alert_id=%s run_id=%s incompatible_fields=%s",
-                        alert_id,
-                        run.id,
-                        fields,
-                    )
-                    run = None
+                    await self.deliver_pending_notifications()
+                    return await self.get(alert_id)
             if run is None:
                 run_id = uuid4()
                 manifest = self._create_run_manifest(run_id, generation_snapshot)
@@ -409,7 +513,22 @@ class AlertAnalysisService:
                 reason="a fenced run update was rejected",
             ) from exc
         except Exception as exc:
+            model_failure = self._model_failure_from_exception(exc)
+            pause_settings_revision = self._pause_revision_for(run, model_failure)
             error = f"{type(exc).__name__}: {sanitize(str(exc))}"
+            notification_failure = model_failure or ModelFailure(
+                category=ModelFailureCategory.INTERNAL,
+                provider="database-alert-agent",
+                phase="unknown",
+                safe_detail=error,
+            )
+            notification_event = AnalysisFailureEvent(
+                alert=initial_state.alert,
+                status=AlertStatus.FAILED,
+                message=error,
+                run_id=run.id,
+                failure=notification_failure,
+            )
             try:
                 await self.repository.finalize_run(
                     alert_id,
@@ -426,6 +545,10 @@ class AlertAnalysisService:
                         details={"error": error},
                     ),
                     error=error,
+                    model_failure=notification_failure,
+                    pause_settings_revision=pause_settings_revision,
+                    notification_kind=NotificationKind.ANALYSIS_FAILURE,
+                    notification_event=notification_event.model_dump(mode="json"),
                 )
             except RunLeaseConflict as lease_exc:
                 raise LeaseLostError(
@@ -434,6 +557,7 @@ class AlertAnalysisService:
                     fencing_token=run.fencing_token,
                     reason="the lease was lost before failure could be recorded",
                 ) from lease_exc
+            await self.deliver_pending_notifications()
             raise AnalysisFailedError(alert_id, error) from exc
 
         try:
@@ -449,26 +573,10 @@ class AlertAnalysisService:
                 reason="the lease was lost before the final result could be recorded",
             ) from exc
 
+        await self.deliver_pending_notifications()
         if final_state.status == AlertStatus.FAILED:
             error = final_state.error or "Investigation failed"
             raise AnalysisFailedError(alert_id, error)
-
-        # Send notification
-        if final_state.recommendation and final_state.alert:
-            if final_state.status == AlertStatus.COMPLETED:
-                message = "数据库告警分析已完成。"
-            else:
-                message = "数据库告警分析已结束，结论不充分。"
-            await self._send_analysis_result(
-                final_state.alert,
-                run_id=run.id,
-                status=final_state.status,
-                message=message,
-                recommendation=final_state.recommendation,
-                lease_owner=run.lease_owner,
-                fencing_token=run.fencing_token,
-            )
-
         return await self.get(alert_id)
 
     async def _run_agent_with_controls(
@@ -563,6 +671,47 @@ class AlertAnalysisService:
             )
         run_status, final_stage, message = terminal
         details: dict[str, Any]
+        model_failure = final_state.model_failure
+        if final_state.status == AlertStatus.FAILED and model_failure is None:
+            model_failure = ModelFailure(
+                category=ModelFailureCategory.INTERNAL,
+                provider="database-alert-agent",
+                phase="unknown",
+                safe_detail=final_state.error or "Investigation failed",
+            )
+        pause_settings_revision = self._pause_revision_for(run, model_failure)
+        notification_kind: NotificationKind | None = None
+        notification_event: ManagementNotificationEvent | None = None
+        if final_state.alert is not None:
+            if final_state.status == AlertStatus.FAILED or (
+                final_state.advisor_degraded and model_failure is not None
+            ):
+                assert model_failure is not None
+                notification_kind = NotificationKind.ANALYSIS_FAILURE
+                notification_event = AnalysisFailureEvent(
+                    alert=final_state.alert,
+                    status=final_state.status,
+                    message=(
+                        model_failure.safe_detail
+                        or final_state.error
+                        or "AI provider request failed"
+                    ),
+                    run_id=run.id,
+                    failure=model_failure,
+                )
+            elif final_state.recommendation is not None:
+                notification_kind = NotificationKind.ANALYSIS_RESULT
+                notification_event = AnalysisResultEvent(
+                    alert=final_state.alert,
+                    recommendation=final_state.recommendation,
+                    status=final_state.status,
+                    message=(
+                        "数据库告警分析已完成。"
+                        if final_state.status == AlertStatus.COMPLETED
+                        else "数据库告警分析已结束，结论不充分。"
+                    ),
+                    run_id=run.id,
+                )
         if final_state.status == AlertStatus.FAILED:
             details = {"error": final_state.error or "Investigation failed"}
         else:
@@ -588,7 +737,37 @@ class AlertAnalysisService:
             recommendation=final_state.recommendation,
             advisor_metadata=final_state.advisor_metadata,
             error=final_state.error,
+            model_failure=model_failure,
+            pause_settings_revision=pause_settings_revision,
+            notification_kind=notification_kind,
+            notification_event=(
+                notification_event.model_dump(mode="json")
+                if notification_event is not None
+                else None
+            ),
         )
+
+    @staticmethod
+    def _model_failure_from_exception(exc: BaseException) -> ModelFailure | None:
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, AdvisorError) and current.failure is not None:
+                return current.failure
+            current = current.__cause__ or current.__context__
+        return None
+
+    def _pause_revision_for(
+        self,
+        run: InvestigationRun,
+        failure: ModelFailure | None,
+    ) -> str | None:
+        if failure is None or not failure.pauses_dispatch or run.config_snapshot is None:
+            return None
+        run_revision = run.config_snapshot.ai_settings_revision
+        current_revision = str(self.runtime_manifest_config.get("ai_settings_revision", ""))
+        return run_revision if run_revision and run_revision == current_revision else None
 
     def retire_adapters(self, *adapters: object) -> None:
         """Defer closing replaced adapters until no investigation still uses them."""
@@ -755,6 +934,7 @@ class AlertAnalysisService:
             stream_main_agent_reasoning=self.stream_main_agent_reasoning,
             ai_model=getattr(self.advisor, "model", ""),
             ai_provider=getattr(self.advisor, "provider", ""),
+            ai_settings_revision=str(self.runtime_manifest_config.get("ai_settings_revision", "")),
             ai_react_model=getattr(self.advisor, "react_model", "")
             or getattr(self.advisor, "model", ""),
             ai_mcp_model=getattr(self.advisor, "mcp_model", "")
@@ -762,9 +942,10 @@ class AlertAnalysisService:
             ai_react_reasoning_effort=getattr(self.advisor, "react_reasoning_effort", ""),
             ai_reasoning_effort=getattr(self.advisor, "reasoning_effort", ""),
             ai_mcp_reasoning_effort=getattr(self.advisor, "mcp_reasoning_effort", ""),
-            ai_timeout_seconds=float(self.runtime_manifest_config.get("ai_timeout_seconds", 300)),
-            # Historical snapshot field only; live model calls have no retry-count budget.
-            ai_max_retries=0,
+            ai_max_retries=max(
+                int(self.runtime_manifest_config.get("ai_provider_max_attempts", 3)) - 1,
+                0,
+            ),
             ai_max_tokens=int(self.runtime_manifest_config.get("ai_max_tokens", 16_384)),
             prompt_version=str(
                 self.runtime_manifest_config.get("prompt_version")
@@ -815,6 +996,7 @@ class AlertAnalysisService:
             InvalidAlertPayloadError: If a run is already in progress and force=False
         """
         stored = await self.get(alert_id)
+        await self.require_dispatch_enabled()
 
         # Check if a run is already in progress
         if stored.latest_run and stored.latest_run.status == RunStatus.RUNNING:
@@ -900,58 +1082,113 @@ class AlertAnalysisService:
         self._analysis_registry.cancel(run_id)
         return run
 
-    async def _send_analysis_result(
-        self,
-        alert: NormalizedAlert,
-        *,
-        run_id: UUID,
-        status: AlertStatus,
-        message: str,
-        recommendation: Recommendation,
-        lease_owner: str,
-        fencing_token: int,
-    ) -> None:
-        """Send analysis result notification and persist delivery status."""
-        from app.domain.models import AnalysisResultEvent
+    async def deliver_pending_notifications(self, *, limit: int = 20) -> int:
+        """Claim and deliver durable notification intents without rerunning analysis."""
 
-        event = AnalysisResultEvent(
-            alert=alert,
-            recommendation=recommendation,
-            status=status,
-            message=message,
-            run_id=run_id,
+        owner = f"notification-{uuid4()}"
+        deliveries = await self.repository.claim_notification_deliveries(
+            owner=owner,
+            limit=limit,
+            lease_seconds=60,
         )
-        try:
-            await self.notifier.send(event)
-            await self.repository.append_progress(
-                str(alert.id),
-                ProgressRecord(
-                    run_id=run_id,
-                    stage=InvestigationStage.REPORTING,
-                    message="企微机器人通知已发送",
-                ),
-                lease_owner=lease_owner,
-                fencing_token=fencing_token,
-                allow_terminal=True,
-            )
-        except RunLeaseConflict:
-            raise
-        except Exception as exc:
-            error_msg = sanitize(f"{type(exc).__name__}: {exc}")
-            logger.warning(
-                "wecom_analysis_result_send_failed alert_id=%s error=%s",
-                alert.id,
-                error_msg,
-            )
-            await self.repository.append_progress(
-                str(alert.id),
-                ProgressRecord(
-                    run_id=run_id,
-                    stage=InvestigationStage.REPORTING,
-                    message="企微机器人通知失败",
-                    details={"error": error_msg},
-                ),
-                lease_owner=lease_owner,
-                fencing_token=fencing_token,
-                allow_terminal=True,
-            )
+        completed = 0
+        for delivery in deliveries:
+            try:
+                if delivery.kind == NotificationKind.ANALYSIS_FAILURE:
+                    event: ManagementNotificationEvent = AnalysisFailureEvent.model_validate(
+                        delivery.event
+                    )
+                else:
+                    event = AnalysisResultEvent.model_validate(delivery.event)
+            except Exception as exc:
+                await self.repository.fail_notification_delivery(
+                    str(delivery.id),
+                    owner=owner,
+                    error=f"Invalid persisted notification event: {sanitize(str(exc))}",
+                    unknown_outcome=False,
+                )
+                continue
+
+            try:
+                message_id = await self.notifier.send(event)
+            except NotificationError as exc:
+                await self.repository.fail_notification_delivery(
+                    str(delivery.id),
+                    owner=owner,
+                    error=str(exc),
+                    unknown_outcome=exc.unknown_outcome,
+                )
+                logger.warning(
+                    "notification_delivery_failed delivery_id=%s kind=%s error=%s",
+                    delivery.id,
+                    delivery.kind.value,
+                    sanitize(str(exc)),
+                )
+                continue
+            except Exception as exc:
+                await self.repository.fail_notification_delivery(
+                    str(delivery.id),
+                    owner=owner,
+                    error=f"{type(exc).__name__}: {sanitize(str(exc))}",
+                    unknown_outcome=False,
+                )
+                logger.warning(
+                    "notification_delivery_failed delivery_id=%s kind=%s error=%s",
+                    delivery.id,
+                    delivery.kind.value,
+                    sanitize(str(exc)),
+                )
+                continue
+
+            try:
+                await self.repository.complete_notification_delivery(
+                    str(delivery.id),
+                    owner=owner,
+                    message_id=message_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "notification_delivery_commit_failed delivery_id=%s error=%s",
+                    delivery.id,
+                    sanitize(str(exc)),
+                )
+                try:
+                    await self.repository.fail_notification_delivery(
+                        str(delivery.id),
+                        owner=owner,
+                        error=f"Delivery outcome could not be persisted: {sanitize(str(exc))}",
+                        unknown_outcome=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "notification_delivery_unknown_outcome_not_persisted delivery_id=%s",
+                        delivery.id,
+                    )
+                continue
+            completed += 1
+        return completed
+
+    def start_notification_delivery_worker(self, *, interval_seconds: float = 10.0) -> None:
+        if self._notification_delivery_task is not None:
+            return
+
+        async def run() -> None:
+            while True:
+                try:
+                    await self.deliver_pending_notifications()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Durable notification delivery cycle failed")
+                await asyncio.sleep(interval_seconds)
+
+        task = asyncio.create_task(run(), name="notification-delivery-worker")
+        self._notification_delivery_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def clear_worker(completed: asyncio.Task[None]) -> None:
+            if self._notification_delivery_task is completed:
+                self._notification_delivery_task = None
+
+        task.add_done_callback(clear_worker)

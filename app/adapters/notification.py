@@ -13,20 +13,56 @@ import httpx
 
 from app.application.sanitization import sanitize_text
 from app.domain.errors import NotificationError
-from app.domain.models import AnalysisResultEvent
+from app.domain.models import (
+    AnalysisFailureEvent,
+    ManagementNotificationEvent,
+    NotificationKind,
+)
 
 logger = logging.getLogger(__name__)
 
 WECOM_RATE_LIMIT_PER_MINUTE = 20
 WECOM_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_WECOM_MAIN_TITLE_LIMIT = 26
+_WECOM_BODY_LIMIT = 112
 _WHITESPACE = re.compile(r"\s+")
 _SHANGHAI_TIME_ZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
-def _safe_text(value: Any, *, limit: int, fallback: str = "未提供") -> str:
+def _safe_text(value: Any, *, limit: int | None, fallback: str = "未提供") -> str:
     raw = "" if value is None else str(value)
     cleaned = _WHITESPACE.sub(" ", sanitize_text(raw)).strip()
     return cleaned[:limit] or fallback
+
+
+def _wecom_title_and_body(*, title: str, alert_name: str, reason: str) -> tuple[str, str]:
+    """Use a compact header and reserve body space for the full alert title."""
+    title = _safe_text(title, limit=None)
+    if len(title) <= _WECOM_MAIN_TITLE_LIMIT:
+        return title, _safe_text(f"告警原因：{reason}", limit=_WECOM_BODY_LIMIT)
+
+    short_name = _safe_text(alert_name, limit=_WECOM_MAIN_TITLE_LIMIT + 1, fallback="")
+    if (
+        not short_name
+        or short_name.casefold() == "unknown"
+        or len(short_name) > _WECOM_MAIN_TITLE_LIMIT
+    ):
+        short_name = "数据库告警分析"
+
+    body = f"告警标题：{title}"
+    if len(body) > _WECOM_BODY_LIMIT:
+        suffix = "…（完整标题见详情）"
+        return short_name, body[: _WECOM_BODY_LIMIT - len(suffix)] + suffix
+
+    reason_prefix = "\n告警原因："
+    reason_limit = _WECOM_BODY_LIMIT - len(body) - len(reason_prefix)
+    if reason_limit > 0:
+        reason = _safe_text(reason, limit=reason_limit + 1, fallback="")
+        if len(reason) > reason_limit:
+            reason = reason[: reason_limit - 1] + "…"
+        if reason:
+            body += reason_prefix + reason
+    return short_name, body
 
 
 def _format_wecom_alert_time(value: datetime) -> str:
@@ -36,7 +72,7 @@ def _format_wecom_alert_time(value: datetime) -> str:
 
 
 def _action_urls(
-    event: AnalysisResultEvent,
+    event: ManagementNotificationEvent,
     *,
     page_base_url: str,
 ) -> dict[str, str]:
@@ -51,18 +87,67 @@ def _action_urls(
     }
 
 
+def build_wecom_failure_card(
+    event: AnalysisFailureEvent,
+    *,
+    page_base_url: str,
+) -> dict[str, Any]:
+    if not page_base_url:
+        raise NotificationError("WeCom page base URL is not configured")
+    failure = event.failure
+    alert = event.alert
+    urls = _action_urls(event, page_base_url=page_base_url)
+    status_detail = (
+        f"HTTP {failure.http_status}" if failure.http_status is not None else failure.category.value
+    )
+    if failure.vendor_code:
+        status_detail = f"{status_detail} / {failure.vendor_code}"
+    return {
+        "card_type": "text_notice",
+        "source": {"desc": "数据库告警 Agent", "desc_color": 1},
+        "main_title": {
+            "title": "数据库告警分析失败",
+            "desc": _safe_text(_format_wecom_alert_time(alert.occurred_at), limit=30),
+        },
+        "emphasis_content": {
+            "title": _safe_text(failure.category.value, limit=26),
+            "desc": "分析调度已暂停" if failure.pauses_dispatch else "本次分析已终止",
+        },
+        "sub_title_text": _safe_text(
+            f"告警：{alert.title}\n失败说明：{event.message}",
+            limit=_WECOM_BODY_LIMIT,
+        ),
+        "horizontal_content_list": [
+            {"keyname": "供应商", "value": _safe_text(failure.provider, limit=26)},
+            {"keyname": "模型", "value": _safe_text(failure.model, limit=26)},
+            {"keyname": "阶段", "value": _safe_text(failure.phase, limit=26)},
+            {"keyname": "响应", "value": _safe_text(status_detail, limit=40)},
+            {"keyname": "外部ID", "value": _safe_text(alert.external_id, limit=26)},
+        ],
+        "jump_list": [{"type": 1, "title": "查看失败详情", "url": urls["overview"]}],
+        "card_action": {"type": 1, "url": urls["overview"]},
+    }
+
+
 def build_wecom_template_card(
-    event: AnalysisResultEvent,
+    event: ManagementNotificationEvent,
     *,
     page_base_url: str,
 ) -> dict[str, Any]:
     """Build a bounded WeCom text-notice card with analysis detail actions."""
+    if isinstance(event, AnalysisFailureEvent):
+        return build_wecom_failure_card(event, page_base_url=page_base_url)
 
     if not page_base_url:
         raise NotificationError("WeCom page base URL is not configured")
 
     alert = event.alert
     database = alert.database
+    main_title, sub_title_text = _wecom_title_and_body(
+        title=alert.title,
+        alert_name=alert.alert_name,
+        reason=alert.reason,
+    )
     urls = _action_urls(event, page_base_url=page_base_url)
     severity_labels = {
         "CRITICAL": "严重",
@@ -78,9 +163,7 @@ def build_wecom_template_card(
     host = (database.host or database.instance) if database else None
     database_name = None
     if database:
-        database_name = " / ".join(
-            value for value in (database.engine, database.database) if value
-        )
+        database_name = " / ".join(value for value in (database.engine, database.database) if value)
 
     return {
         "card_type": "text_notice",
@@ -89,7 +172,7 @@ def build_wecom_template_card(
             "desc_color": 2 if severity == "CRITICAL" else 0,
         },
         "main_title": {
-            "title": _safe_text(alert.title, limit=26),
+            "title": main_title,
             "desc": _safe_text(_format_wecom_alert_time(alert.occurred_at), limit=30),
         },
         "emphasis_content": {
@@ -99,10 +182,7 @@ def build_wecom_template_card(
                 limit=15,
             ),
         },
-        "sub_title_text": _safe_text(
-            f"告警原因：{alert.reason}",
-            limit=112,
-        ),
+        "sub_title_text": sub_title_text,
         "horizontal_content_list": [
             {
                 "keyname": "告警级别",
@@ -172,14 +252,20 @@ class _WeComRateLimiter:
 
 
 class LogManagementNotifier:
-    async def send(self, event: AnalysisResultEvent) -> str:
+    async def send(self, event: ManagementNotificationEvent) -> str:
         delivery_id = f"log-{uuid4()}"
+        kind = (
+            NotificationKind.ANALYSIS_FAILURE
+            if isinstance(event, AnalysisFailureEvent)
+            else NotificationKind.ANALYSIS_RESULT
+        )
         logger.warning(
-            "analysis_result delivery_id=%s alert_id=%s status=%s knowledge_matches=%s",
+            "analysis_notification delivery_id=%s alert_id=%s run_id=%s kind=%s status=%s",
             delivery_id,
             event.alert.id,
+            event.run_id,
+            kind.value,
             event.status.value,
-            len(event.recommendation.knowledge_matches),
         )
         return delivery_id
 
@@ -204,14 +290,19 @@ class WeComManagementNotifier:
         self._retry_delay = retry_delay_seconds
         self._rate_limiter = _WeComRateLimiter(max_per_window=rate_limit_per_minute)
 
-    async def send(self, event: AnalysisResultEvent) -> str | None:
+    async def send(self, event: ManagementNotificationEvent) -> str | None:
         if not self._url:
             raise NotificationError("WeCom webhook URL is not configured")
+        kind = (
+            NotificationKind.ANALYSIS_FAILURE
+            if isinstance(event, AnalysisFailureEvent)
+            else NotificationKind.ANALYSIS_RESULT
+        )
         headers = {
             "Content-Type": "application/json",
             "X-Alert-Id": str(event.alert.id),
             "X-Analysis-Status": event.status.value,
-            "Idempotency-Key": f"{event.alert.id}:analysis-result",
+            "Idempotency-Key": f"{event.alert.id}:{event.run_id}:{kind.value.lower()}",
         }
         payload = {
             "msgtype": "template_card",
@@ -228,9 +319,7 @@ class WeComManagementNotifier:
                 async with httpx.AsyncClient(
                     timeout=self._timeout, transport=self._transport
                 ) as client:
-                    response = await client.post(
-                        self._url, json=payload, headers=headers
-                    )
+                    response = await client.post(self._url, json=payload, headers=headers)
                     response.raise_for_status()
                 break
             except httpx.HTTPStatusError as exc:
@@ -249,9 +338,12 @@ class WeComManagementNotifier:
                     await asyncio.sleep(self._retry_delay)
                     continue
                 if isinstance(exc, httpx.TimeoutException):
-                    raise NotificationError("WeCom webhook timed out") from exc
+                    raise NotificationError(
+                        "WeCom webhook timed out", unknown_outcome=True
+                    ) from exc
                 raise NotificationError(
-                    f"WeCom webhook request failed: {type(exc).__name__}"
+                    f"WeCom webhook request failed: {type(exc).__name__}",
+                    unknown_outcome=True,
                 ) from exc
 
         assert response is not None  # noqa: S101 - reached only on success

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.domain.models import ModelFailure
+
 
 class AlertAgentError(Exception):
     """Base error for the application."""
@@ -16,11 +18,29 @@ class InvalidAlertPayloadError(AlertAgentError):
 
 
 class AdvisorError(AlertAgentError):
-    pass
+    def __init__(self, message: str, *, failure: ModelFailure | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
+
+
+class AnalysisDispatchPausedError(AlertAgentError):
+    def __init__(self, version: int, reason: str) -> None:
+        super().__init__(reason)
+        self.version = version
+        self.reason = reason
+
+
+class AnalysisSettingsRevisionConflict(AlertAgentError):
+    def __init__(self, expected: str, current: str) -> None:
+        super().__init__("AI settings changed during dispatch validation")
+        self.expected = expected
+        self.current = current
 
 
 class NotificationError(AlertAgentError):
-    pass
+    def __init__(self, message: str, *, unknown_outcome: bool = False) -> None:
+        super().__init__(message)
+        self.unknown_outcome = unknown_outcome
 
 
 class AnalysisFailedError(AlertAgentError):

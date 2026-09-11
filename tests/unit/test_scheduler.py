@@ -16,7 +16,28 @@ from app.application.scheduler import (
     _remaining_poll_delay,
 )
 from app.config import Settings
-from app.domain.models import AlertStatus
+from app.domain.models import (
+    AlertStatus,
+    FlashDutyPollStatus,
+    ModelFailure,
+    ModelFailureCategory,
+)
+
+
+class PollStateRepository:
+    def __init__(self) -> None:
+        self.started: list[dict[str, object]] = []
+        self.completed: list[dict[str, object]] = []
+        self.failed: list[dict[str, object]] = []
+
+    async def record_flashduty_poll_started(self, **values: object) -> None:
+        self.started.append(values)
+
+    async def record_flashduty_poll_completed(self, **values: object) -> None:
+        self.completed.append(values)
+
+    async def record_flashduty_poll_failed(self, **values: object) -> None:
+        self.failed.append(values)
 
 
 def test_redis_scheduler_construction_does_not_require_running_event_loop() -> None:
@@ -63,7 +84,15 @@ async def test_redis_scheduler_requeues_pending_alerts_on_start() -> None:
     settings = Settings(_env_file=None, ai_provider="fake")
     repository = Repository()
     client = FakeRedis()
-    service = SimpleNamespace(repository=repository)
+
+    class Service:
+        def __init__(self, repository: Repository) -> None:
+            self.repository = repository
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
+
+    service = Service(repository)
     scheduler = RedisAnalysisScheduler(
         settings,
         service,  # type: ignore[arg-type]
@@ -124,11 +153,8 @@ async def test_in_memory_scheduler_runs_shared_investigation_pipeline(
 
     assert result.status == AlertStatus.INCONCLUSIVE
     assert result.latest_run is not None
-    # The investigation pipeline records INCONCLUSIVE, then the notification step
-    # appends a REPORTING progress record for the WeCom delivery status.
     assert any(record.stage.value == "INCONCLUSIVE" for record in result.progress)
-    assert result.progress[-1].stage.value == "REPORTING"
-    assert "通知" in result.progress[-1].message
+    assert result.progress[-1].stage.value == "INCONCLUSIVE"
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -145,6 +171,9 @@ async def test_in_memory_scheduler_retries_job_while_old_lease_is_active() -> No
 
         def __init__(self) -> None:
             self.calls = 0
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
 
         async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
             self.calls += 1
@@ -180,6 +209,9 @@ async def test_in_memory_scheduler_retries_after_worker_loses_lease() -> None:
 
         def __init__(self) -> None:
             self.calls = 0
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
 
         async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
             self.calls += 1
@@ -225,6 +257,9 @@ async def test_in_memory_scheduler_applies_runtime_worker_concurrency() -> None:
             self.active = 0
             self.max_active = 0
             self.started = 0
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
 
         async def analyze_by_id(self, alert_id):  # type: ignore[no-untyped-def]
             self.active += 1
@@ -320,6 +355,97 @@ async def test_flashduty_poller_recovers_missed_alert_and_deduplicates(
     assert list_payloads[1]["start_time"] == 400
     assert list_payloads[0]["channel_ids"] == [7]
     assert list_payloads[0]["by_updated_at"] is False
+    poll_state = await runtime.repository.get_flashduty_poll_state()
+    assert poll_state.status == FlashDutyPollStatus.SUCCESS
+    assert poll_state.start_time == 400
+    assert poll_state.end_time == 1300
+    assert poll_state.fetched_count == 1
+    assert poll_state.created_count == 0
+    assert poll_state.deduplicated_count == 1
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_flashduty_poller_ingests_without_enqueue_while_dispatch_paused(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        ai_provider="fake",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'paused-poller.db'}",
+        flashduty_enabled=True,
+        flashduty_app_key="test-app-key",
+        flashduty_polling_enabled=True,
+        flashduty_poll_interval_seconds=300,
+        flashduty_poll_lookback_seconds=900,
+        flashduty_poll_channel_ids=[7],
+    )
+    runtime = build_runtime(settings)
+    await runtime.repository.initialize()
+    trigger, _ = await runtime.service.ingest(
+        "canonical",
+        {
+            "external_id": "poll-pause-trigger",
+            "severity": "CRITICAL",
+            "title": "Pause trigger",
+            "reason": "test",
+        },
+    )
+    run = await runtime.repository.create_run(str(trigger.alert.id), "pause-worker", 300)
+    assert run is not None
+    await runtime.repository.pause_analysis_dispatch(
+        ModelFailure(
+            category=ModelFailureCategory.AUTHENTICATION,
+            provider="fake",
+            model="fake-model",
+            pauses_dispatch=True,
+            safe_detail="authentication rejected",
+        ),
+        trigger_run_id=str(run.id),
+        settings_revision="a" * 64,
+    )
+
+    class RecordingClient:
+        async def list_alerts(self, **_payload):  # type: ignore[no-untyped-def]
+            return FlashDutyResponse(
+                "req-list",
+                {
+                    "items": [
+                        {
+                            "alert_id": "763a1b2c3d4e5f6789abcdef",
+                            "title": "Database latency",
+                            "description": "Latency is above threshold",
+                            "alert_severity": "Warning",
+                            "alert_status": "Warning",
+                            "alert_key": "database-latency-paused",
+                            "start_time": 900,
+                            "labels": {"env": "prod", "service": "orders-db"},
+                        }
+                    ],
+                    "total": 1,
+                    "has_next_page": False,
+                },
+            )
+
+    scheduler = ManualAnalysisScheduler()
+    poller = FlashDutyAlertPoller(
+        settings,
+        runtime.service,
+        scheduler,
+        RecordingClient(),  # type: ignore[arg-type]
+    )
+
+    assert await poller.run_once(now=1000) == 1
+    assert scheduler.jobs == []
+    queued = await runtime.service.list_alerts(
+        page=1,
+        page_size=10,
+        statuses={AlertStatus.QUEUED},
+    )
+    assert [item.external_id for item in queued.items] == ["763a1b2c3d4e5f6789abcdef"]
+    poll_state = await runtime.repository.get_flashduty_poll_state()
+    assert poll_state.status == FlashDutyPollStatus.SUCCESS
+    assert poll_state.created_count == 1
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 
@@ -356,6 +482,10 @@ async def test_flashduty_poller_fetches_more_than_100_pages_without_truncation()
     class RecordingService:
         def __init__(self) -> None:
             self.alert_ids: list[str] = []
+            self.repository = PollStateRepository()
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
 
         async def ingest(self, source, payload):  # type: ignore[no-untyped-def]
             assert source == "flashduty"
@@ -384,6 +514,16 @@ async def test_flashduty_poller_fetches_more_than_100_pages_without_truncation()
     assert len(scheduler.jobs) == 101
     assert all(payload["start_time"] == 100 for payload in list_payloads)
     assert all(payload["end_time"] == 1000 for payload in list_payloads)
+    assert service.repository.started == [{"start_time": 100, "end_time": 1000}]
+    assert service.repository.completed == [
+        {
+            "start_time": 100,
+            "end_time": 1000,
+            "fetched_count": 101,
+            "created_count": 101,
+            "deduplicated_count": 0,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -409,18 +549,26 @@ async def test_flashduty_poller_rejects_silently_incomplete_pagination() -> None
             )
 
     class ServiceThatMustNotRun:
+        repository = PollStateRepository()
+
+        async def is_dispatch_enabled(self) -> bool:
+            return True
+
         async def ingest(self, source, payload):  # type: ignore[no-untyped-def]
             raise AssertionError(f"unexpected ingest: {source} {payload}")
 
+    service = ServiceThatMustNotRun()
     poller = FlashDutyAlertPoller(
         settings,
-        ServiceThatMustNotRun(),  # type: ignore[arg-type]
+        service,  # type: ignore[arg-type]
         ManualAnalysisScheduler(),
         IncompleteClient(),  # type: ignore[arg-type]
     )
 
     with pytest.raises(RuntimeError, match="pagination was incomplete"):
         await poller.run_once(now=1000)
+    assert len(service.repository.failed) == 1
+    assert "pagination was incomplete" in str(service.repository.failed[0]["error"])
 
 
 @pytest.mark.asyncio

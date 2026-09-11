@@ -8,15 +8,21 @@ from app.domain.models import (
     AlertListResult,
     AlertStatus,
     AnalysisConfigSnapshot,
-    AnalysisResultEvent,
+    AnalysisDispatchControl,
     DashboardSummary,
+    DispatchValidationResult,
     EvidenceRecord,
+    FlashDutyPollState,
     InvestigationContext,
     InvestigationDecisionResult,
     InvestigationRun,
     InvestigationStage,
     KnowledgeExcerpt,
+    ManagementNotificationEvent,
+    ModelFailure,
     NormalizedAlert,
+    NotificationDelivery,
+    NotificationKind,
     ProgressRecord,
     Recommendation,
     RunStatus,
@@ -83,6 +89,15 @@ class EvidenceRecordConflict(RuntimeError):
         super().__init__(f"Evidence record conflict for {evidence_id}: {detail}")
 
 
+class AnalysisDispatchConflict(RuntimeError):
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Analysis dispatch control changed: expected version {expected}, actual {actual}"
+        )
+
+
 class RunLeaseConflict(RuntimeError):
     """A fenced write could not prove ownership of an active run lease."""
 
@@ -145,6 +160,8 @@ class AIAdvisor(Protocol):
         reasoning_callback: ReasoningTraceCallback | None = None,
     ) -> InvestigationDecisionResult: ...
 
+    async def probe(self) -> AdvisorMetadata: ...
+
     async def advise(
         self,
         alert: NormalizedAlert,
@@ -171,8 +188,9 @@ class ToolResultAnalyzer(Protocol):
         artifact: ArtifactRef,
     ) -> ToolResultAnalysis: ...
 
+
 class ManagementNotifier(Protocol):
-    async def send(self, event: AnalysisResultEvent) -> str | None: ...
+    async def send(self, event: ManagementNotificationEvent) -> str | None: ...
 
 
 class InvestigationTool(Protocol):
@@ -213,6 +231,71 @@ class AlertRepository(Protocol):
     async def ping(self) -> None: ...
 
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int: ...
+
+    async def get_dispatch_control(self) -> AnalysisDispatchControl: ...
+
+    async def pause_analysis_dispatch(
+        self,
+        failure: ModelFailure,
+        *,
+        trigger_run_id: str,
+        settings_revision: str,
+    ) -> AnalysisDispatchControl: ...
+
+    async def record_dispatch_validation(
+        self,
+        *,
+        expected_version: int,
+        validation: DispatchValidationResult,
+    ) -> AnalysisDispatchControl: ...
+
+    async def resume_analysis_dispatch(
+        self,
+        *,
+        expected_version: int,
+        expected_settings_revision: str,
+        resumed_by: str,
+        validation: DispatchValidationResult,
+    ) -> AnalysisDispatchControl: ...
+
+    async def get_flashduty_poll_state(self) -> FlashDutyPollState: ...
+
+    async def record_flashduty_poll_started(self, *, start_time: int, end_time: int) -> None: ...
+
+    async def record_flashduty_poll_completed(
+        self,
+        *,
+        start_time: int,
+        end_time: int,
+        fetched_count: int,
+        created_count: int,
+        deduplicated_count: int,
+    ) -> None: ...
+
+    async def record_flashduty_poll_failed(
+        self, *, start_time: int | None, end_time: int | None, error: str
+    ) -> None: ...
+
+    async def claim_notification_deliveries(
+        self,
+        *,
+        owner: str,
+        limit: int,
+        lease_seconds: int,
+    ) -> list[NotificationDelivery]: ...
+
+    async def complete_notification_delivery(
+        self, delivery_id: str, *, owner: str, message_id: str | None
+    ) -> None: ...
+
+    async def fail_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        owner: str,
+        error: str,
+        unknown_outcome: bool,
+    ) -> None: ...
 
     async def create_or_get(
         self,
@@ -257,6 +340,10 @@ class AlertRepository(Protocol):
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
+        model_failure: ModelFailure | None = None,
+        pause_settings_revision: str | None = None,
+        notification_kind: NotificationKind | None = None,
+        notification_event: dict[str, Any] | None = None,
     ) -> ProgressRecord: ...
 
     async def get(self, alert_id: str, run_id: str | None = None) -> StoredAlert | None: ...

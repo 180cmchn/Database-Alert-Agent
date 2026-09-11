@@ -261,6 +261,73 @@ export interface ValidationRecord {
 
 export type AIProvider = "openai_compatible" | "openai_responses" | "fake";
 
+export interface ModelFailure {
+  category: "AUTHENTICATION" | "AUTHORIZATION" | "QUOTA_EXHAUSTED" | "CONFIGURATION" | "RATE_LIMITED_OR_QUOTA_UNKNOWN" | "PROVIDER_UNAVAILABLE" | "CONNECTION" | "TIMEOUT" | "INVALID_RESPONSE" | "INTERNAL";
+  provider: string;
+  model: string;
+  phase: "react" | "final" | "mcp" | "unknown";
+  retryable: boolean;
+  pauses_dispatch: boolean;
+  http_status?: number | null;
+  vendor_code?: string | null;
+  request_id?: string | null;
+  safe_detail: string;
+  attempts: number;
+  elapsed_ms: number;
+  occurred_at: string;
+}
+export interface DispatchValidationResult {
+  success: boolean;
+  settings_revision: string;
+  provider: string;
+  model: string;
+  detail: string;
+  failure?: ModelFailure | null;
+  validated_at: string;
+  validated_by: string;
+}
+
+export interface AnalysisDispatchControl {
+  state: "ENABLED" | "PAUSED";
+  version: number;
+  reason?: ModelFailure | null;
+  trigger_run_id?: string | null;
+  paused_settings_revision?: string | null;
+  paused_at?: string | null;
+  resumed_at?: string | null;
+  resumed_by?: string | null;
+  last_validation?: DispatchValidationResult | null;
+  updated_at: string;
+}
+
+export interface FlashDutyPollState {
+  status: "NEVER" | "SUCCESS" | "FAILED" | "DISABLED";
+  last_started_at?: string | null;
+  last_completed_at?: string | null;
+  last_error?: string | null;
+  start_time?: number | null;
+  end_time?: number | null;
+  fetched_count: number;
+  created_count: number;
+  deduplicated_count: number;
+  updated_at: string;
+}
+
+export interface AnalysisDispatchStatus {
+  dispatch: AnalysisDispatchControl;
+  flashduty_poll: FlashDutyPollState;
+  flashduty_polling_enabled: boolean;
+  pending_count: number;
+  runtime_settings_revision: string;
+  ai_settings_revision: string;
+}
+
+export interface ValidateAndResumeDispatchResponse extends AnalysisDispatchStatus {
+  validation_succeeded: boolean;
+  resumed: boolean;
+  republished_count: number;
+}
+
 export interface AnalysisConfigSnapshot {
   knowledge_sources: string[];
   external_knowledge_enabled: boolean;
@@ -273,6 +340,7 @@ export interface AnalysisConfigSnapshot {
   stream_main_agent_reasoning: boolean;
   ai_model: string;
   ai_provider: string;
+  ai_settings_revision: string;
 }
 
 export interface InvestigationRun {
@@ -282,6 +350,7 @@ export interface InvestigationRun {
   status: "RUNNING" | "COMPLETED" | "INCONCLUSIVE" | "FAILED" | "CANCELLED";
   current_stage: InvestigationStage;
   error?: string | null;
+  model_failure?: ModelFailure | null;
   cancel_requested_at?: string | null;
   cancel_requested_by?: string | null;
   cancelled_at?: string | null;

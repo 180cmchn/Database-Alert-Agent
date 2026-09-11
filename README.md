@@ -25,6 +25,18 @@ Database Alert Agent 轮询 FlashDuty 协作空间中的数据库告警，去重
    调查并生成结论；程序随后只校验输出结构、证据引用与来源资格，不调用第二个模型判断或否决根因。
    整次分析还受 `ANALYSIS_TIMEOUT_SECONDS` 和主动取消控制。
 
+### 失败、恢复与显式重分析
+
+- 自动调度只处理 `RECEIVED` 和 `QUEUED`。`FAILED`、`CANCELLED` 以及已有业务结论的告警都是终态；
+  FlashDuty 重叠轮询、Redis redelivery、进程重启和过期租约恢复都不会为 `FAILED` 自动创建新 attempt。
+- 只有 manifest 兼容且 checkpoint 完整的过期运行会在**同一个 run** 内恢复。checkpoint 缺失、损坏或不兼容时，
+  原 run 以 `FAILED` 结束；之后只能由管理员显式调用 reanalysis。
+- 模型错误按状态码和供应商错误码结构化分类。确认的认证、授权、额度/计费或模型配置错误会持久暂停分析调度；
+  未确认语义的 HTTP 429、5xx、连接错误和超时采用有界重试，但不会被误判为额度耗尽或自动暂停。
+- 调度暂停不停止 FlashDuty 轮询、去重和入库；新告警保留在待执行队列。保存设置、重启、等待或轮询成功
+  都不会清除暂停。管理员必须针对当前模型配置和调度版本执行“验证模型并恢复调度”。验证成功只补投
+  `RECEIVED`/`QUEUED`，历史 `FAILED` 仍需逐条显式重分析。
+
 调查主图：
 
 ```text
@@ -40,6 +52,20 @@ START -> enrich_alert -> fingerprint -> knowledge -> react_decide
 上限不是错误；主 Agent 基于已有 observation 正常输出最终结论。运行时记录的
 `planner_requests`、`accepted_decisions`、`remote_tool_calls`、`host_bootstrap_calls`、
 `session_attempts` 和 `model_tokens` 仅用于审计累计，配置或历史检查点中的同名 limit 不会终止分析。
+
+### 企微通知卡片
+
+企微原生 `text_notice` 卡片的标题先脱敏并折叠空白。不超过 26 个字符时保留原标题；长标题
+改用有效且不超过 26 个字符的 `alert_name`，短名为空、为 `unknown`（忽略大小写）或过长时
+显示“数据库告警分析”。脱敏后的完整长标题优先放入正文，再用剩余空间分行展示告警原因。
+正文总计不超过 112 个字符，原因摘要超出剩余空间时以“…”结尾；标题行本身超长时以
+“（完整标题见详情）”明确提示省略，可通过现有卡片入口查看完整标题。原始告警数据不改写。
+
+26/112 字符是发送端的展示预算，不是客户端宽度或字号自适应保证；实际换行和裁切仍需在
+企微桌面端、手机窄屏及大字体设置下验收。成功/结论不充分卡片保留事实与分析入口；执行失败使用独立的
+确定性卡片，只展示结构化供应商故障和失败详情，不依赖模型生成的 `Recommendation`，也不输出推测性
+根因或处置建议。通知意图与分析终态原子落库；明确发送失败最多投递三次，网络超时等结果不确定的发送
+标记为 `UNKNOWN`，不会盲目重复发送。
 
 ## 实时 Agent 轨迹
 
@@ -542,6 +568,8 @@ Alembic 使用完全一致的值，再启动服务并检查 `/health/ready`。�
 - `POST /api/v1/alerts/{alert_id}/reanalyze`：使用当前配置创建新的分析运行。
 - `POST /api/v1/admin/flashduty/poll`：管理员手动执行一轮 FlashDuty 拉取、去重和调度。
 - `GET|PATCH /api/v1/admin/settings`：查看或更新允许在线维护的运行配置。
+- `GET /api/v1/admin/analysis-dispatch`：读取持久化调度状态、暂停原因、最近模型验证、FlashDuty 最近轮询状态和待执行数量。
+- `POST /api/v1/admin/analysis-dispatch/validate-and-resume`：按调度版本和当前模型配置指纹验证模型；仅验证成功时恢复并补投待执行告警。
 - `GET /health/live`、`GET /health/ready`：存活和就绪检查。
 
 管理员接口使用：
@@ -568,8 +596,9 @@ python tools/evaluate_production_gates.py \
   --enforce-gates
 ```
 
-离线测试使用 fake client、Replay MCP 和临时数据库，不访问内网 MCP。重点覆盖 ReAct 正常 `finish`、
-轮次上限、整次超时、主动取消、checkpoint 恢复、确定性结果投影、artifact 追溯及前端增量轨迹。
+离线测试使用 fake client、Replay MCP 和临时数据库，不访问真实模型、FlashDuty、MCP 或企微。重点覆盖
+ReAct 正常 `finish`、轮次上限、整次超时、主动取消、同 run checkpoint 恢复、模型故障分类、持久调度
+暂停、显式验证恢复、确定性结果投影、通知补发、artifact 追溯及前端增量轨迹。
 
 生产部署应把 `APP_CODE_VERSION` 设置为不可变镜像摘要或 Git revision，并让同一批 API 与 Worker 使用
 一致值。数据库升级使用 Alembic；生产升级前停止服务并备份数据库。

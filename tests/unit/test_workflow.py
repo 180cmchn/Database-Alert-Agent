@@ -17,18 +17,21 @@ from app.application.evidence_context import model_evidence_payload
 from app.application.factory import apply_runtime_settings, build_runtime
 from app.application.validation import enforce_post_evidence_root_cause_policy
 from app.config import Settings
-from app.domain.errors import AdvisorError, AnalysisFailedError
+from app.domain.errors import AdvisorError, AnalysisDispatchPausedError, AnalysisFailedError
 from app.domain.models import (
     EVIDENCE_RECORD_V2,
     AdvisorMetadata,
     AlertStatus,
     AnalysisBasis,
     AnalysisBasisSource,
+    AnalysisDispatchState,
     DatabaseTarget,
     EvidenceUnitStatus,
     InvestigationDecision,
     InvestigationDecisionResult,
     InvestigationStage,
+    ModelFailure,
+    ModelFailureCategory,
     Recommendation,
     RecommendationStep,
     RootCauseAnalysisStep,
@@ -543,6 +546,48 @@ class FlakyAdvisor(FakeAIAdvisor):
         )
 
 
+class PausingAdvisor(FakeAIAdvisor):
+    def __init__(self, *, release: asyncio.Event | None = None) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = release
+
+    async def advise(  # type: ignore[no-untyped-def]
+        self,
+        alert,
+        knowledge,
+        evidence=None,
+        knowledge_match_summary="",
+    ):
+        del alert, knowledge, evidence, knowledge_match_summary
+        self.calls += 1
+        self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        raise AdvisorError(
+            "confirmed quota failure",
+            failure=ModelFailure(
+                category=ModelFailureCategory.QUOTA_EXHAUSTED,
+                provider=self.provider,
+                model=self.model,
+                phase="final",
+                pauses_dispatch=True,
+                http_status=429,
+                vendor_code="insufficient_quota",
+                safe_detail="confirmed quota failure",
+            ),
+        )
+
+
+class EventKindNotifier:
+    def __init__(self) -> None:
+        self.kinds: list[str] = []
+
+    async def send(self, event):  # type: ignore[no-untyped-def]
+        self.kinds.append(type(event).__name__)
+        return "recorded"
+
+
 class RecordingMCPStyleTool:
     name = "mcp_style_probe"
     source_system = "test_mcp"
@@ -825,7 +870,7 @@ async def test_wecom_send_failure_does_not_change_analysis_status(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Path) -> None:
+async def test_failed_analysis_requires_explicit_reanalysis(tmp_path: Path) -> None:
     events: list[str] = []
     advisor = FlakyAdvisor()
     settings = settings_for(tmp_path).model_copy(update={"ai_fallback_enabled": False})
@@ -849,11 +894,106 @@ async def test_failed_analysis_can_be_retried_then_sends_one_result(tmp_path: Pa
     assert failed.error is not None
     assert "AI advisor failed: AdvisorError: temporary failure" in failed.error
 
-    result = await runtime.service.analyze("canonical", payload, retry_failed=True)
+    unchanged = await runtime.service.analyze("canonical", payload)
+    assert unchanged.status == AlertStatus.FAILED
+    assert advisor.calls == 1
+    assert events == ["RESULT:CRITICAL"]
+
+    run, _snapshot = await runtime.service.reanalyze(exc_info.value.alert_id)
+    reanalysis_task = next(
+        task
+        for task in runtime.service._background_tasks
+        if task.get_name() == f"reanalyze-{run.id}"
+    )
+    await reanalysis_task
+    result = await runtime.service.get(exc_info.value.alert_id)
 
     assert result.status == AlertStatus.INCONCLUSIVE
     assert advisor.calls == 2
-    assert events == ["RESULT:CRITICAL"]
+    assert events == ["RESULT:CRITICAL", "RESULT:CRITICAL"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_model_failure_pauses_dispatch_and_preserves_failure(
+    tmp_path: Path,
+) -> None:
+    notifier = EventKindNotifier()
+    runtime = build_runtime(
+        settings_for(tmp_path),
+        advisor=PausingAdvisor(),
+        notifier=notifier,
+    )
+    await runtime.repository.initialize()
+
+    result = await runtime.service.analyze(
+        "canonical",
+        {
+            "external_id": "quota-pauses-dispatch",
+            "severity": "CRITICAL",
+            "title": "Provider quota",
+            "reason": "test",
+        },
+    )
+
+    assert result.status == AlertStatus.INCONCLUSIVE
+    assert result.latest_run is not None
+    assert result.latest_run.model_failure is not None
+    assert result.latest_run.model_failure.category == ModelFailureCategory.QUOTA_EXHAUSTED
+    control = await runtime.repository.get_dispatch_control()
+    assert control.state == AnalysisDispatchState.PAUSED
+    assert control.reason == result.latest_run.model_failure
+    assert notifier.kinds == ["AnalysisFailureEvent"]
+
+    with pytest.raises(AnalysisDispatchPausedError):
+        await runtime.service.analyze(
+            "canonical",
+            {
+                "external_id": "queued-while-paused",
+                "severity": "WARNING",
+                "title": "Still ingest this alert",
+                "reason": "test",
+            },
+        )
+    queued = await runtime.service.list_alerts(
+        page=1,
+        page_size=10,
+        statuses={AlertStatus.QUEUED},
+    )
+    assert [item.external_id for item in queued.items] == ["queued-while-paused"]
+    await runtime.repository.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stale_inflight_provider_failure_does_not_pause_new_settings(
+    tmp_path: Path,
+) -> None:
+    release = asyncio.Event()
+    advisor = PausingAdvisor(release=release)
+    runtime = build_runtime(settings_for(tmp_path), advisor=advisor)
+    await runtime.repository.initialize()
+    analysis = asyncio.create_task(
+        runtime.service.analyze(
+            "canonical",
+            {
+                "external_id": "stale-provider-failure",
+                "severity": "CRITICAL",
+                "title": "Provider quota",
+                "reason": "test",
+            },
+        )
+    )
+    await advisor.started.wait()
+    runtime.service.runtime_manifest_config["ai_settings_revision"] = "f" * 64
+    release.set()
+
+    result = await analysis
+
+    assert result.latest_run is not None
+    assert result.latest_run.model_failure is not None
+    assert result.latest_run.model_failure.pauses_dispatch is True
+    control = await runtime.repository.get_dispatch_control()
+    assert control.state == AnalysisDispatchState.ENABLED
     await runtime.repository.close()  # type: ignore[attr-defined]
 
 

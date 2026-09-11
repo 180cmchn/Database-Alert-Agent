@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -10,6 +11,7 @@ import pytest
 from app.adapters.notification import (
     LogManagementNotifier,
     WeComManagementNotifier,
+    build_wecom_failure_card,
     build_wecom_template_card,
 )
 from app.domain.errors import NotificationError
@@ -17,16 +19,21 @@ from app.domain.models import (
     AlertStatus,
     AnalysisBasis,
     AnalysisBasisSource,
+    AnalysisFailureEvent,
     AnalysisResultEvent,
     DatabaseTarget,
     KnowledgeExcerpt,
     KnowledgeReference,
+    ModelFailure,
+    ModelFailureCategory,
     NormalizedAlert,
     Recommendation,
     RecommendationStep,
     Severity,
 )
 from app.logging_config import configure_logging
+
+MONGODB_MEMORY_TITLE = "MongoDBHostMemoryLow / 10.126.53.39:9100"
 
 
 def analysis_result_event(*, title: str = "数据库连接数接近上限") -> AnalysisResultEvent:
@@ -96,26 +103,88 @@ def analysis_result_event(*, title: str = "数据库连接数接近上限") -> A
     )
 
 
-def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
-    event = analysis_result_event()
+def analysis_failure_event() -> AnalysisFailureEvent:
+    result = analysis_result_event()
+    return AnalysisFailureEvent(
+        alert=result.alert,
+        status=AlertStatus.FAILED,
+        message="Authorization: Bearer must-not-appear",
+        run_id=uuid4(),
+        failure=ModelFailure(
+            category=ModelFailureCategory.AUTHORIZATION,
+            provider="openai_compatible",
+            model="analysis-model",
+            phase="final",
+            pauses_dispatch=True,
+            http_status=403,
+            vendor_code="permission_denied",
+            request_id="provider-request-1",
+            safe_detail="forbidden",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "alert_name", "expected_title", "expected_subtitle"),
+    [
+        (
+            "数据库连接数接近上限",
+            None,
+            "数据库连接数接近上限",
+            "告警原因：connection_exhausted",
+        ),
+        (
+            MONGODB_MEMORY_TITLE,
+            "MongoDBHostMemoryLow",
+            "MongoDBHostMemoryLow",
+            f"告警标题：{MONGODB_MEMORY_TITLE}\n告警原因：connection_exhausted",
+        ),
+        (
+            MONGODB_MEMORY_TITLE,
+            None,
+            "数据库告警分析",
+            f"告警标题：{MONGODB_MEMORY_TITLE}\n告警原因：connection_exhausted",
+        ),
+    ],
+    ids=["short-title", "mongodb-alert-name", "mongodb-default-unknown"],
+)
+def test_wecom_card_contains_alert_facts_and_exactly_two_actions(
+    title: str,
+    alert_name: str | None,
+    expected_title: str,
+    expected_subtitle: str,
+) -> None:
+    event = analysis_result_event(title=title)
+    if alert_name is not None:
+        event.alert.alert_name = alert_name
+    original_alert = event.alert.model_dump()
     card = build_wecom_template_card(
         event,
         page_base_url="https://alerts.intra.example.com",
     )
 
     assert card["card_type"] == "text_notice"
-    assert card["main_title"]["title"] == "数据库连接数接近上限"
+    assert card["main_title"]["title"] == expected_title
     assert card["main_title"]["desc"] == "2026-09-04 04:15:30（北京时间）"
-    facts = {item["keyname"]: item["value"] for item in card["horizontal_content_list"]}
-    assert facts["告警级别"] == "严重 / CRITICAL"
-    assert facts["告警主机"] == "db-orders.internal"
-    assert facts["数据库"] == "postgresql"
+    assert card["sub_title_text"] == expected_subtitle
+    assert card["source"] == {"desc": "数据库告警 Agent", "desc_color": 2}
+    assert card["emphasis_content"] == {"title": "CRITICAL", "desc": "分析完成"}
+    assert card["horizontal_content_list"] == [
+        {"keyname": "告警级别", "value": "严重 / CRITICAL"},
+        {"keyname": "告警主机", "value": "db-orders.internal"},
+        {"keyname": "数据库", "value": "postgresql"},
+        {"keyname": "环境", "value": "production"},
+        {"keyname": "服务", "value": "orders-api"},
+        {"keyname": "外部ID", "value": "wecom-test-1"},
+    ]
+    assert event.alert.model_dump() == original_alert
 
     actions = card["jump_list"]
     assert [item["title"] for item in actions] == [
         "AI 分析结论",
         "告警恢复建议",
     ]
+    assert [item["type"] for item in actions] == [1, 1]
     assert actions[0]["url"] == (
         f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}/root-cause"
         f"?run_id={event.run_id}"
@@ -127,14 +196,164 @@ def test_wecom_card_contains_alert_facts_and_exactly_two_actions() -> None:
     assert card["card_action"] == {
         "type": 1,
         "url": (
-            f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}"
-            f"?run_id={event.run_id}"
+            f"https://alerts.intra.example.com/wecom/alerts/{event.alert.id}?run_id={event.run_id}"
         ),
     }
 
 
+@pytest.mark.parametrize(
+    ("title", "expected_title", "expected_subtitle"),
+    [
+        ("数据库连接数接近上限", "数据库连接数接近上限", "告警原因：connection_exhausted"),
+        ("", "未提供", "告警原因：connection_exhausted"),
+        (" \n\t ", "未提供", "告警原因：connection_exhausted"),
+        ("A" * 26, "A" * 26, "告警原因：connection_exhausted"),
+        ("A" * 27, "OtherAlert", f"告警标题：{'A' * 27}\n告警原因：connection_exhausted"),
+        ("中" * 27, "OtherAlert", f"告警标题：{'中' * 27}\n告警原因：connection_exhausted"),
+        (
+            "DB数据库" * 6,
+            "OtherAlert",
+            f"告警标题：{'DB数据库' * 6}\n告警原因：connection_exhausted",
+        ),
+        (
+            f"{' ' * 30}数据库\n\t 告警  ",
+            "数据库 告警",
+            "告警原因：connection_exhausted",
+        ),
+        (
+            "token=very-long-secret-that-must-be-redacted",
+            "token=***REDACTED***",
+            "告警原因：connection_exhausted",
+        ),
+        (
+            "数据库连接异常 token=x",
+            "OtherAlert",
+            "告警标题：数据库连接异常 token=***REDACTED***\n告警原因：connection_exhausted",
+        ),
+    ],
+    ids=[
+        "short-title-wins",
+        "empty-title",
+        "blank-title",
+        "title-26",
+        "english-title-27",
+        "chinese-title-27",
+        "mixed-long-title",
+        "collapse-before-measuring",
+        "redaction-shortens-title",
+        "redaction-expands-title-to-27",
+    ],
+)
+def test_wecom_card_selects_title_after_sanitizing(
+    title: str,
+    expected_title: str,
+    expected_subtitle: str,
+) -> None:
+    event = analysis_result_event(title=title)
+    event.alert.alert_name = "OtherAlert"
+
+    card = build_wecom_template_card(event, page_base_url="https://alerts.intra.example.com")
+
+    assert card["main_title"]["title"] == expected_title
+    assert card["sub_title_text"] == expected_subtitle
+    assert event.alert.title == title
+
+
+@pytest.mark.parametrize(
+    ("alert_name", "expected_title"),
+    [
+        ("", "数据库告警分析"),
+        (" \n\t ", "数据库告警分析"),
+        ("unknown", "数据库告警分析"),
+        ("UNKNOWN", "数据库告警分析"),
+        (" \tUnKnOwN\n", "数据库告警分析"),
+        ("名" * 26, "名" * 26),
+        ("名" * 27, "数据库告警分析"),
+        (f"{' ' * 30}MongoDBHostMemoryLow\n", "MongoDBHostMemoryLow"),
+        ("token=very-long-secret-that-must-be-redacted", "token=***REDACTED***"),
+        ("数据库连接异常 token=x", "数据库告警分析"),
+    ],
+    ids=[
+        "empty",
+        "blank",
+        "unknown",
+        "uppercase-unknown",
+        "cleaned-mixed-case-unknown",
+        "name-26",
+        "name-27",
+        "collapse-before-measuring",
+        "redaction-shortens-name",
+        "redaction-expands-name-to-27",
+    ],
+)
+def test_wecom_card_uses_only_valid_short_alert_names(
+    alert_name: str,
+    expected_title: str,
+) -> None:
+    event = analysis_result_event(title=MONGODB_MEMORY_TITLE)
+    event.alert.alert_name = alert_name
+    event.alert.database = None
+    original_alert = event.alert.model_dump()
+
+    card = build_wecom_template_card(event, page_base_url="https://alerts.intra.example.com")
+
+    assert card["main_title"]["title"] == expected_title
+    assert card["sub_title_text"] == (
+        f"告警标题：{MONGODB_MEMORY_TITLE}\n告警原因：connection_exhausted"
+    )
+    facts = {item["keyname"]: item["value"] for item in card["horizontal_content_list"]}
+    assert facts["告警主机"] == "未提供"
+    assert facts["数据库"] == "未提供"
+    assert event.alert.model_dump() == original_alert
+
+
+@pytest.mark.parametrize(
+    ("title", "reason", "expected_subtitle"),
+    [
+        ("中" * 107, "原因", f"告警标题：{'中' * 107}"),
+        ("中" * 108, "原因", f"告警标题：{'中' * 97}…（完整标题见详情）"),
+        ("中" * 101, "原因", f"告警标题：{'中' * 101}"),
+        ("中" * 100, "因", f"告警标题：{'中' * 100}\n告警原因：因"),
+        ("中" * 100, "原因", f"告警标题：{'中' * 100}\n告警原因：…"),
+        ("中" * 99, "原因长", f"告警标题：{'中' * 99}\n告警原因：原…"),
+        (MONGODB_MEMORY_TITLE, "", f"告警标题：{MONGODB_MEMORY_TITLE}"),
+        (MONGODB_MEMORY_TITLE, " \n\t ", f"告警标题：{MONGODB_MEMORY_TITLE}"),
+        ("短标题", "因" * 120, f"告警原因：{'因' * 107}"),
+    ],
+    ids=[
+        "title-line-112",
+        "title-line-113-has-detail-marker",
+        "reason-prefix-only-is-omitted",
+        "one-reason-character-fits",
+        "one-character-budget-uses-ellipsis",
+        "reason-is-truncated-with-ellipsis",
+        "empty-reason-is-omitted",
+        "blank-reason-is-omitted",
+        "short-title-keeps-existing-reason-limit",
+    ],
+)
+def test_wecom_card_preserves_title_within_body_budget(
+    title: str,
+    reason: str,
+    expected_subtitle: str,
+) -> None:
+    event = analysis_result_event(title=title)
+    event.alert.reason = reason
+
+    card = build_wecom_template_card(event, page_base_url="https://alerts.intra.example.com")
+
+    assert card["sub_title_text"] == expected_subtitle
+    assert len(card["sub_title_text"]) <= 112
+    assert event.alert.title == title
+
+
 def test_wecom_card_sanitizes_and_bounds_text_fields() -> None:
-    event = analysis_result_event(title=f"token=must-not-appear {'连接异常' * 20}")
+    event = analysis_result_event(
+        title="数据库连接异常告警\tAuthorization: title-secret",
+    )
+    event.alert.alert_name = "token=short-secret"
+    event.alert.reason = "password=reason-secret\n重试\t稍后"
+    original_alert = event.alert.model_dump()
     card = build_wecom_template_card(
         event,
         page_base_url="https://alerts.intra.example.com",
@@ -142,10 +361,61 @@ def test_wecom_card_sanitizes_and_bounds_text_fields() -> None:
 
     serialized = str(card)
     assert "must-not-appear" not in serialized
+    assert "title-secret" not in serialized
+    assert "short-secret" not in serialized
+    assert "reason-secret" not in serialized
     assert "***REDACTED***" in serialized
+    assert card["main_title"]["title"] == "token=***REDACTED***"
+    assert card["sub_title_text"] == (
+        "告警标题：数据库连接异常告警 Authorization=***REDACTED***"
+        "\n告警原因：password=***REDACTED*** 重试 稍后"
+    )
+    assert event.alert.model_dump() == original_alert
     assert len(card["main_title"]["title"]) <= 26
     assert len(card["sub_title_text"]) <= 112
     assert all(len(item["value"]) <= 26 for item in card["horizontal_content_list"])
+
+
+def test_wecom_failure_card_is_deterministic_and_contains_no_recommendation() -> None:
+    event = analysis_failure_event()
+
+    card = build_wecom_failure_card(
+        event,
+        page_base_url="https://alerts.intra.example.com",
+    )
+
+    serialized = json.dumps(card, ensure_ascii=False)
+    assert card["main_title"]["title"] == "数据库告警分析失败"
+    assert card["emphasis_content"] == {
+        "title": "AUTHORIZATION",
+        "desc": "分析调度已暂停",
+    }
+    assert "HTTP 403 / permission_denied" in serialized
+    assert "must-not-appear" not in serialized
+    assert "recommendation" not in serialized.casefold()
+    assert "root cause" not in serialized.casefold()
+
+
+@pytest.mark.asyncio
+async def test_wecom_failure_notification_uses_run_scoped_failure_key() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok", "msgid": "failure-1"})
+
+    event = analysis_failure_event()
+    notifier = WeComManagementNotifier(
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
+        "https://alerts.intra.example.com",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await notifier.send(event) == "failure-1"
+    assert requests[0].headers["idempotency-key"] == (
+        f"{event.alert.id}:{event.run_id}:analysis_failure"
+    )
+    assert requests[0].headers["x-analysis-status"] == "FAILED"
 
 
 @pytest.mark.asyncio
@@ -166,7 +436,36 @@ async def test_log_notifier_records_only_delivery_metadata(
 
 
 @pytest.mark.asyncio
-async def test_wecom_notifier_sends_one_template_card() -> None:
+@pytest.mark.parametrize(
+    ("title", "alert_name", "expected_title", "expected_subtitle"),
+    [
+        (
+            "数据库连接数接近上限",
+            None,
+            "数据库连接数接近上限",
+            "告警原因：connection_exhausted",
+        ),
+        (
+            MONGODB_MEMORY_TITLE,
+            "MongoDBHostMemoryLow",
+            "MongoDBHostMemoryLow",
+            f"告警标题：{MONGODB_MEMORY_TITLE}\n告警原因：connection_exhausted",
+        ),
+        (
+            MONGODB_MEMORY_TITLE,
+            None,
+            "数据库告警分析",
+            f"告警标题：{MONGODB_MEMORY_TITLE}\n告警原因：connection_exhausted",
+        ),
+    ],
+    ids=["short-title", "mongodb-alert-name", "mongodb-default-unknown"],
+)
+async def test_wecom_notifier_sends_one_template_card(
+    title: str,
+    alert_name: str | None,
+    expected_title: str,
+    expected_subtitle: str,
+) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -176,7 +475,9 @@ async def test_wecom_notifier_sends_one_template_card() -> None:
             json={"errcode": 0, "errmsg": "ok", "msgid": "wecom-message-1"},
         )
 
-    event = analysis_result_event()
+    event = analysis_result_event(title=title)
+    if alert_name is not None:
+        event.alert.alert_name = alert_name
     notifier = WeComManagementNotifier(
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret-key",
         "https://alerts.intra.example.com",
@@ -190,10 +491,18 @@ async def test_wecom_notifier_sends_one_template_card() -> None:
     request = requests[0]
     assert request.headers["x-alert-id"] == str(event.alert.id)
     assert request.headers["x-analysis-status"] == "COMPLETED"
-    assert request.headers["idempotency-key"] == f"{event.alert.id}:analysis-result"
+    assert request.headers["idempotency-key"] == (
+        f"{event.alert.id}:{event.run_id}:analysis_result"
+    )
     assert b'"msgtype":"template_card"' in request.content
     assert b'"card_type":"text_notice"' in request.content
     assert request.content.count(b'"title":"') >= 3
+    payload = json.loads(request.content)
+    assert payload["msgtype"] == "template_card"
+    assert payload["template_card"]["main_title"]["title"] == expected_title
+    assert payload["template_card"]["sub_title_text"] == expected_subtitle
+    assert "must-not-appear" not in request.content.decode()
+    assert event.alert.title == title
 
 
 @pytest.mark.asyncio

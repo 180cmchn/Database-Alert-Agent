@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from app.adapters.ai import (
+    AI_PROVIDER_MAX_ATTEMPTS,
     PROMPT_VERSION,
     ConservativeFallbackAdvisor,
     FakeAIAdvisor,
@@ -83,6 +86,24 @@ def _flashduty_tool_timeout(settings: Settings) -> float:
     )
 
 
+def ai_settings_revision(settings: Settings) -> str:
+    payload = {
+        "provider": settings.ai_provider,
+        "base_url": settings.ai_base_url.rstrip("/"),
+        "model": settings.ai_model,
+        "react_model": settings.ai_react_model,
+        "mcp_model": settings.ai_mcp_model,
+        "json_mode": settings.ai_json_mode,
+        "reasoning_effort": settings.ai_reasoning_effort,
+        "react_reasoning_effort": settings.ai_react_reasoning_effort,
+        "mcp_reasoning_effort": settings.ai_mcp_reasoning_effort,
+        "max_tokens": settings.ai_max_tokens,
+        "api_key_hash": hashlib.sha256(settings.ai_api_key.encode("utf-8")).hexdigest(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
     """Return non-secret runtime values that must be frozen per investigation."""
 
@@ -91,12 +112,14 @@ def _runtime_manifest_config(settings: Settings) -> dict[str, object]:
         "prompt_version": PROMPT_VERSION,
         "ai_timeout_seconds": settings.ai_timeout_seconds,
         "ai_max_tokens": settings.ai_max_tokens,
+        "ai_provider_max_attempts": AI_PROVIDER_MAX_ATTEMPTS,
         "analysis_timeout_seconds": settings.analysis_timeout_seconds,
         "prometheus_mcp_timeout_seconds": settings.prometheus_mcp_timeout_seconds,
         "prometheus_investigation_budget_seconds": (
             settings.prometheus_investigation_budget_seconds
         ),
         "prometheus_mcp_tool_timeout_seconds": settings.prometheus_mcp_tool_timeout_seconds,
+        "ai_settings_revision": ai_settings_revision(settings),
     }
 
 
@@ -428,9 +451,7 @@ def apply_runtime_settings(runtime: Runtime, settings: Settings) -> None:
     service.react_max_rounds = settings.react_max_rounds
     service.analysis_timeout_seconds = settings.analysis_timeout_seconds
     service.alert_analysis_filter_enabled = settings.alert_analysis_filter_enabled
-    service.alert_analysis_filter_severities = frozenset(
-        settings.alert_analysis_filter_severities
-    )
+    service.alert_analysis_filter_severities = frozenset(settings.alert_analysis_filter_severities)
     service.ai_fallback_enabled = settings.ai_fallback_enabled
     service.stream_main_agent_reasoning = settings.stream_main_agent_reasoning
     service.external_knowledge_min_relevance = settings.external_knowledge_min_relevance

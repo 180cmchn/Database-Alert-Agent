@@ -14,6 +14,7 @@ from app.adapters.persistence import (
     AgentArtifactRow,
     AgentCheckpointRow,
     InvestigationRunRow,
+    NotificationDeliveryRow,
     SQLAlchemyAlertRepository,
     ToolInvocationRow,
 )
@@ -34,11 +35,17 @@ from app.domain.models import (
     EVIDENCE_RECORD_V2,
     AlertStatus,
     AnalysisConfigSnapshot,
+    AnalysisDispatchState,
+    AnalysisFailureEvent,
     EvidenceRecord,
     EvidenceUnit,
     EvidenceUnitKind,
     EvidenceUnitStatus,
     InvestigationStage,
+    ModelFailure,
+    ModelFailureCategory,
+    NotificationDeliveryStatus,
+    NotificationKind,
     ProgressRecord,
     RunStatus,
     ToolStatus,
@@ -107,11 +114,7 @@ async def test_update_alert_requires_active_run_lease(tmp_path: Path) -> None:
     run = await repository.create_run(str(alert.id), "detail-worker", 300)
     assert run is not None
     enriched = alert.model_copy(
-        update={
-            "database": alert.database.model_copy(
-                update={"host": "detail-host", "port": 3306}
-            )
-        }
+        update={"database": alert.database.model_copy(update={"host": "detail-host", "port": 3306})}
     )
 
     with pytest.raises(RunLeaseConflict):
@@ -210,7 +213,12 @@ async def test_run_lease_renewal_requires_current_owner_and_fencing_token(
         ),
         error="test setup",
     )
-    second = await repository.create_run(str(stored.alert.id), "worker-b", 30)
+    second = await repository.create_run_for_reanalyze(
+        str(stored.alert.id),
+        "worker-b",
+        30,
+        AnalysisConfigSnapshot(),
+    )
     assert second is not None
     assert second.fencing_token == second.attempt == 2
 
@@ -262,6 +270,204 @@ async def test_run_lease_renewal_requires_current_owner_and_fencing_token(
     assert unchanged is not None
     assert unchanged.latest_run is not None
     assert unchanged.latest_run.current_stage == InvestigationStage.INVESTIGATING
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_notification_and_dispatch_pause_survive_restart(tmp_path: Path) -> None:
+    database = tmp_path / "notification-restart.db"
+    repository = SQLAlchemyAlertRepository(sqlite_url(database))
+    await repository.initialize()
+    alert = CanonicalAlertSourceAdapter().normalize(
+        {
+            "external_id": "notification-restart",
+            "severity": "CRITICAL",
+            "title": "Provider quota failure",
+            "reason": "persistence contract",
+        }
+    )
+    stored, _ = await repository.create_or_get(alert)
+    run = await repository.create_run(str(stored.alert.id), "worker-a", 300)
+    assert run is not None
+    failure = ModelFailure(
+        category=ModelFailureCategory.QUOTA_EXHAUSTED,
+        provider="openai_compatible",
+        model="analysis-model",
+        phase="final",
+        pauses_dispatch=True,
+        http_status=429,
+        vendor_code="insufficient_quota",
+        safe_detail="confirmed quota exhaustion",
+    )
+    event = AnalysisFailureEvent(
+        alert=stored.alert,
+        status=AlertStatus.FAILED,
+        message="Model provider failure",
+        run_id=run.id,
+        failure=failure,
+    )
+    await repository.finalize_run(
+        str(stored.alert.id),
+        str(run.id),
+        lease_owner="worker-a",
+        fencing_token=run.fencing_token,
+        run_status=RunStatus.FAILED,
+        final_stage=InvestigationStage.FAILED,
+        alert_status=AlertStatus.FAILED,
+        progress=ProgressRecord(
+            run_id=run.id,
+            stage=InvestigationStage.FAILED,
+            message="分析失败。",
+        ),
+        error="Model provider failure",
+        model_failure=failure,
+        pause_settings_revision="a" * 64,
+        notification_kind=NotificationKind.ANALYSIS_FAILURE,
+        notification_event=event.model_dump(mode="json"),
+    )
+    await repository.close()
+
+    restarted = SQLAlchemyAlertRepository(sqlite_url(database))
+    await restarted.initialize()
+    control = await restarted.get_dispatch_control()
+    assert control.state == AnalysisDispatchState.PAUSED
+    assert control.reason == failure
+    deliveries = await restarted.claim_notification_deliveries(
+        owner="restart-worker",
+        limit=10,
+        lease_seconds=60,
+    )
+    assert len(deliveries) == 1
+    assert deliveries[0].kind == NotificationKind.ANALYSIS_FAILURE
+    assert deliveries[0].attempts == 1
+    assert AnalysisFailureEvent.model_validate(deliveries[0].event) == event
+    await restarted.complete_notification_delivery(
+        str(deliveries[0].id),
+        owner="restart-worker",
+        message_id="wecom-1",
+    )
+    assert (
+        await restarted.claim_notification_deliveries(
+            owner="restart-worker-2",
+            limit=10,
+            lease_seconds=60,
+        )
+        == []
+    )
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_failures_are_bounded_and_unknown_outcomes_are_not_retried(
+    tmp_path: Path,
+) -> None:
+    repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "notification-retries.db"))
+    await repository.initialize()
+
+    async def queue_delivery(external_id: str) -> str:
+        alert = CanonicalAlertSourceAdapter().normalize(
+            {
+                "external_id": external_id,
+                "severity": "WARNING",
+                "title": "Notification retry",
+                "reason": "persistence contract",
+            }
+        )
+        stored, _ = await repository.create_or_get(alert)
+        run = await repository.create_run(str(stored.alert.id), f"worker-{external_id}", 300)
+        assert run is not None
+        failure = ModelFailure(
+            category=ModelFailureCategory.INTERNAL,
+            provider="internal",
+            safe_detail="analysis failed",
+        )
+        event = AnalysisFailureEvent(
+            alert=stored.alert,
+            status=AlertStatus.FAILED,
+            message="Analysis failed",
+            run_id=run.id,
+            failure=failure,
+        )
+        await repository.finalize_run(
+            str(stored.alert.id),
+            str(run.id),
+            lease_owner=f"worker-{external_id}",
+            fencing_token=run.fencing_token,
+            run_status=RunStatus.FAILED,
+            final_stage=InvestigationStage.FAILED,
+            alert_status=AlertStatus.FAILED,
+            progress=ProgressRecord(
+                run_id=run.id,
+                stage=InvestigationStage.FAILED,
+                message="分析失败。",
+            ),
+            error="Analysis failed",
+            model_failure=failure,
+            notification_kind=NotificationKind.ANALYSIS_FAILURE,
+            notification_event=event.model_dump(mode="json"),
+        )
+        return str(run.id)
+
+    await queue_delivery("definite")
+    await queue_delivery("unknown")
+    claimed = await repository.claim_notification_deliveries(
+        owner="delivery-worker",
+        limit=10,
+        lease_seconds=60,
+    )
+    assert len(claimed) == 2
+    definite = next(item for item in claimed if item.event["alert"]["external_id"] == "definite")
+    unknown = next(item for item in claimed if item.event["alert"]["external_id"] == "unknown")
+    await repository.fail_notification_delivery(
+        str(definite.id),
+        owner="delivery-worker",
+        error="WeCom rejected message",
+        unknown_outcome=False,
+    )
+    await repository.fail_notification_delivery(
+        str(unknown.id),
+        owner="delivery-worker",
+        error="WeCom request timed out",
+        unknown_outcome=True,
+    )
+
+    for attempt in (2, 3):
+        async with repository.session_factory() as session:
+            row = await session.get(NotificationDeliveryRow, str(definite.id))
+            assert row is not None
+            row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+        retry = await repository.claim_notification_deliveries(
+            owner=f"delivery-worker-{attempt}",
+            limit=10,
+            lease_seconds=60,
+        )
+        assert [item.id for item in retry] == [definite.id]
+        assert retry[0].attempts == attempt
+        await repository.fail_notification_delivery(
+            str(definite.id),
+            owner=f"delivery-worker-{attempt}",
+            error="WeCom rejected message",
+            unknown_outcome=False,
+        )
+
+    assert (
+        await repository.claim_notification_deliveries(
+            owner="delivery-worker-final",
+            limit=10,
+            lease_seconds=60,
+        )
+        == []
+    )
+    async with repository.session_factory() as session:
+        definite_row = await session.get(NotificationDeliveryRow, str(definite.id))
+        unknown_row = await session.get(NotificationDeliveryRow, str(unknown.id))
+        assert definite_row is not None and unknown_row is not None
+        assert definite_row.status == NotificationDeliveryStatus.FAILED.value
+        assert definite_row.attempts == 3
+        assert unknown_row.status == NotificationDeliveryStatus.UNKNOWN.value
+        assert unknown_row.attempts == 1
+        assert unknown_row.next_attempt_at is None
     await repository.close()
 
 
@@ -531,9 +737,7 @@ async def test_agent_event_append_detects_stale_and_concurrent_sequences(
         [large_event],
         expected_sequence=4,
     )
-    restored_large_event = (
-        await repository.list_agent_events(str(run_id), after_sequence=4)
-    )[0]
+    restored_large_event = (await repository.list_agent_events(str(run_id), after_sequence=4))[0]
     assert restored_large_event.payload["projection"] == "x" * 20_000
     assert restored_large_event.payload["token"] == REDACTED
 
@@ -713,7 +917,7 @@ async def test_checkpoint_writes_are_isolated_by_run_before_checkpoint_exists(
 
 
 @pytest.mark.asyncio
-async def test_reclaim_rejects_corrupt_latest_checkpoint_without_fallback(
+async def test_reclaim_marks_corrupt_checkpoint_failed_without_replacement(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "reclaim-corrupt.db"))
@@ -750,18 +954,18 @@ async def test_reclaim_rejects_corrupt_latest_checkpoint_without_fallback(
         checkpoint_row.state_hash = "0" * 64
         await session.commit()
 
-    with pytest.raises(RuntimeError, match="state hash mismatch"):
-        await repository.reclaim_expired_run(alert_id, "recovery-worker", 300)
-    async with repository.session_factory() as session:
-        run_row = await session.get(InvestigationRunRow, str(run_id))
-        assert run_row is not None
-        assert run_row.lease_owner == "test-worker"
-        assert run_row.fencing_token == 1
+    assert await repository.reclaim_expired_run(alert_id, "recovery-worker", 300) is None
+    current = await repository.get(alert_id)
+    assert current is not None and current.latest_run is not None
+    assert current.status == AlertStatus.FAILED
+    assert current.latest_run.status == RunStatus.FAILED
+    assert "state hash mismatch" in (current.error or "")
+    assert await repository.create_run(alert_id, "new-worker", 300) is None
     await repository.close()
 
 
 @pytest.mark.asyncio
-async def test_reclaim_skips_legacy_run_without_checkpoint_and_allows_new_attempt(
+async def test_reclaim_marks_missing_checkpoint_failed_without_replacement(
     tmp_path: Path,
 ) -> None:
     repository = SQLAlchemyAlertRepository(sqlite_url(tmp_path / "reclaim-legacy.db"))
@@ -788,15 +992,14 @@ async def test_reclaim_skips_legacy_run_without_checkpoint_and_allows_new_attemp
     )
     replacement = await repository.create_run(str(stored.alert.id), "new-worker", 300)
 
-    assert replacement is not None
-    assert replacement.attempt == legacy.attempt + 1
+    assert replacement is None
     current = await repository.get(str(stored.alert.id))
     assert current is not None and current.latest_run is not None
-    assert current.latest_run.id == replacement.id
-    assert [item.status for item in current.all_runs] == [
-        RunStatus.RUNNING,
-        RunStatus.FAILED,
-    ]
+    assert current.status == AlertStatus.FAILED
+    assert current.latest_run.id == legacy.id
+    assert current.latest_run.status == RunStatus.FAILED
+    assert "without a recoverable checkpoint" in (current.error or "")
+    assert [item.status for item in current.all_runs] == [RunStatus.FAILED]
     await repository.close()
 
 
@@ -1026,9 +1229,7 @@ def _mysql_datetime_zero_invocation_row() -> tuple[ToolInvocation, ToolInvocatio
             retryable=True,
         ),
     )
-    row = SQLAlchemyAlertRepository._tool_invocation_row(
-        invocation.model_dump(mode="json")
-    )
+    row = SQLAlchemyAlertRepository._tool_invocation_row(invocation.model_dump(mode="json"))
     row.created_at = datetime(2026, 8, 31, 23, 59, 58, tzinfo=UTC)
     row.started_at = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
     row.completed_at = datetime(2026, 9, 1, 0, 0, 1, tzinfo=UTC)
@@ -1039,10 +1240,13 @@ def _mysql_datetime_zero_invocation_row() -> tuple[ToolInvocation, ToolInvocatio
 def test_tool_invocation_validation_accepts_mysql_datetime_zero_rounding() -> None:
     invocation, row = _mysql_datetime_zero_invocation_row()
 
-    assert SQLAlchemyAlertRepository._validated_tool_invocation_row(
-        row,
-        dialect_name="mysql",
-    ) == invocation
+    assert (
+        SQLAlchemyAlertRepository._validated_tool_invocation_row(
+            row,
+            dialect_name="mysql",
+        )
+        == invocation
+    )
 
 
 def test_tool_invocation_validation_keeps_sqlite_datetime_comparison_exact() -> None:
@@ -1051,8 +1255,7 @@ def test_tool_invocation_validation_keeps_sqlite_datetime_comparison_exact() -> 
     with pytest.raises(
         ToolInvocationConflict,
         match=(
-            "persisted invocation columns drifted: "
-            "completed_at, created_at, deadline, started_at"
+            "persisted invocation columns drifted: completed_at, created_at, deadline, started_at"
         ),
     ):
         SQLAlchemyAlertRepository._validated_tool_invocation_row(

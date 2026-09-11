@@ -1,6 +1,7 @@
 import type {
   AdminSettings,
   AdminSettingsPatch,
+  AnalysisDispatchStatus,
   AlertAccepted,
   AlertListResponse,
   AlertStatus,
@@ -14,6 +15,7 @@ import type {
   ReanalyzeResponse,
   Severity,
   StoredAlert,
+  ValidateAndResumeDispatchResponse,
 } from "../types/api";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -143,6 +145,26 @@ export const api = {
     request<AdminSettings>(
       "/api/v1/admin/settings",
       { method: "PATCH", body: JSON.stringify(patch) },
+      token,
+    ),
+
+  getAnalysisDispatch: (token: string) =>
+    request<AnalysisDispatchStatus>("/api/v1/admin/analysis-dispatch", {}, token),
+
+  validateAndResumeDispatch: (
+    expectedDispatchVersion: number,
+    expectedSettingsRevision: string,
+    token: string,
+  ) =>
+    request<ValidateAndResumeDispatchResponse>(
+      "/api/v1/admin/analysis-dispatch/validate-and-resume",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          expected_dispatch_version: expectedDispatchVersion,
+          expected_settings_revision: expectedSettingsRevision,
+        }),
+      },
       token,
     ),
 };

@@ -26,6 +26,7 @@ from sqlalchemy import (
     desc,
     event,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -43,11 +44,22 @@ from app.domain.models import (
     AlertStatus,
     AlertSummary,
     AnalysisConfigSnapshot,
+    AnalysisDispatchControl,
+    AnalysisDispatchState,
+    AnalysisFailureEvent,
     DashboardSummary,
+    DispatchValidationResult,
     EvidenceRecord,
+    FlashDutyPollState,
+    FlashDutyPollStatus,
     InvestigationRun,
     InvestigationStage,
+    ModelFailure,
+    ModelFailureCategory,
     NormalizedAlert,
+    NotificationDelivery,
+    NotificationDeliveryStatus,
+    NotificationKind,
     ProgressRecord,
     Recommendation,
     RunStatus,
@@ -59,6 +71,7 @@ from app.domain.models import (
 from app.domain.ports import (
     AgentCheckpointVersionConflict,
     AgentEventSequenceConflict,
+    AnalysisDispatchConflict,
     EvidenceRecordConflict,
     RunCancellationConflict,
     RunCancellationRequested,
@@ -319,7 +332,7 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 
 _UNBOUNDED_TEXT = Text().with_variant(LONGTEXT(), "mysql")
-DATABASE_SCHEMA_REVISION = "0018"
+DATABASE_SCHEMA_REVISION = "0019"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -387,7 +400,75 @@ class InvestigationRunRow(Base):
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
     recommendation_json: Mapped[dict | None] = mapped_column(JSON)
     advisor_metadata_json: Mapped[dict | None] = mapped_column(JSON)
+    model_failure_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+
+class AnalysisDispatchControlRow(Base):
+    __tablename__ = "analysis_dispatch_control"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason_json: Mapped[dict | None] = mapped_column(JSON)
+    trigger_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("investigation_runs.id", ondelete="SET NULL")
+    )
+    paused_settings_revision: Mapped[str | None] = mapped_column(String(64))
+    last_validation_json: Mapped[dict | None] = mapped_column(JSON)
+    paused_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    resumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    resumed_by: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+
+
+class NotificationDeliveryRow(Base):
+    __tablename__ = "analysis_notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint("run_id", "kind", name="uq_notification_run_kind"),
+        Index(
+            "ix_notification_delivery_status_due",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    alert_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("alerts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("investigation_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    message_id: Mapped[str | None] = mapped_column(String(255))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    claim_owner: Mapped[str | None] = mapped_column(String(255))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class FlashDutyPollStateRow(Base):
+    __tablename__ = "flashduty_poll_state"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    last_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    last_completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    last_error: Mapped[str | None] = mapped_column(Text)
+    start_time: Mapped[int | None] = mapped_column(Integer)
+    end_time: Mapped[int | None] = mapped_column(Integer)
+    fetched_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deduplicated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=_utc_now)
 
 
@@ -696,6 +777,35 @@ class SQLAlchemyAlertRepository:
                     )
 
             await self._assert_schema_current(connection)
+            now = _utc_now()
+            dispatch_exists = await connection.scalar(
+                select(AnalysisDispatchControlRow.id).where(
+                    AnalysisDispatchControlRow.id == "global"
+                )
+            )
+            if dispatch_exists is None:
+                await connection.execute(
+                    AnalysisDispatchControlRow.__table__.insert().values(
+                        id="global",
+                        state=AnalysisDispatchState.ENABLED.value,
+                        version=1,
+                        updated_at=now,
+                    )
+                )
+            poll_state_exists = await connection.scalar(
+                select(FlashDutyPollStateRow.id).where(FlashDutyPollStateRow.id == "global")
+            )
+            if poll_state_exists is None:
+                await connection.execute(
+                    FlashDutyPollStateRow.__table__.insert().values(
+                        id="global",
+                        status=FlashDutyPollStatus.NEVER.value,
+                        fetched_count=0,
+                        created_count=0,
+                        deduplicated_count=0,
+                        updated_at=now,
+                    )
+                )
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -704,6 +814,289 @@ class SQLAlchemyAlertRepository:
         async with self.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
             await self._assert_schema_current(connection)
+
+    async def get_dispatch_control(self) -> AnalysisDispatchControl:
+        async with self.session_factory() as session:
+            row = await session.get(AnalysisDispatchControlRow, "global")
+            if row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            return self._dispatch_control(row)
+
+    async def pause_analysis_dispatch(
+        self,
+        failure: ModelFailure,
+        *,
+        trigger_run_id: str,
+        settings_revision: str,
+    ) -> AnalysisDispatchControl:
+        if not failure.pauses_dispatch:
+            raise ValueError("Only a dispatch-pausing model failure may pause analysis")
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            now = _utc_now()
+            row.state = AnalysisDispatchState.PAUSED.value
+            row.version += 1
+            row.reason_json = failure.model_dump(mode="json")
+            row.trigger_run_id = trigger_run_id
+            row.paused_settings_revision = settings_revision
+            row.paused_at = now
+            row.resumed_at = None
+            row.resumed_by = None
+            row.last_validation_json = None
+            row.updated_at = now
+            await session.commit()
+            return self._dispatch_control(row)
+
+    async def record_dispatch_validation(
+        self,
+        *,
+        expected_version: int,
+        validation: DispatchValidationResult,
+    ) -> AnalysisDispatchControl:
+        if validation.success:
+            raise ValueError("Failed validation recording requires success=false")
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            if row.version != expected_version:
+                raise AnalysisDispatchConflict(expected_version, row.version)
+            if row.state != AnalysisDispatchState.PAUSED.value:
+                raise ValueError("Analysis dispatch is not paused")
+            row.version += 1
+            row.last_validation_json = validation.model_dump(mode="json")
+            row.updated_at = _utc_now()
+            await session.commit()
+            return self._dispatch_control(row)
+
+    async def resume_analysis_dispatch(
+        self,
+        *,
+        expected_version: int,
+        expected_settings_revision: str,
+        resumed_by: str,
+        validation: DispatchValidationResult,
+    ) -> AnalysisDispatchControl:
+        if not validation.success:
+            raise ValueError("Successful dispatch resume requires success=true")
+        if validation.settings_revision != expected_settings_revision:
+            raise ValueError("Validated AI settings revision does not match resume request")
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            if row.version != expected_version:
+                raise AnalysisDispatchConflict(expected_version, row.version)
+            if row.state != AnalysisDispatchState.PAUSED.value:
+                raise ValueError("Analysis dispatch is not paused")
+            now = _utc_now()
+            row.state = AnalysisDispatchState.ENABLED.value
+            row.version += 1
+            row.resumed_at = now
+            row.resumed_by = resumed_by
+            row.last_validation_json = validation.model_dump(mode="json")
+            row.updated_at = now
+            await session.commit()
+            return self._dispatch_control(row)
+
+    async def get_flashduty_poll_state(self) -> FlashDutyPollState:
+        async with self.session_factory() as session:
+            row = await session.get(FlashDutyPollStateRow, "global")
+            if row is None:
+                raise RuntimeError("FlashDuty poll state is not initialized")
+            return self._flashduty_poll_state(row)
+
+    async def record_flashduty_poll_started(self, *, start_time: int, end_time: int) -> None:
+        async with self.session_factory() as session:
+            row = await session.get(FlashDutyPollStateRow, "global")
+            if row is None:
+                raise RuntimeError("FlashDuty poll state is not initialized")
+            now = _utc_now()
+            row.last_started_at = now
+            row.start_time = start_time
+            row.end_time = end_time
+            row.last_error = None
+            row.updated_at = now
+            await session.commit()
+
+    async def record_flashduty_poll_completed(
+        self,
+        *,
+        start_time: int,
+        end_time: int,
+        fetched_count: int,
+        created_count: int,
+        deduplicated_count: int,
+    ) -> None:
+        async with self.session_factory() as session:
+            row = await session.get(FlashDutyPollStateRow, "global")
+            if row is None:
+                raise RuntimeError("FlashDuty poll state is not initialized")
+            now = _utc_now()
+            row.status = FlashDutyPollStatus.SUCCESS.value
+            row.last_completed_at = now
+            row.last_error = None
+            row.start_time = start_time
+            row.end_time = end_time
+            row.fetched_count = fetched_count
+            row.created_count = created_count
+            row.deduplicated_count = deduplicated_count
+            row.updated_at = now
+            await session.commit()
+
+    async def record_flashduty_poll_failed(
+        self,
+        *,
+        start_time: int | None,
+        end_time: int | None,
+        error: str,
+    ) -> None:
+        async with self.session_factory() as session:
+            row = await session.get(FlashDutyPollStateRow, "global")
+            if row is None:
+                raise RuntimeError("FlashDuty poll state is not initialized")
+            row.status = FlashDutyPollStatus.FAILED.value
+            row.last_error = sanitize_text(error)[:2000]
+            row.start_time = start_time
+            row.end_time = end_time
+            row.updated_at = _utc_now()
+            await session.commit()
+
+    async def claim_notification_deliveries(
+        self,
+        *,
+        owner: str,
+        limit: int,
+        lease_seconds: int,
+    ) -> list[NotificationDelivery]:
+        if limit < 1 or lease_seconds < 1:
+            raise ValueError("Notification claim limits must be positive")
+        now = _utc_now()
+        async with self.session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(NotificationDeliveryRow)
+                        .where(
+                            NotificationDeliveryRow.attempts < 3,
+                            or_(
+                                NotificationDeliveryRow.status
+                                == NotificationDeliveryStatus.PENDING.value,
+                                (
+                                    (
+                                        NotificationDeliveryRow.status
+                                        == NotificationDeliveryStatus.FAILED.value
+                                    )
+                                    & (
+                                        (NotificationDeliveryRow.next_attempt_at.is_(None))
+                                        | (NotificationDeliveryRow.next_attempt_at <= now)
+                                    )
+                                ),
+                                (
+                                    (
+                                        NotificationDeliveryRow.status
+                                        == NotificationDeliveryStatus.SENDING.value
+                                    )
+                                    & (NotificationDeliveryRow.claim_expires_at <= now)
+                                ),
+                            ),
+                        )
+                        .order_by(NotificationDeliveryRow.created_at)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                row.status = NotificationDeliveryStatus.SENDING.value
+                row.claim_owner = owner
+                row.claim_expires_at = now + timedelta(seconds=lease_seconds)
+                row.attempts += 1
+                row.updated_at = now
+            await session.commit()
+            return [self._notification_delivery(row) for row in rows]
+
+    async def complete_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        owner: str,
+        message_id: str | None,
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(NotificationDeliveryRow)
+                .where(
+                    NotificationDeliveryRow.id == delivery_id,
+                    NotificationDeliveryRow.status == NotificationDeliveryStatus.SENDING.value,
+                    NotificationDeliveryRow.claim_owner == owner,
+                )
+                .values(
+                    status=NotificationDeliveryStatus.SENT.value,
+                    message_id=message_id,
+                    error=None,
+                    claim_owner=None,
+                    claim_expires_at=None,
+                    next_attempt_at=None,
+                    sent_at=now,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("Notification delivery claim was lost")
+            await session.commit()
+
+    async def fail_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        owner: str,
+        error: str,
+        unknown_outcome: bool,
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            row = await session.scalar(
+                select(NotificationDeliveryRow)
+                .where(
+                    NotificationDeliveryRow.id == delivery_id,
+                    NotificationDeliveryRow.status == NotificationDeliveryStatus.SENDING.value,
+                    NotificationDeliveryRow.claim_owner == owner,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("Notification delivery claim was lost")
+            row.status = (
+                NotificationDeliveryStatus.UNKNOWN.value
+                if unknown_outcome
+                else NotificationDeliveryStatus.FAILED.value
+            )
+            row.error = sanitize_text(error)[:2000]
+            row.claim_owner = None
+            row.claim_expires_at = None
+            row.next_attempt_at = (
+                None if unknown_outcome or row.attempts >= 3 else now + timedelta(seconds=30)
+            )
+            row.updated_at = now
+            await session.commit()
 
     async def cleanup_expired_alerts(self, cutoff: datetime) -> int:
         """Delete expired terminal alerts."""
@@ -1086,6 +1479,43 @@ class SQLAlchemyAlertRepository:
         alert_row.advisor_metadata_json = None
         alert_row.error = None
 
+    @staticmethod
+    def _queue_internal_failure_notification(
+        session: AsyncSession,
+        *,
+        alert_row: AlertRow,
+        run_row: InvestigationRunRow,
+        error: str,
+        now: datetime,
+    ) -> None:
+        failure = ModelFailure(
+            category=ModelFailureCategory.INTERNAL,
+            provider="database-alert-agent",
+            phase="unknown",
+            safe_detail=sanitize_text(error),
+        )
+        run_row.model_failure_json = failure.model_dump(mode="json")
+        event = AnalysisFailureEvent(
+            alert=NormalizedAlert.model_validate(alert_row.alert_json),
+            status=AlertStatus.FAILED,
+            message=sanitize_text(error),
+            run_id=run_row.id,
+            failure=failure,
+        )
+        session.add(
+            NotificationDeliveryRow(
+                id=str(uuid4()),
+                alert_id=alert_row.id,
+                run_id=run_row.id,
+                kind=NotificationKind.ANALYSIS_FAILURE.value,
+                status=NotificationDeliveryStatus.PENDING.value,
+                event_json=event.model_dump(mode="json"),
+                attempts=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
     async def create_run(
         self,
         alert_id: str,
@@ -1098,11 +1528,21 @@ class SQLAlchemyAlertRepository:
         manifest_payload = _model_payload(manifest) if manifest is not None else None
         async with self.session_factory() as session:
             alert_row = await _lock_alert_row(session, alert_id)
+            dispatch_row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if dispatch_row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            if dispatch_row.state == AnalysisDispatchState.PAUSED.value:
+                return None
             if not alert_row or alert_row.status in {
                 AlertStatus.COMPLETED.value,
                 AlertStatus.INCONCLUSIVE.value,
                 AlertStatus.FILTERED.value,
                 AlertStatus.CANCELLED.value,
+                AlertStatus.FAILED.value,
             }:
                 return None
             latest_query = (
@@ -1121,8 +1561,21 @@ class SQLAlchemyAlertRepository:
                     return None
                 latest.status = RunStatus.FAILED.value
                 latest.current_stage = InvestigationStage.FAILED.value
-                latest.error = "Investigation lease expired"
+                latest.error = "Investigation lease expired without a recoverable checkpoint"
+                latest.lease_expires_at = None
                 latest.updated_at = now
+                alert_row.status = AlertStatus.FAILED.value
+                alert_row.error = latest.error
+                alert_row.updated_at = now
+                self._queue_internal_failure_notification(
+                    session,
+                    alert_row=alert_row,
+                    run_row=latest,
+                    error=latest.error,
+                    now=now,
+                )
+                await session.commit()
+                return None
             self._archive_legacy_alert_result(latest, alert_row)
             attempt = (latest.attempt + 1) if latest else 1
             run_identity = (
@@ -1192,6 +1645,15 @@ class SQLAlchemyAlertRepository:
         manifest_payload = _model_payload(manifest) if manifest is not None else None
         async with self.session_factory() as session:
             alert_row = await _lock_alert_row(session, alert_id)
+            dispatch_row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if dispatch_row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            if dispatch_row.state == AnalysisDispatchState.PAUSED.value:
+                return None
             if not alert_row:
                 return None
             latest_query = (
@@ -1280,7 +1742,17 @@ class SQLAlchemyAlertRepository:
 
         now = _utc_now()
         async with self.session_factory() as session:
-            if await _lock_alert_row(session, alert_id) is None:
+            alert_row = await _lock_alert_row(session, alert_id)
+            if alert_row is None:
+                return None
+            dispatch_row = await session.scalar(
+                select(AnalysisDispatchControlRow)
+                .where(AnalysisDispatchControlRow.id == "global")
+                .with_for_update()
+            )
+            if dispatch_row is None:
+                raise RuntimeError("Analysis dispatch control is not initialized")
+            if dispatch_row.state == AnalysisDispatchState.PAUSED.value:
                 return None
             latest_query = (
                 select(InvestigationRunRow)
@@ -1318,15 +1790,56 @@ class SQLAlchemyAlertRepository:
                 .limit(1)
             )
             checkpoint_row = (await session.execute(checkpoint_query)).scalar_one_or_none()
+            recovery_error: str | None = None
             if checkpoint_row is None:
+                recovery_error = "Investigation lease expired without a recoverable checkpoint"
+            else:
+                try:
+                    manifest = _decode_run_manifest(latest)
+                    _decode_checkpoint_row(
+                        checkpoint_row,
+                        expected_run_id=latest.id,
+                        expected_namespace="agent",
+                        expected_manifest_hash=manifest.digest(),
+                    )
+                except RuntimeError as exc:
+                    recovery_error = sanitize_text(str(exc))
+            if recovery_error is not None:
+                latest_sequence = await session.scalar(
+                    select(ProgressRow.sequence)
+                    .where(ProgressRow.run_id == latest.id)
+                    .order_by(desc(ProgressRow.sequence))
+                    .limit(1)
+                )
+                latest.status = RunStatus.FAILED.value
+                latest.current_stage = InvestigationStage.FAILED.value
+                latest.error = recovery_error
+                latest.lease_expires_at = None
+                latest.updated_at = now
+                alert_row.status = AlertStatus.FAILED.value
+                alert_row.error = recovery_error
+                alert_row.updated_at = now
+                session.add(
+                    ProgressRow(
+                        id=str(uuid4()),
+                        alert_id=alert_id,
+                        run_id=latest.id,
+                        sequence=(latest_sequence or 0) + 1,
+                        stage=InvestigationStage.FAILED.value,
+                        message="调查运行无法安全恢复。",
+                        details_json={"reason": "unrecoverable_expired_run"},
+                        created_at=now,
+                    )
+                )
+                self._queue_internal_failure_notification(
+                    session,
+                    alert_row=alert_row,
+                    run_row=latest,
+                    error=recovery_error,
+                    now=now,
+                )
+                await session.commit()
                 return None
-            manifest = _decode_run_manifest(latest)
-            _decode_checkpoint_row(
-                checkpoint_row,
-                expected_run_id=latest.id,
-                expected_namespace="agent",
-                expected_manifest_hash=manifest.digest(),
-            )
 
             previous_token = latest.fencing_token
             statement = (
@@ -2457,6 +2970,10 @@ class SQLAlchemyAlertRepository:
         recommendation: Recommendation | None = None,
         advisor_metadata: AdvisorMetadata | None = None,
         error: str | None = None,
+        model_failure: ModelFailure | None = None,
+        pause_settings_revision: str | None = None,
+        notification_kind: NotificationKind | None = None,
+        notification_event: dict[str, Any] | None = None,
     ) -> ProgressRecord:
         expected_terminal = {
             RunStatus.COMPLETED: (
@@ -2480,12 +2997,17 @@ class SQLAlchemyAlertRepository:
             raise ValueError("terminal progress must belong to the finalized run")
         if progress.stage != final_stage:
             raise ValueError("terminal progress stage must match the finalized stage")
+        if (notification_kind is None) != (notification_event is None):
+            raise ValueError("notification kind and event must be provided together")
 
         serialized_recommendation = (
             recommendation.model_dump(mode="json") if recommendation else None
         )
         serialized_advisor_metadata = (
             advisor_metadata.model_dump(mode="json") if advisor_metadata else None
+        )
+        serialized_model_failure = (
+            model_failure.model_dump(mode="json") if model_failure is not None else None
         )
 
         async with self.session_factory() as session:
@@ -2525,6 +3047,7 @@ class SQLAlchemyAlertRepository:
             run_row.error = error
             run_row.recommendation_json = serialized_recommendation
             run_row.advisor_metadata_json = serialized_advisor_metadata
+            run_row.model_failure_json = serialized_model_failure
             run_row.updated_at = now
 
             session.add(
@@ -2545,6 +3068,49 @@ class SQLAlchemyAlertRepository:
             alert_row.advisor_metadata_json = serialized_advisor_metadata
             alert_row.error = error
             alert_row.updated_at = now
+
+            if (
+                model_failure is not None
+                and model_failure.pauses_dispatch
+                and pause_settings_revision is not None
+            ):
+                dispatch_row = await session.scalar(
+                    select(AnalysisDispatchControlRow)
+                    .where(AnalysisDispatchControlRow.id == "global")
+                    .with_for_update()
+                )
+                if dispatch_row is None:
+                    raise RuntimeError("Analysis dispatch control is not initialized")
+                already_paused = (
+                    dispatch_row.state == AnalysisDispatchState.PAUSED.value
+                    and dispatch_row.paused_settings_revision == pause_settings_revision
+                )
+                if not already_paused:
+                    dispatch_row.state = AnalysisDispatchState.PAUSED.value
+                    dispatch_row.version += 1
+                    dispatch_row.reason_json = serialized_model_failure
+                    dispatch_row.trigger_run_id = run_id
+                    dispatch_row.paused_settings_revision = pause_settings_revision
+                    dispatch_row.paused_at = now
+                    dispatch_row.resumed_at = None
+                    dispatch_row.resumed_by = None
+                    dispatch_row.last_validation_json = None
+                    dispatch_row.updated_at = now
+
+            if notification_kind is not None and notification_event is not None:
+                session.add(
+                    NotificationDeliveryRow(
+                        id=str(uuid4()),
+                        alert_id=alert_id,
+                        run_id=run_id,
+                        kind=notification_kind.value,
+                        status=NotificationDeliveryStatus.PENDING.value,
+                        event_json=notification_event,
+                        attempts=0,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
 
             await session.commit()
             return saved_progress
@@ -2705,9 +3271,7 @@ class SQLAlchemyAlertRepository:
         for field in ("started_at", "collected_at"):
             evidence_payload.pop(field)
             authoritative_payload.pop(field)
-        return _canonical_json_hash(evidence_payload) == _canonical_json_hash(
-            authoritative_payload
-        )
+        return _canonical_json_hash(evidence_payload) == _canonical_json_hash(authoritative_payload)
 
     @classmethod
     async def _require_evidence_artifact_ownership(
@@ -3122,6 +3686,65 @@ class SQLAlchemyAlertRepository:
             cancel_requested_by=row.cancel_requested_by,
             cancelled_at=row.cancelled_at,
             config_snapshot=config_snapshot,
+            model_failure=(
+                ModelFailure.model_validate(row.model_failure_json)
+                if row.model_failure_json
+                else None
+            ),
             created_at=row.created_at,
             updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _dispatch_control(row: AnalysisDispatchControlRow) -> AnalysisDispatchControl:
+        return AnalysisDispatchControl(
+            state=AnalysisDispatchState(row.state),
+            version=row.version,
+            reason=ModelFailure.model_validate(row.reason_json) if row.reason_json else None,
+            trigger_run_id=row.trigger_run_id,
+            paused_settings_revision=row.paused_settings_revision,
+            paused_at=row.paused_at,
+            resumed_at=row.resumed_at,
+            resumed_by=row.resumed_by,
+            last_validation=(
+                DispatchValidationResult.model_validate(row.last_validation_json)
+                if row.last_validation_json
+                else None
+            ),
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _flashduty_poll_state(row: FlashDutyPollStateRow) -> FlashDutyPollState:
+        return FlashDutyPollState(
+            status=FlashDutyPollStatus(row.status),
+            last_started_at=row.last_started_at,
+            last_completed_at=row.last_completed_at,
+            last_error=row.last_error,
+            start_time=row.start_time,
+            end_time=row.end_time,
+            fetched_count=row.fetched_count,
+            created_count=row.created_count,
+            deduplicated_count=row.deduplicated_count,
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _notification_delivery(row: NotificationDeliveryRow) -> NotificationDelivery:
+        return NotificationDelivery(
+            id=row.id,
+            alert_id=row.alert_id,
+            run_id=row.run_id,
+            kind=NotificationKind(row.kind),
+            status=NotificationDeliveryStatus(row.status),
+            event=row.event_json,
+            attempts=row.attempts,
+            error=row.error,
+            message_id=row.message_id,
+            next_attempt_at=row.next_attempt_at,
+            claim_owner=row.claim_owner,
+            claim_expires_at=row.claim_expires_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            sent_at=row.sent_at,
         )

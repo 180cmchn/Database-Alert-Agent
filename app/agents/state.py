@@ -14,6 +14,7 @@ from app.domain.models import (
     InvestigationRun,
     InvestigationStage,
     KnowledgeExcerpt,
+    ModelFailure,
     NormalizedAlert,
     ProgressRecord,
     Recommendation,
@@ -88,6 +89,7 @@ class AgentState(BaseModel):
     evidence_sufficient: bool = False
 
     # Configuration
+    model_failure: ModelFailure | None = None
     ai_fallback_enabled: bool = True
     stream_main_agent_reasoning: bool = True
     knowledge_sources: list[str] = Field(default_factory=list)

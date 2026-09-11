@@ -20,6 +20,7 @@ from app.agent_runtime.trace import trace_entry_from_event
 from app.api.schemas import (
     AgentTraceResponse,
     AlertAccepted,
+    AnalysisDispatchStatusResponse,
     CancelRunResponse,
     FlashDutyHandlingResponse,
     FlashDutyPollAlertItem,
@@ -28,13 +29,20 @@ from app.api.schemas import (
     ReanalyzeResponse,
     RuntimeSettingsPatch,
     RuntimeSettingsResponse,
+    ValidateAndResumeDispatchRequest,
+    ValidateAndResumeDispatchResponse,
 )
 from app.application.admin import (
     AdminAuditLogger,
     RuntimeSettingsConflictError,
     RuntimeSettingsManager,
 )
-from app.application.factory import Runtime, apply_runtime_settings, build_runtime
+from app.application.factory import (
+    Runtime,
+    ai_settings_revision,
+    apply_runtime_settings,
+    build_runtime,
+)
 from app.application.flashduty_handling import (
     FlashDutyHandlingInvalidResponseError,
     FlashDutyHandlingTimeoutError,
@@ -51,7 +59,9 @@ from app.application.scheduler import (
 from app.config import Settings, get_deployment_settings
 from app.domain.errors import (
     AlertNotFoundError,
+    AnalysisDispatchPausedError,
     AnalysisFailedError,
+    AnalysisSettingsRevisionConflict,
     InvalidAlertPayloadError,
     UnknownAlertSourceError,
 )
@@ -63,7 +73,11 @@ from app.domain.models import (
     Severity,
     StoredAlert,
 )
-from app.domain.ports import AnalysisJobScheduler, RunCancellationConflict
+from app.domain.ports import (
+    AnalysisDispatchConflict,
+    AnalysisJobScheduler,
+    RunCancellationConflict,
+)
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -113,6 +127,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(settings.log_level)
         await runtime.repository.initialize()
+        runtime.service.start_notification_delivery_worker()
         app.state.runtime = runtime
         app.state.scheduler = scheduler
         app.state.flashduty_poller = flashduty_poller
@@ -182,6 +197,122 @@ def create_app(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),  # noqa: B008
     ) -> str:
         return authenticate_admin(credentials)
+
+    async def dispatch_status_response() -> AnalysisDispatchStatusResponse:
+        control = await runtime.repository.get_dispatch_control()
+        poll_state = await runtime.repository.get_flashduty_poll_state()
+        pending = await runtime.service.list_alerts(
+            page=1,
+            page_size=1,
+            statuses={AlertStatus.RECEIVED, AlertStatus.QUEUED},
+        )
+        return AnalysisDispatchStatusResponse(
+            dispatch=control,
+            flashduty_poll=poll_state,
+            flashduty_polling_enabled=flashduty_poller.enabled,
+            pending_count=pending.total,
+            runtime_settings_revision=runtime_settings.revision,
+            ai_settings_revision=ai_settings_revision(runtime.settings),
+        )
+
+    async def republish_pending_alerts() -> int:
+        page = 1
+        page_size = 100
+        alert_ids: list[str] = []
+        while True:
+            pending = await runtime.service.list_alerts(
+                page=page,
+                page_size=page_size,
+                statuses={AlertStatus.RECEIVED, AlertStatus.QUEUED},
+            )
+            alert_ids.extend(str(item.id) for item in pending.items)
+            if page >= pending.pages:
+                break
+            page += 1
+        for alert_id in alert_ids:
+            await scheduler.enqueue(alert_id)
+        return len(alert_ids)
+
+    @app.exception_handler(AnalysisDispatchPausedError)
+    async def analysis_dispatch_paused_handler(
+        _request: Request, exc: AnalysisDispatchPausedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=423,
+            content={
+                "code": "ANALYSIS_DISPATCH_PAUSED",
+                "message": exc.reason,
+                "dispatch_version": exc.version,
+            },
+        )
+
+    @app.get(
+        "/api/v1/admin/analysis-dispatch",
+        response_model=AnalysisDispatchStatusResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def read_analysis_dispatch() -> AnalysisDispatchStatusResponse:
+        return await dispatch_status_response()
+
+    @app.post(
+        "/api/v1/admin/analysis-dispatch/validate-and-resume",
+        response_model=ValidateAndResumeDispatchResponse,
+        tags=["admin"],
+        dependencies=[Depends(require_admin)],
+    )
+    async def validate_and_resume_analysis_dispatch(
+        payload: ValidateAndResumeDispatchRequest,
+        actor: str = Depends(require_admin),  # noqa: B008
+    ) -> ValidateAndResumeDispatchResponse:
+        try:
+            _control, validation_succeeded = await runtime.service.validate_and_resume_dispatch(
+                expected_version=payload.expected_dispatch_version,
+                expected_ai_settings_revision=payload.expected_settings_revision,
+                resumed_by=actor,
+            )
+        except AnalysisDispatchConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ANALYSIS_DISPATCH_VERSION_CONFLICT",
+                    "message": "Analysis dispatch state changed; reload before retrying",
+                    "expected_version": exc.expected,
+                    "current_version": exc.actual,
+                },
+            ) from exc
+        except AnalysisSettingsRevisionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "AI_SETTINGS_REVISION_CONFLICT",
+                    "message": "AI settings changed; reload before validating again",
+                    "expected_revision": exc.expected,
+                    "current_revision": exc.current,
+                },
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ANALYSIS_DISPATCH_STATE_CONFLICT", "message": str(exc)},
+            ) from exc
+
+        republished_count = 0
+        if validation_succeeded:
+            republished_count = await republish_pending_alerts()
+        await audit_logger.record(
+            action=("validate-and-resume" if validation_succeeded else "validate-failed"),
+            target="analysis-dispatch",
+            fields=["dispatch_version", "ai_settings_revision"],
+            actor=actor,
+        )
+        status = await dispatch_status_response()
+        return ValidateAndResumeDispatchResponse(
+            **status.model_dump(),
+            validation_succeeded=validation_succeeded,
+            resumed=validation_succeeded,
+            republished_count=republished_count,
+        )
 
     @app.exception_handler(UnknownAlertSourceError)
     async def unknown_source_handler(
