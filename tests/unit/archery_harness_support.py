@@ -347,20 +347,22 @@ def _success(
     *,
     rows: list[dict[str, Any]] | None = None,
     max_result_chars: int | None = None,
+    mcp_reported_row_count: int | None = None,
 ) -> ReplayCallFixture:
     expected_arguments = {**TARGET_ARGUMENTS, "sql_content": sql}
     if max_result_chars is not None:
         expected_arguments["max_result_chars"] = max_result_chars
+    structured_content: dict[str, Any] = {
+        "status": "success",
+        "full_sql": sql,
+        "rows": rows or [],
+    }
+    if mcp_reported_row_count is not None:
+        structured_content["mcp_reported_row_count"] = mcp_reported_row_count
     return ReplayCallFixture(
         tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
         expected_arguments=expected_arguments,
-        result={
-            "structuredContent": {
-                "status": "success",
-                "full_sql": sql,
-                "rows": rows or [],
-            }
-        },
+        result={"structuredContent": structured_content},
     )
 
 

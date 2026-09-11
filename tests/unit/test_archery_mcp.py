@@ -3439,6 +3439,43 @@ def test_plain_text_allowlist_rejection_is_a_business_failure() -> None:
         )
 
 
+def test_sql_query_failure_prefix_is_a_business_failure() -> None:
+    detail = 'SQL 查询失败：(2002, "Can\'t connect to MySQL server on \'db-1.example\' (110)")'
+
+    with pytest.raises(ArcheryMCPToolError, match="failed"):
+        ArcheryMCPClient.validate_business_success(
+            {"result": detail},
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        )
+
+
+def test_sql_query_failure_prefix_with_ascii_colon_is_a_business_failure() -> None:
+    detail = 'SQL 查询失败:(2002, "Can\'t connect to MySQL server")'
+
+    with pytest.raises(ArcheryMCPToolError, match="failed"):
+        ArcheryMCPClient.validate_business_success(
+            {"result": detail},
+            tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+        )
+
+
+def test_mid_line_query_failure_wording_is_not_a_business_failure() -> None:
+    ArcheryMCPClient.validate_business_success(
+        {"result": "记录: SQL 查询失败示例，来自历史归档"},
+        tool_name=ARCHERY_MCP_QUERY_TOOL_NAME,
+    )
+
+
+def test_iserror_true_still_raises_regardless_of_sql_failure_text() -> None:
+    with pytest.raises(ArcheryMCPToolError):
+        ArcheryMCPClient.extract_tool_payload(
+            {
+                "isError": True,
+                "content": [{"type": "text", "text": "remote transport failure"}],
+            }
+        )
+
+
 def test_slow_log_evidence_keeps_history_and_adds_independent_analysis() -> None:
     payload = {
         "full_sql": "SELECT * FROM mysql_slow_query_review_history",

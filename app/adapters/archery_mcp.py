@@ -239,6 +239,10 @@ _ALLOWLIST_REJECTION_TEXT: Final = re.compile(
     r")",
     re.IGNORECASE | re.MULTILINE,
 )
+_SQL_QUERY_FAILURE_TEXT: Final = re.compile(
+    r"^\s*SQL\s*查询失败[：:]",
+    re.MULTILINE,
+)
 _INFORMATION_SCHEMA_PROJECTION_FIELDS: Final = {
     "columns": {
         "character_maximum_length",
@@ -3812,6 +3816,8 @@ class ArcheryMCPClient:
             supplemental_text,
         ):
             if _ALLOWLIST_REJECTION_TEXT.search(text):
+                raise ArcheryMCPToolError(f"{tool_name} failed: {safe_error_detail(text)}")
+            if _SQL_QUERY_FAILURE_TEXT.search(text):
                 raise ArcheryMCPToolError(f"{tool_name} failed: {safe_error_detail(text)}")
 
     @staticmethod

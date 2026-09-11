@@ -325,6 +325,11 @@ class ArcheryHarnessState:
     history_exact_sample: str | None = None
     history_host_call_ids: set[str] = field(default_factory=set)
     history_host_stage_attempts: set[str] = field(default_factory=set)
+    history_page_backoff_count: int = 0
+    history_page_last_incomplete_size: int | None = None
+    history_page_last_declared_rows: int | None = None
+    history_page_last_recovered_rows: int | None = None
+    history_page_backoff_pending_context: dict[str, Any] | None = None
     finish_accepted: bool = False
     finish_summary: str | None = None
 
@@ -475,6 +480,29 @@ def _record_history_recovery_terminal_failure(
     if not state.history_recovery_listing_completed:
         failure["id_listing_completed"] = False
     state.slow_query_analysis_failures.append(failure)
+
+
+def _next_history_page_size(
+    current_size: int,
+    payload: Mapping[str, Any],
+) -> int:
+    """Return the next History page LIMIT from response-aware backoff.
+
+    Prefers the row count this response proves it can fully return (from
+    ``ArcheryMCPClient.truncation_row_shortfall``) over blind halving, so a
+    small full result set is not requested at the same truncating size
+    repeatedly. Falls back to halving when no reliable row-count signal is
+    available. The result is always strictly smaller than ``current_size``
+    and never below 1.
+    """
+
+    shortfall = ArcheryMCPClient.truncation_row_shortfall(payload)
+    if shortfall is not None:
+        _declared, recovered = shortfall
+        next_size = recovered - 1 if recovered > 1 else 1
+    else:
+        next_size = current_size // 2
+    return max(1, min(next_size, current_size - 1))
 
 
 @dataclass(slots=True)
@@ -1232,6 +1260,10 @@ class ArcheryHarnessScenario:
             "history_exact_sample": None,
             "history_host_call_ids": set(),
             "history_host_stage_attempts": set(),
+            "history_page_backoff_count": 0,
+            "history_page_last_incomplete_size": None,
+            "history_page_last_declared_rows": None,
+            "history_page_last_recovered_rows": None,
         }
         for field_name, default in pipeline_defaults.items():
             if not hasattr(state, field_name):
@@ -1255,6 +1287,10 @@ class ArcheryHarnessScenario:
             state.history_snapshot_max_id = None
             state.history_page_cursor = None
             state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+            state.history_page_backoff_count = 0
+            state.history_page_last_incomplete_size = None
+            state.history_page_last_declared_rows = None
+            state.history_page_last_recovered_rows = None
             state.history_ranking_rows = {}
             state.history_compact_rows = {}
             state.history_ranking_scan_complete = False
@@ -1513,6 +1549,11 @@ class ArcheryHarnessScenario:
         state.history_pipeline_endpoint = endpoint
         state.history_page_cursor = None
         state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+        state.history_page_backoff_count = 0
+        state.history_page_last_incomplete_size = None
+        state.history_page_last_declared_rows = None
+        state.history_page_last_recovered_rows = None
+        state.history_page_backoff_pending_context = None
         return True
 
     def _history_pipeline_page_sql(
@@ -2115,6 +2156,9 @@ class ArcheryHarnessScenario:
             if model_call.call_id in state.history_host_call_ids:
                 metadata["host_generated"] = True
                 metadata["internal_only"] = True
+                if state.history_page_backoff_pending_context is not None:
+                    metadata["host_call_context"] = state.history_page_backoff_pending_context
+                    state.history_page_backoff_pending_context = None
 
         if action.tool_name in {_RESULT_ASSESSMENT_TOOL_NAME, _FINISH_TOOL_NAME}:
             return PreparedCall(
@@ -5326,7 +5370,26 @@ class ArcheryHarnessScenario:
             )
         if self.client.is_result_incomplete(payload):
             if state.history_page_size > 1:
-                state.history_page_size = max(1, state.history_page_size // 2)
+                shortfall = self.client.truncation_row_shortfall(payload)
+                previous_page_size = state.history_page_size
+                state.history_page_backoff_count += 1
+                state.history_page_last_incomplete_size = previous_page_size
+                state.history_page_last_declared_rows = (
+                    shortfall[0] if shortfall is not None else None
+                )
+                state.history_page_last_recovered_rows = (
+                    shortfall[1] if shortfall is not None else None
+                )
+                state.history_page_size = _next_history_page_size(
+                    state.history_page_size,
+                    payload,
+                )
+                state.history_page_backoff_pending_context = {
+                    "stage": f"history_{projection}_scan",
+                    "reason": "response_incomplete",
+                    "previous_page_size": previous_page_size,
+                    "next_page_size": state.history_page_size,
+                }
                 return self._pipeline_progress_transition(state, call, raw_result)
             return self._pipeline_failure_transition(
                 state,
@@ -5428,6 +5491,11 @@ class ArcheryHarnessScenario:
             state.history_pipeline_phase = _HISTORY_PIPELINE_COMPACT
             state.history_page_cursor = None
             state.history_page_size = ARCHERY_HISTORY_PAGE_SIZE
+            state.history_page_backoff_count = 0
+            state.history_page_last_incomplete_size = None
+            state.history_page_last_declared_rows = None
+            state.history_page_last_recovered_rows = None
+            state.history_page_backoff_pending_context = None
         else:
             state.history_compact_scan_complete = True
             state.history_page_cursor = None

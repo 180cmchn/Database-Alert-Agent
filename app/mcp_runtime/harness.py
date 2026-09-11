@@ -726,12 +726,29 @@ class MCPAgentHarnessRuntime[StateT, ObservationT]:
                         content=reasoning,
                         trace_key=f"decision:{decision_key}:reasoning",
                     )
+                if (
+                    isinstance(action, CallToolAction)
+                    and prepared is not None
+                    and prepared.metadata.get("host_generated") is True
+                ):
+                    trace_action_content: dict[str, Any] = {
+                        "action": "call_tool",
+                        "origin": "deterministic_host",
+                        "tool_name": action.tool_name,
+                        **prepared.metadata.get("host_call_context", {}),
+                        "arguments": {"internal_host_call": True},
+                    }
+                else:
+                    trace_action_content = {
+                        **action.model_dump(mode="json"),
+                        "origin": "model",
+                    }
                 await self._emit_trace(
                     ctx,
                     AgentEventKind.TRACE_ACTION,
                     actor=f"{self.scenario.provider}_agent",
                     content=json.dumps(
-                        action.model_dump(mode="json"),
+                        trace_action_content,
                         ensure_ascii=False,
                         sort_keys=True,
                         default=str,

@@ -861,3 +861,222 @@ def test_explain_failure_finishes_current_row_and_continues_next_id() -> None:
     assert next_sample is not None
     assert next_sample.arguments["sql_content"] == f"EXPLAIN {samples[1]}"
     assert state.history_current_id == 1
+
+
+def test_truncated_page_backoff_uses_recovered_row_count_not_halving() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    assert ranking.arguments["limit_num"] == 100
+    _apply_query_result(
+        scenario,
+        state,
+        ranking,
+        [{"id": 1, "Query_time_max": 4.0, "Query_time_sum": 7.0}],
+    )
+    compact = scenario.next_host_call(specs)
+    assert compact is not None
+    assert compact.arguments["limit_num"] == 100
+    prepared = _prepare_host_call(scenario, state, compact)
+    fixture = _success(
+        compact.arguments["sql_content"],
+        rows=[_history_compact_row(row_id) for row_id in range(8, 0, -1)],
+        max_result_chars=compact.arguments.get("max_result_chars"),
+        mcp_reported_row_count=14,
+    )
+    scenario.on_result(state, prepared, fixture.result)
+
+    assert state.history_page_backoff_count == 1
+    assert state.history_page_last_incomplete_size == 100
+    assert state.history_page_last_declared_rows == 14
+    assert state.history_page_last_recovered_rows == 8
+    assert state.history_page_size == 7
+    assert state.history_page_cursor is None
+    assert state.history_compact_rows == {}
+
+    next_page = scenario.next_host_call(specs)
+    assert next_page is not None
+    assert next_page.arguments["limit_num"] == 7
+
+
+def test_truncated_page_backoff_falls_back_to_one_when_recovered_row_is_singular() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    _apply_query_result(
+        scenario,
+        state,
+        ranking,
+        [{"id": 1, "Query_time_max": 4.0, "Query_time_sum": 7.0}],
+    )
+    compact = scenario.next_host_call(specs)
+    assert compact is not None
+    prepared = _prepare_host_call(scenario, state, compact)
+    fixture = _success(
+        compact.arguments["sql_content"],
+        rows=[_history_compact_row(1)],
+        max_result_chars=compact.arguments.get("max_result_chars"),
+        mcp_reported_row_count=14,
+    )
+    scenario.on_result(state, prepared, fixture.result)
+
+    assert state.history_page_size == 1
+    next_page = scenario.next_host_call(specs)
+    assert next_page is not None
+    assert next_page.arguments["limit_num"] == 1
+
+
+def test_truncated_page_backoff_without_row_signal_halves() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    prepared = _prepare_host_call(scenario, state, ranking)
+    fixture = _success(
+        ranking.arguments["sql_content"],
+        rows=[{"id": 1, "Query_time_max": 4.0, "Query_time_sum": 7.0}],
+        max_result_chars=ranking.arguments.get("max_result_chars"),
+    )
+    raw_result = deepcopy(fixture.result)
+    raw_result["structuredContent"]["result_incomplete"] = True
+    scenario.on_result(state, prepared, raw_result)
+
+    assert state.history_page_last_declared_rows is None
+    assert state.history_page_last_recovered_rows is None
+    assert state.history_page_size == 50
+
+
+def test_history_page_backoff_size_is_strictly_smaller_and_at_least_one() -> None:
+    payload_with_shortfall = {"rows": [{"id": 1}] * 8, "mcp_reported_row_count": 14}
+    assert archery_harness_module._next_history_page_size(100, payload_with_shortfall) == 7
+    assert 1 <= archery_harness_module._next_history_page_size(100, payload_with_shortfall) < 100
+    assert archery_harness_module._next_history_page_size(2, {}) == 1
+    assert archery_harness_module._next_history_page_size(1, {}) == 1
+
+
+def test_history_page_incomplete_at_limit_one_fails_closed_and_ineligible() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    _apply_query_result(
+        scenario,
+        state,
+        ranking,
+        [{"id": 1, "Query_time_max": 4.0, "Query_time_sum": 7.0}],
+    )
+    compact = scenario.next_host_call(specs)
+    assert compact is not None
+    state.history_page_size = 1
+    prepared = _prepare_host_call(scenario, state, compact)
+    fixture = _success(
+        compact.arguments["sql_content"],
+        rows=[],
+        max_result_chars=compact.arguments.get("max_result_chars"),
+        mcp_reported_row_count=1,
+    )
+    scenario.on_result(state, prepared, fixture.result)
+
+    assert state.history_pipeline_phase == "COMPLETED"
+    assert state.finish_accepted is True
+    assert state.history_window_state == "FAILED_TERMINAL"
+    assert state.history_window_failure["reason_code"] == "history_pipeline_page_incomplete"
+    archery_harness_module._materialize_incomplete_pipeline_scan(scenario.client, state)
+    evidence = ArcherySlowLogEvidenceTool(scenario.client)._build_slow_query_evidence(
+        state.final_result,
+        session_attempts=1,
+        root_cause_ineligible_reason="",
+        parsed_rows=scenario.client._tabular_rows(state.final_result.payload),
+    )
+    assert evidence["root_cause_eligible"] is False
+
+
+def test_small_result_set_wide_row_regression_recovers_all_ids_after_backoff() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    _apply_query_result(
+        scenario,
+        state,
+        ranking,
+        [
+            {"id": row_id, "Query_time_max": float(row_id), "Query_time_sum": float(row_id * 10)}
+            for row_id in range(14, 0, -1)
+        ],
+    )
+    assert state.history_ranking_scan_complete is True
+    assert set(state.history_ranking_rows) == set(range(1, 15))
+
+    compact = scenario.next_host_call(specs)
+    assert compact is not None
+    assert compact.arguments["limit_num"] == 100
+    prepared = _prepare_host_call(scenario, state, compact)
+    fixture = _success(
+        compact.arguments["sql_content"],
+        rows=[_history_compact_row(row_id) for row_id in range(14, 6, -1)],
+        max_result_chars=compact.arguments.get("max_result_chars"),
+        mcp_reported_row_count=14,
+    )
+    scenario.on_result(state, prepared, fixture.result)
+    assert state.history_page_size == 7
+    assert state.history_compact_rows == {}
+
+    second_page = scenario.next_host_call(specs)
+    assert second_page is not None
+    assert second_page.arguments["limit_num"] == 7
+    _apply_query_result(
+        scenario,
+        state,
+        second_page,
+        [_history_compact_row(row_id) for row_id in range(14, 7, -1)],
+    )
+    assert set(state.history_compact_rows) == set(range(8, 15))
+    assert state.history_page_cursor == 8
+
+    third_page = scenario.next_host_call(specs)
+    assert third_page is not None
+    assert "id < 8" in third_page.arguments["sql_content"]
+    _apply_query_result(
+        scenario,
+        state,
+        third_page,
+        [_history_compact_row(row_id) for row_id in range(7, 0, -1)],
+    )
+    assert set(state.history_compact_rows) == set(range(1, 15))
+    assert state.history_page_cursor == 1
+
+    fourth_page = scenario.next_host_call(specs)
+    assert fourth_page is not None
+    assert "id < 1" in fourth_page.arguments["sql_content"]
+    _apply_query_result(scenario, state, fourth_page, [])
+
+    assert state.history_compact_scan_complete is True
+    assert set(state.history_compact_rows) == set(range(1, 15))
+    assert set(state.history_ranking_rows) == set(state.history_compact_rows)
+    assert state.history_reconcile_ids == []
+    assert state.history_pipeline_phase == "ENRICHMENT"
+
+
+def test_sql_query_failure_prefix_is_classified_as_tool_error_not_success() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    prepared = _prepare_host_call(scenario, state, ranking)
+    raw_result = {
+        "structuredContent": {
+            "result": 'SQL 查询失败：(2002, "Can\'t connect to MySQL server on \'db-1.example\'")',
+        }
+    }
+    with pytest.raises(archery_harness_module.ArcheryMCPToolError, match="failed"):
+        scenario.on_result(state, prepared, raw_result)
+
+
+def test_mid_line_query_failure_text_is_not_misclassified_as_tool_error() -> None:
+    scenario, state, specs = _pipeline_scenario()
+    ranking = scenario.next_host_call(specs)
+    assert ranking is not None
+    _apply_query_result(
+        scenario,
+        state,
+        ranking,
+        [{"id": 1, "Query_time_max": 4.0, "Query_time_sum": 7.0, "备注": "记录: SQL 查询失败示例"}],
+    )
+    assert state.history_ranking_rows[1]["备注"] == "记录: SQL 查询失败示例"

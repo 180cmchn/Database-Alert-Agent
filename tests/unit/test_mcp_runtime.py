@@ -3659,3 +3659,220 @@ async def test_resume_does_not_recover_started_invocation_from_legacy_response_s
         planner.requests[0].messages,
         sort_keys=True,
     )
+
+
+class _HostGeneratedCallScenario(_Scenario):
+    """Emulate deterministic Host-generated calls keyed by query, like a real
+    Host pipeline that recognizes its own generated call ids and re-derives the
+    same metadata deterministically on every prepare_call, including reprepare
+    after a durable-decision resume."""
+
+    def __init__(self, metadata_by_query: dict[str, dict[str, Any]]) -> None:
+        self._metadata_by_query = deepcopy(metadata_by_query)
+
+    def prepare_call(
+        self,
+        action: Any,
+        *,
+        state: _ScenarioState,
+    ) -> PreparedCall:
+        prepared = super().prepare_call(action, state=state)
+        query = str(action.arguments.get("query", ""))
+        pending = self._metadata_by_query.get(query)
+        if pending is None:
+            return prepared
+        return prepared.model_copy(update={"metadata": deepcopy(pending)}, deep=True)
+
+
+async def _trace_action_events(sink: InMemoryEventSink, run_id: Any) -> list[dict[str, Any]]:
+    events = await sink.read(run_id)
+    return [
+        json.loads(event.payload["content"])
+        for event in events
+        if event.kind == AgentEventKind.TRACE_ACTION
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trace_action_marks_host_generated_call_origin_without_leaking_arguments() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    session = _TrackingSession()
+
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("host-driven", sql_content="SELECT 1"), _finish()]),
+        scenario=_HostGeneratedCallScenario(
+            {"host-driven": {"host_generated": True, "internal_only": True}}
+        ),
+        event_sink=sink,
+        budget=_budget(),
+    ).run(run_id=run_id)
+
+    assert result.state.successful_queries == ["host-driven"]
+    action_traces = await _trace_action_events(sink, run_id)
+    assert len(action_traces) == 2
+    host_trace, finish_trace = action_traces
+    assert host_trace == {
+        "action": "call_tool",
+        "origin": "deterministic_host",
+        "tool_name": "fixture.query",
+        "arguments": {"internal_host_call": True},
+    }
+    assert finish_trace["origin"] == "model"
+    assert finish_trace["action"] == "finish"
+
+
+@pytest.mark.asyncio
+async def test_trace_action_host_generated_call_carries_backoff_context_once() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    session = _TrackingSession()
+
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner(
+            [
+                _call("host-backoff-1", sql_content="SELECT 1"),
+                _call("host-backoff-2", sql_content="SELECT 2"),
+                _finish(),
+            ]
+        ),
+        scenario=_HostGeneratedCallScenario(
+            {
+                "host-backoff-1": {
+                    "host_generated": True,
+                    "internal_only": True,
+                    "host_call_context": {
+                        "stage": "history_compact_scan",
+                        "reason": "response_incomplete",
+                        "previous_page_size": 100,
+                        "next_page_size": 7,
+                    },
+                },
+                "host-backoff-2": {"host_generated": True, "internal_only": True},
+            }
+        ),
+        event_sink=sink,
+        budget=_budget(),
+    ).run(run_id=run_id)
+
+    assert result.state.successful_queries == ["host-backoff-1", "host-backoff-2"]
+    action_traces = await _trace_action_events(sink, run_id)
+    assert len(action_traces) == 3
+    annotated_trace, plain_host_trace, finish_trace = action_traces
+    assert annotated_trace == {
+        "action": "call_tool",
+        "origin": "deterministic_host",
+        "tool_name": "fixture.query",
+        "stage": "history_compact_scan",
+        "reason": "response_incomplete",
+        "previous_page_size": 100,
+        "next_page_size": 7,
+        "arguments": {"internal_host_call": True},
+    }
+    assert plain_host_trace == {
+        "action": "call_tool",
+        "origin": "deterministic_host",
+        "tool_name": "fixture.query",
+        "arguments": {"internal_host_call": True},
+    }
+    assert finish_trace["origin"] == "model"
+
+
+@pytest.mark.asyncio
+async def test_trace_action_model_call_origin_preserves_full_arguments() -> None:
+    run_id = uuid4()
+    sink = InMemoryEventSink()
+    session = _TrackingSession()
+
+    result = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(session),
+        planner=ScriptedPlanner([_call("model-driven"), _finish()]),
+        scenario=_Scenario(),
+        event_sink=sink,
+        budget=_budget(),
+    ).run(run_id=run_id)
+
+    assert result.state.successful_queries == ["model-driven"]
+    action_traces = await _trace_action_events(sink, run_id)
+    assert len(action_traces) == 2
+    call_trace, finish_trace = action_traces
+    assert call_trace["origin"] == "model"
+    assert call_trace["arguments"] == {"query": "model-driven"}
+    assert finish_trace["origin"] == "model"
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_duplicate_host_generated_call_and_keeps_durable_decision_bare() -> (
+    None
+):
+    run_id = uuid4()
+    sink = _InterruptAfterDecisionSink()
+    first_session = _TrackingSession()
+    first_planner = ScriptedPlanner([_call("host-resume", sql_content="SELECT 1"), _finish()])
+    checkpoints: list[Any] = []
+
+    async def capture_checkpoint(snapshot: Any) -> None:
+        checkpoints.append(snapshot)
+
+    first_runtime = MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(first_session),
+        planner=first_planner,
+        scenario=_HostGeneratedCallScenario(
+            {"host-resume": {"host_generated": True, "internal_only": True}}
+        ),
+        event_sink=sink,
+        budget=_budget(),
+        checkpoint_hook=capture_checkpoint,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await first_runtime.run(run_id=run_id)
+
+    assert first_session.call_calls == 0
+    events = await sink.read(run_id)
+    durable_decisions = [event for event in events if event.kind == AgentEventKind.MODEL_DECISION]
+    assert len(durable_decisions) == 1
+    assert "origin" not in durable_decisions[0].payload["decision"]
+    action_traces_before_resume = [
+        event for event in events if event.kind == AgentEventKind.TRACE_ACTION
+    ]
+    assert action_traces_before_resume == []
+
+    stale_checkpoint = checkpoints[-1]
+    second_session = _TrackingSession()
+    second_planner = ScriptedPlanner([_finish()])
+    resumed = await MCPAgentHarnessRuntime(
+        connector=_SingleSessionConnector(second_session),
+        planner=second_planner,
+        scenario=_HostGeneratedCallScenario(
+            {"host-resume": {"host_generated": True, "internal_only": True}}
+        ),
+        event_sink=sink,
+        budget=_budget(),
+    ).resume(
+        stale_checkpoint,
+        restored_budget=BudgetLedger.from_snapshot(stale_checkpoint.budget),
+    )
+
+    assert second_session.call_calls == 1
+    assert resumed.state.successful_queries == ["host-resume"]
+    resumed_action_traces = await _trace_action_events(sink, run_id)
+    assert len(resumed_action_traces) == 2
+    host_trace, finish_trace = resumed_action_traces
+    assert host_trace == {
+        "action": "call_tool",
+        "origin": "deterministic_host",
+        "tool_name": "fixture.query",
+        "arguments": {"internal_host_call": True},
+    }
+    assert finish_trace["origin"] == "model"
+    durable_decisions_after_resume = [
+        event
+        for event in await sink.read(run_id)
+        if event.kind == AgentEventKind.MODEL_DECISION
+    ]
+    assert len(durable_decisions_after_resume) == 2
+    assert all(
+        "origin" not in event.payload["decision"] for event in durable_decisions_after_resume
+    )

@@ -671,3 +671,121 @@ async def test_budget_stop_checkpoint_rematerializes_same_partial_result() -> No
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_backoff_computed_page_size_survives_checkpoint_resume() -> None:
+    planning_connector = ReplayMCPConnector(ARCHERY_HARNESS_PROVIDER, [])
+    scenario, state = _pipeline_scenario(planning_connector)
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    state.history_pipeline_phase = "COMPACT"
+    state.history_pipeline_target = target
+    state.history_result_target = target
+    state.history_pipeline_endpoint = "db-1.example:3306"
+    state.history_snapshot_max_id = 14
+    state.history_ranking_rows = {
+        row_id: {
+            "id": row_id,
+            "Query_time_max": float(row_id),
+            "Query_time_sum": float(row_id * 10),
+        }
+        for row_id in range(14, 0, -1)
+    }
+    state.history_ranking_scan_complete = True
+    state.history_ranking_page_count = 1
+    state.history_page_size = 2
+
+    specs = scenario.build_tool_specs(_analysis_tools())
+    truncated_page = scenario.next_host_call(specs)
+    assert truncated_page is not None
+    assert truncated_page.arguments["limit_num"] == 2
+
+    truncated_fixture = ReplayCallFixture(
+        tool_name=truncated_page.name,
+        expected_arguments=dict(truncated_page.arguments),
+        result={
+            "structuredContent": {
+                "status": "success",
+                "full_sql": truncated_page.arguments["sql_content"],
+                "rows": [_compact_row(14)],
+                "mcp_reported_row_count": 2,
+            }
+        },
+    )
+    first_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="compact-truncated-before-checkpoint",
+                tools=_analysis_tools(),
+                calls=[truncated_fixture],
+            )
+        ],
+    )
+    captured = []
+
+    async def interrupt_after_backoff(snapshot) -> None:
+        if (
+            snapshot.active_call is None
+            and snapshot.invocations
+            and snapshot.invocations[-1].status == ToolInvocationStatus.SUCCEEDED
+            and snapshot.state.history_page_backoff_count == 1
+        ):
+            captured.append(snapshot)
+            raise asyncio.CancelledError
+
+    sink = InMemoryEventSink()
+    with pytest.raises(asyncio.CancelledError):
+        await _runtime(
+            scenario,
+            first_connector,
+            sink,
+            checkpoint_hook=interrupt_after_backoff,
+        ).run(run_id=uuid4(), initial_state=state)
+
+    checkpoint = captured[-1]
+    assert checkpoint.state.history_page_size == 1
+    assert checkpoint.state.history_page_last_incomplete_size == 2
+    assert checkpoint.state.history_page_last_declared_rows == 2
+    assert checkpoint.state.history_page_last_recovered_rows == 1
+    assert checkpoint.state.history_page_cursor is None
+    assert checkpoint.state.history_compact_rows == {}
+
+    second_connector = ReplayMCPConnector(
+        ARCHERY_HARNESS_PROVIDER,
+        [
+            ReplaySessionFixture(
+                session_id="compact-truncated-after-checkpoint",
+                tools=_analysis_tools(),
+                calls=[],
+            )
+        ],
+    )
+    resumed_scenario, _ = _restored_scenario(checkpoint, second_connector)
+    pending = []
+
+    async def interrupt_next_call(snapshot) -> None:
+        if (
+            snapshot.active_call is not None
+            and snapshot.invocations[-1].status == ToolInvocationStatus.PENDING
+        ):
+            pending.append(snapshot)
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _runtime(
+            resumed_scenario,
+            second_connector,
+            sink,
+            checkpoint_hook=interrupt_next_call,
+        ).resume(
+            checkpoint,
+            restored_budget=BudgetLedger.from_snapshot(checkpoint.budget),
+        )
+
+    resumed = pending[-1]
+    assert resumed.active_call.effective_arguments["limit_num"] == 1
+    assert resumed.state.history_page_size == 1
+    assert resumed.state.history_page_cursor is None
+    assert resumed.state.history_compact_rows == {}
+    assert resumed.state.history_page_backoff_count == 1

@@ -80,6 +80,10 @@ def test_project_catalog_loads_secret_free_selection_and_execution_metadata() ->
     assert archery.prompts.workflow_directives[
         "archery.history.truncation.fetch_single_id"
     ].startswith("完整非 sample 字段扫描完成后")
+    list_ids_directive = archery.prompts.workflow_directives["archery.history.truncation.list_ids"]
+    assert "响应被截断时" in list_ids_directive
+    assert "退回二分减半" in list_ids_directive
+    assert "fail closed" in list_ids_directive
     sample_directive = archery.prompts.workflow_directives[
         "archery.history.truncation.project_sample_prefix"
     ]

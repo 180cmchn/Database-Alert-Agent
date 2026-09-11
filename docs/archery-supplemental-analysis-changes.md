@@ -65,6 +65,26 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 - 预算、deadline 或分片失败发生在 History 恢复阶段时 fail closed；若只发生在 supplemental 阶段，
   完整 History 内容和资格保持不变，仅 supplemental 标记为 partial/failed。
 
+### History 分页退避、错误分类与审计表达（本次变更）
+
+- 分页退避改为响应感知：截断时 Host 优先使用 `truncation_row_shortfall()` 从已截断响应中解析出的
+  完整行数（`recovered_rows`）计算下一页 `LIMIT`（`recovered_rows - 1`，`recovered_rows <= 1` 时为 1），
+  不再机械按 100→50→25→... 二分；只有在响应未提供可靠行数信号时才回退二分减半。新页大小必须严格
+  小于当前页大小，且不小于 1；`LIMIT` 收缩到 1 仍不完整时按既有 `history_pipeline_page_incomplete`
+  fail closed，不改变 keyset 分页、快照上界或无损恢复语义——截断页始终不推进 cursor、不进入累计
+  结果。`ArcheryHarnessState` 新增 `history_page_backoff_count`、`history_page_last_incomplete_size`、
+  `history_page_last_declared_rows`、`history_page_last_recovered_rows` 四个可 checkpoint 字段用于审计
+  和恢复后继续同一退避决策，进入新一轮 Ranking/Compact 扫描时重置。
+- 修正 SQL 查询失败误判为成功：`ArcheryMCPClient.validate_business_success()` 新增对 Archery SQL 工具
+  `SQL 查询失败：`/`SQL 查询失败:` 明确失败前缀（行首锚定）的识别，命中时转换为 `ArcheryMCPToolError`
+  并经 `safe_error_detail()` 脱敏，使该 invocation 最终状态为 `FAILED` 而非之前依赖 SQL 回显缺失才能
+  发现的 `SUCCEEDED`；History 扫描随之按既有 `on_failure()` fail closed。普通结果文本中包含“查询失败”
+  字样但不在行首出现前缀时不受影响，`isError=true` 的既有行为不变。
+- 审计轨迹区分调用来源：不改动持久化 `MODEL_DECISION` 事件的结构以保持 replay 兼容；仅调整用户可见
+  的 `TRACE_ACTION` 内容——模型生成的调用标记 `"origin": "model"`，Host 确定性生成的调用标记
+  `"origin": "deterministic_host"` 并携带 `stage`/`reason`/`previous_page_size`/`next_page_size`，
+  `arguments` 仍只暴露 `{"internal_host_call": true}`，不泄露完整 SQL 或内部凭据。
+
 ### 补充证据绑定
 
 - sample 绑定真实 history `id/checksum/sample`，相同 checksum 只选择优先级最高的一行。
@@ -122,13 +142,17 @@ hint 等语法容易出现不一致。SQL 词法与结构提取需要集中维�
 最终提交前执行并记录以下离线验证：
 
 ```text
-pytest -m "not live" -q: 1227 passed, 1 skipped, 3 deselected, 24 warnings
+定向测试（deterministic / checkpoint / replay / runtime / archery_mcp / mcp_runtime / mcp_catalog）: 410 passed
+pytest -m "not live" -q: 1301 passed, 1 skipped, 3 deselected, 27 warnings
 ruff check app tests migrations: 通过
 python -m compileall -q app tests migrations: 通过
 受影响应用文件的 LSP diagnostics: 通过
 ```
 
-24 条 warning 来自 Starlette、LangGraph/LangChain 和 Alembic 依赖的弃用提示，没有本次实现产生的
+27 条 warning 来自 Starlette、LangGraph/LangChain 和 Alembic 依赖的弃用提示，没有本次实现产生的
 测试失败。该离线套件的持久化 fixture 使用隔离的临时 SQLite 数据库；它不写入已迁移的 MySQL，也不
-把 SQLite 结果表述为 MySQL 事务语义验证。
+把 SQLite 结果表述为 MySQL 事务语义验证。`test_service_run_lease.py::test_service_force_reanalysis_supersedes_an_active_run`
+在整套并发运行时偶发超时（与本次改动无关的既有计时敏感测试），单独重跑稳定通过。
 
+本次相对上一基线（1227 passed）新增 74 个测试用例，覆盖响应感知分页退避、Checkpoint 恢复、
+SQL 查询失败分类、TRACE_ACTION origin 区分和 catalog 指令文案。
