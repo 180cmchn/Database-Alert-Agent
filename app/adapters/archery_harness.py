@@ -146,6 +146,19 @@ _HISTORY_PIPELINE_PHASES = {
     _HISTORY_PIPELINE_ENRICHMENT,
     _HISTORY_PIPELINE_COMPLETED,
 }
+_HISTORY_REQUIRED_COLUMNS = frozenset(
+    {
+        "id",
+        "hostname_max",
+        "db_max",
+        "checksum",
+        "ts_min",
+        "ts_max",
+        "query_time_max",
+        "query_time_sum",
+        "sample",
+    }
+)
 _SAMPLE_PENDING = "PENDING"
 _SAMPLE_DIRECT_PENDING = "DIRECT_PENDING"
 _SAMPLE_CHUNK_PENDING = "CHUNK_PENDING"
@@ -1367,12 +1380,16 @@ class ArcheryHarnessScenario:
                 state.history_pipeline_requested_sql = sql
             limit_num = state.history_page_size
         elif state.history_pipeline_phase == _HISTORY_PIPELINE_COMPACT:
+            if not self._history_pipeline_columns(state):
+                return self._stop_pipeline_for_missing_columns(state)
             sql = self._history_pipeline_page_sql(state, projection="compact")
             limit_num = state.history_page_size
         elif state.history_pipeline_phase == _HISTORY_PIPELINE_RECONCILE:
             if not state.history_reconcile_ids:
                 self._finalize_history_pipeline_scan(state)
                 return self.next_host_call(tools)
+            if not self._history_pipeline_columns(state):
+                return self._stop_pipeline_for_missing_columns(state)
             sql = self._history_pipeline_page_sql(
                 state,
                 projection="compact",
@@ -1483,6 +1500,62 @@ class ArcheryHarnessScenario:
         except ValueError:
             return ()
 
+    def _history_table_columns_ready(
+        self,
+        state: ArcheryHarnessState,
+        target: tuple[int, str],
+    ) -> bool:
+        """Return whether target's discovered History schema is safe to project.
+
+        Both the Host-driven and model-driven entry points into the
+        deterministic History pipeline must agree on this check: adopting the
+        RANKING phase before the real schema is known leaves later COMPACT
+        pages with no columns to project, which used to raise an uncaught
+        ``ValueError`` from ``history_compact_projection_sql`` deep inside the
+        planner loop.
+        """
+
+        discovered_columns = state.table_columns.get(target, {}).get(
+            ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
+        )
+        if not discovered_columns or not _HISTORY_REQUIRED_COLUMNS <= {
+            column.casefold() for column in discovered_columns
+        }:
+            return False
+        try:
+            self.client.history_base_projection_columns(tuple(discovered_columns))
+        except ValueError:
+            return False
+        return True
+
+    def _stop_pipeline_for_missing_columns(
+        self,
+        state: ArcheryHarnessState,
+    ) -> MCPModelToolCall:
+        """Fail the deterministic pipeline closed instead of building a compact
+        projection with no discovered History columns.
+
+        This is a defensive backstop: ``_history_table_columns_ready`` already
+        keeps the pipeline from ever adopting RANKING without a confirmed
+        schema, so COMPACT/RECONCILE should never observe empty columns. If
+        that invariant is ever violated by a future code path, fail closed
+        with a normal finish call instead of letting
+        ``history_compact_projection_sql`` raise an uncaught ``ValueError``.
+        """
+
+        state.history_pipeline_phase = _HISTORY_PIPELINE_COMPLETED
+        state.finish_summary = (
+            "Deterministic Archery History recovery stopped: the discovered table "
+            "schema for the History table was lost or never confirmed before the "
+            "non-sample projection."
+        )
+        return self._make_host_call(
+            _FINISH_TOOL_NAME,
+            {"reason": state.finish_summary},
+            purpose="finish-missing-history-columns",
+            state=state,
+        )
+
     @staticmethod
     def _next_history_recovery_id(state: ArcheryHarnessState) -> int | None:
         pending_states = {
@@ -1506,17 +1579,6 @@ class ArcheryHarnessScenario:
         self,
         state: ArcheryHarnessState,
     ) -> bool:
-        required_columns = {
-            "id",
-            "hostname_max",
-            "db_max",
-            "checksum",
-            "ts_min",
-            "ts_max",
-            "query_time_max",
-            "query_time_sum",
-            "sample",
-        }
         candidates: list[tuple[tuple[int, str], str]] = []
         for target, endpoints_value in state.resolved_endpoints.items():
             if target[1].casefold() != "archery":
@@ -1526,16 +1588,7 @@ class ArcheryHarnessScenario:
                 self.client.clean_table_name(table).casefold() for table in discovered_tables
             }:
                 continue
-            discovered_columns = state.table_columns.get(target, {}).get(
-                ARCHERY_SLOW_QUERY_REVIEW_TABLE.casefold()
-            )
-            if not discovered_columns or not required_columns <= {
-                column.casefold() for column in discovered_columns
-            }:
-                continue
-            try:
-                self.client.history_base_projection_columns(tuple(discovered_columns))
-            except ValueError:
+            if not self._history_table_columns_ready(state, target):
                 continue
             endpoints = sorted(endpoints_value)
             if len(endpoints) == 1:
@@ -5336,6 +5389,26 @@ class ArcheryHarnessScenario:
                     raw_result,
                     reason_code="history_pipeline_scope_unresolved",
                     detail="The first ranking page could not be bound to its target and endpoint.",
+                )
+            if not self._history_table_columns_ready(state, target):
+                failure = self._local_rejection(
+                    stage="table_structure",
+                    target=self._analysis_target_from_arguments(target, call.effective_arguments),
+                    error_type="target_unresolved",
+                    reason_code="history_columns_not_discovered",
+                    detail=(
+                        "尚未确认 "
+                        f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} "
+                        "的完整真实字段（例如通过 list_table_columns_gymJPA），"
+                        "排名投影结果暂不采纳为确定性流水线的起点。"
+                    ),
+                )
+                state.slow_query_analysis_failures.append(failure)
+                return self._inbound_rejection_transition(
+                    state,
+                    call,
+                    raw_result=raw_result,
+                    failure=failure,
                 )
             state.history_pipeline_phase = _HISTORY_PIPELINE_RANKING
             state.history_pipeline_target = target

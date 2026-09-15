@@ -19,6 +19,7 @@ from tests.unit.archery_harness_support import (
     _analysis_tools,
     _scenario,
     _success,
+    _target_call,
 )
 
 
@@ -247,6 +248,77 @@ def test_pipeline_requires_discovered_complete_history_schema_before_start() -> 
     assert ranking.arguments["db_name"] == "archery"
     assert "SELECT id, Query_time_max, Query_time_sum" in ranking.arguments["sql_content"]
     assert "hostname_max = 'db-1.example:3306'" in ranking.arguments["sql_content"]
+
+
+def test_model_issued_ranking_query_is_rejected_before_history_columns_discovered() -> None:
+    """Regression for the 8ca625b0 crash-loop: a model that discovers the
+    History table's columns via raw ``information_schema`` SQL (instead of
+    ``list_table_columns_gymJPA``) never populates ``state.table_columns``.
+    If the model then sends the ranking-shaped SQL itself, the Host must
+    reject it locally instead of silently adopting RANKING and crashing two
+    steps later inside ``history_compact_projection_sql``.
+    """
+    scenario, state, specs = _pipeline_scenario()
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    state.table_columns.pop(target)
+
+    ranking_sql = (
+        "SELECT id, Query_time_max, Query_time_sum FROM "
+        f"{ARCHERY_SLOW_QUERY_REVIEW_TABLE} WHERE hostname_max = 'db-1.example:3306' "
+        "AND ts_min >= '2026-07-23 15:00:00' AND ts_min < '2026-07-23 16:00:00' "
+        "AND ts_max >= '2026-07-23 16:00:00' ORDER BY id DESC LIMIT 100"
+    )
+    call = _target_call(
+        "model-ranking",
+        ranking_sql,
+        instance_id=target[0],
+        db_name=target[1],
+    )
+    prepared = _prepare_host_call(scenario, state, call)
+    assert "local_rejection" not in prepared.metadata
+
+    transition = scenario.on_result(
+        state,
+        prepared,
+        {
+            "structuredContent": {
+                "status": "success",
+                "full_sql": ranking_sql,
+                "rows": [{"id": 501, "Query_time_max": 9.5, "Query_time_sum": 63.0}],
+            }
+        },
+    )
+
+    assert transition.status == ToolInvocationStatus.SKIPPED
+    assert state.history_pipeline_phase == "IDLE"
+    assert [
+        failure.get("reason_code") for failure in state.slow_query_analysis_failures
+    ] == ["history_columns_not_discovered"]
+    assert state.slow_query_analysis_failures[0].get("terminal") is not True
+
+
+def test_compact_phase_finishes_instead_of_crashing_when_columns_go_missing() -> None:
+    """Defensive backstop: if COMPACT/RECONCILE is ever reached with no
+    discovered History columns (schema invariant violated upstream),
+    ``next_host_call`` must fail closed with a normal finish call instead of
+    letting ``history_compact_projection_sql`` raise an uncaught
+    ``ValueError`` from inside the planner loop.
+    """
+    scenario, state, specs = _pipeline_scenario()
+    target = (TARGET_ARGUMENTS["instance_id"], TARGET_ARGUMENTS["db_name"])
+    assert scenario.next_host_call(specs) is not None
+
+    state.history_pipeline_phase = "COMPACT"
+    state.history_pipeline_target = target
+    state.history_result_target = target
+    state.history_pipeline_endpoint = "db-1.example:3306"
+    state.table_columns.pop(target)
+
+    call = scenario.next_host_call(specs)
+
+    assert call is not None
+    assert call.name == "finish_archery_investigation"
+    assert state.history_pipeline_phase == "COMPLETED"
 
 
 
