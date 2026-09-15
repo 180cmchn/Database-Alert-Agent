@@ -19,11 +19,18 @@ export interface FlashDutyHandler {
   acknowledged_at: string;
 }
 
+export interface FlashDutyUnacknowledgedAssignee {
+  person_id: number;
+  person_name: string | null;
+  assigned_at: string;
+}
+
 export interface FlashDutyHandlingResponse {
   linked_incident: boolean;
   incident_id: string | null;
   progress: FlashDutyProgress | null;
   handlers: FlashDutyHandler[];
+  unacknowledged_assignees: FlashDutyUnacknowledgedAssignee[];
   handlers_complete: boolean;
   refreshed_at: string;
   warning_code: "INCIDENT_DETAILS_UNAVAILABLE" | null;

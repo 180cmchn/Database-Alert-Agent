@@ -415,6 +415,9 @@ def test_get_flashduty_handling_projects_current_incident(tmp_path: Path) -> Non
     assert [(item["person_id"], item["person_name"]) for item in body["handlers"]] == [
         (11, "dylan.du")
     ]
+    assert [
+        (item["person_id"], item["person_name"]) for item in body["unacknowledged_assignees"]
+    ] == [(12, "assigned.only")]
     assert body["warning_code"] is None
     assert flashduty.calls == [
         ("alert", "663a1b2c3d4e5f6789abcdef", False),
@@ -447,6 +450,7 @@ def test_get_flashduty_handling_keeps_partial_alert_progress(tmp_path: Path) -> 
     assert body["linked_incident"] is True
     assert body["progress"] == "Triggered"
     assert body["handlers"] == []
+    assert body["unacknowledged_assignees"] == []
     assert body["handlers_complete"] is False
     assert body["warning_code"] == "INCIDENT_DETAILS_UNAVAILABLE"
 

@@ -51,11 +51,19 @@ class FlashDutyHandler:
 
 
 @dataclass(frozen=True)
+class FlashDutyUnacknowledgedAssignee:
+    person_id: int
+    person_name: str | None
+    assigned_at: datetime
+
+
+@dataclass(frozen=True)
 class FlashDutyHandlingResult:
     linked_incident: bool
     incident_id: str | None
     progress: FlashDutyProgress | None
     handlers: tuple[FlashDutyHandler, ...]
+    unacknowledged_assignees: tuple[FlashDutyUnacknowledgedAssignee, ...]
     handlers_complete: bool
     refreshed_at: datetime
     warning_code: str | None = None
@@ -302,7 +310,9 @@ def _member_page(
     ], total
 
 
-def _handlers(incident: Mapping[str, Any]) -> tuple[FlashDutyHandler, ...]:
+def _handlers(
+    incident: Mapping[str, Any],
+) -> tuple[tuple[FlashDutyHandler, ...], tuple[FlashDutyUnacknowledgedAssignee, ...]]:
     responders_value = incident.get("responders", [])
     if responders_value is None:
         responders_value = []
@@ -310,6 +320,7 @@ def _handlers(incident: Mapping[str, Any]) -> tuple[FlashDutyHandler, ...]:
         raise FlashDutyHandlingInvalidResponseError("FlashDuty responders must be a list")
 
     handlers: list[FlashDutyHandler] = []
+    unacknowledged: list[FlashDutyUnacknowledgedAssignee] = []
     for index, responder_value in enumerate(responders_value):
         responder = _mapping(responder_value, f"responder[{index}]")
         person_id = responder.get("person_id")
@@ -322,8 +333,6 @@ def _handlers(incident: Mapping[str, Any]) -> tuple[FlashDutyHandler, ...]:
             f"responder[{index}].acknowledged_at",
             zero_is_none=True,
         )
-        if acknowledged_at is None:
-            continue
         assigned_at = _timestamp(
             responder.get("assigned_at"),
             f"responder[{index}].assigned_at",
@@ -335,17 +344,27 @@ def _handlers(incident: Mapping[str, Any]) -> tuple[FlashDutyHandler, ...]:
                 f"FlashDuty responder[{index}].person_name must be a string"
             )
         person_name = person_name_value.strip() if person_name_value else None
-        handlers.append(
-            FlashDutyHandler(
-                person_id=person_id,
-                person_name=person_name or None,
-                assigned_at=assigned_at,
-                acknowledged_at=acknowledged_at,
+        if acknowledged_at is not None:
+            handlers.append(
+                FlashDutyHandler(
+                    person_id=person_id,
+                    person_name=person_name or None,
+                    assigned_at=assigned_at,
+                    acknowledged_at=acknowledged_at,
+                )
             )
-        )
+        elif assigned_at is not None:
+            unacknowledged.append(
+                FlashDutyUnacknowledgedAssignee(
+                    person_id=person_id,
+                    person_name=person_name or None,
+                    assigned_at=assigned_at,
+                )
+            )
 
     handlers.sort(key=lambda item: (item.acknowledged_at, item.person_id))
-    return tuple(handlers)
+    unacknowledged.sort(key=lambda item: (item.assigned_at, item.person_id))
+    return tuple(handlers), tuple(unacknowledged)
 
 
 async def read_flashduty_handling(
@@ -386,6 +405,7 @@ async def read_flashduty_handling(
             incident_id=None,
             progress=None,
             handlers=(),
+            unacknowledged_assignees=(),
             handlers_complete=True,
             refreshed_at=datetime.now(UTC),
         )
@@ -398,6 +418,7 @@ async def read_flashduty_handling(
             incident_id=incident_id,
             progress=alert_progress,
             handlers=(),
+            unacknowledged_assignees=(),
             handlers_complete=False,
             refreshed_at=datetime.now(UTC),
             warning_code=_INCIDENT_DETAILS_UNAVAILABLE,
@@ -422,13 +443,14 @@ async def read_flashduty_handling(
             incident_id=incident_id,
             progress=alert_progress,
             handlers=(),
+            unacknowledged_assignees=(),
             handlers_complete=False,
             refreshed_at=datetime.now(UTC),
             warning_code=_INCIDENT_DETAILS_UNAVAILABLE,
         )
 
     try:
-        handlers = _handlers(incident)
+        handlers, unacknowledged_assignees = _handlers(incident)
     except FlashDutyHandlingInvalidResponseError as exc:
         logger.warning(
             "flashduty_incident_responders_unavailable alert_id=%s incident_id=%s error=%s",
@@ -441,16 +463,19 @@ async def read_flashduty_handling(
             incident_id=incident_id,
             progress=incident_progress,
             handlers=(),
+            unacknowledged_assignees=(),
             handlers_complete=False,
             refreshed_at=datetime.now(UTC),
             warning_code=_INCIDENT_DETAILS_UNAVAILABLE,
         )
 
-    if handlers:
+    person_ids = {handler.person_id for handler in handlers}
+    person_ids.update(assignee.person_id for assignee in unacknowledged_assignees)
+    if person_ids:
         try:
             member_names = await member_name_resolver.resolve(
                 client,
-                {handler.person_id for handler in handlers},
+                person_ids,
                 deadline=deadline,
             )
         except (TimeoutError, FlashDutyError, FlashDutyHandlingInvalidResponseError) as exc:
@@ -468,11 +493,19 @@ async def read_flashduty_handling(
                 )
                 for handler in handlers
             )
+            unacknowledged_assignees = tuple(
+                replace(
+                    assignee,
+                    person_name=member_names.get(assignee.person_id, assignee.person_name),
+                )
+                for assignee in unacknowledged_assignees
+            )
     return FlashDutyHandlingResult(
         linked_incident=True,
         incident_id=incident_id,
         progress=incident_progress,
         handlers=handlers,
+        unacknowledged_assignees=unacknowledged_assignees,
         handlers_complete=True,
         refreshed_at=datetime.now(UTC),
     )

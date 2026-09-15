@@ -8,7 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_runtime.trace import AgentTraceEntry
 from app.application.admin import runtime_configuration_issues
-from app.application.flashduty_handling import FlashDutyHandlingResult, FlashDutyProgress
+from app.application.flashduty_handling import (
+    FlashDutyHandlingResult,
+    FlashDutyProgress,
+)
 from app.config import Settings
 from app.domain.models import (
     AlertStatus,
@@ -77,11 +80,18 @@ class FlashDutyHandler(BaseModel):
     acknowledged_at: datetime
 
 
+class FlashDutyUnacknowledgedAssignee(BaseModel):
+    person_id: int = Field(gt=0)
+    person_name: str | None = None
+    assigned_at: datetime
+
+
 class FlashDutyHandlingResponse(BaseModel):
     linked_incident: bool
     incident_id: str | None = None
     progress: FlashDutyProgress | None = None
     handlers: list[FlashDutyHandler] = Field(default_factory=list)
+    unacknowledged_assignees: list[FlashDutyUnacknowledgedAssignee] = Field(default_factory=list)
     handlers_complete: bool
     refreshed_at: datetime
     warning_code: Literal["INCIDENT_DETAILS_UNAVAILABLE"] | None = None
@@ -100,6 +110,14 @@ class FlashDutyHandlingResponse(BaseModel):
                     acknowledged_at=handler.acknowledged_at,
                 )
                 for handler in result.handlers
+            ],
+            unacknowledged_assignees=[
+                FlashDutyUnacknowledgedAssignee(
+                    person_id=assignee.person_id,
+                    person_name=assignee.person_name,
+                    assigned_at=assignee.assigned_at,
+                )
+                for assignee in result.unacknowledged_assignees
             ],
             handlers_complete=result.handlers_complete,
             refreshed_at=result.refreshed_at,

@@ -85,3 +85,10 @@ export function compactId(value: string, size = 8): string {
     ? value
     : `${value.slice(0, size)}…${value.slice(-size)}`;
 }
+
+export function unacknowledgedAssigneeLabel(assignee: {
+  person_id: number;
+  person_name: string | null;
+}): string {
+  return `${assignee.person_name || `成员 #${assignee.person_id}`}未认领`;
+}

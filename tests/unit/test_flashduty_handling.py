@@ -152,6 +152,8 @@ async def test_handling_uses_latest_incident_progress_and_acknowledged_responder
     assert [handler.person_name for handler in result.handlers] == ["dylan.du", "alice.chen"]
     assert not hasattr(result.handlers[0], "email")
     assert result.handlers[0].acknowledged_at.isoformat() == "2024-04-09T08:07:10+00:00"
+    assert [item.person_id for item in result.unacknowledged_assignees] == [5]
+    assert result.unacknowledged_assignees[0].person_name == "assigned.only"
     assert client.calls == [
         ("alert", ALERT_ID, False),
         ("incident", INCIDENT_ID, False),
@@ -173,6 +175,7 @@ async def test_handling_reports_alert_without_linked_incident() -> None:
     assert result.incident_id is None
     assert result.progress is None
     assert result.handlers == ()
+    assert result.unacknowledged_assignees == ()
     assert result.handlers_complete is True
     assert client.calls == [("alert", ALERT_ID, False)]
     assert client.member_calls == []
@@ -201,6 +204,7 @@ async def test_handling_keeps_alert_progress_when_incident_detail_fails() -> Non
     assert result.linked_incident is True
     assert result.progress is FlashDutyProgress.TRIGGERED
     assert result.handlers == ()
+    assert result.unacknowledged_assignees == ()
     assert result.handlers_complete is False
     assert result.warning_code == "INCIDENT_DETAILS_UNAVAILABLE"
 
@@ -273,6 +277,155 @@ async def test_closed_incident_keeps_acknowledged_handler() -> None:
     assert result.handlers[0].person_id == 7
     assert result.handlers[0].person_name == "dylan.du"
     assert result.handlers[0].assigned_at is None
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_assignee_uses_member_directory_name() -> None:
+    client = StubHandlingClient(
+        alert_data={
+            "alert_id": ALERT_ID,
+            "incident": {"incident_id": INCIDENT_ID, "progress": "Processing"},
+        },
+        incident_data={
+            "incident_id": INCIDENT_ID,
+            "progress": "Processing",
+            "responders": [
+                {
+                    "person_id": 12,
+                    "person_name": None,
+                    "assigned_at": 1_712_650_020,
+                    "acknowledged_at": 0,
+                }
+            ],
+        },
+        member_pages={
+            1: {
+                "total": 1,
+                "items": [{"member_id": 12, "member_name": "assigned.only"}],
+            }
+        },
+    )
+
+    result = await read_flashduty_handling(
+        client,
+        make_alert(),
+        member_name_resolver=FlashDutyMemberNameResolver(),
+    )
+
+    assert result.handlers == ()
+    assert len(result.unacknowledged_assignees) == 1
+    assert result.unacknowledged_assignees[0].person_id == 12
+    assert result.unacknowledged_assignees[0].person_name == "assigned.only"
+    assert result.unacknowledged_assignees[0].assigned_at.isoformat() == (
+        "2024-04-09T08:07:00+00:00"
+    )
+    assert result.handlers_complete is True
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_assignee_survives_member_directory_failure() -> None:
+    client = StubHandlingClient(
+        alert_data={
+            "alert_id": ALERT_ID,
+            "incident": {"incident_id": INCIDENT_ID, "progress": "Processing"},
+        },
+        incident_data={
+            "incident_id": INCIDENT_ID,
+            "progress": "Processing",
+            "responders": [
+                {
+                    "person_id": 12,
+                    "person_name": "Incident fallback",
+                    "assigned_at": 1_712_650_020,
+                    "acknowledged_at": 0,
+                }
+            ],
+        },
+        member_error=FlashDutyAPIError(
+            "directory unavailable",
+            code="UpstreamError",
+            request_id="req-members",
+        ),
+    )
+
+    result = await read_flashduty_handling(
+        client,
+        make_alert(),
+        member_name_resolver=FlashDutyMemberNameResolver(),
+    )
+
+    assert result.unacknowledged_assignees[0].person_name == "Incident fallback"
+    assert result.handlers_complete is True
+    assert result.warning_code is None
+
+
+@pytest.mark.asyncio
+async def test_responder_without_assigned_or_acknowledged_time_is_ignored() -> None:
+    client = StubHandlingClient(
+        alert_data={
+            "alert_id": ALERT_ID,
+            "incident": {"incident_id": INCIDENT_ID, "progress": "Triggered"},
+        },
+        incident_data={
+            "incident_id": INCIDENT_ID,
+            "progress": "Triggered",
+            "responders": [
+                {
+                    "person_id": 21,
+                    "person_name": "Never assigned",
+                    "assigned_at": 0,
+                    "acknowledged_at": 0,
+                }
+            ],
+        },
+    )
+
+    result = await read_flashduty_handling(
+        client,
+        make_alert(),
+        member_name_resolver=FlashDutyMemberNameResolver(),
+    )
+
+    assert result.handlers == ()
+    assert result.unacknowledged_assignees == ()
+    assert client.member_calls == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_acknowledged_and_unacknowledged_responders_split_correctly() -> None:
+    client = StubHandlingClient(
+        alert_data={
+            "alert_id": ALERT_ID,
+            "incident": {"incident_id": INCIDENT_ID, "progress": "Processing"},
+        },
+        incident_data={
+            "incident_id": INCIDENT_ID,
+            "progress": "Processing",
+            "responders": [
+                {
+                    "person_id": 11,
+                    "person_name": "Database Owner",
+                    "assigned_at": 1_712_650_010,
+                    "acknowledged_at": 1_712_650_030,
+                },
+                {
+                    "person_id": 12,
+                    "person_name": "Assigned Only",
+                    "assigned_at": 1_712_650_020,
+                    "acknowledged_at": 0,
+                },
+            ],
+        },
+    )
+
+    result = await read_flashduty_handling(
+        client,
+        make_alert(),
+        member_name_resolver=FlashDutyMemberNameResolver(),
+    )
+
+    assert [handler.person_id for handler in result.handlers] == [11]
+    assert [item.person_id for item in result.unacknowledged_assignees] == [12]
 
 
 @pytest.mark.asyncio

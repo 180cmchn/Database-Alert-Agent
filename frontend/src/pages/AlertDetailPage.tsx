@@ -43,7 +43,14 @@ import {
 } from "../components/ui";
 import { useAdminAuth } from "../context/AdminAuthContext";
 import { api, ApiError } from "../lib/api";
-import { compactId, formatDateTime, formatJson, formatPercent, stageLabel } from "../lib/format";
+import {
+  compactId,
+  formatDateTime,
+  formatJson,
+  formatPercent,
+  stageLabel,
+  unacknowledgedAssigneeLabel,
+} from "../lib/format";
 import {
   canRequestRunCancellation,
   isRunCancellationPending,
@@ -142,7 +149,7 @@ function FlashDutyHandlingCard({
               <div className="flashduty-handling-warning" role="status">
                 处理人暂时无法完整读取，请稍后重试。
               </div>
-            ) : handling.handlers.length > 0 ? (
+            ) : handling.handlers.length > 0 || handling.unacknowledged_assignees.length > 0 ? (
               <div className="flashduty-handler-list">
                 {handling.handlers.map((handler) => (
                   <div className="flashduty-handler" key={`${handler.person_id}-${handler.acknowledged_at}`}>
@@ -151,6 +158,12 @@ function FlashDutyHandlingCard({
                       {handler.assigned_at && `分派于 ${formatDateTime(handler.assigned_at)} · `}
                       认领于 {formatDateTime(handler.acknowledged_at)}
                     </span>
+                  </div>
+                ))}
+                {handling.unacknowledged_assignees.map((assignee) => (
+                  <div className="flashduty-handler flashduty-handler-unacknowledged" key={`${assignee.person_id}-${assignee.assigned_at}`}>
+                    <strong>{unacknowledgedAssigneeLabel(assignee)}</strong>
+                    <span>分派于 {formatDateTime(assignee.assigned_at)}</span>
                   </div>
                 ))}
               </div>
