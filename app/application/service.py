@@ -25,6 +25,7 @@ from app.application.analysis_control import (
     ActiveAnalysisRegistry,
     wait_for_persisted_cancellation,
 )
+from app.application.flashduty_handling import FlashDutyMemberNameResolver
 from app.application.sanitization import sanitize, sanitize_alert
 from app.application.wecom_mention import (
     WeComMentionFlashDutyClient,
@@ -112,6 +113,7 @@ class AlertAnalysisService:
         knowledge_sources: list[str] | None = None,
         runtime_manifest_config: dict[str, Any] | None = None,
         flashduty_client: WeComMentionFlashDutyClient | None = None,
+        flashduty_member_name_resolver: FlashDutyMemberNameResolver | None = None,
         wecom_mention_enabled: bool = False,
         wecom_mention_mode: WeComMentionMode = WeComMentionMode.ON_CALL_PERSON,
     ) -> None:
@@ -139,6 +141,9 @@ class AlertAnalysisService:
         self.knowledge_sources = knowledge_sources or []
         self.runtime_manifest_config = dict(runtime_manifest_config or {})
         self.flashduty_client = flashduty_client
+        self.flashduty_member_name_resolver = (
+            flashduty_member_name_resolver or FlashDutyMemberNameResolver()
+        )
         self.wecom_mention_enabled = wecom_mention_enabled
         self.wecom_mention_mode = wecom_mention_mode
         self._active_analyses = 0
@@ -1201,6 +1206,7 @@ class AlertAnalysisService:
                 mode=self.wecom_mention_mode,
                 repository=self.repository,
                 flashduty_client=self.flashduty_client,
+                member_name_resolver=self.flashduty_member_name_resolver,
             )
             if not targets:
                 return

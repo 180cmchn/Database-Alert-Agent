@@ -497,7 +497,6 @@ export interface WeComMentionEngineOwner {
 }
 
 export interface WeComMentionFlashDutyMember {
-  flashduty_person_id: number;
   flashduty_member_name: string;
   target: WeComMentionTarget;
   updated_at: string;

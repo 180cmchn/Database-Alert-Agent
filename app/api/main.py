@@ -50,7 +50,6 @@ from app.application.factory import (
 from app.application.flashduty_handling import (
     FlashDutyHandlingInvalidResponseError,
     FlashDutyHandlingTimeoutError,
-    FlashDutyMemberNameResolver,
     read_flashduty_handling,
 )
 from app.application.scheduler import (
@@ -127,7 +126,7 @@ def create_app(
         settings, runtime.service, scheduler, runtime.flashduty_client
     )
     retention_cleaner = WeeklyAlertRetentionCleaner(settings, runtime.repository)
-    flashduty_member_names = FlashDutyMemberNameResolver()
+    flashduty_member_names = runtime.flashduty_member_name_resolver
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -756,79 +755,81 @@ def create_app(
         return WeComMentionFlashDutyMemberListResponse(items=items)
 
     @app.get(
-        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        "/api/v1/admin/wecom-mention/flashduty-members/{member_name}",
         response_model=WeComMentionFlashDutyMember,
         tags=["admin"],
         dependencies=[Depends(require_admin)],
     )
-    async def get_wecom_mention_flashduty_member(person_id: int) -> WeComMentionFlashDutyMember:
-        members = await runtime.repository.get_wecom_mention_flashduty_members({person_id})
-        member = members.get(person_id)
+    async def get_wecom_mention_flashduty_member(
+        member_name: str,
+    ) -> WeComMentionFlashDutyMember:
+        members = await runtime.repository.get_wecom_mention_flashduty_members({member_name})
+        member = members.get(member_name)
         if member is None:
             raise HTTPException(
                 status_code=404,
                 detail={
                     "code": "WECOM_MENTION_FLASHDUTY_MEMBER_NOT_FOUND",
-                    "message": f"No mention mapping configured for person_id {person_id}",
+                    "message": f"No mention mapping configured for member_name {member_name}",
                 },
             )
         return member
 
     @app.put(
-        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        "/api/v1/admin/wecom-mention/flashduty-members/{member_name}",
         response_model=WeComMentionFlashDutyMember,
         tags=["admin"],
         dependencies=[Depends(require_admin)],
     )
     async def upsert_wecom_mention_flashduty_member(
-        person_id: int,
+        member_name: str,
         payload: WeComMentionFlashDutyMemberRequest,
         actor: str = Depends(require_admin),  # noqa: B008
     ) -> WeComMentionFlashDutyMember:
-        if person_id <= 0:
+        normalized_member_name = member_name.strip()
+        if not normalized_member_name:
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "code": "INVALID_PERSON_ID",
-                    "message": "person_id must be a positive integer",
+                    "code": "INVALID_MEMBER_NAME",
+                    "message": "member_name must not be blank",
                 },
             )
         member = await runtime.repository.upsert_wecom_mention_flashduty_member(
-            person_id,
-            payload.flashduty_member_name,
+            normalized_member_name,
             payload.target.to_domain(),
             updated_by=actor,
         )
         await audit_logger.record(
             action="upsert",
-            target=f"wecom-mention-flashduty-member:{person_id}",
-            fields=["flashduty_member_name", "target"],
+            target=f"wecom-mention-flashduty-member:{normalized_member_name}",
+            fields=["target"],
             actor=actor,
         )
         return member
 
     @app.delete(
-        "/api/v1/admin/wecom-mention/flashduty-members/{person_id}",
+        "/api/v1/admin/wecom-mention/flashduty-members/{member_name}",
         status_code=204,
         tags=["admin"],
         dependencies=[Depends(require_admin)],
     )
     async def delete_wecom_mention_flashduty_member(
-        person_id: int,
+        member_name: str,
         actor: str = Depends(require_admin),  # noqa: B008
     ) -> Response:
-        deleted = await runtime.repository.delete_wecom_mention_flashduty_member(person_id)
+        deleted = await runtime.repository.delete_wecom_mention_flashduty_member(member_name)
         if not deleted:
             raise HTTPException(
                 status_code=404,
                 detail={
                     "code": "WECOM_MENTION_FLASHDUTY_MEMBER_NOT_FOUND",
-                    "message": f"No mention mapping configured for person_id {person_id}",
+                    "message": f"No mention mapping configured for member_name {member_name}",
                 },
             )
         await audit_logger.record(
             action="delete",
-            target=f"wecom-mention-flashduty-member:{person_id}",
+            target=f"wecom-mention-flashduty-member:{member_name}",
             actor=actor,
         )
         return Response(status_code=204)

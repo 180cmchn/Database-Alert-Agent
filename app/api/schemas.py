@@ -375,11 +375,10 @@ class WeComMentionEngineOwnerListResponse(BaseModel):
 
 
 class WeComMentionFlashDutyMemberRequest(BaseModel):
-    """Upsert payload for the ON_CALL_PERSON mention mapping (path carries the person id)."""
+    """Upsert payload for the ON_CALL_PERSON mention mapping (path carries the member name)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    flashduty_member_name: str = Field(default="", max_length=255)
     target: WeComMentionTargetRequest
 
 

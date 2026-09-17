@@ -10,15 +10,17 @@ Two admin-selected modes are supported:
 * ``DATABASE_OWNER``: match the alert's normalized database engine against an
   admin-maintained engine -> WeCom identity table.
 * ``ON_CALL_PERSON``: read the FlashDuty incident linked to the alert, take
-  the currently assigned/acknowledged person(s), and map their FlashDuty
-  ``person_id`` through an admin-maintained FlashDuty member -> WeCom identity
-  table (FlashDuty exposes no WeCom userid itself).
+  the currently assigned/acknowledged person(s), resolve their numeric
+  FlashDuty ``person_id`` to a human-readable ``member_name`` via FlashDuty's
+  member directory, and map that name through an admin-maintained FlashDuty
+  member -> WeCom identity table (FlashDuty exposes no WeCom userid itself).
 
 Resolution is best-effort by design: every "this mode does not apply" state
-(no engine, non-FlashDuty alert, no linked incident, no admin mapping) simply
-returns an empty tuple. Only genuine transport/response failures raise
-``WeComMentionError`` so the caller can log a distinct "resolution failed"
-outcome without ever affecting the already-delivered notification card.
+(no engine, non-FlashDuty alert, no linked incident, unresolvable member name,
+no admin mapping) simply returns an empty tuple. Only genuine transport/
+response failures raise ``WeComMentionError`` so the caller can log a distinct
+"resolution failed" outcome without ever affecting the already-delivered
+notification card.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Protocol
 
+from app.application.flashduty_handling import FlashDutyMemberNameResolver
 from app.domain.models import NormalizedAlert, WeComMentionMode, WeComMentionTarget
 from app.domain.ports import AlertRepository
 
@@ -64,6 +67,14 @@ class WeComMentionFlashDutyClient(Protocol):
         incident_id: str,
         *,
         retry_until_cancelled: bool = True,
+    ) -> WeComMentionFlashDutyResponse: ...
+
+    async def list_members(
+        self,
+        *,
+        page: int,
+        limit: int = 100,
+        retry_until_cancelled: bool = False,
     ) -> WeComMentionFlashDutyResponse: ...
 
 
@@ -148,6 +159,7 @@ async def _resolve_on_call_person(
     *,
     repository: AlertRepository,
     flashduty_client: WeComMentionFlashDutyClient | None,
+    member_name_resolver: FlashDutyMemberNameResolver,
     timeout_seconds: float,
 ) -> tuple[WeComMentionTarget, ...]:
     if alert.source.casefold() != "flashduty":
@@ -187,16 +199,45 @@ async def _resolve_on_call_person(
     if not person_ids:
         return ()
 
-    members = await repository.get_wecom_mention_flashduty_members(set(person_ids))
-    targets: list[WeComMentionTarget] = []
+    if deadline - loop.time() <= 0:
+        return ()
+    member_names_by_person_id = await member_name_resolver.resolve(
+        flashduty_client,
+        set(person_ids),
+        deadline=deadline,
+    )
+
+    member_names: list[str] = []
+    seen_member_names: set[str] = set()
     for person_id in person_ids:
-        member = members.get(person_id)
-        if member is None:
+        member_name = member_names_by_person_id.get(person_id)
+        if member_name is None:
             logger.info(
-                "wecom_mention_flashduty_member_unmapped alert_id=%s incident_id=%s person_id=%s",
+                "wecom_mention_flashduty_person_unresolved alert_id=%s incident_id=%s "
+                "person_id=%s",
                 alert.id,
                 incident_id,
                 person_id,
+            )
+            continue
+        if member_name in seen_member_names:
+            continue
+        seen_member_names.add(member_name)
+        member_names.append(member_name)
+    if not member_names:
+        return ()
+
+    members = await repository.get_wecom_mention_flashduty_members(set(member_names))
+    targets: list[WeComMentionTarget] = []
+    for member_name in member_names:
+        member = members.get(member_name)
+        if member is None:
+            logger.info(
+                "wecom_mention_flashduty_member_unmapped alert_id=%s incident_id=%s "
+                "member_name=%s",
+                alert.id,
+                incident_id,
+                member_name,
             )
             continue
         targets.append(member.target)
@@ -209,6 +250,7 @@ async def resolve_wecom_mention_targets(
     mode: WeComMentionMode,
     repository: AlertRepository,
     flashduty_client: WeComMentionFlashDutyClient | None,
+    member_name_resolver: FlashDutyMemberNameResolver | None = None,
     timeout_seconds: float = WECOM_MENTION_RESOLUTION_TIMEOUT_SECONDS,
 ) -> tuple[WeComMentionTarget, ...]:
     """Best-effort resolve the @ mention targets for one notification event.
@@ -236,5 +278,6 @@ async def resolve_wecom_mention_targets(
         alert,
         repository=repository,
         flashduty_client=flashduty_client,
+        member_name_resolver=member_name_resolver or FlashDutyMemberNameResolver(),
         timeout_seconds=timeout_seconds,
     )

@@ -117,8 +117,7 @@ class WeComMentionEngineOwner(BaseModel):
 class WeComMentionFlashDutyMember(BaseModel):
     """Admin-configured FlashDuty person identity bridge (mode ON_CALL_PERSON)."""
 
-    flashduty_person_id: int = Field(gt=0)
-    flashduty_member_name: str = Field(default="", max_length=255)
+    flashduty_member_name: str = Field(min_length=1, max_length=255)
     target: WeComMentionTarget
     updated_at: datetime = Field(default_factory=utc_now)
     updated_by: str = Field(default="", max_length=255)
