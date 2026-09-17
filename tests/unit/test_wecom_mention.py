@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.adapters.flashduty import FlashDutyResponse
+from app.adapters.flashduty import FlashDutyAPIError, FlashDutyResponse
 from app.application.wecom_mention import (
     WeComMentionInvalidResponseError,
     resolve_wecom_mention_targets,
@@ -53,32 +53,42 @@ class FakeRepository:
         self,
         *,
         engine_owners: dict[str, WeComMentionEngineOwner] | None = None,
-        flashduty_members: dict[int, WeComMentionFlashDutyMember] | None = None,
+        flashduty_members: dict[str, WeComMentionFlashDutyMember] | None = None,
     ) -> None:
         self._engine_owners = engine_owners or {}
         self._flashduty_members = flashduty_members or {}
-        self.requested_person_ids: set[int] | None = None
+        self.requested_member_names: set[str] | None = None
 
     async def get_wecom_mention_engine_owner(self, engine: str) -> WeComMentionEngineOwner | None:
         return self._engine_owners.get(engine)
 
     async def get_wecom_mention_flashduty_members(
-        self, person_ids: set[int]
-    ) -> dict[int, WeComMentionFlashDutyMember]:
-        self.requested_person_ids = person_ids
+        self, member_names: set[str]
+    ) -> dict[str, WeComMentionFlashDutyMember]:
+        self.requested_member_names = member_names
         return {
-            person_id: member
-            for person_id, member in self._flashduty_members.items()
-            if person_id in person_ids
+            member_name: member
+            for member_name, member in self._flashduty_members.items()
+            if member_name in member_names
         }
 
 
 class FakeFlashDutyClient:
-    def __init__(self, *, alert_data: object, incident_data: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        alert_data: object,
+        incident_data: object | None = None,
+        member_names: dict[int, str] | None = None,
+        member_error: Exception | None = None,
+    ) -> None:
         self._alert_data = alert_data
         self._incident_data = incident_data
+        self._member_names = member_names or {}
+        self._member_error = member_error
         self.alert_info_calls: list[str] = []
         self.incident_info_calls: list[str] = []
+        self.member_calls: list[int] = []
 
     async def alert_info(
         self, alert_id: str, *, retry_until_cancelled: bool = True
@@ -91,6 +101,25 @@ class FakeFlashDutyClient:
     ) -> FlashDutyResponse:
         self.incident_info_calls.append(incident_id)
         return FlashDutyResponse(request_id="req-incident", data=self._incident_data)
+
+    async def list_members(
+        self,
+        *,
+        page: int,
+        limit: int = 100,
+        retry_until_cancelled: bool = False,
+    ) -> FlashDutyResponse:
+        self.member_calls.append(page)
+        if self._member_error is not None:
+            raise self._member_error
+        items = [
+            {"member_id": person_id, "member_name": name}
+            for person_id, name in self._member_names.items()
+        ]
+        return FlashDutyResponse(
+            request_id=f"req-members-{page}",
+            data={"items": items, "total": len(items)},
+        )
 
 
 @pytest.mark.asyncio
@@ -152,7 +181,7 @@ async def test_on_call_person_mode_prefers_assigned_to_over_responders() -> None
     target = make_target("张三")
     repository = FakeRepository(
         flashduty_members={
-            101: WeComMentionFlashDutyMember(flashduty_person_id=101, target=target),
+            "zhangsan": WeComMentionFlashDutyMember(flashduty_member_name="zhangsan", target=target),
         },
     )
     client = FakeFlashDutyClient(
@@ -161,6 +190,7 @@ async def test_on_call_person_mode_prefers_assigned_to_over_responders() -> None
             "assigned_to": {"person_ids": [101]},
             "responders": [{"person_id": 202, "acknowledged_at": 1700000000}],
         },
+        member_names={101: "zhangsan", 202: "lisi"},
     )
     alert = make_alert()
 
@@ -172,7 +202,7 @@ async def test_on_call_person_mode_prefers_assigned_to_over_responders() -> None
     )
 
     assert resolved == (target,)
-    assert repository.requested_person_ids == {101}
+    assert repository.requested_member_names == {"zhangsan"}
 
 
 @pytest.mark.asyncio
@@ -180,7 +210,7 @@ async def test_on_call_person_mode_falls_back_to_latest_responder() -> None:
     target = make_target("李四")
     repository = FakeRepository(
         flashduty_members={
-            202: WeComMentionFlashDutyMember(flashduty_person_id=202, target=target),
+            "lisi": WeComMentionFlashDutyMember(flashduty_member_name="lisi", target=target),
         },
     )
     client = FakeFlashDutyClient(
@@ -191,6 +221,7 @@ async def test_on_call_person_mode_falls_back_to_latest_responder() -> None:
                 {"person_id": 202, "acknowledged_at": 1700000500},
             ],
         },
+        member_names={101: "zhangsan", 202: "lisi"},
     )
     alert = make_alert()
 
@@ -210,6 +241,7 @@ async def test_on_call_person_mode_skips_unmapped_person() -> None:
     client = FakeFlashDutyClient(
         alert_data={"incident": {"incident_id": _OBJECT_ID}},
         incident_data={"assigned_to": {"person_ids": [999]}},
+        member_names={999: "unmapped-user"},
     )
     alert = make_alert()
 
@@ -314,6 +346,25 @@ async def test_on_call_person_mode_raises_on_malformed_incident_id() -> None:
     alert = make_alert()
 
     with pytest.raises(WeComMentionInvalidResponseError):
+        await resolve_wecom_mention_targets(
+            alert,
+            mode=WeComMentionMode.ON_CALL_PERSON,
+            repository=repository,
+            flashduty_client=client,
+        )
+
+
+@pytest.mark.asyncio
+async def test_on_call_person_mode_propagates_member_directory_failure() -> None:
+    repository = FakeRepository()
+    client = FakeFlashDutyClient(
+        alert_data={"incident": {"incident_id": _OBJECT_ID}},
+        incident_data={"assigned_to": {"person_ids": [101]}},
+        member_error=FlashDutyAPIError("member list unavailable"),
+    )
+    alert = make_alert()
+
+    with pytest.raises(FlashDutyAPIError):
         await resolve_wecom_mention_targets(
             alert,
             mode=WeComMentionMode.ON_CALL_PERSON,

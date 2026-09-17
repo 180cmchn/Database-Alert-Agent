@@ -275,23 +275,23 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
   const [items, setItems] = useState<WeComMentionFlashDutyMember[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [busyKey, setBusyKey] = useState<number | "__new__" | null>(null);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editName, setEditName] = useState("");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [editingMemberName, setEditingMemberName] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<TargetDraft>(EMPTY_TARGET_DRAFT);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [newPersonId, setNewPersonId] = useState("");
-  const [newName, setNewName] = useState("");
+  const [newMemberName, setNewMemberName] = useState("");
   const [newDraft, setNewDraft] = useState<TargetDraft>(EMPTY_TARGET_DRAFT);
   const [rowError, setRowError] = useState("");
-  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [confirmDeleteMemberName, setConfirmDeleteMemberName] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
       const response = await api.getWeComMentionFlashDutyMembers(token);
-      setItems([...response.items].sort((a, b) => a.flashduty_person_id - b.flashduty_person_id));
+      setItems(
+        [...response.items].sort((a, b) => a.flashduty_member_name.localeCompare(b.flashduty_member_name)),
+      );
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "映射列表加载失败");
     } finally {
@@ -302,23 +302,22 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
   useEffect(() => { void load(); }, [load]);
 
   function startEdit(member: WeComMentionFlashDutyMember) {
-    setEditingId(member.flashduty_person_id);
-    setEditName(member.flashduty_member_name);
+    setEditingMemberName(member.flashduty_member_name);
     setEditDraft(targetToDraft(member.target));
     setRowError("");
   }
 
-  async function saveEdit(personId: number) {
+  async function saveEdit(memberName: string) {
     const target = draftToTarget(editDraft);
     if (!target) {
       setRowError("请填写展示名称，并至少提供企微 userid 或手机号之一。");
       return;
     }
-    setBusyKey(personId);
+    setBusyKey(memberName);
     setRowError("");
     try {
-      await api.upsertWeComMentionFlashDutyMember(personId, editName.trim(), target, token);
-      setEditingId(null);
+      await api.upsertWeComMentionFlashDutyMember(memberName, target, token);
+      setEditingMemberName(null);
       await load();
     } catch (saveError) {
       setRowError(saveError instanceof Error ? saveError.message : "保存失败");
@@ -328,10 +327,10 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
   }
 
   async function submitNew() {
-    const personId = Number(newPersonId);
+    const memberName = newMemberName.trim();
     const target = draftToTarget(newDraft);
-    if (!Number.isInteger(personId) || personId <= 0) {
-      setRowError("请填写有效的 FlashDuty person_id（正整数）。");
+    if (!memberName) {
+      setRowError("请填写 FlashDuty member_name。");
       return;
     }
     if (!target) {
@@ -341,10 +340,9 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
     setBusyKey("__new__");
     setRowError("");
     try {
-      await api.upsertWeComMentionFlashDutyMember(personId, newName.trim(), target, token);
+      await api.upsertWeComMentionFlashDutyMember(memberName, target, token);
       setShowAddForm(false);
-      setNewPersonId("");
-      setNewName("");
+      setNewMemberName("");
       setNewDraft(EMPTY_TARGET_DRAFT);
       await load();
     } catch (submitError) {
@@ -355,15 +353,15 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
   }
 
   async function confirmDelete() {
-    if (confirmDeleteId === null) return;
-    setBusyKey(confirmDeleteId);
+    if (!confirmDeleteMemberName) return;
+    setBusyKey(confirmDeleteMemberName);
     try {
-      await api.deleteWeComMentionFlashDutyMember(confirmDeleteId, token);
-      setConfirmDeleteId(null);
+      await api.deleteWeComMentionFlashDutyMember(confirmDeleteMemberName, token);
+      setConfirmDeleteMemberName(null);
       await load();
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : "删除失败");
-      setConfirmDeleteId(null);
+      setConfirmDeleteMemberName(null);
     } finally {
       setBusyKey(null);
     }
@@ -378,8 +376,7 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
         <table className="alert-table">
           <thead>
             <tr>
-              <th>FlashDuty person_id</th>
-              <th>FlashDuty 姓名（备注）</th>
+              <th>FlashDuty member_name</th>
               <th>展示名称</th>
               <th>企微 userid</th>
               <th>手机号</th>
@@ -389,28 +386,17 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
           </thead>
           <tbody>
             {items.map((member) => {
-              const isEditing = editingId === member.flashduty_person_id;
-              const isBusy = busyKey === member.flashduty_person_id;
+              const isEditing = editingMemberName === member.flashduty_member_name;
+              const isBusy = busyKey === member.flashduty_member_name;
               return (
-                <tr key={member.flashduty_person_id}>
-                  <td><code>{member.flashduty_person_id}</code></td>
+                <tr key={member.flashduty_member_name}>
+                  <td><code>{member.flashduty_member_name}</code></td>
                   {isEditing ? (
-                    <>
-                      <td>
-                        <input
-                          placeholder="FlashDuty 姓名（可选备注）"
-                          value={editName}
-                          disabled={isBusy}
-                          onChange={(event) => setEditName(event.target.value)}
-                        />
-                      </td>
-                      <td colSpan={3}>
-                        <TargetFieldsInline draft={editDraft} onChange={setEditDraft} disabled={isBusy} />
-                      </td>
-                    </>
+                    <td colSpan={3}>
+                      <TargetFieldsInline draft={editDraft} onChange={setEditDraft} disabled={isBusy} />
+                    </td>
                   ) : (
                     <>
-                      <td>{member.flashduty_member_name || "—"}</td>
                       <td>{member.target.display_label}</td>
                       <td>{member.target.wecom_userid || "—"}</td>
                       <td>{member.target.wecom_mobile || "—"}</td>
@@ -420,10 +406,10 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
                   <td>
                     {isEditing ? (
                       <div className="mention-row-actions">
-                        <button type="button" className="button primary small" onClick={() => void saveEdit(member.flashduty_person_id)} disabled={isBusy}>
+                        <button type="button" className="button primary small" onClick={() => void saveEdit(member.flashduty_member_name)} disabled={isBusy}>
                           {isBusy ? <InlineLoading label="保存中" /> : <><Check size={14} /> 保存</>}
                         </button>
-                        <button type="button" className="button secondary small" onClick={() => { setEditingId(null); setRowError(""); }} disabled={isBusy}>
+                        <button type="button" className="button secondary small" onClick={() => { setEditingMemberName(null); setRowError(""); }} disabled={isBusy}>
                           <X size={14} /> 取消
                         </button>
                       </div>
@@ -432,7 +418,7 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
                         <button type="button" className="button secondary small" onClick={() => startEdit(member)}>
                           <Pencil size={14} /> 编辑
                         </button>
-                        <button type="button" className="button danger small" onClick={() => setConfirmDeleteId(member.flashduty_person_id)}>
+                        <button type="button" className="button danger small" onClick={() => setConfirmDeleteMemberName(member.flashduty_member_name)}>
                           <Trash2 size={14} /> 删除
                         </button>
                       </div>
@@ -442,25 +428,15 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
               );
             })}
             {items.length === 0 && !showAddForm && (
-              <tr><td colSpan={7}><span className="muted-copy">尚未配置任何 FlashDuty 成员的企微身份映射</span></td></tr>
+              <tr><td colSpan={6}><span className="muted-copy">尚未配置任何 FlashDuty 成员的企微身份映射</span></td></tr>
             )}
             {showAddForm && (
               <tr>
                 <td>
                   <input
-                    type="number"
-                    min="1"
-                    placeholder="FlashDuty person_id"
-                    value={newPersonId}
-                    onChange={(event) => setNewPersonId(event.target.value)}
-                    disabled={busyKey === "__new__"}
-                  />
-                </td>
-                <td>
-                  <input
-                    placeholder="FlashDuty 姓名（可选备注）"
-                    value={newName}
-                    onChange={(event) => setNewName(event.target.value)}
+                    placeholder="FlashDuty member_name（如 kobeway.wei）"
+                    value={newMemberName}
+                    onChange={(event) => setNewMemberName(event.target.value)}
                     disabled={busyKey === "__new__"}
                   />
                 </td>
@@ -490,12 +466,12 @@ export function WeComMentionFlashDutyMembersEditor({ token }: { token: string })
         </button>
       )}
       <ConfirmDialog
-        open={confirmDeleteId !== null}
+        open={confirmDeleteMemberName !== null}
         title="删除该成员的@提醒映射？"
-        description={`删除后，person_id ${confirmDeleteId} 对应的成员在 ON_CALL_PERSON 模式下将不再被@，直至重新配置。`}
+        description={`删除后，成员 ${confirmDeleteMemberName} 在 ON_CALL_PERSON 模式下将不再被@，直至重新配置。`}
         confirmLabel="确认删除"
-        busy={busyKey === confirmDeleteId}
-        onCancel={() => setConfirmDeleteId(null)}
+        busy={busyKey === confirmDeleteMemberName}
+        onCancel={() => setConfirmDeleteMemberName(null)}
         onConfirm={() => void confirmDelete()}
       />
     </div>

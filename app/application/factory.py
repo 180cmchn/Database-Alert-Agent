@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -50,6 +50,7 @@ from app.adapters.prometheus_mcp import (
 )
 from app.adapters.tool_result_analysis import DeterministicToolResultProcessor
 from app.agents.graph import InvestigationAgent
+from app.application.flashduty_handling import FlashDutyMemberNameResolver
 from app.application.service import AlertAnalysisService
 from app.application.validation import RuleConclusionValidator
 from app.config import Settings
@@ -76,6 +77,9 @@ class Runtime:
     repository: AlertRepository
     service: AlertAnalysisService
     flashduty_client: FlashDutyClient | None = None
+    flashduty_member_name_resolver: FlashDutyMemberNameResolver = field(
+        default_factory=FlashDutyMemberNameResolver
+    )
     deployment_settings: Settings | None = None
 
 
@@ -498,6 +502,7 @@ def build_runtime(
         notifier = _build_notifier(settings)
 
     flashduty_client = _build_flashduty_client(settings)
+    flashduty_member_name_resolver = FlashDutyMemberNameResolver()
     alert_detail_enricher = (
         FlashDutyAlertDetailEnricher(
             flashduty_client,
@@ -540,6 +545,7 @@ def build_runtime(
         knowledge_sources=settings.knowledge_sources,
         runtime_manifest_config=_runtime_manifest_config(settings),
         flashduty_client=flashduty_client,
+        flashduty_member_name_resolver=flashduty_member_name_resolver,
         wecom_mention_enabled=settings.wecom_mention_enabled,
         wecom_mention_mode=WeComMentionMode(settings.wecom_mention_mode),
     )
@@ -548,5 +554,6 @@ def build_runtime(
         repository=repository,
         service=service,
         flashduty_client=flashduty_client,
+        flashduty_member_name_resolver=flashduty_member_name_resolver,
         deployment_settings=(deployment_settings or settings).model_copy(deep=True),
     )

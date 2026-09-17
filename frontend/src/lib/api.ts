@@ -201,24 +201,19 @@ export const api = {
       token,
     ),
 
-  upsertWeComMentionFlashDutyMember: (
-    personId: number,
-    flashdutyMemberName: string,
-    target: WeComMentionTarget,
-    token: string,
-  ) =>
+  upsertWeComMentionFlashDutyMember: (memberName: string, target: WeComMentionTarget, token: string) =>
     request<WeComMentionFlashDutyMember>(
-      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(String(personId))}`,
+      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(memberName)}`,
       {
         method: "PUT",
-        body: JSON.stringify({ flashduty_member_name: flashdutyMemberName, target }),
+        body: JSON.stringify({ target }),
       },
       token,
     ),
 
-  deleteWeComMentionFlashDutyMember: (personId: number, token: string) =>
+  deleteWeComMentionFlashDutyMember: (memberName: string, token: string) =>
     request<void>(
-      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(String(personId))}`,
+      `/api/v1/admin/wecom-mention/flashduty-members/${encodeURIComponent(memberName)}`,
       { method: "DELETE" },
       token,
     ),

@@ -77,20 +77,21 @@ async def test_flashduty_member_upsert_batch_get_list_and_delete_round_trip(
         )
 
         created_a = await repository.upsert_wecom_mention_flashduty_member(
-            101, "Zhang San", target_a, updated_by="admin-a"
+            "zhangsan.wei", target_a, updated_by="admin-a"
         )
-        assert created_a.flashduty_person_id == 101
-        assert created_a.flashduty_member_name == "Zhang San"
+        assert created_a.flashduty_member_name == "zhangsan.wei"
         assert created_a.target == target_a
 
         await repository.upsert_wecom_mention_flashduty_member(
-            202, "Li Si", target_b, updated_by="admin-a"
+            "lisi.wei", target_b, updated_by="admin-a"
         )
 
-        batch = await repository.get_wecom_mention_flashduty_members({101, 202, 303})
-        assert set(batch.keys()) == {101, 202}
-        assert batch[101].target == target_a
-        assert batch[202].target == target_b
+        batch = await repository.get_wecom_mention_flashduty_members(
+            {"zhangsan.wei", "lisi.wei", "wangwu.wei"}
+        )
+        assert set(batch.keys()) == {"zhangsan.wei", "lisi.wei"}
+        assert batch["zhangsan.wei"].target == target_a
+        assert batch["lisi.wei"].target == target_b
 
         empty_batch = await repository.get_wecom_mention_flashduty_members(set())
         assert empty_batch == {}
@@ -99,20 +100,23 @@ async def test_flashduty_member_upsert_batch_get_list_and_delete_round_trip(
             display_label="张三（新）", wecom_userid="zhangsan2", wecom_mobile=None
         )
         updated = await repository.upsert_wecom_mention_flashduty_member(
-            101, "Zhang San", updated_target, updated_by="admin-b"
+            "zhangsan.wei", updated_target, updated_by="admin-b"
         )
         assert updated.target == updated_target
         assert updated.updated_by == "admin-b"
 
         listed = await repository.list_wecom_mention_flashduty_members()
-        assert [member.flashduty_person_id for member in listed] == [101, 202]
+        assert [member.flashduty_member_name for member in listed] == [
+            "lisi.wei",
+            "zhangsan.wei",
+        ]
 
-        deleted = await repository.delete_wecom_mention_flashduty_member(101)
+        deleted = await repository.delete_wecom_mention_flashduty_member("zhangsan.wei")
         assert deleted is True
-        remaining = await repository.get_wecom_mention_flashduty_members({101})
+        remaining = await repository.get_wecom_mention_flashduty_members({"zhangsan.wei"})
         assert remaining == {}
 
-        deleted_again = await repository.delete_wecom_mention_flashduty_member(101)
+        deleted_again = await repository.delete_wecom_mention_flashduty_member("zhangsan.wei")
         assert deleted_again is False
     finally:
         await repository.close()

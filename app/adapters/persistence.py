@@ -12,7 +12,6 @@ from uuid import uuid4
 from jsonpointer import JsonPointerException, resolve_pointer
 from sqlalchemy import (
     JSON,
-    BigInteger,
     Column,
     DateTime,
     ForeignKey,
@@ -354,7 +353,7 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 
 _UNBOUNDED_TEXT = Text().with_variant(LONGTEXT(), "mysql")
-DATABASE_SCHEMA_REVISION = "0020"
+DATABASE_SCHEMA_REVISION = "0021"
 _TOOL_INVOCATION_LIFECYCLE_FIELDS = frozenset(
     {"status", "started_at", "completed_at", "error", "artifact_ref"}
 )
@@ -492,8 +491,7 @@ class WeComMentionEngineOwnerRow(Base):
 class WeComMentionFlashDutyMemberRow(Base):
     __tablename__ = "wecom_mention_flashduty_members"
 
-    flashduty_person_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    flashduty_member_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    flashduty_member_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     display_label: Mapped[str] = mapped_column(String(100), nullable=False)
     wecom_userid: Mapped[str | None] = mapped_column(String(128))
     wecom_mobile: Mapped[str | None] = mapped_column(String(32))
@@ -1163,7 +1161,6 @@ class SQLAlchemyAlertRepository:
         row: WeComMentionFlashDutyMemberRow,
     ) -> WeComMentionFlashDutyMember:
         return WeComMentionFlashDutyMember(
-            flashduty_person_id=row.flashduty_person_id,
             flashduty_member_name=row.flashduty_member_name,
             target=WeComMentionTarget(
                 display_label=row.display_label,
@@ -1232,30 +1229,29 @@ class SQLAlchemyAlertRepository:
         async with self.session_factory() as session:
             rows = await session.scalars(
                 select(WeComMentionFlashDutyMemberRow).order_by(
-                    WeComMentionFlashDutyMemberRow.flashduty_person_id
+                    WeComMentionFlashDutyMemberRow.flashduty_member_name
                 )
             )
             return [self._wecom_mention_flashduty_member(row) for row in rows]
 
     async def get_wecom_mention_flashduty_members(
-        self, person_ids: set[int]
-    ) -> dict[int, WeComMentionFlashDutyMember]:
-        if not person_ids:
+        self, member_names: set[str]
+    ) -> dict[str, WeComMentionFlashDutyMember]:
+        if not member_names:
             return {}
         async with self.session_factory() as session:
             rows = await session.scalars(
                 select(WeComMentionFlashDutyMemberRow).where(
-                    WeComMentionFlashDutyMemberRow.flashduty_person_id.in_(person_ids)
+                    WeComMentionFlashDutyMemberRow.flashduty_member_name.in_(member_names)
                 )
             )
             return {
-                row.flashduty_person_id: self._wecom_mention_flashduty_member(row)
+                row.flashduty_member_name: self._wecom_mention_flashduty_member(row)
                 for row in rows
             }
 
     async def upsert_wecom_mention_flashduty_member(
         self,
-        flashduty_person_id: int,
         flashduty_member_name: str,
         target: WeComMentionTarget,
         *,
@@ -1263,10 +1259,9 @@ class SQLAlchemyAlertRepository:
     ) -> WeComMentionFlashDutyMember:
         now = _utc_now()
         async with self.session_factory() as session:
-            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_person_id)
+            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_member_name)
             if row is None:
                 row = WeComMentionFlashDutyMemberRow(
-                    flashduty_person_id=flashduty_person_id,
                     flashduty_member_name=flashduty_member_name,
                     display_label=target.display_label,
                     wecom_userid=target.wecom_userid,
@@ -1276,7 +1271,6 @@ class SQLAlchemyAlertRepository:
                 )
                 session.add(row)
             else:
-                row.flashduty_member_name = flashduty_member_name
                 row.display_label = target.display_label
                 row.wecom_userid = target.wecom_userid
                 row.wecom_mobile = target.wecom_mobile
@@ -1285,9 +1279,9 @@ class SQLAlchemyAlertRepository:
             await session.commit()
             return self._wecom_mention_flashduty_member(row)
 
-    async def delete_wecom_mention_flashduty_member(self, flashduty_person_id: int) -> bool:
+    async def delete_wecom_mention_flashduty_member(self, flashduty_member_name: str) -> bool:
         async with self.session_factory() as session:
-            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_person_id)
+            row = await session.get(WeComMentionFlashDutyMemberRow, flashduty_member_name)
             if row is None:
                 return False
             await session.delete(row)

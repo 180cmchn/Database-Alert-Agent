@@ -1151,7 +1151,7 @@ def test_wecom_mention_flashduty_member_endpoints_require_admin_and_round_trip(
     client, _ = create_admin_client(tmp_path)
     with client:
         list_endpoint = "/api/v1/admin/wecom-mention/flashduty-members"
-        item_endpoint = f"{list_endpoint}/101"
+        item_endpoint = f"{list_endpoint}/kobeway.wei"
 
         assert client.get(list_endpoint).status_code == 401
         assert client.get(item_endpoint).status_code == 401
@@ -1164,7 +1164,6 @@ def test_wecom_mention_flashduty_member_endpoints_require_admin_and_round_trip(
             item_endpoint,
             headers=ADMIN_HEADERS,
             json={
-                "flashduty_member_name": "Zhang San",
                 "target": {
                     "display_label": "张三",
                     "wecom_userid": "zhangsan",
@@ -1173,19 +1172,20 @@ def test_wecom_mention_flashduty_member_endpoints_require_admin_and_round_trip(
         )
         assert created.status_code == 200
         created_body = created.json()
-        assert created_body["flashduty_person_id"] == 101
-        assert created_body["flashduty_member_name"] == "Zhang San"
+        assert created_body["flashduty_member_name"] == "kobeway.wei"
 
         listed = client.get(list_endpoint, headers=ADMIN_HEADERS)
         assert listed.status_code == 200
-        assert [item["flashduty_person_id"] for item in listed.json()["items"]] == [101]
+        assert [item["flashduty_member_name"] for item in listed.json()["items"]] == [
+            "kobeway.wei"
+        ]
 
-        invalid_person_id = client.put(
-            f"{list_endpoint}/0",
+        blank_member_name = client.put(
+            f"{list_endpoint}/%20",
             headers=ADMIN_HEADERS,
             json={"target": {"display_label": "无效", "wecom_userid": "x"}},
         )
-        assert invalid_person_id.status_code == 422
+        assert blank_member_name.status_code == 422
 
         deleted = client.delete(item_endpoint, headers=ADMIN_HEADERS)
         assert deleted.status_code == 204
