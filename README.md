@@ -581,10 +581,11 @@ Authorization: Bearer <ADMIN_API_TOKEN>
 
 ## 验证
 
+main 分支不包含测试代码，完整验证（pytest、ruff/compileall 对 tests 目录的检查）请在 dev 分支执行。
+
 ```bash
-pytest -m "not live"
-ruff check app tests migrations
-python -m compileall -q app tests
+ruff check app migrations
+python -m compileall -q app
 cd frontend && npm run build
 git diff --check
 ```
