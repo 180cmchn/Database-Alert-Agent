@@ -236,6 +236,71 @@ async def test_on_call_person_mode_falls_back_to_latest_responder() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_call_person_mode_falls_back_to_unacknowledged_assignee() -> None:
+    """Dispatch-only responders (no assigned_to, not yet acknowledged) still resolve.
+
+    Regression for the reported bug: the alert detail page shows "参与处理人
+    xxx 未认领 分派于 xxx" purely from responders[].assigned_at, but the old
+    fallback only scanned acknowledged_at and silently produced no mention.
+    """
+    target = make_target("王五")
+    repository = FakeRepository(
+        flashduty_members={
+            "wangwu": WeComMentionFlashDutyMember(flashduty_member_name="wangwu", target=target),
+        },
+    )
+    client = FakeFlashDutyClient(
+        alert_data={"incident": {"incident_id": _OBJECT_ID}},
+        incident_data={
+            "responders": [
+                {"person_id": 303, "assigned_at": 1700000000},
+            ],
+        },
+        member_names={303: "wangwu"},
+    )
+    alert = make_alert()
+
+    resolved = await resolve_wecom_mention_targets(
+        alert,
+        mode=WeComMentionMode.ON_CALL_PERSON,
+        repository=repository,
+        flashduty_client=client,
+    )
+
+    assert resolved == (target,)
+
+
+@pytest.mark.asyncio
+async def test_on_call_person_mode_prefers_newer_unacknowledged_over_older_acknowledged() -> None:
+    """A more recent re-dispatch outranks an older acknowledgement."""
+    target = make_target("赵六")
+    repository = FakeRepository(
+        flashduty_members={
+            "zhaoliu": WeComMentionFlashDutyMember(flashduty_member_name="zhaoliu", target=target),
+        },
+    )
+    client = FakeFlashDutyClient(
+        alert_data={"incident": {"incident_id": _OBJECT_ID}},
+        incident_data={
+            "responders": [
+                {"person_id": 101, "acknowledged_at": 1700000000},
+                {"person_id": 404, "assigned_at": 1700000500},
+            ],
+        },
+        member_names={101: "zhangsan", 404: "zhaoliu"},
+    )
+    alert = make_alert()
+
+    resolved = await resolve_wecom_mention_targets(
+        alert,
+        mode=WeComMentionMode.ON_CALL_PERSON,
+        repository=repository,
+        flashduty_client=client,
+    )
+
+    assert resolved == (target,)
+
+@pytest.mark.asyncio
 async def test_on_call_person_mode_skips_unmapped_person() -> None:
     repository = FakeRepository(flashduty_members={})
     client = FakeFlashDutyClient(

@@ -28,9 +28,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Protocol
 
-from app.application.flashduty_handling import FlashDutyMemberNameResolver
+from app.application.flashduty_handling import (
+    FlashDutyHandlingInvalidResponseError,
+    FlashDutyMemberNameResolver,
+    parse_incident_responders,
+)
 from app.domain.models import NormalizedAlert, WeComMentionMode, WeComMentionTarget
 from app.domain.ports import AlertRepository
 
@@ -126,32 +131,28 @@ def _assigned_person_ids(incident: Mapping[str, Any]) -> list[int]:
     return resolved
 
 
-def _latest_responder_person_id(incident: Mapping[str, Any]) -> int | None:
-    """Fall back to the most recently acknowledged responder when unassigned."""
+def _current_responder_person_id(incident: Mapping[str, Any]) -> int | None:
+    """Fall back to the most recently assigned or acknowledged responder.
 
-    responders_value = incident.get("responders")
-    if responders_value is None:
+    Mirrors the same-timeline comparison the alert detail page uses so an
+    unacknowledged assignee is picked up immediately after FlashDuty
+    dispatches them, not only once they acknowledge.
+    """
+
+    try:
+        handlers, unacknowledged = parse_incident_responders(incident)
+    except FlashDutyHandlingInvalidResponseError as exc:
+        raise WeComMentionInvalidResponseError(str(exc)) from exc
+
+    candidates: list[tuple[datetime, int]] = [
+        (item.assigned_at, item.person_id) for item in unacknowledged if item.assigned_at
+    ]
+    candidates.extend(
+        (item.acknowledged_at, item.person_id) for item in handlers if item.acknowledged_at
+    )
+    if not candidates:
         return None
-    if not isinstance(responders_value, list):
-        raise WeComMentionInvalidResponseError("FlashDuty incident.responders must be a list")
-
-    latest: tuple[int, int] | None = None  # (acknowledged_at, person_id)
-    for item in responders_value:
-        if not isinstance(item, Mapping):
-            continue
-        person_id = item.get("person_id")
-        acknowledged_at = item.get("acknowledged_at")
-        if isinstance(person_id, bool) or not isinstance(person_id, int) or person_id <= 0:
-            continue
-        if (
-            isinstance(acknowledged_at, bool)
-            or not isinstance(acknowledged_at, int)
-            or acknowledged_at <= 0
-        ):
-            continue
-        if latest is None or acknowledged_at > latest[0]:
-            latest = (acknowledged_at, person_id)
-    return latest[1] if latest is not None else None
+    return max(candidates, key=lambda pair: pair[0])[1]
 
 
 async def _resolve_on_call_person(
@@ -194,7 +195,7 @@ async def _resolve_on_call_person(
 
     person_ids = _assigned_person_ids(incident)
     if not person_ids:
-        fallback_person_id = _latest_responder_person_id(incident)
+        fallback_person_id = _current_responder_person_id(incident)
         person_ids = [fallback_person_id] if fallback_person_id is not None else []
     if not person_ids:
         return ()
