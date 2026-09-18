@@ -310,7 +310,7 @@ def _member_page(
     ], total
 
 
-def _handlers(
+def parse_incident_responders(
     incident: Mapping[str, Any],
 ) -> tuple[tuple[FlashDutyHandler, ...], tuple[FlashDutyUnacknowledgedAssignee, ...]]:
     responders_value = incident.get("responders", [])
@@ -450,7 +450,7 @@ async def read_flashduty_handling(
         )
 
     try:
-        handlers, unacknowledged_assignees = _handlers(incident)
+        handlers, unacknowledged_assignees = parse_incident_responders(incident)
     except FlashDutyHandlingInvalidResponseError as exc:
         logger.warning(
             "flashduty_incident_responders_unavailable alert_id=%s incident_id=%s error=%s",
